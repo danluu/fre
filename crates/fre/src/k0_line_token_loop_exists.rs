@@ -16,22 +16,26 @@
 //! Construction also admits the unanchored byte language
 //! `(BRANCH | ...)+ TERMINAL` under a stronger proof: every atom byte is
 //! globally unique, every branch has a required fixed final atom, and the
-//! one-byte terminal is outside the token alphabet. Terminal occurrences are
-//! therefore barriers, and the maximal valid token suffix immediately before
-//! each terminal can be decoded exactly in reverse. Scanning terminals in
-//! source order yields the leftmost match without restart caps or fallback
-//! after source inspection.
+//! one-to-eight-byte terminal has a lead byte outside the token alphabet.
+//! Terminal leads are therefore barriers, and a complete terminal can be
+//! authenticated before decoding the preceding token exactly in reverse.
+//! The one-byte case can additionally decode the maximal valid token suffix
+//! for leftmost span recovery. Multi-byte predicate execution gives a bounded
+//! number of rejected terminal leads to this direct route, then fails open to
+//! the retained canonical suffix owner on dense inputs.
 
 use memchr::{memchr, memrchr};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 const MAX_BRANCHES: usize = 4;
 const MAX_ATOMS: usize = 16;
-const MAX_TERMINAL_BYTES: usize = 8;
+pub(crate) const MAX_TERMINAL_BYTES: usize = 8;
 const MAX_LATER_FIND_CANDIDATES: usize = 4;
 const UNBOUNDED: u8 = u8::MAX;
 pub(crate) const MIN_INPUT_BYTES: usize = 1_024;
 pub(crate) const UNANCHORED_MIN_INPUT_BYTES: usize = 32;
+pub(crate) const UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES: usize = 4_096;
+const UNANCHORED_MULTIBYTE_MAX_REJECTIONS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Atom {
@@ -86,40 +90,77 @@ pub(crate) struct Plan {
 pub(crate) struct UnanchoredPlan(Plan);
 
 impl UnanchoredPlan {
-    /// Attempt the complete ordinary full-input predicate. A refusal is only
-    /// possible before source inspection at the measured size crossover.
+    pub(crate) const fn minimum_input_bytes(&self) -> usize {
+        if self.0.terminal_len == 1 {
+            UNANCHORED_MIN_INPUT_BYTES
+        } else {
+            UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES
+        }
+    }
+
+    /// Attempt the ordinary full-input predicate. The one-byte route can
+    /// refuse only before source inspection at the measured size crossover.
+    /// A multi-byte route may also fail open after a bounded number of rejected
+    /// terminal leads so the retained canonical suffix owner handles dense
+    /// inputs without an unbounded retry tax.
     #[inline]
     pub(crate) fn try_is_match_full(&self, haystack: &[u8]) -> Option<bool> {
-        let output = (haystack.len() >= UNANCHORED_MIN_INPUT_BYTES)
-            .then(|| self.is_match_full_impl(haystack));
+        let output = if haystack.len() < self.minimum_input_bytes() {
+            None
+        } else {
+            let rejection_limit =
+                (self.0.terminal_len > 1).then_some(UNANCHORED_MULTIBYTE_MAX_REJECTIONS);
+            self.try_is_match_full_impl(haystack, rejection_limit)
+        };
         #[cfg(test)]
         unanchored_route_probe::record_exists(output);
         output
     }
 
+    #[cfg(test)]
     #[inline]
     fn is_match_full_impl(&self, haystack: &[u8]) -> bool {
-        let terminal = self.0.terminal[0];
+        self.try_is_match_full_impl(haystack, None).unwrap_or(false)
+    }
+
+    fn try_is_match_full_impl(
+        &self,
+        haystack: &[u8],
+        rejection_limit: Option<usize>,
+    ) -> Option<bool> {
+        let terminal_len = usize::from(self.0.terminal_len);
+        let Some(last_start) = haystack.len().checked_sub(terminal_len) else {
+            return Some(false);
+        };
+        let terminal = &self.0.terminal[..terminal_len];
         let mut search_start = 0_usize;
-        while search_start < haystack.len() {
-            let Some(relative) = memchr(terminal, &haystack[search_start..]) else {
-                return false;
+        let mut rejections = 0_usize;
+        while search_start <= last_start {
+            let Some(relative) = memchr(terminal[0], &haystack[search_start..=last_start]) else {
+                return Some(false);
             };
             let candidate = search_start.saturating_add(relative);
-            if self.0.matches_one_token_reverse(haystack, candidate) {
-                return true;
+            let candidate_end = candidate.saturating_add(terminal_len);
+            if &haystack[candidate..candidate_end] == terminal
+                && self.0.matches_one_token_reverse(haystack, candidate)
+            {
+                return Some(true);
+            }
+            rejections = rejections.saturating_add(1);
+            if rejection_limit.is_some_and(|limit| rejections >= limit) {
+                return None;
             }
             search_start = candidate.saturating_add(1);
         }
-        false
+        Some(false)
     }
 
     /// Attempt the complete ordinary full-input leftmost-first span. Once the
     /// size gate admits the source, the result is authoritative.
     #[inline]
     pub(crate) fn try_find_full(&self, haystack: &[u8]) -> Option<Option<(usize, usize)>> {
-        let output =
-            (haystack.len() >= UNANCHORED_MIN_INPUT_BYTES).then(|| self.find_full_impl(haystack));
+        let output = (self.0.terminal_len == 1 && haystack.len() >= self.minimum_input_bytes())
+            .then(|| self.find_full_impl(haystack));
         #[cfg(test)]
         unanchored_route_probe::record_span(output);
         output
@@ -692,7 +733,7 @@ pub(crate) fn inspect(
 )]
 pub(crate) fn inspect_unanchored(
     hir: &Hir,
-    expected_terminal: u8,
+    expected_terminal: &[u8],
     initial_work: u64,
     work_limit: u64,
 ) -> Result<UnanchoredInspectionOutcome, InspectionError> {
@@ -778,22 +819,24 @@ pub(crate) fn inspect_unanchored(
         return unanchored_ineligible(budget.actual);
     };
     budget.charge(1)?;
-    let [terminal_byte] = literal.0.as_ref() else {
-        return unanchored_ineligible(budget.actual);
-    };
-    budget.charge(1)?;
-    if *terminal_byte != expected_terminal {
+    if literal.0.is_empty() || literal.0.len() > MAX_TERMINAL_BYTES {
         return unanchored_ineligible(budget.actual);
     }
+    budget
+        .charge(u64::try_from(literal.0.len()).map_err(|_| InspectionError::ArithmeticOverflow)?)?;
+    if literal.0.as_ref() != expected_terminal {
+        return unanchored_ineligible(budget.actual);
+    }
+    let terminal_lead = literal.0[0];
     for atom in &atoms[..atom_count] {
         budget.charge(1)?;
-        if atom.byte == *terminal_byte {
+        if atom.byte == terminal_lead {
             return unanchored_ineligible(budget.actual);
         }
     }
 
     let mut terminal = [0_u8; MAX_TERMINAL_BYTES];
-    terminal[0] = *terminal_byte;
+    terminal[..literal.0.len()].copy_from_slice(&literal.0);
     Ok(UnanchoredInspectionOutcome::Eligible {
         plan: UnanchoredPlan(Plan {
             atoms,
@@ -801,7 +844,8 @@ pub(crate) fn inspect_unanchored(
             branch_count: u8::try_from(branch_hirs.len())
                 .map_err(|_| InspectionError::ArithmeticOverflow)?,
             terminal,
-            terminal_len: 1,
+            terminal_len: u8::try_from(literal.0.len())
+                .map_err(|_| InspectionError::ArithmeticOverflow)?,
         }),
         planner_work: budget.actual,
     })
@@ -1133,10 +1177,10 @@ mod tests {
     }
 
     fn unanchored_plan(pattern: &str) -> super::UnanchoredPlan {
-        unanchored_plan_with_terminal(pattern, b'Z')
+        unanchored_plan_with_terminal(pattern, b"Z")
     }
 
-    fn unanchored_plan_with_terminal(pattern: &str, terminal: u8) -> super::UnanchoredPlan {
+    fn unanchored_plan_with_terminal(pattern: &str, terminal: &[u8]) -> super::UnanchoredPlan {
         let UnanchoredInspectionOutcome::Eligible { plan, .. } =
             inspect_unanchored(&parse_scoped_bytes(pattern), terminal, 0, u64::MAX).unwrap()
         else {
@@ -1146,8 +1190,12 @@ mod tests {
     }
 
     fn unanchored_eligible(pattern: &str) -> bool {
+        unanchored_eligible_with_terminal(pattern, b"Z")
+    }
+
+    fn unanchored_eligible_with_terminal(pattern: &str, terminal: &[u8]) -> bool {
         matches!(
-            inspect_unanchored(&parse_scoped_bytes(pattern), b'Z', 0, u64::MAX).unwrap(),
+            inspect_unanchored(&parse_scoped_bytes(pattern), terminal, 0, u64::MAX,).unwrap(),
             UnanchoredInspectionOutcome::Eligible { .. }
         )
     }
@@ -1655,6 +1703,18 @@ mod tests {
     fn unanchored_grammar_authenticates_scoped_byte_hir_and_strong_edges() {
         assert!(unanchored_eligible(r"(?-u:(?:ab+c|de?f)+Z)"));
         assert!(unanchored_eligible(r"(?-u:(?:xy{2,4}q|rst)+Z)"));
+        assert!(unanchored_eligible_with_terminal(
+            r"(?-u:(?:ab+c|de?f)+XYZ)",
+            b"XYZ",
+        ));
+        assert!(unanchored_eligible_with_terminal(
+            r"(?-u:(?:ab|cd)+Xab)",
+            b"Xab",
+        ));
+        assert!(unanchored_eligible_with_terminal(
+            r"(?:ab|cd)+λ",
+            "λ".as_bytes(),
+        ));
 
         for pattern in [
             r"(?-u:(?:ab+c|ae?f)+Z)",
@@ -1683,42 +1743,60 @@ mod tests {
         assert!(matches!(
             inspect_unanchored(
                 &parse_scoped_bytes(r"(?-u:(?:ab+c|de?f)+Z)"),
-                b'Q',
+                b"Q",
                 0,
                 u64::MAX,
             )
             .unwrap(),
             UnanchoredInspectionOutcome::Ineligible { .. }
         ));
+        assert!(!unanchored_eligible_with_terminal(
+            r"(?-u:(?:ab+c|de?f)+XYZ)",
+            b"XYQ",
+        ));
+        assert!(!unanchored_eligible_with_terminal(
+            r"(?-u:(?:ab+c|de?f)+abcdefghi)",
+            b"abcdefghi",
+        ));
+        assert!(!unanchored_eligible_with_terminal(
+            r"(?-u:(?:ab+c|de?f)+aYZ)",
+            b"aYZ",
+        ));
     }
 
     #[test]
     fn unanchored_inspector_work_limit_closes_exactly() {
-        let hir = parse_scoped_bytes(r"(?-u:(?:ab+c|de?f)+Z)");
-        let UnanchoredInspectionOutcome::Eligible { planner_work, .. } =
-            inspect_unanchored(&hir, b'Z', 0, u64::MAX).unwrap()
-        else {
-            panic!("expected eligibility");
-        };
-        assert!(matches!(
-            inspect_unanchored(&hir, b'Z', 0, planner_work).unwrap(),
-            UnanchoredInspectionOutcome::Eligible {
-                planner_work: actual,
-                ..
-            } if actual == planner_work
-        ));
-        let limit = planner_work - 1;
-        assert!(matches!(
-            inspect_unanchored(&hir, b'Z', 0, limit),
-            Err(super::InspectionError::WorkLimit {
-                actual,
-                needed,
-                limit: observed,
-            }) if limit == planner_work - 1
-                && observed == limit
-                && actual <= limit
-                && needed > limit
-        ));
+        for (pattern, terminal) in [
+            (r"(?-u:(?:ab+c|de?f)+Z)", b"Z".as_slice()),
+            (r"(?-u:(?:ab+c|de?f)+XYZ)", b"XYZ".as_slice()),
+            (r"(?-u:(?:ab+c|de?f)+QRSTUVWX)", b"QRSTUVWX".as_slice()),
+        ] {
+            let hir = parse_scoped_bytes(pattern);
+            let UnanchoredInspectionOutcome::Eligible { planner_work, .. } =
+                inspect_unanchored(&hir, terminal, 0, u64::MAX).unwrap()
+            else {
+                panic!("expected eligibility for {pattern:?}");
+            };
+            assert!(matches!(
+                inspect_unanchored(&hir, terminal, 0, planner_work).unwrap(),
+                UnanchoredInspectionOutcome::Eligible {
+                    planner_work: actual,
+                    ..
+                } if actual == planner_work
+            ));
+            let limit = planner_work - 1;
+            assert!(matches!(
+                inspect_unanchored(&hir, terminal, 0, limit),
+                Err(super::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit: observed,
+                }) if limit == planner_work - 1
+                    && observed == limit
+                    && actual <= limit
+                    && needed > limit
+            ));
+        }
     }
 
     #[test]
@@ -1799,9 +1877,122 @@ mod tests {
     }
 
     #[test]
+    fn unanchored_multibyte_predicate_is_exact_and_span_declines() {
+        for (pattern, terminal, sources) in [
+            (
+                r"(?-u:(?:ab|cd)+XY)",
+                b"XY".as_slice(),
+                [
+                    b"abXY".as_slice(),
+                    b"cdabXY".as_slice(),
+                    b"abX".as_slice(),
+                    b"abXQ".as_slice(),
+                    b"X!cdXY".as_slice(),
+                ],
+            ),
+            (
+                r"(?-u:(?:ab|cd)+Xab)",
+                b"Xab".as_slice(),
+                [
+                    b"abXab".as_slice(),
+                    b"cdabXab".as_slice(),
+                    b"abXa".as_slice(),
+                    b"abXQab".as_slice(),
+                    b"X!cdXab".as_slice(),
+                ],
+            ),
+            (
+                r"(?-u:(?:ab|cd)+QRSTUVWX)",
+                b"QRSTUVWX".as_slice(),
+                [
+                    b"abQRSTUVWX".as_slice(),
+                    b"cdabQRSTUVWX".as_slice(),
+                    b"abQRSTUVW".as_slice(),
+                    b"abQRSTUVQX".as_slice(),
+                    b"Q!cdQRSTUVWX".as_slice(),
+                ],
+            ),
+        ] {
+            let plan = unanchored_plan_with_terminal(pattern, terminal);
+            let oracle = regex::bytes::Regex::new(pattern).unwrap();
+            assert_eq!(usize::from(plan.0.terminal_len), terminal.len());
+            for source in sources {
+                assert_eq!(
+                    plan.is_match_full_impl(source),
+                    oracle.is_match(source),
+                    "pattern={pattern:?} source={source:?}",
+                );
+                let mut admitted = vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES];
+                admitted.extend_from_slice(source);
+                assert_eq!(
+                    plan.try_find_full(&admitted),
+                    None,
+                    "multi-byte span must decline before source inspection",
+                );
+            }
+        }
+
+        const OVERLAP_PATTERN: &str = r"(?-u:(?:ab|cd)+XYX)";
+        let overlap = unanchored_plan_with_terminal(OVERLAP_PATTERN, b"XYX");
+        let overlap_oracle = regex::bytes::Regex::new(OVERLAP_PATTERN).unwrap();
+        for source in [
+            b"XabXYX".as_slice(),
+            b"XYabXYX".as_slice(),
+            b"abXYXYX".as_slice(),
+            b"abXY".as_slice(),
+        ] {
+            assert_eq!(
+                overlap.is_match_full_impl(source),
+                overlap_oracle.is_match(source),
+                "overlap source={source:?}",
+            );
+        }
+
+        const ADVANCE_PATTERN: &str = r"(?-u:(?:ab|cd)+XabX)";
+        let advance = unanchored_plan_with_terminal(ADVANCE_PATTERN, b"XabX");
+        let advance_oracle = regex::bytes::Regex::new(ADVANCE_PATTERN).unwrap();
+        assert!(advance.is_match_full_impl(b"XabXabX"));
+        assert_eq!(
+            advance.is_match_full_impl(b"XabXabX"),
+            advance_oracle.is_match(b"XabXabX"),
+            "the rejected terminal at zero must not skip the overlapping valid terminal at three",
+        );
+    }
+
+    #[test]
+    fn unanchored_multibyte_predicate_is_exhaustively_differential() {
+        const PATTERN: &str = r"(?-u:(?:ab|cd)+Xab)";
+        let plan = unanchored_plan_with_terminal(PATTERN, b"Xab");
+        let oracle = regex::bytes::Regex::new(PATTERN).unwrap();
+
+        fn visit(
+            plan: super::UnanchoredPlan,
+            oracle: &regex::bytes::Regex,
+            source: &mut Vec<u8>,
+            depth: usize,
+        ) {
+            assert_eq!(
+                plan.is_match_full_impl(source),
+                oracle.is_match(source),
+                "source={source:?}",
+            );
+            if depth == 6 {
+                return;
+            }
+            for byte in [b'a', b'b', b'c', b'd', b'X', b'!'] {
+                source.push(byte);
+                visit(plan, oracle, source, depth + 1);
+                source.pop();
+            }
+        }
+
+        visit(plan, &oracle, &mut Vec::new(), 0);
+    }
+
+    #[test]
     fn unanchored_raw_bytes_and_same_address_mutations_are_exact() {
         const PATTERN: &str = r"(?-u:(?:\xFFa+q|\xFEb?r)+\xFD)";
-        let plan = unanchored_plan_with_terminal(PATTERN, 0xFD);
+        let plan = unanchored_plan_with_terminal(PATTERN, &[0xFD]);
         let oracle = regex::bytes::Regex::new(PATTERN).unwrap();
         let mut source = vec![0; 32];
         source.extend_from_slice(&[0xFF, b'a', b'a', b'q', 0xFE, b'b', b'r', 0xFD]);
@@ -1829,6 +2020,21 @@ mod tests {
             .map(|matched| (matched.start(), matched.end()));
         assert_eq!(plan.try_is_match_full(&source), Some(true));
         assert_eq!(plan.try_find_full(&source), Some(expected));
+
+        const MULTI_PATTERN: &str = r"(?-u:(?:\xFFa+q|\xFEb?r)+\xFD\xFC)";
+        let multi = unanchored_plan_with_terminal(MULTI_PATTERN, &[0xFD, 0xFC]);
+        let multi_oracle = regex::bytes::Regex::new(MULTI_PATTERN).unwrap();
+        let mut multi_source = vec![0_u8; 32];
+        multi_source.extend_from_slice(&[0xFF, b'a', b'q', 0xFD, 0xFC]);
+        assert_eq!(
+            multi.is_match_full_impl(&multi_source),
+            multi_oracle.is_match(&multi_source),
+        );
+        multi_source[36] = 0xFB;
+        assert_eq!(
+            multi.is_match_full_impl(&multi_source),
+            multi_oracle.is_match(&multi_source),
+        );
     }
 
     #[test]
@@ -1937,6 +2143,219 @@ mod tests {
                 span_attempts: 1,
                 span_completed: 1,
             },
+        );
+    }
+
+    #[test]
+    fn unanchored_multibyte_publication_is_exists_only_and_coexists_with_suffix() {
+        const PATTERN: &str = r"(?-u:(?:ab|cd)+XYZ)";
+        fn retained(regex: &crate::PortableRegex) -> bool {
+            matches!(
+                &regex.plan,
+                PortablePlan::K0(plan) if plan.exclusive.unanchored_token_loop().is_some()
+            )
+        }
+
+        let complete = PortableBuilder::new(PATTERN).build().unwrap();
+        assert!(retained(&complete));
+        let PortablePlan::K0(complete_k0) = &complete.plan else {
+            panic!("target must remain K0");
+        };
+        let suffix = complete_k0
+            .mandatory_suffix
+            .as_ref()
+            .expect("three-byte terminal keeps its canonical suffix owner");
+        assert_eq!(suffix.needle(), b"XYZ");
+        let direct = complete_k0
+            .exclusive
+            .unanchored_token_loop()
+            .expect("multi-byte direct owner");
+        assert_eq!(direct.0.terminal_len, 3);
+        assert_eq!(&direct.0.terminal[..3], b"XYZ");
+
+        for (pattern, terminal) in [
+            (r"(?-u:(?:ab|cd)+XY)", b"XY".as_slice()),
+            (r"(?-u:(?:ab|cd)+Xab)", b"Xab".as_slice()),
+            (r"(?-u:(?:ab|cd)+QRSTUVWX)", b"QRSTUVWX".as_slice()),
+            (r"(?:ab|cd)+λ", "λ".as_bytes()),
+        ] {
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            assert!(retained(&regex), "pattern={pattern:?}");
+            let PortablePlan::K0(k0) = &regex.plan else {
+                panic!("target must remain K0 for {pattern:?}");
+            };
+            let plan = k0
+                .exclusive
+                .unanchored_token_loop()
+                .expect("multi-byte direct owner");
+            assert_eq!(usize::from(plan.0.terminal_len), terminal.len());
+            assert_eq!(&plan.0.terminal[..terminal.len()], terminal);
+        }
+        let two = PortableBuilder::new(r"(?-u:(?:ab|cd)+XY)").build().unwrap();
+        let PortablePlan::K0(two_k0) = &two.plan else {
+            panic!("two-byte target must remain K0");
+        };
+        assert!(
+            two_k0.mandatory_suffix.is_none(),
+            "the deferred two-byte certificate need not create a suffix owner",
+        );
+
+        let exact_work = complete.build_report().planner_work;
+        let exact_bytes = complete.build_report().charged_persistent_bytes;
+        let at_work = PortableBuilder::new(PATTERN)
+            .limits(BuildLimits {
+                max_planner_work: exact_work,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert!(retained(&at_work));
+        let below_work = PortableBuilder::new(PATTERN)
+            .limits(BuildLimits {
+                max_planner_work: exact_work - 1,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert!(!retained(&below_work));
+        let PortablePlan::K0(below_work_k0) = &below_work.plan else {
+            panic!("below-work target must remain K0");
+        };
+        assert_eq!(
+            below_work_k0
+                .mandatory_suffix
+                .as_ref()
+                .expect("sidecar work refusal preserves the suffix")
+                .needle(),
+            b"XYZ",
+        );
+
+        let at_bytes = PortableBuilder::new(PATTERN)
+            .limits(BuildLimits {
+                max_persistent_bytes: exact_bytes,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert!(retained(&at_bytes));
+        let below_bytes = PortableBuilder::new(PATTERN)
+            .limits(BuildLimits {
+                max_persistent_bytes: exact_bytes - 1,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert!(!retained(&below_bytes));
+        let PortablePlan::K0(below_bytes_k0) = &below_bytes.plan else {
+            panic!("below-storage target must remain K0");
+        };
+        assert_eq!(
+            below_bytes_k0
+                .mandatory_suffix
+                .as_ref()
+                .expect("sidecar storage refusal preserves the suffix")
+                .needle(),
+            b"XYZ",
+        );
+
+        let forced = PortableBuilder::new(PATTERN)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert!(!retained(&forced));
+
+        let mut below = vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES - 7 - 1];
+        below.extend_from_slice(b"cdabXYZ");
+        assert_eq!(below.len(), super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES - 1,);
+        super::unanchored_route_probe::reset();
+        assert!(complete.is_match(&below));
+        assert_eq!(
+            complete
+                .find(&below)
+                .map(|matched| (matched.start(), matched.end())),
+            Some((below.len() - 7, below.len())),
+        );
+        assert_eq!(
+            super::unanchored_route_probe::snapshot(),
+            super::unanchored_route_probe::Counts::default(),
+        );
+
+        let mut at = vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES - 7];
+        at.extend_from_slice(b"cdabXYZ");
+        assert_eq!(at.len(), super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES);
+        super::unanchored_route_probe::reset();
+        assert!(complete.is_match(&at));
+        assert_eq!(
+            complete
+                .find(&at)
+                .map(|matched| (matched.start(), matched.end())),
+            Some((at.len() - 7, at.len())),
+        );
+        assert_eq!(
+            super::unanchored_route_probe::snapshot(),
+            super::unanchored_route_probe::Counts {
+                exists_attempts: 1,
+                exists_completed: 1,
+                span_attempts: 1,
+                span_completed: 0,
+            },
+        );
+
+        let address = at.as_ptr();
+        let last = at.len() - 1;
+        at[last] = b'Q';
+        assert_eq!(at.as_ptr(), address);
+        assert!(!complete.is_match(&at));
+        assert_eq!(complete.find(&at), None);
+        at[last] = b'Z';
+        assert_eq!(at.as_ptr(), address);
+        assert!(complete.is_match(&at));
+        assert!(complete.find(&at).is_some());
+        let after_mutations = super::unanchored_route_probe::snapshot();
+        assert_eq!(after_mutations.exists_attempts, 3);
+        assert_eq!(
+            after_mutations.exists_completed, 2,
+            "one rejected multi-byte terminal fails open to canonical K0",
+        );
+        assert_eq!(after_mutations.span_attempts, 3);
+        assert_eq!(after_mutations.span_completed, 0);
+
+        assert!(
+            complete
+                .is_match_with_limits(&at, SearchLimits::unlimited())
+                .unwrap(),
+        );
+        assert_eq!(
+            complete
+                .find_value(&at, SearchLimits::unlimited())
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            Some((at.len() - 7, at.len())),
+        );
+        assert!(
+            complete
+                .is_match_window_value(&at, SearchWindow::full(&at), SearchLimits::unlimited(),)
+                .unwrap(),
+        );
+        assert_eq!(
+            super::unanchored_route_probe::snapshot(),
+            after_mutations,
+            "explicit and windowed APIs remain canonical",
+        );
+
+        let mut dense_then_late = vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES];
+        dense_then_late.extend_from_slice(b"XYZ!XYZ!XYZ!XYZ!abXYZ");
+        super::unanchored_route_probe::reset();
+        assert!(complete.is_match(&dense_then_late));
+        assert_eq!(
+            super::unanchored_route_probe::snapshot(),
+            super::unanchored_route_probe::Counts {
+                exists_attempts: 1,
+                exists_completed: 0,
+                span_attempts: 0,
+                span_completed: 0,
+            },
+            "multi-byte candidate saturation fails open to canonical K0",
         );
     }
 

@@ -10257,16 +10257,13 @@ impl PortableBuilder {
             }
         };
         let deferred_short_unbounded = mandatory_suffix.deferred_short_unbounded;
-        // Preserve the exact one-byte suffix certificate after the deferred
-        // transaction consumes its copy. The final ordinary token-loop proof
-        // cross-checks its HIR terminal against this independently analyzed
-        // byte instead of relying on shape alone.
-        let deferred_short_terminal = deferred_short_unbounded.as_ref().and_then(|candidate| {
-            let [terminal] = candidate.as_bytes() else {
-                return None;
-            };
-            Some(*terminal)
-        });
+        // Preserve the exact one- or two-byte suffix certificate after the
+        // deferred transaction consumes its copy. The final ordinary
+        // token-loop proof cross-checks its HIR terminal against this
+        // independently analyzed byte string instead of relying on shape
+        // alone. Longer certificates remain available from a retained
+        // mandatory-suffix owner.
+        let deferred_short_terminal = deferred_short_unbounded;
         fallback_planner_work = mandatory_suffix.planner_work;
         let packed_frontier = if k0_absolute_end_proof.is_none()
             && matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
@@ -11006,15 +11003,28 @@ impl PortableBuilder {
         } else {
             None
         };
-        // The exact unanchored language `(BRANCH | ...)+ BYTE` fills the
-        // remaining one-byte-terminal gap. A globally unique token alphabet
-        // makes reverse decoding deterministic, while the disjoint terminal
-        // is a barrier between candidate regions. Keep this ordinary-only
+        // The exact unanchored language `(BRANCH | ...)+ TERMINAL` fills the
+        // remaining deterministic-token gap. A globally unique token alphabet
+        // makes reverse decoding deterministic, while the terminal's disjoint
+        // lead byte is a barrier between candidates. A retained mandatory
+        // suffix authenticates terminals of three to eight bytes; the deferred
+        // certificate above authenticates one or two. Keep this ordinary-only
         // proof at the same final, boxed priority as the disjoint line owners.
+        let authenticated_unanchored_terminal = mandatory_suffix_plan
+            .as_ref()
+            .map(K0MandatorySuffixPlan::needle)
+            .filter(|terminal| {
+                (1..=k0_line_token_loop_exists::MAX_TERMINAL_BYTES).contains(&terminal.len())
+            })
+            .or_else(|| {
+                deferred_short_terminal
+                    .as_ref()
+                    .map(MandatorySuffixCandidate::as_bytes)
+            });
         let unanchored_token_loop_inspection = if line_token_loop_inspection.is_none()
             && line_prefix_tail_inspection.is_none()
-            && let Some(deferred_short_terminal) = deferred_short_terminal
-            && mandatory_suffix_plan.is_none()
+            && let Some(authenticated_terminal) = authenticated_unanchored_terminal
+            && (authenticated_terminal.len() > 1 || mandatory_suffix_plan.is_none())
             && correlated_terminal.is_none()
             && k0_absolute_end_proof.is_none()
             && packed_frontier_plan.is_none()
@@ -11023,7 +11033,7 @@ impl PortableBuilder {
         {
             match k0_line_token_loop_exists::inspect_unanchored(
                 &rust.hir,
-                deferred_short_terminal,
+                authenticated_terminal,
                 fallback_planner_work,
                 self.limits.max_planner_work,
             ) {
@@ -11497,9 +11507,7 @@ impl K0LinePlan {
     const fn minimum_input_bytes(&self) -> usize {
         match self {
             Self::PrefixTail(_) | Self::TokenLoop(_) => k0_line_token_loop_exists::MIN_INPUT_BYTES,
-            Self::UnanchoredTokenLoop(_) => {
-                k0_line_token_loop_exists::UNANCHORED_MIN_INPUT_BYTES
-            }
+            Self::UnanchoredTokenLoop(plan) => plan.minimum_input_bytes(),
         }
     }
 
