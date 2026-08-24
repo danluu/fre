@@ -43140,7 +43140,11 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
 ) -> Result<(Vec<u8>, usize), ObjectError> {
     const LINE_START_OFFSET: u8 = 8;
     const SCRATCH_OFFSET: u8 = 16;
-    let frame_bytes = if caller_scratch_bytes == 0 { 16 } else { 32 };
+    // The line traversal keeps its current line start in RBP. RBP is
+    // callee-saved under SysV, so preserve it with the other live registers.
+    // Six pushes leave RSP 8 mod 16; the odd-eight frame sizes restore the
+    // required 16-byte alignment at each private-domain call site.
+    let frame_bytes = if caller_scratch_bytes == 0 { 24 } else { 40 };
     let mut assembler = X86Assembler::new();
     let line_loop = assembler.label()?;
     let scan = assembler.label()?;
@@ -43153,6 +43157,7 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     let invalid = assembler.label()?;
 
     x86_native_capture_reducer_boundary(&mut assembler, caller_scratch_bytes, invalid)?;
+    assembler.instruction(&[0x55])?;
     assembler.instruction(&[0x53])?;
     assembler.instruction(&[0x41, 0x54])?;
     assembler.instruction(&[0x41, 0x55])?;
@@ -43235,6 +43240,7 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     assembler.instruction(&[0x41, 0x5d])?;
     assembler.instruction(&[0x41, 0x5c])?;
     assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
     assembler.instruction(&[0xc3])?;
     assembler.bind(invalid)?;
     assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
@@ -71177,6 +71183,40 @@ mod tests {
     // work below its general cap while making the correlated lookup cheaper
     // than both the primary-only and fully refined incumbent extremes.
     const MANDATORY_TEDDY_STRUCTURAL_PATTERN: &str = r"(?:\x00\x00\x00|\x01\x01\x01|\x02\x02\x02|\x03\x03\x03|\x04\x04\x04|\x0e\x0e\x0e|\x0f\x0f\x0f|\x10\x10\x10|\x11\x11\x11|\x14\x14\x14|\x15\x15\x15|\x16\x16\x16|\x17\x17\x17|\x1c\x1c\x1c|\x1d\x1d\x1d|\x1e\x1e\x1e|\x1f\x1f\x1f){2}";
+
+    #[test]
+    fn x86_capture_grep_wrapper_preserves_rbp_and_aligns_private_calls() {
+        for (caller_scratch_bytes, frame_bytes) in [(0, 24_u8), (64, 40_u8)] {
+            let (code, private_call) =
+                lower_x86_64_native_capture_grep_wrapper_v1(caller_scratch_bytes)
+                    .expect("lower x86 capture grep wrapper");
+            let prologue = [
+                0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec,
+                frame_bytes,
+            ];
+            let epilogue = [
+                0x48, 0x83, 0xc4, frame_bytes, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c,
+                0x5b, 0x5d, 0xc3,
+            ];
+            assert_eq!(
+                code.windows(prologue.len())
+                    .filter(|window| *window == prologue)
+                    .count(),
+                1,
+                "one RBP-preserving prologue for caller scratch {caller_scratch_bytes}",
+            );
+            assert_eq!(
+                code.windows(epilogue.len())
+                    .filter(|window| *window == epilogue)
+                    .count(),
+                1,
+                "one RBP-restoring epilogue for caller scratch {caller_scratch_bytes}",
+            );
+            assert!(private_call > 0);
+            assert_eq!(code.get(private_call - 1), Some(&0xe8));
+            assert_eq!(frame_bytes % 16, 8);
+        }
+    }
 
     fn exact_one_byte_pattern(bytes: impl IntoIterator<Item = u8>) -> String {
         let mut pattern = String::from("(?-u:");

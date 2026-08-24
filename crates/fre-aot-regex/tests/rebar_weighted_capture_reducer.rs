@@ -211,6 +211,7 @@ fn linked_fake_children_close_priority_crlf_and_failure_transactions() {
     );
     let entries = count.receipt().component_entry_symbols();
     assert_eq!(entries.len(), 2);
+    let grep_abi_wrapper = "fre_aot_weighted_grep_abi_wrap_v1";
 
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -242,6 +243,19 @@ fn linked_fake_children_close_priority_crlf_and_failure_transactions() {
     .unwrap();
     writeln!(
         source,
+        "extern uint32_t {grep_abi_wrapper}(const unsigned char*,size_t,uint64_t*,uint32_t*);"
+    )
+    .unwrap();
+    if !cfg!(target_arch = "x86_64") {
+        writeln!(
+            source,
+            "uint32_t {grep_abi_wrapper}(const unsigned char*h,size_t n,uint64_t*v,uint32_t*p){{*p=1;return {}(h,n,v);}}",
+            grep.reducer_symbol()
+        )
+        .unwrap();
+    }
+    writeln!(
+        source,
         "uint32_t {}(const unsigned char*h,size_t n,size_t s,size_t e,size_t*r){{\
          if(s>e||e>n)return 77;if(n&&h[0]=='S')return 9;\
          if(n&&h[0]=='Z'){{r[0]=s;r[1]=s;return 1;}}\
@@ -263,7 +277,7 @@ fn linked_fake_children_close_priority_crlf_and_failure_transactions() {
     .unwrap();
     writeln!(
         source,
-        "int main(void){{uint64_t v;uint32_t s;\
+        "int main(void){{uint64_t v;uint32_t s,abi;\
          static const unsigned char p[8]={{'P',0,0,0,0,0,0,0}};\
          static const unsigned char bad_status[1]={{'S'}};\
          static const unsigned char zero_width[1]={{'Z'}};\
@@ -275,7 +289,7 @@ fn linked_fake_children_close_priority_crlf_and_failure_transactions() {
          v=93;s={}(zero_width,1,&v);if(s!=3||v!=93)return 12;\
          v=94;s={}(beyond_end,1,&v);if(s!=3||v!=94)return 13;\
          v=95;s={}(late_invalid,2,&v);if(s!=3||v!=95)return 14;\
-         v=96;s={}(lines,11,&v);if(s!=0||v!=6)return 15;\
+         v=96;abi=0;s={}(lines,11,&v,&abi);if(s!=0||v!=6||abi!=1)return 15;\
          v=97;s={}(p,(size_t)-1,&v);if(s!=2||v!=97)return 16;\
          return 0;}}",
         count.reducer_symbol(),
@@ -283,7 +297,7 @@ fn linked_fake_children_close_priority_crlf_and_failure_transactions() {
         count.reducer_symbol(),
         count.reducer_symbol(),
         count.reducer_symbol(),
-        grep.reducer_symbol(),
+        grep_abi_wrapper,
         count.reducer_symbol(),
     )
     .unwrap();
@@ -295,11 +309,52 @@ fn linked_fake_children_close_priority_crlf_and_failure_transactions() {
     } else {
         "cc"
     };
-    let output = Command::new(compiler)
+    let mut command = Command::new(compiler);
+    command
         .arg("-O0")
         .arg(&c_path)
         .arg(&count_object)
-        .arg(&grep_object)
+        .arg(&grep_object);
+    if cfg!(target_arch = "x86_64") {
+        let prefix = if cfg!(target_os = "macos") { "_" } else { "" };
+        let type_directive = if cfg!(target_os = "linux") {
+            format!(".type {prefix}{grep_abi_wrapper},@function\n")
+        } else {
+            String::new()
+        };
+        let size_directive = if cfg!(target_os = "linux") {
+            format!(
+                ".size {prefix}{grep_abi_wrapper},.-{prefix}{grep_abi_wrapper}\n"
+            )
+        } else {
+            String::new()
+        };
+        let assembly = format!(
+            ".text\n.p2align 4\n.globl {prefix}{grep_abi_wrapper}\n{type_directive}\
+             {prefix}{grep_abi_wrapper}:\n\
+             pushq %rbp\n\
+             pushq %rbx\n\
+             subq $8,%rsp\n\
+             movq %rcx,%rbx\n\
+             movabsq $0x6a09e667f3bcc909,%rbp\n\
+             call {prefix}{grep_reducer}\n\
+             movabsq $0x6a09e667f3bcc909,%r10\n\
+             cmpq %r10,%rbp\n\
+             sete %r11b\n\
+             movzbl %r11b,%r11d\n\
+             movl %r11d,(%rbx)\n\
+             addq $8,%rsp\n\
+             popq %rbx\n\
+             popq %rbp\n\
+             ret\n\
+             {size_directive}",
+            grep_reducer = grep.reducer_symbol(),
+        );
+        let assembly_path = directory.join("grep_abi.S");
+        fs::write(&assembly_path, assembly).expect("write x86 grep ABI wrapper");
+        command.arg(assembly_path);
+    }
+    let output = command
         .arg("-o")
         .arg(&executable)
         .output()
