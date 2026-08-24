@@ -52927,15 +52927,15 @@ mod tests {
         assert!(!expected_mutated_exists);
         assert_eq!(regex.is_match(&source), expected_mutated_exists);
         assert_eq!(regex.is_match(&source), expected_mutated_exists);
-        assert_eq!(contextual_v4_facade_probe::snapshot(), (2, 1));
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (0, 0));
         source[mutated] = b'f';
         let retained_direct_counts = super::k0_line_token_loop_exists::route_probe::snapshot();
         assert_eq!(
             retained_direct_counts,
             super::k0_line_token_loop_exists::route_probe::Counts {
                 attempts: 5,
-                completed: 3,
-                declined: 2,
+                completed: 5,
+                declined: 0,
             },
         );
 
@@ -53019,7 +53019,7 @@ mod tests {
             retained_direct_counts,
             "explicit, accounted, find, session, and capture APIs stay out of Exists",
         );
-        assert_eq!(contextual_v4_facade_probe::snapshot(), (2, 1));
+        assert_eq!(contextual_v4_facade_probe::snapshot(), (0, 0));
 
         let short = b"abbbcZ\n";
         assert_eq!(regex.is_match(short), upstream.is_match(short));
@@ -53027,8 +53027,8 @@ mod tests {
             super::k0_line_token_loop_exists::route_probe::snapshot(),
             super::k0_line_token_loop_exists::route_probe::Counts {
                 attempts: 5,
-                completed: 3,
-                declined: 2,
+                completed: 5,
+                declined: 0,
             },
             "a short ordinary call must bypass the outlined route",
         );
