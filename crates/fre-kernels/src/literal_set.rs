@@ -1453,7 +1453,6 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     /// Returns [`LiteralSetError::InvalidWindow`] when `window` lies outside
     /// the original haystack.
     #[doc(hidden)]
-    #[cold]
     #[inline(never)]
     pub fn first_acceptance_window_value(
         &self,
