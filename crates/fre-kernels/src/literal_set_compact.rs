@@ -251,7 +251,7 @@ impl LiteralSetCompactPlan {
     ) -> Result<bool, LiteralSetError> {
         validate_window(window, haystack.len())?;
         Ok(self
-            .first_relative_end(&haystack[window.start()..window.end()], true)
+            .first_end_window_value_validated(haystack, window)
             .is_some())
     }
 
@@ -262,9 +262,7 @@ impl LiteralSetCompactPlan {
         window: Window,
     ) -> Result<Option<usize>, LiteralSetError> {
         validate_window(window, haystack.len())?;
-        self.first_relative_end(&haystack[window.start()..window.end()], true)
-            .map(|end| self.absolute_end(window.start(), end))
-            .transpose()
+        Ok(self.first_end_window_value_validated(haystack, window))
     }
 
     #[inline(never)]
@@ -278,20 +276,29 @@ impl LiteralSetCompactPlan {
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
         validate_window(window, haystack.len())?;
-        let input = Input::new(&haystack[window.start()..window.end()]);
-        let matches = self
-            .automaton
-            .try_find_iter(input)
-            .expect("the compact literal NFA supports unanchored iteration");
-        for matched in matches {
-            let span = self.absolute_span(window.start(), matched)?;
+        if self.window_is_too_short(window) {
+            return Ok(Ok(()));
+        }
+        let mut input = Input::new(haystack).span(window.start()..window.end());
+        loop {
+            let Some(matched) = self
+                .automaton
+                .try_find(&input)
+                .expect("the compact literal NFA supports unanchored search")
+            else {
+                return Ok(Ok(()));
+            };
+            let span = self.absolute_span(matched)?;
             match visitor(span) {
                 Ok(true) => {}
                 Ok(false) => return Ok(Ok(())),
                 Err(error) => return Ok(Err(error)),
             }
+            if window.end() - matched.end() < self.build.minimum_pattern_bytes {
+                return Ok(Ok(()));
+            }
+            input.set_start(matched.end());
         }
-        Ok(Ok(()))
     }
 
     #[inline(never)]
@@ -301,20 +308,30 @@ impl LiteralSetCompactPlan {
         window: Window,
     ) -> Result<u64, LiteralSetError> {
         validate_window(window, haystack.len())?;
-        let input = Input::new(&haystack[window.start()..window.end()]);
-        let matches = self
-            .automaton
-            .try_find_iter(input)
-            .expect("the compact literal NFA supports unanchored iteration");
-        let mut count = 0_u64;
-        for _ in matches {
-            count = count
-                .checked_add(1)
-                .ok_or(LiteralSetError::ArithmeticOverflow {
-                    computation: "compact literal-set ordinary match count",
-                })?;
+        if self.window_is_too_short(window) {
+            return Ok(0);
         }
-        Ok(count)
+        let mut input = Input::new(haystack).span(window.start()..window.end());
+        let mut count = 0_usize;
+        loop {
+            let Some(matched) = self
+                .automaton
+                .try_find(&input)
+                .expect("the compact literal NFA supports unanchored search")
+            else {
+                break;
+            };
+            // Matches do not overlap and have positive width, so their count
+            // is bounded by the validated window length.
+            count += 1;
+            if window.end() - matched.end() < self.build.minimum_pattern_bytes {
+                break;
+            }
+            input.set_start(matched.end());
+        }
+        u64::try_from(count).map_err(|_| LiteralSetError::ArithmeticOverflow {
+            computation: "compact literal-set ordinary match count",
+        })
     }
 
     #[inline]
@@ -323,17 +340,25 @@ impl LiteralSetCompactPlan {
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<(usize, usize)>, LiteralSetError> {
-        let input = Input::new(&haystack[window.start()..window.end()]);
+        if self.window_is_too_short(window) {
+            return Ok(None);
+        }
+        let input = Input::new(haystack).span(window.start()..window.end());
         self.automaton
             .try_find(&input)
             .expect("the compact literal NFA supports unanchored search")
-            .map(|matched| self.absolute_span(window.start(), matched))
+            .map(|matched| self.absolute_span(matched))
             .transpose()
     }
 
     #[inline]
-    fn first_relative_end(&self, haystack: &[u8], earliest: bool) -> Option<usize> {
-        let input = Input::new(haystack).earliest(earliest);
+    fn first_end_window_value_validated(&self, haystack: &[u8], window: Window) -> Option<usize> {
+        if self.window_is_too_short(window) {
+            return None;
+        }
+        let input = Input::new(haystack)
+            .span(window.start()..window.end())
+            .earliest(true);
         self.automaton
             .try_find(&input)
             .expect("the compact literal NFA supports unanchored search")
@@ -341,23 +366,18 @@ impl LiteralSetCompactPlan {
     }
 
     #[inline]
-    fn absolute_end(&self, base: usize, relative_end: usize) -> Result<usize, LiteralSetError> {
-        base.checked_add(relative_end)
-            .ok_or(LiteralSetError::ArithmeticOverflow {
-                computation: "compact literal-set match end",
-            })
+    fn window_is_too_short(&self, window: Window) -> bool {
+        window.end() - window.start() < self.build.minimum_pattern_bytes
     }
 
     #[inline]
     fn absolute_span(
         &self,
-        base: usize,
         matched: aho_corasick::Match,
     ) -> Result<(usize, usize), LiteralSetError> {
-        let relative_end = matched.end();
+        let end = matched.end();
         let width = self.build.minimum_pattern_bytes;
-        debug_assert_eq!(matched.start(), relative_end - width);
-        let end = self.absolute_end(base, relative_end)?;
+        debug_assert_eq!(matched.start(), end - width);
         let start = end
             .checked_sub(width)
             .ok_or(LiteralSetError::ArithmeticOverflow {
@@ -750,6 +770,24 @@ mod tests {
             ordinary.try_visit_spans_window_value(haystack, invalid, |_| { Ok::<bool, ()>(true) }),
             Err(expected),
         );
+
+        let short = Window::new(1, haystack.len());
+        assert_eq!(ordinary.exists_window_value(haystack, short), Ok(false));
+        assert_eq!(
+            ordinary.selected_end_window_value(haystack, short),
+            Ok(None)
+        );
+        assert_eq!(ordinary.find_window_value(haystack, short), Ok(None));
+        assert_eq!(ordinary.count_spans_window_value(haystack, short), Ok(0));
+        let mut short_calls = 0;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(haystack, short, |_| {
+                short_calls += 1;
+                Ok::<bool, ()>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(short_calls, 0);
 
         let full = Window::full(haystack);
         let mut calls = 0;
