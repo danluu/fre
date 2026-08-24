@@ -462,7 +462,7 @@ impl LiteralSetCompactOrdinaryCandidate {
 }
 
 impl CompactEngine {
-    #[inline(never)]
+    #[inline]
     fn find_window_value(
         &self,
         haystack: &[u8],
@@ -472,7 +472,7 @@ impl CompactEngine {
         self.find_window_value_validated(haystack, window)
     }
 
-    #[inline(never)]
+    #[inline]
     fn exists_window_value(
         &self,
         haystack: &[u8],
@@ -484,7 +484,7 @@ impl CompactEngine {
             .is_some())
     }
 
-    #[inline(never)]
+    #[inline]
     fn selected_end_window_value(
         &self,
         haystack: &[u8],
@@ -494,12 +494,12 @@ impl CompactEngine {
         Ok(self.first_end_window_value_validated(haystack, window))
     }
 
-    #[inline(never)]
+    #[inline]
     fn try_visit_spans_window_value<F, E>(
         &self,
         haystack: &[u8],
         window: Window,
-        mut visitor: F,
+        visitor: F,
     ) -> Result<Result<(), E>, LiteralSetError>
     where
         F: FnMut((usize, usize)) -> Result<bool, E>,
@@ -508,6 +508,20 @@ impl CompactEngine {
         if self.window_is_too_short(window) {
             return Ok(Ok(()));
         }
+        self.try_visit_spans_window_value_nonempty(haystack, window, visitor)
+    }
+
+    #[inline(never)]
+    fn try_visit_spans_window_value_nonempty<F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, LiteralSetError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        debug_assert!(!self.window_is_too_short(window));
         let mut input = Input::new(haystack).span(window.start()..window.end());
         loop {
             let Some(matched) = self
@@ -530,7 +544,7 @@ impl CompactEngine {
         }
     }
 
-    #[inline(never)]
+    #[inline]
     fn count_spans_window_value(
         &self,
         haystack: &[u8],
@@ -540,6 +554,16 @@ impl CompactEngine {
         if self.window_is_too_short(window) {
             return Ok(0);
         }
+        self.count_spans_window_value_nonempty(haystack, window)
+    }
+
+    #[inline(never)]
+    fn count_spans_window_value_nonempty(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<u64, LiteralSetError> {
+        debug_assert!(!self.window_is_too_short(window));
         let mut input = Input::new(haystack).span(window.start()..window.end());
         let mut count = 0_usize;
         loop {
