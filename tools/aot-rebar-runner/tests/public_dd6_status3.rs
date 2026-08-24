@@ -248,8 +248,8 @@ fn configured_smoke_klv() -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "recursive Cargo smoke for the helper-free linked native-row bridge"]
-fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
+#[ignore = "recursive Cargo smoke for the helper-free shared ordered-many reducers"]
+fn configured_shared_ordered_many_reducers_match_build_many()
 -> Result<(), DynError> {
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
@@ -262,11 +262,23 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
 
     let result = (|| {
         let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        for (index, model) in [Model::Count, Model::SpanSum, Model::GrepCount]
+        for (index, (model, force_v15, direct_grep)) in [
+            (Model::Count, false, false),
+            (Model::SpanSum, false, false),
+            (Model::GrepCount, false, false),
+            (Model::GrepCount, true, false),
+            (Model::GrepCount, false, true),
+        ]
             .into_iter()
             .enumerate()
         {
-            let klv_bytes = configured_native_rows_klv(model);
+            let klv_bytes = if direct_grep {
+                configured_direct_grep_klv()
+            } else if force_v15 {
+                configured_shared_v15_grep_klv()
+            } else {
+                configured_native_rows_klv(model)
+            };
             let benchmark = Benchmark::parse(&klv_bytes)?;
             let expected = oracle(&benchmark)?;
             let klv = root.join(format!("native-rows-{index}.klv"));
@@ -336,72 +348,75 @@ fn configured_native_row_bridge_activates_later_entries_and_matches_build_many()
                 .into());
             }
             let provenance = std::str::from_utf8(&provenance.stdout)?;
-            if model != Model::GrepCount {
+            if direct_grep {
                 for expected_field in [
                     "schema=fre.aot.rebar-runner.v2",
-                    "shared_ordered_many=true",
-                    "source_pattern_count=5",
-                    "boundary=single-call-shared-ordered-many-helper-free-native-reducer",
+                    "shared_ordered_many=false",
+                    "source_pattern_count=1",
+                    "aggregate_strategy=Some(NativeFused)",
+                    "adapter=general-aot-linked-native-grep-count-reducer-prepared-v2",
+                    "grep_iteration_strategy=linked-native-grep-count-reducer-v1",
                 ] {
                     if !provenance.contains(expected_field) {
                         return Err(format!(
-                            "shared ordered-many provenance omitted {expected_field:?}: {provenance}"
+                            "direct Grep provenance omitted {expected_field:?}: {provenance}"
                         )
                         .into());
                     }
                 }
                 continue;
             }
+            let (adapter, span_iteration, grep_iteration) = match model {
+                Model::Count => (
+                    "adapter=general-aot-shared-ordered-many-native-count-v1",
+                    "span_iteration_strategy=not-applicable",
+                    "grep_iteration_strategy=not-applicable",
+                ),
+                Model::SpanSum => (
+                    "adapter=general-aot-shared-ordered-many-native-span-sum-v1",
+                    "span_iteration_strategy=linked-shared-ordered-many-native-span-sum-reducer-v1",
+                    "grep_iteration_strategy=not-applicable",
+                ),
+                Model::GrepCount => (
+                    "adapter=general-aot-shared-ordered-many-native-grep-count-v1",
+                    "span_iteration_strategy=not-applicable",
+                    "grep_iteration_strategy=linked-shared-ordered-many-native-grep-count-reducer-v1",
+                ),
+                _ => unreachable!("configured shared scalar test uses only scalar models"),
+            };
+            let (source_pattern_count, aggregate_strategy, prepare_version, capabilities) =
+                if force_v15 {
+                    (
+                        "source_pattern_count=2",
+                        "aggregate_strategy=Some(NativeOrderedNfaFused)",
+                        "prepare_config_version=3",
+                        "required_prepare_capabilities=0000000000000001",
+                    )
+                } else {
+                    (
+                        "source_pattern_count=5",
+                        "aggregate_strategy=Some(NativeFused)",
+                        "prepare_config_version=2",
+                        "required_prepare_capabilities=0000000000000000",
+                    )
+                };
             for expected_field in [
-                "schema=fre.aot.rebar-runner.v3",
-                "native_row_bridge=true",
-                "source_pattern_count=5",
-                "source_to_artifact=0,1,2,1,3",
-                "component_count=4",
+                "schema=fre.aot.rebar-runner.v2",
+                "shared_ordered_many=true",
+                source_pattern_count,
+                aggregate_strategy,
+                prepare_version,
+                capabilities,
+                "boundary=single-call-shared-ordered-many-helper-free-native-reducer",
+                adapter,
+                span_iteration,
+                grep_iteration,
             ] {
                 if !provenance.contains(expected_field) {
                     return Err(format!(
-                        "native-row provenance omitted {expected_field:?}: {provenance}"
+                        "shared ordered-many provenance omitted {expected_field:?}: {provenance}"
                     )
                     .into());
-                }
-            }
-            let (expected_boundary, expected_strategy) = (
-                "boundary=single-call-helper-free-native-multi-grep-reducer",
-                "aggregate_strategy=native-independent-span-row-whole-grep-reducer-v1",
-            );
-            for expected_field in [expected_boundary, expected_strategy] {
-                if !provenance.contains(expected_field) {
-                    return Err(format!(
-                        "native-row provenance omitted {expected_field:?}: {provenance}"
-                    )
-                    .into());
-                }
-            }
-            if !provenance.contains("native_multi_grep_reducer=true")
-                || !provenance.contains("multi_grep_reducer_relocation_count=4")
-                || !provenance.contains("multi_grep_reducer_semantic_runtime_calls=0")
-            {
-                return Err(format!(
-                    "native multi-Grep provenance omitted its typed reducer receipt: {provenance}"
-                )
-                .into());
-            }
-            for component in 0..4 {
-                for expected_field in [
-                    format!("component_{component}_native=true"),
-                    format!("component_{component}_source_ordinal="),
-                    format!("component_{component}_entry_symbol="),
-                    format!("component_{component}_runtime_symbols="),
-                    format!("component_{component}_program_sha256="),
-                    format!("component_{component}_object_sha256="),
-                ] {
-                    if !provenance.contains(&expected_field) {
-                        return Err(format!(
-                            "native-row provenance omitted {expected_field:?}: {provenance}"
-                        )
-                        .into());
-                    }
                 }
             }
         }
@@ -437,6 +452,58 @@ fn configured_native_rows_klv(model: Model) -> Vec<u8> {
         ("pattern", b"ab".as_slice()),
         ("pattern", b"".as_slice()),
         ("haystack", b"abx".as_slice()),
+    ] {
+        output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
+        output.extend_from_slice(value);
+        output.push(b'\n');
+    }
+    output
+}
+
+fn configured_shared_v15_grep_klv() -> Vec<u8> {
+    let mut output = Vec::new();
+    for (key, value) in [
+        (
+            "name",
+            b"synthetic/aot-runner/shared-v15-grep".as_slice(),
+        ),
+        ("model", b"grep".as_slice()),
+        ("case-insensitive", b"false".as_slice()),
+        ("unicode", b"true".as_slice()),
+        ("max-iters", b"1".as_slice()),
+        ("max-warmup-iters", b"0".as_slice()),
+        ("max-time", b"1000000000".as_slice()),
+        ("max-warmup-time", b"0".as_slice()),
+        ("pattern", br"\b\w{25,}\b".as_slice()),
+        ("pattern", br"\p{L}{20,}".as_slice()),
+        (
+            "haystack",
+            b"short\none_very_long_identifier_name\ntwentylowercaselettersxx\n".as_slice(),
+        ),
+    ] {
+        output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
+        output.extend_from_slice(value);
+        output.push(b'\n');
+    }
+    output
+}
+
+fn configured_direct_grep_klv() -> Vec<u8> {
+    let mut output = Vec::new();
+    for (key, value) in [
+        (
+            "name",
+            b"synthetic/aot-runner/direct-native-grep".as_slice(),
+        ),
+        ("model", b"grep".as_slice()),
+        ("case-insensitive", b"false".as_slice()),
+        ("unicode", b"false".as_slice()),
+        ("max-iters", b"1".as_slice()),
+        ("max-warmup-iters", b"0".as_slice()),
+        ("max-time", b"1000000000".as_slice()),
+        ("max-warmup-time", b"0".as_slice()),
+        ("pattern", b"ab".as_slice()),
+        ("haystack", b"none\nab\r\nlast".as_slice()),
     ] {
         output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
         output.extend_from_slice(value);

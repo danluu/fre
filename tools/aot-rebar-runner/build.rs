@@ -429,7 +429,7 @@ fn main() {
     if benchmark.uses_native_row_bridge() {
         let shared = if matches!(
             benchmark.model,
-            shared::Model::Count | shared::Model::SpanSum
+            shared::Model::Count | shared::Model::SpanSum | shared::Model::GrepCount
         ) && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         {
             Some(
@@ -457,6 +457,10 @@ fn main() {
                         .module()
                         .prepared_span_sum_symbol()
                         .expect("shared SpanSum export"),
+                    shared::Model::GrepCount => compiled
+                        .module()
+                        .prepared_grep_count_symbol()
+                        .expect("shared GrepCount export"),
                     _ => unreachable!("shared ordered-many gate accepts only scalar models"),
                 };
                 fs::write(&object_path, compiled.object())
@@ -837,9 +841,12 @@ fn configured_source(
         3
     };
     let prepared_bulk_strategy = format!("{:?}", compiled.module().prepared_bulk_strategy());
-    let native_scalar_reducer =
+    let native_scalar_reducer = if shared_ordered_many {
+        shared::authenticate_shared_ordered_many_whole_scalar_reducer(benchmark.model, compiled)
+    } else {
         shared::authenticate_native_whole_scalar_reducer(benchmark.model, compiled)
-            .expect("compiled native scalar reducer failed build-time authentication");
+    }
+    .expect("compiled native scalar reducer failed build-time authentication");
     let single_native_uniform_capture_operation_only = single_native_uniform_capture
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
     let shared_uniform_capture_operation_only = shared_uniform_capture
@@ -914,6 +921,8 @@ fn configured_source(
             "linked-native-uniform-capture-reducer-v1".to_owned()
         } else if prepared_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
             "per-line-linked-prepared-span-fill-uniform-capture-v1".to_owned()
+        } else if shared_ordered_many && benchmark.model == shared::Model::GrepCount {
+            "linked-shared-ordered-many-native-grep-count-reducer-v1".to_owned()
         } else if benchmark.model == shared::Model::GrepCount {
             "linked-native-grep-count-reducer-v1".to_owned()
         } else {
@@ -987,6 +996,9 @@ fn configured_source(
             match benchmark.model {
                 shared::Model::Count => "general-aot-shared-ordered-many-native-count-v1",
                 shared::Model::SpanSum => "general-aot-shared-ordered-many-native-span-sum-v1",
+                shared::Model::GrepCount => {
+                    "general-aot-shared-ordered-many-native-grep-count-v1"
+                }
                 _ => unreachable!("shared ordered-many binding has a non-scalar model"),
             }
         } else if native_uniform_capture {

@@ -379,10 +379,11 @@ pub const fn is_native_whole_scalar_reducer(
                 PreparedAggregateStrategy::NativeFused
                     | PreparedAggregateStrategy::NativeOrderedNfaFused
             )
-        ) | (
-            Model::GrepCount,
-            Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
         )
+            | (
+                Model::GrepCount,
+                Some(PreparedAggregateStrategy::NativeOrderedNfaFused)
+            )
     )
 }
 
@@ -402,10 +403,36 @@ pub fn authenticate_native_whole_scalar_reducer(
     model: Model,
     compiled: &CompiledRegex,
 ) -> Result<bool, String> {
+    authenticate_native_whole_scalar_reducer_with_policy(model, compiled, false)
+}
+
+/// Authenticate a complete scalar reducer selected specifically by the
+/// shared ordered-many route.
+///
+/// Unlike a direct single-pattern Grep artifact, the shared Grep compiler
+/// lowers a Span-output automaton before appending the whole-haystack native
+/// reducer. The route proof is therefore the only place where GrepCount plus
+/// `NativeFused` is an eligible whole-operation scalar topology.
+pub fn authenticate_shared_ordered_many_whole_scalar_reducer(
+    model: Model,
+    compiled: &CompiledRegex,
+) -> Result<bool, String> {
+    authenticate_native_whole_scalar_reducer_with_policy(model, compiled, true)
+}
+
+fn authenticate_native_whole_scalar_reducer_with_policy(
+    model: Model,
+    compiled: &CompiledRegex,
+    shared_ordered_many: bool,
+) -> Result<bool, String> {
     let receipt = compiled.receipt();
     let module = compiled.module();
     let strategy = receipt.prepared_aggregate_strategy;
-    if !is_native_whole_scalar_reducer(model, strategy) {
+    let shared_native_fused_grep = shared_ordered_many
+        && model == Model::GrepCount
+        && strategy == Some(PreparedAggregateStrategy::NativeFused)
+        && receipt.output == OutputContract::Span;
+    if !is_native_whole_scalar_reducer(model, strategy) && !shared_native_fused_grep {
         return Ok(false);
     }
 
@@ -1541,6 +1568,7 @@ fn shared_ordered_many_v15_symbol_identities_are_closed(
     let reducer_prefix = match model {
         Model::Count => "fre_aot_regex_count_exclusive_v1_",
         Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
+        Model::GrepCount => "fre_aot_regex_grep_count_exclusive_v1_",
         _ => return false,
     };
     let Some(reducer_identity) = native_symbol_identity(reducer, reducer_prefix) else {
@@ -1563,11 +1591,24 @@ fn shared_ordered_many_native_fused_symbol_identities_are_closed(
     let reducer_prefix = match model {
         Model::Count => "fre_aot_regex_count_exclusive_v1_",
         Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
+        Model::GrepCount => "fre_aot_regex_grep_count_exclusive_v1_",
         _ => return false,
     };
-    native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_").is_some()
-        && native_symbol_identity(reducer, reducer_prefix).is_some()
-        && native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_").is_some()
+    let Some(ordinary_identity) =
+        native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    let Some(reducer_identity) = native_symbol_identity(reducer, reducer_prefix) else {
+        return false;
+    };
+    let Some(program_identity) =
+        native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    reducer_identity == program_identity
+        && reducer_identity != ordinary_identity
         && [ordinary_entry, reducer, program]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
@@ -1913,12 +1954,12 @@ pub struct NativeRowBridge {
 /// Compile one genuine shared-scan ordered multi-pattern reducer.
 ///
 /// This route joins independently parsed canonical HIRs into one ordered
-/// automaton and emits one native Count or SpanSum entry. The combined program
-/// compares the full ordinary optimizing portfolio first, so an exact
-/// helper-free `NativeFused` reducer remains incumbent ahead of explicit V15.
-/// It never invokes or retains the independent native-row bridge. The caller
-/// may fall back only after classifying the returned typed error outside this
-/// function.
+/// automaton and emits one native Count, SpanSum, or GrepCount entry. The
+/// combined program compares the full ordinary optimizing portfolio first, so
+/// an exact helper-free `NativeFused` reducer remains incumbent ahead of
+/// explicit V15. It never invokes or retains the independent native-row
+/// bridge. The caller may fall back only after classifying the returned typed
+/// error outside this function.
 pub fn compile_shared_ordered_many_aggregate(
     benchmark: &Benchmark,
     target: Target,
@@ -2103,10 +2144,13 @@ pub fn try_compile_shared_ordered_many_aggregate(
 ) -> Result<SharedOrderedManyAggregateDisposition, String> {
     if benchmark.patterns.len() <= 1
         || benchmark.patterns.len() > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
-        || !matches!(benchmark.model, Model::Count | Model::SpanSum)
+        || !matches!(
+            benchmark.model,
+            Model::Count | Model::SpanSum | Model::GrepCount
+        )
     {
         return Err(format!(
-            "shared ordered-many AOT requires a 2..={} row Count/SpanSum job, got model={} rows={}",
+            "shared ordered-many AOT requires a 2..={} row Count/SpanSum/GrepCount job, got model={} rows={}",
             fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS,
             benchmark.model.name(),
             benchmark.patterns.len(),
@@ -2166,10 +2210,11 @@ fn authenticate_shared_ordered_many_aggregate(
     let shared_receipt = artifact.receipt();
     let strategy = module.prepared_aggregate_strategy();
     let whole_scalar_is_authenticated =
-        authenticate_native_whole_scalar_reducer(benchmark.model, compiled)?;
+        authenticate_shared_ordered_many_whole_scalar_reducer(benchmark.model, compiled)?;
     let reducer = match benchmark.model {
         Model::Count => module.prepared_count_symbol(),
         Model::SpanSum => module.prepared_span_sum_symbol(),
+        Model::GrepCount => module.prepared_grep_count_symbol(),
         _ => None,
     };
     let prepared_entry = module.prepared_entry_symbol();
@@ -4415,6 +4460,28 @@ mod tests {
     }
 
     #[test]
+    fn shared_native_fused_identity_binds_reducer_to_its_program() {
+        let ordinary = format!("fre_aot_regex_search_v1_{}", "a".repeat(64));
+        let reducer = format!("fre_aot_regex_grep_count_exclusive_v1_{}", "b".repeat(64));
+        let program = format!("fre_aot_regex_runtime_program_v1_{}", "b".repeat(64));
+        assert!(shared_ordered_many_native_fused_symbol_identities_are_closed(
+            Model::GrepCount,
+            &ordinary,
+            &reducer,
+            &program,
+        ));
+
+        let wrong_program =
+            format!("fre_aot_regex_runtime_program_v1_{}", "c".repeat(64));
+        assert!(!shared_ordered_many_native_fused_symbol_identities_are_closed(
+            Model::GrepCount,
+            &ordinary,
+            &reducer,
+            &wrong_program,
+        ));
+    }
+
+    #[test]
     fn prepared_row_symbol_identity_requires_one_exact_suffix() {
         let ordinary = format!("fre_aot_regex_search_v1_{}", "a".repeat(64));
         let prepared = format!("fre_aot_regex_search_exclusive_v1_{}", "a".repeat(64));
@@ -4606,6 +4673,10 @@ mod tests {
             Some(PreparedAggregateStrategy::NativeFused),
         );
         assert_eq!(selected.module().required_prepare_capabilities(), 0);
+        assert!(
+            !authenticate_native_whole_scalar_reducer(Model::GrepCount, &selected)
+                .expect("direct Grep remains outside Span-output scalar admission"),
+        );
     }
 
     #[test]
@@ -5258,6 +5329,98 @@ mod tests {
         );
         assert!(artifact.compiled().module().prepared_count_symbol().is_some());
         assert_ne!(artifact.receipt().ordered_sources_sha256, [0; 32]);
+    }
+
+    #[test]
+    fn shared_ordered_many_grep_count_is_one_native_line_operation() {
+        let mut multi = fixture("grep", b"foo", b"none\nbar\nfoo\n");
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, b"pattern:3:bar\n".iter().copied());
+        let benchmark = Benchmark::parse(&multi).expect("shared GrepCount fixture");
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let artifact = compile_shared_ordered_many_aggregate(&benchmark, target)
+            .expect("shared GrepCount aggregate");
+        let compiled = artifact.compiled();
+        assert_eq!(artifact.receipt().rows, 2);
+        assert_eq!(
+            artifact.receipt().aggregate_strategy,
+            PreparedAggregateStrategy::NativeFused,
+        );
+        assert_eq!(
+            compiled.module().prepared_aggregate_exports(),
+            PreparedAggregateExports::GREP_COUNT,
+        );
+        assert!(compiled.module().prepared_grep_count_symbol().is_some());
+        assert_eq!(compiled.module().prepared_count_symbol(), None);
+        assert_eq!(compiled.module().prepared_span_sum_symbol(), None);
+        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        assert!(
+            authenticate_shared_ordered_many_whole_scalar_reducer(Model::GrepCount, compiled)
+                .expect("authenticate shared GrepCount reducer"),
+        );
+    }
+
+    #[test]
+    fn shared_ordered_many_grep_count_v15_is_one_closed_count_prepared_operation() {
+        let mut multi = fixture(
+            "grep",
+            br"\b\w{25,}\b",
+            b"short\none_very_long_identifier_name\n",
+        );
+        let second = br"\p{L}{20,}";
+        let mut second_field = format!("pattern:{}:", second.len()).into_bytes();
+        second_field.extend_from_slice(second);
+        second_field.push(b'\n');
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, second_field);
+        let mut benchmark = Benchmark::parse(&multi).expect("shared V15 GrepCount fixture");
+        benchmark.unicode = true;
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let artifact = compile_shared_ordered_many_aggregate(&benchmark, target)
+            .expect("shared V15 GrepCount aggregate");
+        let compiled = artifact.compiled();
+        assert_eq!(
+            artifact.receipt().aggregate_strategy,
+            PreparedAggregateStrategy::NativeOrderedNfaFused,
+        );
+        assert_eq!(
+            compiled.module().required_prepare_capabilities(),
+            PREPARED_CAPABILITY_ORDERED_NFA_V15,
+        );
+        assert_eq!(compiled.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+        assert_eq!(
+            benchmark
+                .model
+                .prepare_operation_flags_for_required_capabilities(
+                    compiled.module().required_prepare_capabilities(),
+                ),
+            Model::Count.prepare_operation_flags(),
+        );
+        assert_eq!(
+            compiled.module().prepared_grep_count_symbol(),
+            Some(compiled.module().entry_symbol()),
+        );
+        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        assert!(
+            authenticate_shared_ordered_many_whole_scalar_reducer(Model::GrepCount, compiled)
+                .expect("authenticate shared V15 GrepCount reducer"),
+        );
     }
 
     #[test]
@@ -6195,10 +6358,17 @@ mod tests {
                 assert!(!is_native_whole_scalar_reducer(model, strategy));
             }
         }
+        assert!(!is_native_whole_scalar_reducer(
+            Model::GrepCount,
+            Some(PreparedAggregateStrategy::NativeFused),
+        ));
+        assert!(is_native_whole_scalar_reducer(
+            Model::GrepCount,
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+        ));
         for model in [
             Model::Compile,
             Model::CountCaptures,
-            Model::GrepCount,
             Model::GrepCaptures,
             Model::RegexRedux,
         ] {
@@ -6207,10 +6377,6 @@ mod tests {
                 Some(PreparedAggregateStrategy::NativeFused),
             ));
         }
-        assert!(is_native_whole_scalar_reducer(
-            Model::GrepCount,
-            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
-        ));
     }
 
     #[test]

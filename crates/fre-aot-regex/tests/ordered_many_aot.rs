@@ -1,7 +1,7 @@
 use fre_aot_regex::{
     CompileMode, DeterminizeLimits, EntryAbi, MatchResult, OrderedManyAotCompileDecline,
     OrderedManyAotCompileDisposition, OrderedManyAotCompileError, OrderedManyAotCompileLimits,
-    OrderedManyAotCompileRequest, OrderedManyPatternId, OrderedManyRow,
+    OrderedManyAotCompileRequest, OrderedManyPatternId, OrderedManyRow, OutputContract,
     PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
     SearchWindow, SlowAotLimits, Target, compile_ordered_many_aot,
     compile_ordered_many_aot_reported,
@@ -16,6 +16,42 @@ fn rows(patterns: &[&str], ids: &[u32]) -> Vec<OrderedManyRow> {
         .zip(ids)
         .map(|(&pattern, &id)| OrderedManyRow::new(OrderedManyPatternId::new(id), pattern))
         .collect()
+}
+
+#[test]
+fn shared_grep_count_uses_one_closed_ordered_automaton_cross_isa() {
+    let patterns = ["foo", "bar+", "(?:quux|xyz)"];
+    let ids = [91, 7, 91];
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let artifact = compile_ordered_many_aot(
+            OrderedManyAotCompileRequest::new(rows(&patterns, &ids), target)
+                .mode(CompileMode::Optimizing),
+            PreparedAggregateExports::GREP_COUNT,
+            SlowAotLimits::default(),
+        )
+        .expect("shared GrepCount native reducer");
+        let compiled = artifact.compiled();
+        let module = compiled.module();
+        assert_eq!(compiled.receipt().output, OutputContract::Span);
+        assert_eq!(
+            artifact.receipt().aggregate_strategy,
+            PreparedAggregateStrategy::NativeFused,
+        );
+        assert_eq!(
+            module.prepared_aggregate_exports(),
+            PreparedAggregateExports::GREP_COUNT,
+        );
+        assert!(module.prepared_grep_count_symbol().is_some());
+        assert_eq!(module.prepared_count_symbol(), None);
+        assert_eq!(module.prepared_span_sum_symbol(), None);
+        assert!(module.required_runtime_symbols().next().is_none());
+        assert!(!compiled.receipt().runtime_helper_required);
+        assert_eq!(artifact.receipt().rows, patterns.len());
+        assert_eq!(
+            oracle(&patterns, b"nope foo barrr xyz"),
+            semantic_spans(&artifact, b"nope foo barrr xyz"),
+        );
+    }
 }
 
 fn oracle(patterns: &[&str], haystack: &[u8]) -> Vec<(usize, usize)> {
@@ -576,11 +612,12 @@ fn full_ordinary_optimizer_keeps_helper_free_native_fused_ahead_of_v15() {
 }
 
 #[test]
-fn shared_v15_scalar_operation_is_closed_for_count_and_span_sum_cross_isa() {
+fn shared_v15_scalar_operation_is_closed_for_all_scalar_exports_cross_isa() {
     for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
         for export in [
             PreparedAggregateExports::COUNT,
             PreparedAggregateExports::SPAN_SUM,
+            PreparedAggregateExports::GREP_COUNT,
         ] {
             let artifact = compile_ordered_many_aot(
                 OrderedManyAotCompileRequest::new(
@@ -608,10 +645,11 @@ fn shared_v15_scalar_operation_is_closed_for_count_and_span_sum_cross_isa() {
             assert_eq!(module.prepared_entry_symbol(), None);
             assert_eq!(module.prepared_span_fill_symbol(), None);
             assert!(module.required_runtime_symbols().next().is_none());
-            let reducer = if export == PreparedAggregateExports::COUNT {
-                module.prepared_count_symbol()
-            } else {
-                module.prepared_span_sum_symbol()
+            let reducer = match export {
+                PreparedAggregateExports::COUNT => module.prepared_count_symbol(),
+                PreparedAggregateExports::SPAN_SUM => module.prepared_span_sum_symbol(),
+                PreparedAggregateExports::GREP_COUNT => module.prepared_grep_count_symbol(),
+                _ => unreachable!("test requests one scalar export"),
             };
             assert_eq!(reducer, Some(module.entry_symbol()));
         }
@@ -619,7 +657,7 @@ fn shared_v15_scalar_operation_is_closed_for_count_and_span_sum_cross_isa() {
 }
 
 #[test]
-fn shared_aot_limits_and_export_surface_fail_closed() {
+fn shared_aot_limits_and_unsupported_export_surfaces_fail_closed() {
     let request = || {
         OrderedManyAotCompileRequest::new(rows(&["a", "b"], &[0, 1]), Target::x86_64_linux())
             .mode(CompileMode::Fast)
@@ -627,7 +665,15 @@ fn shared_aot_limits_and_export_surface_fail_closed() {
     assert!(matches!(
         compile_ordered_many_aot(
             request(),
-            PreparedAggregateExports::GREP_COUNT,
+            PreparedAggregateExports::NONE,
+            SlowAotLimits::default(),
+        ),
+        Err(OrderedManyAotCompileError::UnsupportedExports { .. })
+    ));
+    assert!(matches!(
+        compile_ordered_many_aot(
+            request(),
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::GREP_COUNT),
             SlowAotLimits::default(),
         ),
         Err(OrderedManyAotCompileError::UnsupportedExports { .. })

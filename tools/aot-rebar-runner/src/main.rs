@@ -3387,7 +3387,12 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         // The exact per-line or whole-domain route was authenticated above.
     } else if benchmark.model == shared::Model::GrepCount {
         if native_scalar_reducer {
-            if linked::GREP_ITERATION_STRATEGY != "linked-native-grep-count-reducer-v1"
+            let expected_grep_iteration = if linked::SHARED_ORDERED_MANY_AGGREGATE {
+                "linked-shared-ordered-many-native-grep-count-reducer-v1"
+            } else {
+                "linked-native-grep-count-reducer-v1"
+            };
+            if linked::GREP_ITERATION_STRATEGY != expected_grep_iteration
                 || linked::SPAN_ITERATION_STRATEGY != "not-applicable"
             {
                 return Err(
@@ -3841,20 +3846,29 @@ fn authenticate_linked_shared_uniform_capture(benchmark: &shared::Benchmark) -> 
 }
 
 fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Result<(), String> {
-    let (adapter, reducer_prefix, span_iteration) = match benchmark.model {
+    let (adapter, reducer_prefix, span_iteration, grep_iteration) = match benchmark.model {
         shared::Model::Count => (
             "general-aot-shared-ordered-many-native-count-v1",
             "fre_aot_regex_count_exclusive_v1_",
+            "not-applicable",
             "not-applicable",
         ),
         shared::Model::SpanSum => (
             "general-aot-shared-ordered-many-native-span-sum-v1",
             "fre_aot_regex_span_sum_exclusive_v1_",
             "linked-shared-ordered-many-native-span-sum-reducer-v1",
+            "not-applicable",
+        ),
+        shared::Model::GrepCount => (
+            "general-aot-shared-ordered-many-native-grep-count-v1",
+            "fre_aot_regex_grep_count_exclusive_v1_",
+            "not-applicable",
+            "linked-shared-ordered-many-native-grep-count-reducer-v1",
         ),
         _ => {
             return Err(
-                "shared ordered-many artifact is bound to a non-Count/SpanSum model".to_owned(),
+                "shared ordered-many artifact is bound to a non-Count/SpanSum/GrepCount model"
+                    .to_owned(),
             );
         }
     };
@@ -3887,6 +3901,7 @@ fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Res
         && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
         && entry_identity.is_some()
         && entry_identity != reducer_identity
+        && reducer_identity == program_identity
         && native_fused_bulk_shape;
     let prepared_v15 = linked::ENGINE == "OrderedNfa"
         && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)"
@@ -3919,9 +3934,12 @@ fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Res
         || linked::PROGRAM_SHA256 == [0; 32]
         || linked::OBJECT_SHA256 == [0; 32]
         || linked::ADAPTER != adapter
-        || linked::PREPARE_OPERATION_FLAGS != benchmark.model.prepare_operation_flags()
+        || linked::PREPARE_OPERATION_FLAGS
+            != benchmark.model.prepare_operation_flags_for_required_capabilities(
+                linked::REQUIRED_PREPARE_CAPABILITIES,
+            )
         || linked::SPAN_ITERATION_STRATEGY != span_iteration
-        || linked::GREP_ITERATION_STRATEGY != "not-applicable"
+        || linked::GREP_ITERATION_STRATEGY != grep_iteration
         || reducer_identity.is_none()
         || program_identity.is_none()
         || (!helper_free_native_fused && !prepared_v15)
@@ -4660,6 +4678,9 @@ fn expected_native_scalar_adapter(
         (true, shared::Model::SpanSum) => {
             Some("general-aot-shared-ordered-many-native-span-sum-v1")
         }
+        (true, shared::Model::GrepCount) => {
+            Some("general-aot-shared-ordered-many-native-grep-count-v1")
+        }
         (false, shared::Model::Count | shared::Model::SpanSum) => {
             Some(model.adapter_for_required_capabilities(required_prepare_capabilities))
         }
@@ -4679,7 +4700,9 @@ fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<boo
             "Some(NativeFused)" | "Some(NativeOrderedNfaFused)"
         ))
         || (model == shared::Model::GrepCount
-            && linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)");
+            && (linked::AGGREGATE_STRATEGY == "Some(NativeOrderedNfaFused)"
+                || (linked::SHARED_ORDERED_MANY_AGGREGATE
+                    && linked::AGGREGATE_STRATEGY == "Some(NativeFused)")));
     if linked::NATIVE_SCALAR_REDUCER != strategy_is_native {
         return Err(
             "native scalar reducer flag disagrees with its exact aggregate strategy".to_owned(),
@@ -4753,6 +4776,8 @@ fn authenticate_linked_native_scalar_reducer(model: shared::Model) -> Result<boo
                     "None" | "Some(NativePreparedLoop)" | "Some(NativeFrozenLoop)"
                 )
                 || linked::HAS_SPAN_FILL != (linked::PREPARED_BULK_STRATEGY != "None")
+                || (linked::SHARED_ORDERED_MANY_AGGREGATE
+                    && reducer_identity != program_identity)
                 || !aggregate_helpers.is_empty()))
     {
         return Err("native scalar reducer failed exact capability authentication".to_owned());
@@ -5588,6 +5613,10 @@ mod tests {
                 expected_native_scalar_adapter(shared::Model::SpanSum, true, required),
                 Some("general-aot-shared-ordered-many-native-span-sum-v1"),
             );
+            assert_eq!(
+                expected_native_scalar_adapter(shared::Model::GrepCount, true, required),
+                Some("general-aot-shared-ordered-many-native-grep-count-v1"),
+            );
         }
         assert_eq!(
             expected_native_scalar_adapter(shared::Model::Count, false, 0),
@@ -5611,6 +5640,17 @@ mod tests {
         assert_eq!(
             expected_native_scalar_adapter(shared::Model::GrepCount, false, 0),
             None,
+        );
+        assert_eq!(
+            expected_native_scalar_adapter(
+                shared::Model::GrepCount,
+                false,
+                PREPARE_CAPABILITY_ORDERED_NFA_V15,
+            ),
+            Some(
+                shared::Model::GrepCount
+                    .adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
+            ),
         );
     }
 

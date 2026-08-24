@@ -127,7 +127,7 @@ timing belongs to a separately named compiler-stage benchmark.
   windows. Those adapter routes validate every span and implement Rebar's
   byte-wise empty-match progress and adjacent-empty suppression; they are
   reported as adapter loops rather than whole-operation-native execution.
-- Single-pattern `grep` calls its identity-suffixed native `GrepCount` reducer
+- `grep` calls its identity-suffixed native `GrepCount` reducer
   exactly once per sample. That generated reducer owns Rebar's LF/CRLF line
   domain, including empty input, lone CR, trailing LF, and checked
   transactional `u64` publication, and calls only its authenticated
@@ -137,8 +137,10 @@ timing belongs to a separately named compiler-stage benchmark.
   gate are object-local, and it has no unresolved runtime functions. Only a
   typed unsupported, native-data-byte, or object-byte decline preserves the
   exact incumbent; allocation, lowering, emission, and authentication errors
-  remain terminal. For multiple patterns, an all-ordinary table instead links
-  one identity-suffixed helper-free reducer. It implements the same LF/CRLF
+  remain terminal. Multiple patterns first use one shared ordered automaton
+  and one whole-operation reducer under the same closed authentication. On its
+  typed decline, an all-ordinary table instead links one identity-suffixed
+  helper-free reducer. It implements the same LF/CRLF
   line domain, invokes and validates every retained row even after a prior row
   matches, and stores its `u64` result only after all lines succeed. Its exact
   source map, row identities, relocations, code/object identities, and total
@@ -254,11 +256,13 @@ other safe decline is the exact remaining `ObjectBytes` ceiling after charging
 all row objects. Allocation, arithmetic, lowering, emission, and
 authentication failures are terminal.
 
-Count and SpanSum first attempt an additive shared ordered-many route for
-2..=4,096 rows. That route independently parses every source, preserves source
-order in one ordered-NFA program, and invokes one generated Count or SpanSum
-reducer per benchmark operation. The exact combined raw plan first runs through
-the full ordinary optimizing portfolio. An authenticated `NativeFused`
+Count, SpanSum, and GrepCount first attempt an additive shared ordered-many
+route for 2..=4,096 rows. That route independently parses every source,
+preserves source order in one ordered-NFA program, and invokes one generated
+whole-operation reducer per benchmark operation. GrepCount applies the shared
+union once per LF/CRLF byte line instead of rescanning every independent row.
+The exact combined raw plan first runs through the full ordinary optimizing
+portfolio. An authenticated `NativeFused`
 incumbent has zero required prepare capabilities and no unresolved relocation
 from the selected reducer or unresolved runtime symbol anywhere in the object;
 provenance names it

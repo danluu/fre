@@ -1430,12 +1430,12 @@ pub fn compile_ordered_many_aot(
 /// Attempt one shared ordered-many aggregate while preserving safe structural
 /// and numeric V15 refusals as typed declines.
 ///
-/// Count and SpanSum are fused native whole-operation reducers. The complete
-/// ordinary optimizer transaction runs first and is selected only when its
-/// model-specific reducer is an authenticated helper-free `NativeFused`
-/// function. Every other ordinary aggregate—including a `NativeFused` object
-/// that still imports semantic helpers—defers to the explicit reported V15
-/// transaction against the same raw plan.
+/// Count, SpanSum, and GrepCount are fused native whole-operation reducers.
+/// The complete ordinary optimizer transaction runs first and is selected
+/// only when its model-specific reducer is an authenticated helper-free
+/// `NativeFused` function. Every other ordinary aggregate—including a
+/// `NativeFused` object that still imports semantic helpers—defers to the
+/// explicit reported V15 transaction against the same raw plan.
 ///
 /// # Errors
 ///
@@ -1462,7 +1462,10 @@ pub fn compile_ordered_many_aot_reported(
     if rows.is_empty() {
         return Err(OrderedManyAotCompileError::EmptyPatternSet);
     }
-    if exports.is_empty() || exports.contains(PreparedAggregateExports::GREP_COUNT) {
+    if exports.is_empty()
+        || (exports.contains(PreparedAggregateExports::GREP_COUNT)
+            && exports != PreparedAggregateExports::GREP_COUNT)
+    {
         return Err(OrderedManyAotCompileError::UnsupportedExports { exports });
     }
     if rows.len() > limits.max_rows {
@@ -1593,7 +1596,8 @@ pub fn compile_ordered_many_aot_reported(
         }
         ordinary => {
             let scalar_operation_only = exports == PreparedAggregateExports::COUNT
-                || exports == PreparedAggregateExports::SPAN_SUM;
+                || exports == PreparedAggregateExports::SPAN_SUM
+                || exports == PreparedAggregateExports::GREP_COUNT;
             let disposition = if scalar_operation_only {
                 crate::compile_raw_prepared_ordered_nfa_v15_scalar_operation_reported(
                     pattern_bytes,
@@ -1701,13 +1705,14 @@ fn authenticate_ordered_many_aggregate_entries(
     let object_sha256: [u8; 32] = Sha256::digest(compiled.object()).into();
     let count = exports.contains(PreparedAggregateExports::COUNT);
     let span_sum = exports.contains(PreparedAggregateExports::SPAN_SUM);
+    let grep_count = exports.contains(PreparedAggregateExports::GREP_COUNT);
     if receipt.output != OutputContract::Span
         || receipt.prepared_aggregate_exports != exports
         || module.prepared_aggregate_exports() != exports
         || module.prepared_aggregate_strategy() != receipt.prepared_aggregate_strategy
         || module.prepared_count_symbol().is_some() != count
         || module.prepared_span_sum_symbol().is_some() != span_sum
-        || module.prepared_grep_count_symbol().is_some()
+        || module.prepared_grep_count_symbol().is_some() != grep_count
         || module
             .required_runtime_program()
             .is_none_or(|(_, bytes)| bytes == 0)
@@ -1752,6 +1757,10 @@ fn helper_free_ordered_many_aggregate_is_authenticated(
         exports
             .contains(PreparedAggregateExports::SPAN_SUM)
             .then(|| module.prepared_span_sum_symbol())
+            .flatten(),
+        exports
+            .contains(PreparedAggregateExports::GREP_COUNT)
+            .then(|| module.prepared_grep_count_symbol())
             .flatten(),
     ]
     .into_iter()
