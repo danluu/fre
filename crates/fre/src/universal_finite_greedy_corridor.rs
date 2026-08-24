@@ -45,6 +45,7 @@ use fre_kernels::{
     RequiredLiteralSearchError as SearchError, RequiredLiteralSearchLimits as SearchLimits,
     SimdDispatchContext, Window as LiteralWindow,
 };
+use memchr::memrchr;
 use regex_syntax::hir::{Class, Hir, HirKind};
 
 use crate::pure_byte_class_repeat::SetSeek;
@@ -61,6 +62,10 @@ const UNIVERSAL_WORDS: [u64; 4] = [u64::MAX; 4];
 const SEARCH_BASE_WORK: u64 = 8;
 const SEARCH_CALL_WORK: u64 = 8;
 const NATIVE_SUFFIX_BYTES: usize = 1;
+#[cfg(target_arch = "aarch64")]
+const SINGLETON_MEMRCHR_NEON_BYTES: usize = 16;
+#[cfg(target_arch = "aarch64")]
+const SINGLETON_MEMRCHR_FOUR_VECTOR_BYTES: usize = 64;
 
 #[cfg(test)]
 pub(crate) mod value_path_probe {
@@ -917,6 +922,67 @@ impl Plan {
         let corridor_end = selected_start
             .saturating_add(self.descriptor.maximum_match_bytes)
             .min(window.end());
+        // AArch64 memchr moves from its scalar loop to NEON at one vector, but
+        // does not reach its four-vector loop until one cache line. The
+        // retained literal owner is cheaper only in that transition band.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let corridor_bytes = corridor_end
+                .checked_sub(first_suffix_start)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "universal corridor reverse window",
+                })?;
+            if corridor_bytes >= SINGLETON_MEMRCHR_NEON_BYTES
+                && corridor_bytes < SINGLETON_MEMRCHR_FOUR_VECTOR_BYTES
+            {
+                return self.finish_window_value_with_retained_owner(
+                    haystack,
+                    selected_start,
+                    first_suffix_start,
+                    first_suffix_end,
+                    corridor_end,
+                );
+            }
+        }
+        let &[suffix_byte] = self.suffix.needle() else {
+            return Err(SearchError::ArithmeticOverflow {
+                computation: "universal corridor value search requires one-byte suffix",
+            });
+        };
+        let corridor = haystack
+            .get(first_suffix_start..corridor_end)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "universal corridor reverse window",
+            })?;
+        let Some(last_suffix_offset) = memrchr(suffix_byte, corridor) else {
+            return Err(SearchError::ArithmeticOverflow {
+                computation: "universal corridor reverse finder lost its authenticated suffix",
+            });
+        };
+        let selected_end = first_suffix_start
+            .checked_add(last_suffix_offset)
+            .and_then(|start| start.checked_add(1))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "universal corridor reverse suffix end",
+            })?;
+        if selected_end < first_suffix_end {
+            return Err(SearchError::ArithmeticOverflow {
+                computation: "universal corridor reverse finder moved before its first suffix",
+            });
+        }
+        Ok(Some((selected_start, selected_end)))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    fn finish_window_value_with_retained_owner(
+        &self,
+        haystack: &[u8],
+        selected_start: usize,
+        first_suffix_start: usize,
+        first_suffix_end: usize,
+        corridor_end: usize,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
         let last_suffix = self
             .suffix
             .rfind_window_value(
@@ -1643,7 +1709,7 @@ mod tests {
 
     use super::{
         BYTE_SET_BLOCK_BYTES, BoundedDelimitedSegmentPlan, DELIMITED_SEGMENT_PLAN_ID,
-        Descriptor, InspectionError, InspectionOutcome, LiteralBuildLimits,
+        Descriptor, InspectionError, InspectionOutcome, LiteralBuildLimits, LiteralPlan,
         NativeInspectionOutcome, Plan, SearchAccounting, SearchError, SearchLimits,
         SearchWindow, inspect, inspect_native,
     };
@@ -1869,6 +1935,26 @@ mod tests {
             panic!("native source inspection refused {pattern:?}");
         };
         Plan::build(inspection, LiteralBuildLimits::default()).unwrap()
+    }
+
+    fn plan_with_retained_suffix(suffix: &[u8]) -> Plan {
+        plan_with_retained_suffix_and_maximum(suffix, 3)
+    }
+
+    fn plan_with_retained_suffix_and_maximum(
+        suffix: &[u8],
+        maximum_prefix_bytes: usize,
+    ) -> Plan {
+        Plan {
+            suffix: LiteralPlan::new(suffix, LiteralBuildLimits::default()).unwrap(),
+            descriptor: Descriptor {
+                minimum_prefix_bytes: 0,
+                maximum_prefix_bytes,
+                minimum_match_bytes: 1,
+                maximum_match_bytes: maximum_prefix_bytes.saturating_add(1),
+                suffix_bytes: 1,
+            },
+        }
     }
 
     fn delimited_plan(pattern: &str) -> BoundedDelimitedSegmentPlan {
@@ -2524,6 +2610,86 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn singleton_value_reverse_search_matches_accounted_oracle_for_every_byte_and_subwindow() {
+        for suffix_byte in 0_u8..=u8::MAX {
+            let plan = plan_with_retained_suffix(&[suffix_byte]);
+            let other = suffix_byte.wrapping_add(1);
+            let haystack = [
+                suffix_byte,
+                other,
+                suffix_byte,
+                suffix_byte ^ 0x80,
+                other,
+                suffix_byte,
+                other,
+                suffix_byte,
+            ];
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected = plan
+                        .find_window(&haystack, window, SearchLimits::unlimited())
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        plan.find_window_value(&haystack, window, SearchLimits::unlimited())
+                            .unwrap(),
+                        expected,
+                        "suffix={suffix_byte:#04x} window={start}..{end}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn singleton_value_reverse_search_matches_accounted_oracle_at_breakpoints() {
+        for suffix_byte in 0_u8..=u8::MAX {
+            let plan = plan_with_retained_suffix_and_maximum(&[suffix_byte], 64);
+            let other = suffix_byte.wrapping_add(1);
+            for length in [15_usize, 16, 17, 62, 63, 64, 65] {
+                let mut haystack = vec![other; length];
+                haystack[0] = suffix_byte;
+                haystack[length / 2] = suffix_byte;
+                haystack[length - 1] = suffix_byte;
+                for window in [
+                    SearchWindow::full(&haystack),
+                    SearchWindow::new(1, length),
+                    SearchWindow::new(0, length - 1),
+                    SearchWindow::new(1, length - 1),
+                ] {
+                    let expected = plan
+                        .find_window(&haystack, window, SearchLimits::unlimited())
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        plan.find_window_value(&haystack, window, SearchLimits::unlimited())
+                            .unwrap(),
+                        expected,
+                        "suffix={suffix_byte:#04x} length={length} window={window:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn singleton_value_reverse_search_refuses_forged_suffix_widths() {
+        let haystack = b"XYXY";
+        let window = SearchWindow::full(haystack);
+        for suffix in [b"".as_slice(), b"XY".as_slice()] {
+            let plan = plan_with_retained_suffix(suffix);
+            assert_eq!(
+                plan.find_window_value(haystack, window, SearchLimits::unlimited()),
+                Err(SearchError::ArithmeticOverflow {
+                    computation: "universal corridor value search requires one-byte suffix",
+                }),
+                "forged suffix={suffix:?}",
+            );
         }
     }
 
