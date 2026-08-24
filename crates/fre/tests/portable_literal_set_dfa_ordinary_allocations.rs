@@ -30,6 +30,16 @@ fn literal_set_dfa_ordinary_facades_allocate_nothing() {
     let expected_dense = regex.find(dense);
     let expected_malformed = regex.find(malformed);
 
+    let folded = PortableBuilder::new("(?i-u:alpha|bravo|charlie|delta)")
+        .unicode(false)
+        .build()
+        .expect("ASCII-folded literal-set fixture builds");
+    assert_eq!(folded.build_report().plan, PlanKind::LiteralSetDfa);
+    let mut folded_hit = vec![b'x'; 65_533 - b"ChArLiE".len()];
+    folded_hit.extend_from_slice(b"ChArLiE");
+    let folded_miss = vec![b'x'; 65_533];
+    let expected_folded_hit = folded.find(&folded_hit);
+
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
         assert!(black_box(regex.is_match(black_box(early))));
@@ -43,6 +53,13 @@ fn literal_set_dfa_ordinary_facades_allocate_nothing() {
         );
         assert!(!black_box(regex.is_match(black_box(miss))));
         assert_eq!(black_box(regex.find(black_box(miss))), None);
+        assert!(black_box(folded.is_match(black_box(&folded_hit))));
+        assert_eq!(
+            black_box(folded.find(black_box(&folded_hit))),
+            expected_folded_hit,
+        );
+        assert!(!black_box(folded.is_match(black_box(&folded_miss))));
+        assert_eq!(black_box(folded.find(black_box(&folded_miss))), None);
     }
     assert_eq!(measured.change(), Stats::default());
 }

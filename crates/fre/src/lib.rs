@@ -65,6 +65,7 @@ use regex_syntax::hir::{Class, ClassBytesRange, ClassUnicode, Hir, HirKind, Look
 
 mod aggregate;
 mod aggregate_construction;
+mod ascii_folded_literal_alternation;
 #[cfg(feature = "explicit-count-v3-aot")]
 mod aggregate_count_aot_v3;
 mod aggregate_many;
@@ -6253,24 +6254,24 @@ fn publish_ripgrep_borrowed_flat_literal_set(
                     Err(literal_set) => {
                         let literal_set = literal_set.into_canonical();
                         let storage = literal_set.build_accounting().persistent_bytes;
-                        (PortablePlan::LiteralSetDfa(literal_set), storage)
+                        (PortablePlan::LiteralSetDfa(literal_set.into()), storage)
                     }
                 }
             } else {
                 let literal_set = literal_set.into_canonical();
                 let storage = literal_set.build_accounting().persistent_bytes;
-                (PortablePlan::LiteralSetDfa(literal_set), storage)
+                (PortablePlan::LiteralSetDfa(literal_set.into()), storage)
             }
         }
         LiteralSetCompactBuildOutcome::Canonical(literal_set) => {
             let storage = literal_set.build_accounting().persistent_bytes;
-            (PortablePlan::LiteralSetDfa(literal_set), storage)
+            (PortablePlan::LiteralSetDfa(literal_set.into()), storage)
         }
         LiteralSetCompactBuildOutcome::NotApplicable => {
             let literal_set =
                 LiteralSetPlan::new_stable_borrowed(patterns, builder.limits.literal_set)?;
             let storage = literal_set.build_accounting().persistent_bytes;
-            (PortablePlan::LiteralSetDfa(literal_set), storage)
+            (PortablePlan::LiteralSetDfa(literal_set.into()), storage)
         }
     };
     let report = ripgrep_flat_literal_build_report(builder, planner_work, &publication, storage)?;
@@ -6299,7 +6300,7 @@ fn publish_ripgrep_canonical_flat_literal_set(
         source: publication.source,
         capture_names: publication.capture_names,
         line_total_grep_plan: publication.line_total_grep_plan,
-        plan: PortablePlan::LiteralSetDfa(literal_set),
+        plan: PortablePlan::LiteralSetDfa(literal_set.into()),
         profile: publication.profile,
         limits: builder.limits,
         selection: builder.selection,
@@ -9172,7 +9173,44 @@ impl PortableBuilder {
                 } else {
                     LiteralSetPlan::new(&words, self.limits.literal_set)?
                 };
-                let storage = literal_set.build_accounting().persistent_bytes;
+                let incumbent_storage = literal_set.build_accounting().persistent_bytes;
+                let retained_facade_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                let no_prefilter_ordinary = literal_set
+                    .ordinary_executor()
+                    .is_some_and(|executor| executor.direct_count_scanner_supported());
+                let sidecar = if self.selection == PlanSelection::Auto
+                    && self.byte_native_plans_allowed
+                    && words.len() > PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+                    && syntax.class_ranges > 0
+                    && no_prefilter_ordinary
+                {
+                    ascii_folded_literal_alternation::try_build(
+                        &rust.hir,
+                        syntax.hir_nodes,
+                        syntax.class_ranges,
+                        finite_work,
+                        self.limits.max_planner_work,
+                        retained_facade_bytes,
+                        incumbent_storage,
+                        self.limits.max_persistent_bytes,
+                    )?
+                } else {
+                    ascii_folded_literal_alternation::BuildAttempt {
+                        plan: None,
+                        planner_work: finite_work,
+                        storage_bytes: 0,
+                    }
+                };
+                finite_work = sidecar.planner_work;
+                let storage = incumbent_storage
+                    .checked_add(sidecar.storage_bytes)
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                let literal_set = PortableLiteralSetDfaPlan::with_ordinary_ascii_folded(
+                    literal_set,
+                    sidecar.plan,
+                );
                 return Ok(PortableRegex {
                     source,
                     capture_names,
@@ -12001,6 +12039,33 @@ mod literal_set_dfa_ordinary_facade_probe {
 }
 
 #[cfg(test)]
+mod ascii_folded_literal_set_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
+#[cfg(test)]
 mod literal_set_compact_ordinary_facade_probe {
     use core::cell::Cell;
 
@@ -13413,10 +13478,66 @@ impl PortableK0Plan {
     }
 }
 
+struct PortableLiteralSetDfaPlan {
+    canonical: LiteralSetPlan,
+    ordinary_ascii_folded: Option<Box<ascii_folded_literal_alternation::OrdinaryPlan>>,
+}
+
+impl PortableLiteralSetDfaPlan {
+    const fn canonical(canonical: LiteralSetPlan) -> Self {
+        Self {
+            canonical,
+            ordinary_ascii_folded: None,
+        }
+    }
+
+    const fn with_ordinary_ascii_folded(
+        canonical: LiteralSetPlan,
+        ordinary_ascii_folded: Option<Box<ascii_folded_literal_alternation::OrdinaryPlan>>,
+    ) -> Self {
+        Self {
+            canonical,
+            ordinary_ascii_folded,
+        }
+    }
+
+    #[inline]
+    fn ordinary_ascii_folded(
+        &self,
+    ) -> Option<&ascii_folded_literal_alternation::OrdinaryPlan> {
+        self.ordinary_ascii_folded.as_deref()
+    }
+
+    #[inline]
+    fn ordinary_ascii_folded_for_input(
+        &self,
+        input_bytes: usize,
+    ) -> Option<&ascii_folded_literal_alternation::OrdinaryPlan> {
+        if !ascii_folded_literal_alternation::OrdinaryPlan::supports_full_input(input_bytes) {
+            return None;
+        }
+        self.ordinary_ascii_folded()
+    }
+}
+
+impl core::ops::Deref for PortableLiteralSetDfaPlan {
+    type Target = LiteralSetPlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.canonical
+    }
+}
+
+impl From<LiteralSetPlan> for PortableLiteralSetDfaPlan {
+    fn from(canonical: LiteralSetPlan) -> Self {
+        Self::canonical(canonical)
+    }
+}
+
 enum PortablePlan {
     ExactLiteral(LiteralPlan),
     PackedLiteralSet(PackedLiteralSetPlan),
-    LiteralSetDfa(LiteralSetPlan),
+    LiteralSetDfa(PortableLiteralSetDfaPlan),
     RequiredLiteral(RequiredLiteralPlan),
     DispatchedRequiredLiteral(DispatchedRequiredLiteralPlan),
     BoundedRequiredLiteral(BoundedRequiredLiteralPlan),
@@ -14335,7 +14456,18 @@ impl PortableRegex {
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
-                if let Some(ordinary) = literal_set.ordinary_executor() {
+                if let Some(ordinary) =
+                    literal_set.ordinary_ascii_folded_for_input(haystack.len())
+                {
+                    #[cfg(test)]
+                    {
+                        literal_set_dfa_ordinary_facade_probe::record_exists();
+                        ascii_folded_literal_set_ordinary_facade_probe::record_exists();
+                    }
+                    ordinary
+                        .is_match_full_value(haystack)
+                        .map_err(SearchError::from)
+                } else if let Some(ordinary) = literal_set.ordinary_executor() {
                     #[cfg(test)]
                     literal_set_dfa_ordinary_facade_probe::record_exists();
                     ordinary
@@ -16076,10 +16208,23 @@ impl PortableRegex {
             }
             PortablePlan::LiteralSetDfa(literal_set) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
-                let matched = if let Some(ordinary) = literal_set.ordinary_executor() {
+                let matched = if let Some(ordinary) =
+                    literal_set.ordinary_ascii_folded_for_input(haystack.len())
+                {
+                    #[cfg(test)]
+                    {
+                        literal_set_dfa_ordinary_facade_probe::record_span();
+                        ascii_folded_literal_set_ordinary_facade_probe::record_span();
+                    }
+                    ordinary
+                        .find_full_value(haystack)
+                        .map_err(SearchError::from)
+                } else if let Some(ordinary) = literal_set.ordinary_executor() {
                     #[cfg(test)]
                     literal_set_dfa_ordinary_facade_probe::record_span();
-                    ordinary.find_window_value(haystack, literal_window)
+                    ordinary
+                        .find_window_value(haystack, literal_window)
+                        .map_err(SearchError::from)
                 } else {
                     literal_set
                         .find_window(
@@ -16088,6 +16233,7 @@ impl PortableRegex {
                             LiteralSetSearchLimits::unlimited(),
                         )
                         .map(|(matched, _)| matched)
+                        .map_err(SearchError::from)
                 }?;
                 Ok(matched.map(|(start, end)| Match { start, end }))
             }
@@ -46180,6 +46326,427 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    const ASCII_FOLDED_LITERAL_SET_PATTERN: &str =
+        "(?i-u:alpha|bravo|charlie|delta)";
+
+    fn ascii_folded_literal_set_fixture() -> PortableRegex {
+        let regex = PortableBuilder::new(ASCII_FOLDED_LITERAL_SET_PATTERN)
+            .unicode(false)
+            .build()
+            .expect("ASCII-folded literal alternation builds");
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        let PortablePlan::LiteralSetDfa(plan) = &regex.plan else {
+            panic!("ASCII-folded fixture did not retain a literal-set DFA")
+        };
+        assert_eq!(
+            plan.ordinary_ascii_folded()
+                .expect("ASCII-folded ordinary sidecar is admitted")
+                .branch_count(),
+            4,
+        );
+        regex
+    }
+
+    fn ascii_casings(word: &[u8]) -> Vec<Vec<u8>> {
+        (0..(1_usize << word.len()))
+            .map(|mask| {
+                word.iter()
+                    .enumerate()
+                    .map(|(index, &byte)| {
+                        if mask & (1_usize << index) == 0 {
+                            byte.to_ascii_lowercase()
+                        } else {
+                            byte.to_ascii_uppercase()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ascii_folded_literal_set_ordinary_sidecar_matches_upstream_and_rereads_source() {
+        let regex = ascii_folded_literal_set_fixture();
+        let upstream = regex::bytes::RegexBuilder::new(ASCII_FOLDED_LITERAL_SET_PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let small = b"!!ChArLiE";
+        super::ascii_folded_literal_set_ordinary_facade_probe::reset();
+        assert!(regex.is_match(small));
+        assert_eq!(regex.find(small), Some(Match { start: 2, end: 9 }));
+        assert_eq!(
+            super::ascii_folded_literal_set_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "inputs below the measured crossover stay on the canonical DFA",
+        );
+        let crossover = super::ascii_folded_literal_alternation::MIN_FULL_INPUT_BYTES;
+        let mut below_crossover = vec![b'!'; crossover - 1];
+        below_crossover[crossover - 8..].copy_from_slice(b"ChArLiE");
+        super::ascii_folded_literal_set_ordinary_facade_probe::reset();
+        assert!(regex.is_match(&below_crossover));
+        assert_eq!(
+            regex.find(&below_crossover),
+            Some(Match {
+                start: crossover - 8,
+                end: crossover - 1,
+            }),
+        );
+        assert_eq!(
+            super::ascii_folded_literal_set_ordinary_facade_probe::snapshot(),
+            (0, 0),
+        );
+        let mut at_crossover = vec![b'!'; crossover];
+        at_crossover[crossover - 7..].copy_from_slice(b"ChArLiE");
+        super::ascii_folded_literal_set_ordinary_facade_probe::reset();
+        assert!(regex.is_match(&at_crossover));
+        assert_eq!(
+            regex.find(&at_crossover),
+            Some(Match {
+                start: crossover - 7,
+                end: crossover,
+            }),
+        );
+        assert_eq!(
+            super::ascii_folded_literal_set_ordinary_facade_probe::snapshot(),
+            (1, 1),
+        );
+        let mut checked = 0_usize;
+        super::ascii_folded_literal_set_ordinary_facade_probe::reset();
+        for word in [
+            b"alpha".as_slice(),
+            b"bravo".as_slice(),
+            b"charlie".as_slice(),
+            b"delta".as_slice(),
+        ] {
+            for casing in ascii_casings(word) {
+                let mut haystack = vec![b'!'; 4_097];
+                haystack.extend_from_slice(&casing);
+                haystack.extend_from_slice(b"\0\xfftail");
+                let expected = upstream
+                    .find(&haystack)
+                    .map(|matched| Match {
+                        start: matched.start(),
+                        end: matched.end(),
+                    });
+                assert_eq!(regex.is_match(&haystack), expected.is_some());
+                assert_eq!(regex.find(&haystack), expected);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 224);
+        assert_eq!(
+            super::ascii_folded_literal_set_ordinary_facade_probe::snapshot(),
+            (checked, checked),
+        );
+
+        let mut storage = vec![b'!'; 8_192];
+        let address = storage.as_ptr();
+        storage[8_185..].copy_from_slice(b"ChArLiE");
+        assert_eq!(
+            regex.find(&storage),
+            Some(Match {
+                start: 8_185,
+                end: 8_192,
+            }),
+        );
+        storage[8_185..].copy_from_slice(b"ChArLiX");
+        assert_eq!(storage.as_ptr(), address);
+        assert!(!regex.is_match(&storage));
+        assert_eq!(regex.find(&storage), None);
+        storage[8_187..].copy_from_slice(b"DeLtA");
+        assert_eq!(storage.as_ptr(), address);
+        assert_eq!(
+            regex.find(&storage),
+            Some(Match {
+                start: 8_187,
+                end: 8_192,
+            }),
+        );
+
+        let mut earlier_later_branch = vec![b'!'; 4_096];
+        earlier_later_branch.extend_from_slice(b"cHaRlIe---ALPHA");
+        assert_eq!(
+            regex.find(&earlier_later_branch),
+            Some(Match {
+                start: 4_096,
+                end: 4_103,
+            }),
+            "a later source branch at an earlier start wins",
+        );
+
+        let mut invalid_prefix = vec![b'!'; 4_160];
+        invalid_prefix[..2].copy_from_slice(b"\xff\x80");
+        invalid_prefix[4_096..4_103].copy_from_slice(b"ChArLiE");
+        assert_eq!(
+            regex.find(&invalid_prefix),
+            Some(Match {
+                start: 4_096,
+                end: 4_103,
+            }),
+            "invalid bytes before a match preserve byte-regex semantics",
+        );
+    }
+
+    #[test]
+    fn ascii_folded_literal_set_sidecar_preserves_equal_start_source_priority() {
+        for (pattern, expected_width) in [
+            ("(?i-u:abcde|ab|fghijk|lmnopqrs)", 5),
+            ("(?i-u:ab|abcde|fghijk|lmnopqrs)", 2),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("prefix-related ASCII-folded alternation builds");
+            assert!(
+                ascii_folded_literal_set_sidecar_is_present(&regex),
+                "prefix-related fixture must exercise the sidecar: {pattern:?}",
+            );
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut haystack = vec![b'!'; 4_160];
+            haystack[..2].copy_from_slice(b"\xff\x80");
+            haystack[4_096..4_101].copy_from_slice(b"AbCdE");
+            let expected = upstream.find(&haystack).map(|matched| Match {
+                start: matched.start(),
+                end: matched.end(),
+            });
+            assert_eq!(
+                expected,
+                Some(Match {
+                    start: 4_096,
+                    end: 4_096 + expected_width,
+                }),
+            );
+
+            super::ascii_folded_literal_set_ordinary_facade_probe::reset();
+            assert_eq!(regex.find(&haystack), expected, "pattern={pattern:?}");
+            assert!(regex.is_match(&haystack), "pattern={pattern:?}");
+            assert_eq!(
+                super::ascii_folded_literal_set_ordinary_facade_probe::snapshot(),
+                (1, 1),
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_folded_literal_set_sidecar_isolated_from_checked_and_session_apis() {
+        let regex = ascii_folded_literal_set_fixture();
+        let mut haystack = vec![b'!'; 8_192];
+        haystack.extend_from_slice(b"ChArLiE");
+        let expected = Some(Match {
+            start: 8_192,
+            end: 8_199,
+        });
+        let limits = SearchLimits::unlimited();
+        let window = SearchWindow::full(&haystack);
+
+        super::ascii_folded_literal_set_ordinary_facade_probe::reset();
+        assert!(regex.is_match_value(&haystack, limits).unwrap());
+        assert_eq!(regex.find_value(&haystack, limits).unwrap(), expected);
+        assert!(regex.is_match_accounted(&haystack, limits).unwrap().0);
+        assert_eq!(regex.find_accounted(&haystack, limits).unwrap().0, expected);
+        assert!(regex.is_match_window_value(&haystack, window, limits).unwrap());
+        assert_eq!(
+            regex.find_window_value(&haystack, window, limits).unwrap(),
+            expected,
+        );
+        assert!(regex.is_match_value_at(&haystack, 1, limits).unwrap());
+        assert_eq!(regex.find_at_value(&haystack, 1, limits).unwrap(), expected);
+
+        let mut checked = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(checked.is_match_value(&haystack, limits).unwrap());
+        assert_eq!(checked.find_value(&haystack, limits).unwrap(), expected);
+        let prepared = checked.prepare_is_match_value_token(haystack.len(), limits);
+        assert!(!prepared.uses_prepared_route());
+        assert_eq!(
+            checked.is_match_value_prepared(&haystack, prepared),
+            Ok(true),
+        );
+        let session_spans = checked
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(session_spans, vec![expected.unwrap()]);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(ordinary.is_match_at(&haystack, 0).unwrap());
+        assert_eq!(ordinary.first_acceptance_at(&haystack, 0), Ok(Some(8_199)));
+        assert_eq!(ordinary.find_at(&haystack, 0).unwrap(), expected);
+        let mut ordinary_spans = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_at(&haystack, 0, |matched| {
+                ordinary_spans.push(matched);
+                Ok::<bool, ()>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(ordinary_spans, vec![expected.unwrap()]);
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(&haystack, 0),
+            Ok(Some(1)),
+        );
+        assert_eq!(
+            regex
+                .shortest_match_at_value(&haystack, 0, limits)
+                .unwrap(),
+            Some(8_199),
+        );
+        assert_eq!(
+            regex.selected_end_value(&haystack, limits).unwrap(),
+            Some(8_199),
+        );
+        let spans = regex
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(spans, vec![expected.unwrap()]);
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(&mut locations, &haystack, limits)
+                .unwrap()
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                }),
+            expected,
+        );
+        assert_eq!(
+            super::ascii_folded_literal_set_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "checked, session, iterator, and capture APIs stay canonical",
+        );
+
+        assert!(regex.is_match(&haystack));
+        assert_eq!(regex.find(&haystack), expected);
+        assert_eq!(
+            super::ascii_folded_literal_set_ordinary_facade_probe::snapshot(),
+            (1, 1),
+        );
+    }
+
+    #[test]
+    fn ascii_folded_literal_set_sidecar_resource_refusal_keeps_canonical_build() {
+        let baseline = ascii_folded_literal_set_fixture();
+        let baseline_report = baseline.build_report();
+        assert!(baseline_report.charged_persistent_bytes > 0);
+        assert!(baseline_report.planner_work > 0);
+
+        let exact = PortableBuilder::new(ASCII_FOLDED_LITERAL_SET_PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: baseline_report.planner_work,
+                max_persistent_bytes: baseline_report.charged_persistent_bytes,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("published exact sidecar limits replay");
+        assert!(ascii_folded_literal_set_sidecar_is_present(&exact));
+        assert_eq!(exact.build_report().planner_work, baseline_report.planner_work);
+        assert_eq!(
+            exact.build_report().charged_persistent_bytes,
+            baseline_report.charged_persistent_bytes,
+        );
+
+        let persistent_limit = baseline_report.charged_persistent_bytes - 1;
+        let persistent_refusal = PortableBuilder::new(ASCII_FOLDED_LITERAL_SET_PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_persistent_bytes: persistent_limit,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("optional sidecar persistent refusal keeps the incumbent");
+        let PortablePlan::LiteralSetDfa(plan) = &persistent_refusal.plan else {
+            panic!("persistent-refusal build changed the incumbent family")
+        };
+        assert!(plan.ordinary_ascii_folded().is_none());
+        assert!(persistent_refusal.build_report().charged_persistent_bytes <= persistent_limit);
+
+        let planner_limit = baseline_report.planner_work - 1;
+        let planner_refusal = PortableBuilder::new(ASCII_FOLDED_LITERAL_SET_PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: planner_limit,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("optional sidecar planner refusal keeps the incumbent");
+        let PortablePlan::LiteralSetDfa(plan) = &planner_refusal.plan else {
+            panic!("planner-refusal build changed the incumbent family")
+        };
+        assert!(plan.ordinary_ascii_folded().is_none());
+        assert!(planner_refusal.build_report().planner_work <= planner_limit);
+    }
+
+    fn ascii_folded_literal_set_sidecar_is_present(regex: &PortableRegex) -> bool {
+        let PortablePlan::LiteralSetDfa(plan) = &regex.plan else {
+            return false;
+        };
+        plan.ordinary_ascii_folded().is_some()
+    }
+
+    fn forced_literal_set_dfa(pattern: &str, unicode: bool) -> PortableRegex {
+        PortableBuilder::new(pattern)
+            .unicode(unicode)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("ineligibility fixture builds")
+    }
+
+    #[test]
+    fn ascii_folded_literal_set_sidecar_requires_exact_authenticated_shape() {
+        let packed = PortableBuilder::new("(?i-u:alpha|bravo)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(packed.build_report().plan, PlanKind::PackedLiteralSet);
+        assert!(!ascii_folded_literal_set_sidecar_is_present(&packed));
+
+        let literal_set_dfa_cases = [
+            "(?i-u:alpha|bravo|charlie)",
+            "(?i-u:alphaa|bravoo|charly|deltaa)",
+            "(?i-u:alpha|bravo|charlie|delt(?-i:[A-C]))",
+            "(?i-u:alpha|bravo|charlie|delta|omega)",
+            "(?i-u:alph(?-i:a)|bravo|charlie|delta)",
+            "(?i-u:[a-c]lpha|bravo|charlie|delta)",
+        ];
+        for pattern in literal_set_dfa_cases {
+            let regex = forced_literal_set_dfa(pattern, false);
+            assert_eq!(
+                regex.build_report().plan,
+                PlanKind::LiteralSetDfa,
+                "ineligibility fixture changed family for {pattern:?}",
+            );
+            assert!(
+                !ascii_folded_literal_set_sidecar_is_present(&regex),
+                "ineligible shape admitted a folded sidecar for {pattern:?}",
+            );
+        }
+
+        for (pattern, unicode) in [
+            ("(?i-u:a{2}pha|bravo|charlie|delta)", false),
+            ("(?i:alpha|bravo|charlie|delta)", true),
+        ] {
+            let regex = forced_literal_set_dfa(pattern, unicode);
+            assert!(
+                !ascii_folded_literal_set_sidecar_is_present(&regex),
+                "repeat or Unicode folding admitted the byte-only sidecar for {pattern:?}",
+            );
         }
     }
 
