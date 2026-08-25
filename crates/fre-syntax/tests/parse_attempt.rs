@@ -3,8 +3,8 @@ use std::collections::hash_map::DefaultHasher;
 
 use fre_syntax::{
     AdmissionPolicy, CompatibilityProfile, ErrorCategory, ParseAttemptActual, ParseAttemptTerminal,
-    ParseRequest, QuotaBounded, ResourceKind, RustProfile, RustUnicodeFeatures, SyntaxQuotas,
-    parse, parse_attempt, parse_rust_ast,
+    ParseRequest, QuotaBounded, ResourceKind, RustProfile, RustUnicodeFeatures, SafetyEnvelope,
+    SyntaxQuotas, parse, parse_attempt, parse_rust_ast,
 };
 
 fn semantic_hash<T: Hash>(value: &T) -> u64 {
@@ -55,6 +55,50 @@ fn success_moves_the_exact_source_allocation_into_the_cache_key() {
     assert_eq!(
         legacy.key.pattern.as_bytes(),
         attempt.record().key.pattern.as_bytes()
+    );
+}
+
+#[test]
+fn successful_rust_reparse_handoff_preserves_the_source_allocation() {
+    let mut source = String::with_capacity(128);
+    source.push_str("(?x) a # transferred source");
+    let source_pointer = source.as_ptr();
+    let source_capacity = source.capacity();
+    let source_profile = CompatibilityProfile::RustText(RustProfile::regex_1_12_4());
+    let target_profile = CompatibilityProfile::RustBytes(RustProfile::regex_1_12_4());
+    let admission = AdmissionPolicy::Quota(QuotaBounded {
+        syntax: SyntaxQuotas::default(),
+    });
+    let safety = SafetyEnvelope::default();
+    let mut first_request = ParseRequest::rust(source, source_profile.clone())
+        .with_admission(admission)
+        .with_safety_envelope(safety);
+    assert!(first_request.bind_attempt_source_owner().is_some());
+    let first = parse_attempt(first_request).expect("first Rust parse");
+    assert!(first.receipt().identity.has_stable_source_owner());
+    let handoff = first
+        .into_rust_reparse_handoff(target_profile.clone())
+        .expect("a successful Rust attempt has a Rust handoff");
+    assert_eq!(handoff.source_profile, source_profile);
+    assert_eq!(
+        handoff.request.pattern().as_bytes().as_ptr(),
+        source_pointer
+    );
+    assert_eq!(handoff.request.pattern().capacity_bytes(), source_capacity);
+    assert_eq!(handoff.request.profile(), &target_profile);
+    assert_eq!(handoff.request.admission(), admission);
+    assert_eq!(handoff.request.safety_envelope(), safety);
+    assert!(!handoff.request.attempt_identity().has_stable_source_owner());
+
+    let second = parse_attempt(handoff.request).expect("independent Rust reparse");
+    assert!(second.closes());
+    assert_eq!(
+        second.record().key.pattern.as_bytes().as_ptr(),
+        source_pointer
+    );
+    assert_eq!(
+        second.record().key.pattern.capacity_bytes(),
+        source_capacity
     );
 }
 

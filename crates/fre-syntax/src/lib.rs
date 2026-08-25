@@ -27,7 +27,8 @@ pub use parsed::{
     PARSE_ATTEMPT_ALGORITHM_VERSION, ParseAttempt, ParseAttemptActual,
     ParseAttemptDeclaredFallback, ParseAttemptIdentity, ParseAttemptProspective,
     ParseAttemptReceipt, ParseAttemptTerminal, ParseRecord, ParseRequest, ParseSummary,
-    PatternBytes, Re2Literal, Re2Parsed, RustAstRecord, RustParsed, SCHEMA_VERSION,
+    PatternBytes, Re2Literal, Re2Parsed, RustAstRecord, RustParseHandoff, RustParsed,
+    SCHEMA_VERSION,
 };
 pub use profile::{
     CompatibilityProfile, InputKind, PackageIdentity, PackageVersion, Re2Encoding, Re2Options,
