@@ -191,6 +191,19 @@ pub(crate) enum NativeExactSingletonAnalysis {
     LiteralBytesLimit { needed: u64, limit: u64 },
 }
 
+/// Checked complete finite-language proof requested by the opt-in aggregate
+/// regex-set compiler. A bounded optional proof refusal is kept distinct from
+/// hard construction failures so the caller can return its exact incumbent.
+pub(crate) enum NativeFiniteLanguageAnalysis {
+    Proven(NativeFiniteLanguageCandidate),
+    Declined,
+    ResourceLimit {
+        resource: FactResource,
+        needed: u64,
+        limit: u64,
+    },
+}
+
 impl NativeFiniteLanguageCandidate {
     /// Analyze one canonical parse for the exact output requested by the AOT
     /// entry. Optional proof failure is an optimization decline, never a
@@ -199,6 +212,152 @@ impl NativeFiniteLanguageCandidate {
         let operation = fact_operation(output);
         let facts = analyze_facts(parsed, operation, FactLimits::default()).ok()?;
         Self::from_facts(&facts, operation)
+    }
+
+    /// Analyze one already-parsed regex-set row for a complete, nonempty,
+    /// assertion-free finite byte language. Optional semantic absence and
+    /// bounded proof refusals are reported as declines. Allocation,
+    /// arithmetic, identity, and invariant failures remain terminal.
+    pub(crate) fn analyze_regex_set_checked(
+        parsed: &RustParsed,
+        output: OutputContract,
+        max_finite_strings: usize,
+        max_finite_string_bytes: usize,
+    ) -> Result<NativeFiniteLanguageAnalysis, LowerError> {
+        if output != OutputContract::Exists {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set witness requested non-Exists semantics",
+            });
+        }
+        let operation = fact_operation(output);
+        let limits = FactLimits {
+            max_finite_strings,
+            max_finite_string_bytes,
+            ..FactLimits::default()
+        };
+        let facts = match analyze_facts(parsed, operation, limits) {
+            Ok(facts) => facts,
+            Err(FactError::ResourceLimit {
+                resource,
+                needed,
+                limit,
+            }) => {
+                return Ok(NativeFiniteLanguageAnalysis::ResourceLimit {
+                    resource,
+                    needed,
+                    limit,
+                });
+            }
+            Err(FactError::AllocationFailed {
+                structure,
+                additional,
+            }) => {
+                return Err(LowerError::AllocationFailed {
+                    structure,
+                    additional,
+                });
+            }
+            Err(FactError::ArithmeticOverflow { computation }) => {
+                return Err(LowerError::ArithmeticOverflow { computation });
+            }
+            Err(FactError::InternalInvariant { detail }) => {
+                return Err(LowerError::InternalInvariant { detail });
+            }
+            Err(FactError::CaptureErasureForCaptureOutput) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite regex-set analysis requested capture erasure for capture output",
+                });
+            }
+            Err(_) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite regex-set analysis observed an unknown fact failure",
+                });
+            }
+        };
+        if !facts.identity().authenticates_current() || facts.operation() != operation {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set fact identity did not authenticate",
+            });
+        }
+        if !facts
+            .assertions()
+            .possible()
+            .as_proven()
+            .is_some_and(Vec::is_empty)
+        {
+            return Ok(NativeFiniteLanguageAnalysis::Declined);
+        }
+        let language = match facts.into_finite_language() {
+            FactProof::Proven(language) => language,
+            FactProof::Refused(FactRefusal::Limit {
+                resource,
+                needed,
+                limit,
+            }) => {
+                return Ok(NativeFiniteLanguageAnalysis::ResourceLimit {
+                    resource,
+                    needed,
+                    limit,
+                });
+            }
+            FactProof::Refused(FactRefusal::ArithmeticOverflow { computation }) => {
+                return Err(LowerError::ArithmeticOverflow { computation });
+            }
+            FactProof::Refused(_) | FactProof::Unknown => {
+                return Ok(NativeFiniteLanguageAnalysis::Declined);
+            }
+        };
+        if language.is_empty() || language.strings().any(<[u8]>::is_empty) {
+            return Ok(NativeFiniteLanguageAnalysis::Declined);
+        }
+        let total_bytes = language.total_bytes();
+        let strings = language.into_strings();
+        if strings.len() > max_finite_strings || total_bytes > max_finite_string_bytes {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set proof exceeded its authenticated allowance",
+            });
+        }
+        Ok(NativeFiniteLanguageAnalysis::Proven(Self {
+            operation,
+            strings,
+            total_bytes,
+        }))
+    }
+
+    pub(crate) fn regex_set_language_len(&self) -> usize {
+        self.strings.len()
+    }
+
+    pub(crate) fn authenticate_regex_set_checked(&self) -> Result<(), LowerError> {
+        if self.operation != fact_operation(OutputContract::Exists)
+            || self.strings.is_empty()
+            || self.strings.iter().any(Vec::is_empty)
+        {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set witness lost its semantic proof",
+            });
+        }
+        let total_bytes = self.strings.iter().try_fold(0_usize, |total, string| {
+            total
+                .checked_add(string.len())
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "finite regex-set witness byte census",
+                })
+        })?;
+        if total_bytes != self.total_bytes {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set witness byte census changed",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn regex_set_language_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub(crate) fn regex_set_strings(&self) -> &[Vec<u8>] {
+        &self.strings
     }
 
     /// Allocation-free semantic screen used after an earlier row has crossed
