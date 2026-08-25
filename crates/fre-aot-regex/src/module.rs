@@ -9617,7 +9617,13 @@ impl CompiledModule {
                     .to_le_bytes(),
             );
             selected_identity.update(relocation.offset.to_le_bytes());
-            selected_identity.update([relocation_kind_tag(relocation.kind)]);
+            selected_identity.update([match relocation.kind {
+                RelocationKind::X86PcRelative32 => 1,
+                RelocationKind::X86PltRelative32 => 2,
+                RelocationKind::Aarch64Page21 => 3,
+                RelocationKind::Aarch64PageOff12 => 4,
+                RelocationKind::Aarch64Branch26 => 5,
+            }]);
             selected_identity.update(
                 u64::try_from(relocation.symbol)
                     .map_err(|_| {
