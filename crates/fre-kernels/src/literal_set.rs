@@ -1700,6 +1700,69 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     }
 }
 
+/// Stop at the first direct-DFA acceptance without selecting a pattern or
+/// reconstructing its start.
+///
+/// This deliberately binds only the state needed by one-shot Exists. Bulk
+/// selected-span operations retain `LiteralSetDfaScanner`, whose restart and
+/// root-range fields amortize across matches.
+#[inline(never)]
+fn ordinary_direct_dfa_first_acceptance_end(
+    automaton: &DFA,
+    start_state: StateID,
+    haystack: &[u8],
+) -> Option<usize> {
+    debug_assert!(automaton.prefilter().is_none());
+    debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
+    debug_assert!(!automaton.is_special(start_state));
+    debug_assert!(!automaton.is_match(start_state));
+
+    let anchored = Anchored::No;
+    let mut state = start_state;
+    let mut at = 0;
+    // A short accepting prefix is dominated by entry and branch shape rather
+    // than the saved metadata load. Preserve Aho's native classification for
+    // that prefix, then use the construction-proved boundary for the part of
+    // the scan where it amortizes. This is one continuous DFA traversal: the
+    // second loop resumes from the exact state reached by the first.
+    let native_end = haystack.len().min(32);
+    while at < native_end {
+        state = automaton.next_state(anchored, state, haystack[at]);
+        at += 1;
+        if automaton.is_special(state) {
+            if automaton.is_dead(state) {
+                return None;
+            }
+            if automaton.is_match(state) {
+                return Some(at);
+            }
+        }
+    }
+    while at < haystack.len() {
+        state = automaton.next_state(anchored, state, haystack[at]);
+        at += 1;
+        // The exactly pinned aho-corasick 1.1.4 concrete DFA orders dead and
+        // match states before its unanchored start, followed by ordinary
+        // states. The reachable-state closure test is the upgrade tripwire.
+        debug_assert_eq!(
+            automaton.is_special(state),
+            state < start_state,
+            "Aho's concrete DFA special-state ordering changed",
+        );
+        if state < start_state {
+            if automaton.is_dead(state) {
+                return None;
+            }
+            debug_assert!(
+                automaton.is_match(state),
+                "a DFA without a prefilter has no other special states",
+            );
+            return Some(at);
+        }
+    }
+    None
+}
+
 impl<'a> LiteralSetOrdinaryExecutor<'a> {
     /// Collect every matching plan-relative pattern ID in one forward DFA
     /// traversal when this plan exposes the Standard/K<=64 capability: stable
@@ -1819,6 +1882,19 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         window: Window,
     ) -> Result<Option<usize>, LiteralSetError> {
         validate_window(window, haystack.len())?;
+        if let Some(encoded) = self.direct_dfa_start_state {
+            let base = window.start();
+            let window_bytes = window.end() - base;
+            let relative_end = ordinary_direct_dfa_first_acceptance_end(
+                self.plan.automaton.as_ref(),
+                decode_direct_dfa_start_state(encoded),
+                &haystack[base..window.end()],
+            );
+            return Ok(relative_end.map(|end| {
+                debug_assert!(end <= window_bytes);
+                base + end
+            }));
+        }
         if self.plan.automaton.prefilter().is_some() {
             let input = Input::new(haystack)
                 .span(window.start()..window.end())
@@ -6739,6 +6815,25 @@ mod tests {
         assert_eq!(
             ordinary.find_window_value(&haystack, window),
             Ok(Some((0, 4))),
+        );
+
+        // Resume the same DFA state across the native-classification prefix,
+        // and translate its relative endpoint through a nonzero window base.
+        let mut delayed = vec![200_u8; 80];
+        delayed[47..51].fill(1);
+        let window = Window::new(5, 75);
+        assert_eq!(
+            ordinary.first_acceptance_window_value(&delayed, window),
+            Ok(Some(50)),
+        );
+        assert_eq!(ordinary.exists_window_value(&delayed, window), Ok(true));
+        assert_eq!(
+            ordinary.selected_end_window_value(&delayed, window),
+            Ok(Some(51)),
+        );
+        assert_eq!(
+            ordinary.find_window_value(&delayed, window),
+            Ok(Some((47, 51))),
         );
     }
 
