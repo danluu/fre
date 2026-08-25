@@ -345,6 +345,21 @@ fn exact_root_skip_table_bytes(membership: [u64; 4]) -> Option<[u8; 64]> {
     Some(tables)
 }
 
+fn dense_root_membership(layout: &RegexSetExact64DenseLayoutV1) -> Option<[u64; 4]> {
+    let root_row_bytes =
+        crate::REGEX_SET_EXACT64_AOT_V1_ALPHABET_LEN.checked_mul(core::mem::size_of::<u32>())?;
+    let root_row_end = layout.transition_offset.checked_add(root_row_bytes)?;
+    let root_row = layout.data.get(layout.transition_offset..root_row_end)?;
+    let mut membership = [0_u64; 4];
+    for (byte, cell) in root_row.chunks_exact(4).enumerate() {
+        let target = u32::from_le_bytes(<[u8; 4]>::try_from(cell).ok()?);
+        if target != 0 {
+            membership[byte / 64] |= 1_u64 << (byte % 64);
+        }
+    }
+    Some(membership)
+}
+
 pub(crate) fn authenticates_exact_root_skip_tables(
     layout: &RegexSetExact64DenseLayoutV1,
     root_skip: RegexSetExact64FirstAnyRootSkipLayoutV1,
@@ -358,6 +373,7 @@ pub(crate) fn authenticates_exact_root_skip_tables(
         && root_skip.table_offset.is_multiple_of(16)
         && root_skip.table_bytes == REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_TABLE_BYTES_V1
         && table_end == Some(layout.data.len())
+        && dense_root_membership(layout) == Some(root_skip.membership)
         && output_end
             .and_then(|end| layout.data.get(end..root_skip.table_offset))
             .is_some_and(|padding| padding.iter().all(|&byte| byte == 0))
@@ -1082,6 +1098,64 @@ mod tests {
             assert_eq!(expected, actual, "classification changed byte {byte:#04x}");
         }
         assert_eq!(&tables[48..], &(0_u8..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn self_consistent_root_skip_tables_cannot_forge_dense_root_membership() {
+        let program = selected(&["alpha", "bravo", "cider", "delta", "echo"]);
+        let membership = program
+            .authenticated_graph()
+            .expect("authenticated graph")
+            .root_membership();
+        let mut layout = match build_dense_layout(&program, RegexSetExact64AotLimitsV1::default())
+            .expect("dense layout")
+        {
+            DenseBuildDisposition::Built(layout) => layout,
+            DenseBuildDisposition::Declined { .. } => panic!("dense fixture declined"),
+        };
+        let root_skip = append_exact_root_skip_tables(
+            &mut layout,
+            asimd_linux_target(),
+            membership,
+            RegexSetExact64AotLimitsV1::default(),
+        )
+        .expect("root-skip tables")
+        .expect("ASIMD root-skip selection");
+        assert!(authenticates_exact_root_skip_tables(&layout, root_skip));
+
+        let mut forged_membership = membership;
+        forged_membership[0] ^= 1;
+        let forged_tables =
+            exact_root_skip_table_bytes(forged_membership).expect("self-consistent forged tables");
+        layout.data[root_skip.table_offset..].copy_from_slice(&forged_tables);
+        let forged_root_skip = RegexSetExact64FirstAnyRootSkipLayoutV1 {
+            membership: forged_membership,
+            ..root_skip
+        };
+        assert_eq!(
+            layout.data.get(root_skip.table_offset..),
+            Some(forged_tables.as_slice()),
+            "the forged table authenticates against its own claimed membership"
+        );
+        assert!(
+            !authenticates_exact_root_skip_tables(&layout, forged_root_skip),
+            "the independent dense root row must remain authoritative"
+        );
+        let source_receipt = program.receipt();
+        assert!(matches!(
+            crate::module::lower_native_regex_set_exact64_first_any_aarch64_v1(
+                asimd_linux_target(),
+                [0; 32],
+                source_receipt.artifact_identity(),
+                source_receipt.all_pattern_mask(),
+                layout,
+                Some(forged_root_skip),
+                usize::MAX,
+            ),
+            Err(ObjectError::InvalidModule(
+                "exact64 first-any root-skip proof does not authenticate"
+            ))
+        ));
     }
 
     #[test]
