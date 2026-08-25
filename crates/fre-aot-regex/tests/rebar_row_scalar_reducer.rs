@@ -1,9 +1,13 @@
 use fre_aot_regex::{
     Architecture, CompileMode, CompileRequest, OutputContract, RebarMultiGrepReducerRowV1,
+    PreparedAggregateExports, PreparedOrderedNfaV15CompileDisposition,
+    RebarMixedNativeRowScalarReducerRowV1, RebarMixedNativeRowScalarRouteV1,
     RebarNativeRowScalarOperationV1, RebarNativeRowScalarReducerAotArtifactV1,
     RebarNativeRowScalarReducerAotCompileDeclineV1,
     RebarNativeRowScalarReducerAotCompileDispositionV1, RelocationKind, SectionKind, SymbolBinding,
-    SymbolKind, Target, compile, compile_rebar_native_row_scalar_reducer_aot_v1,
+    SymbolKind, Target, compile, compile_rebar_mixed_native_row_scalar_reducer_aot_v1,
+    compile_rebar_native_row_scalar_reducer_aot_v1,
+    compile_with_prepared_ordered_nfa_v15_reported,
 };
 use fre_syntax::RustProfile;
 
@@ -21,6 +25,60 @@ fn compile_row(source: &str, target: Target) -> fre_aot_regex::CompiledRegex {
             .output(OutputContract::Span),
     )
     .expect("compile public scalar row")
+}
+
+fn compile_prepared_source(source: &str, target: Target) -> fre_aot_regex::CompiledRegex {
+    let disposition = compile_with_prepared_ordered_nfa_v15_reported(
+        CompileRequest::new(source, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        PreparedAggregateExports::NONE,
+    )
+    .expect("compile public prepared scalar row");
+    let PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) = disposition else {
+        panic!("public prepared scalar row unexpectedly declined");
+    };
+    compiled
+}
+
+fn compile_prepared_row(target: Target) -> fre_aot_regex::CompiledRegex {
+    compile_prepared_source(r"(?-u:[\x00-\xFF])\bfoo\b", target)
+}
+
+fn mixed_selected_for(
+    target: Target,
+    operation: RebarNativeRowScalarOperationV1,
+) -> (
+    [fre_aot_regex::CompiledRegex; 2],
+    RebarNativeRowScalarReducerAotArtifactV1,
+) {
+    let compiled = [compile_row("a", target), compile_prepared_row(target)];
+    let rows = [
+        RebarMixedNativeRowScalarReducerRowV1::new(
+            &compiled[0],
+            0,
+            RebarMixedNativeRowScalarRouteV1::Ordinary,
+        ),
+        RebarMixedNativeRowScalarReducerRowV1::new(
+            &compiled[1],
+            1,
+            RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15,
+        ),
+    ];
+    let disposition = compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
+        operation,
+        [0x63; 32],
+        2,
+        32,
+        &[0, 1],
+        &rows,
+        MAX_OBJECT_BYTES,
+    )
+    .expect("compile public mixed row-scalar reducer");
+    let RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(artifact) = disposition else {
+        panic!("public mixed row-scalar reducer unexpectedly declined");
+    };
+    (compiled, artifact)
 }
 
 fn selected_for(
@@ -174,6 +232,122 @@ fn x86_64_cross_format_scalar_closure_is_exact() {
 fn aarch64_cross_format_scalar_closure_is_exact() {
     assert_static_closure(Target::aarch64_linux());
     assert_static_closure(Target::aarch64_macos());
+}
+
+fn assert_static_mixed_closure(target: Target) {
+    for operation in [
+        RebarNativeRowScalarOperationV1::Count,
+        RebarNativeRowScalarOperationV1::SpanSum,
+    ] {
+        let (compiled, artifact) = mixed_selected_for(target, operation);
+        let rows = [
+            RebarMixedNativeRowScalarReducerRowV1::new(
+                &compiled[0],
+                0,
+                RebarMixedNativeRowScalarRouteV1::Ordinary,
+            ),
+            RebarMixedNativeRowScalarReducerRowV1::new(
+                &compiled[1],
+                1,
+                RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15,
+            ),
+        ];
+        assert!(artifact.authenticates_mixed_rows(
+            operation,
+            [0x63; 32],
+            2,
+            32,
+            &[0, 1],
+            &rows,
+        ));
+        let wrong_routes = [
+            RebarMixedNativeRowScalarReducerRowV1::new(
+                &compiled[0],
+                0,
+                RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15,
+            ),
+            RebarMixedNativeRowScalarReducerRowV1::new(
+                &compiled[1],
+                1,
+                RebarMixedNativeRowScalarRouteV1::Ordinary,
+            ),
+        ];
+        assert!(!artifact.authenticates_mixed_rows(
+            operation,
+            [0x63; 32],
+            2,
+            32,
+            &[0, 1],
+            &wrong_routes,
+        ));
+        assert!(!artifact.authenticates_rows(
+            operation,
+            [0x63; 32],
+            2,
+            32,
+            &[0, 1],
+            &[
+                RebarMultiGrepReducerRowV1::new(&compiled[0], 0),
+                RebarMultiGrepReducerRowV1::new(&compiled[1], 1),
+            ],
+        ));
+        let receipt = artifact.receipt();
+        assert!(receipt.uses_mixed_handle_table());
+        assert_eq!(receipt.required_handle_count(), 2);
+        assert_eq!(
+            receipt.row_routes(),
+            [
+                RebarMixedNativeRowScalarRouteV1::Ordinary,
+                RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15,
+            ]
+        );
+        assert_eq!(receipt.semantic_runtime_calls(), 0);
+        assert_eq!(receipt.reducer_relocations().len(), 2);
+        assert!(
+            receipt
+                .reducer_symbol()
+                .starts_with("fre_aot_regex_rebar_mixed_row_scalar_v1_")
+        );
+        assert_eq!(
+            artifact
+                .module()
+                .required_runtime_symbols()
+                .collect::<Vec<_>>(),
+            receipt.row_entry_symbols(),
+        );
+
+        let declined = compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
+            operation,
+            [0x63; 32],
+            2,
+            32,
+            &[0, 1],
+            &rows,
+            1,
+        )
+        .expect("mixed numeric object cap is a typed decline");
+        assert!(matches!(
+            declined,
+            RebarNativeRowScalarReducerAotCompileDispositionV1::Declined(
+                RebarNativeRowScalarReducerAotCompileDeclineV1::ObjectBytes {
+                    limit: 1,
+                    required,
+                }
+            ) if required > 1
+        ));
+    }
+}
+
+#[test]
+fn x86_64_cross_format_mixed_scalar_closure_is_exact() {
+    assert_static_mixed_closure(Target::x86_64_linux());
+    assert_static_mixed_closure(Target::x86_64_macos());
+}
+
+#[test]
+fn aarch64_cross_format_mixed_scalar_closure_is_exact() {
+    assert_static_mixed_closure(Target::aarch64_linux());
+    assert_static_mixed_closure(Target::aarch64_macos());
 }
 
 #[test]
@@ -522,6 +696,262 @@ int main(void){{int r;{calls}return 0;}}
             .success()
     );
     fs::remove_dir_all(&directory).expect("remove link fixture directory");
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes generated public mixed row-scalar reducers"]
+fn linked_mixed_scalar_reducers_validate_handles_priority_and_transactions() {
+    use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+    let mut targets = vec![host_target()];
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    targets.push(Target::x86_64_macos());
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-rebar-mixed-row-scalar-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create mixed link fixture directory");
+
+    for (target_index, target) in targets.into_iter().enumerate() {
+        let (compiled, count) =
+            mixed_selected_for(target, RebarNativeRowScalarOperationV1::Count);
+        let (_, span) = mixed_selected_for(target, RebarNativeRowScalarOperationV1::SpanSum);
+        let count_symbol = count.receipt().reducer_symbol();
+        let span_symbol = span.receipt().reducer_symbol();
+        let entries = count.receipt().row_entry_symbols();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries, span.receipt().row_entry_symbols());
+
+        let count_path = directory.join(format!("mixed-count-{target_index}.o"));
+        let span_path = directory.join(format!("mixed-span-{target_index}.o"));
+        fs::write(&count_path, count.object()).expect("write mixed Count reducer");
+        fs::write(&span_path, span.object()).expect("write mixed SpanSum reducer");
+        let source_path = directory.join(format!("mixed-{target_index}.c"));
+        let executable = directory.join(format!("mixed-{target_index}"));
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <limits.h>\n#include <string.h>\n",
+        );
+        writeln!(
+            &mut source,
+            "extern uint32_t {count_symbol}(void *const*,size_t,const unsigned char*,size_t,uint64_t*);"
+        )
+        .unwrap();
+        writeln!(
+            &mut source,
+            "extern uint32_t {span_symbol}(void *const*,size_t,const unsigned char*,size_t,uint64_t*);"
+        )
+        .unwrap();
+        source.push_str(
+            "static int mode;\nstatic void *const expected_handle=(void*)(uintptr_t)0x1230;\n",
+        );
+        writeln!(
+            &mut source,
+            concat!(
+                "uint32_t {}(const unsigned char*h,size_t n,size_t s,size_t e,size_t*out){{",
+                "(void)h;(void)e;",
+                "if(mode==5){{out[0]=s;out[1]=n+1;return 1;}}",
+                "if(mode==0&&s==0){{out[0]=0;out[1]=2;return 1;}}",
+                "if(mode==2){{out[0]=s;out[1]=s;return 1;}}",
+                "return 0;}}"
+            ),
+            entries[0],
+        )
+        .unwrap();
+        writeln!(
+            &mut source,
+            concat!(
+                "uint32_t {}(void*handle,const unsigned char*h,size_t n,size_t s,size_t e,size_t*out){{",
+                "(void)h;(void)e;if(handle!=expected_handle)return 9;",
+                "if(mode==3)return 7;",
+                "if(mode==4){{out[0]=s;out[1]=n+1;return 1;}}",
+                "if((mode==0||mode==1)&&s==0){{out[0]=0;out[1]=3;return 1;}}",
+                "return 0;}}"
+            ),
+            entries[1],
+        )
+        .unwrap();
+        writeln!(
+            &mut source,
+            r#"
+typedef uint32_t (*mixed_fn)(void *const*,size_t,const unsigned char*,size_t,uint64_t*);
+static int run(mixed_fn f,void *const*handles,size_t count,const unsigned char*h,size_t n,uint32_t status,uint64_t expected){{
+  uint64_t out=UINT64_C(0xa55ac33cf00f9669);uint32_t got=f(handles,count,h,n,&out);
+  return got!=status||(status==0?out!=expected:out!=UINT64_C(0xa55ac33cf00f9669));
+}}
+int main(void){{
+  static const unsigned char h[]={{'x','x','x','x'}};
+  void *valid[2]={{0,(void*)expected_handle}};void *nonnull_ordinary[2]={{(void*)1,(void*)expected_handle}};void *null_prepared[2]={{0,0}};
+  unsigned char unaligned[32];memset(unaligned,0,sizeof(unaligned));
+  mode=0;if(run({count_symbol},valid,2,h,4,0,1))return 1;if(run({span_symbol},valid,2,h,4,0,2))return 2;
+  mode=1;if(run({count_symbol},valid,2,h,4,0,1))return 3;if(run({span_symbol},valid,2,h,4,0,3))return 4;
+  mode=2;if(run({count_symbol},valid,2,h,4,0,5))return 5;if(run({span_symbol},valid,2,h,4,0,0))return 6;
+  mode=3;if(run({count_symbol},valid,2,h,4,3,0))return 7;if(run({span_symbol},valid,2,h,4,3,0))return 8;
+  mode=4;if(run({count_symbol},valid,2,h,4,3,0))return 9;
+  mode=5;if(run({span_symbol},valid,2,h,4,3,0))return 10;
+  mode=0;
+  if(run({count_symbol},0,2,h,4,2,0))return 11;
+  if(run({count_symbol},valid,1,h,4,2,0)||run({count_symbol},valid,3,h,4,2,0))return 12;
+  if(run({count_symbol},(void *const*)(void*)(unaligned+1),2,h,4,2,0))return 13;
+  if(run({count_symbol},(void *const*)(uintptr_t)(UINTPTR_MAX-7),2,h,4,2,0))return 14;
+  if(run({count_symbol},nonnull_ordinary,2,h,4,2,0))return 15;
+  if(run({count_symbol},null_prepared,2,h,4,2,0))return 16;
+  if(run({count_symbol},valid,2,0,1,2,0))return 17;
+  if(run({count_symbol},valid,2,(const unsigned char*)(uintptr_t)(UINTPTR_MAX-1),4,2,0))return 18;
+  uint64_t out=9;if({count_symbol}(valid,2,h,4,0)!=2||out!=9)return 19;
+  if(run({count_symbol},valid,2,h,(size_t)-1,2,0))return 20;
+  if(run({count_symbol},valid,2,h,4,0,1))return 21;
+  return 0;
+}}
+"#,
+        )
+        .unwrap();
+        fs::write(&source_path, source).expect("write mixed C harness");
+        let output = host_cc_command(target)
+            .arg("-O2")
+            .arg(&source_path)
+            .arg(&count_path)
+            .arg(&span_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("link mixed harness");
+        assert!(
+            output.status.success(),
+            "mixed {target:?} link failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let output = Command::new(&executable)
+            .output()
+            .expect("run mixed harness");
+        assert!(
+            output.status.success(),
+            "mixed {target:?} harness failed: status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        drop(compiled);
+    }
+    fs::remove_dir_all(directory).expect("remove mixed link fixture directory");
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links a real prepared V15 handle"]
+fn linked_host_mixed_scalar_reducer_uses_one_prepared_handle_table() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    let target = host_target();
+    let (compiled, count) = mixed_selected_for(target, RebarNativeRowScalarOperationV1::Count);
+    let (_, span) = mixed_selected_for(target, RebarNativeRowScalarOperationV1::SpanSum);
+    let foreign = compile_prepared_source(r"(?-u:[\x00-\xFF])\bbar\b", target);
+    let (program, program_len) = compiled[1]
+        .module()
+        .required_runtime_program()
+        .expect("prepared row runtime program");
+    let (foreign_program, foreign_program_len) = foreign
+        .module()
+        .required_runtime_program()
+        .expect("foreign prepared row runtime program");
+
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-rebar-mixed-row-real-runtime-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create real-runtime fixture directory");
+    let objects = [
+        ("ordinary.o", compiled[0].object()),
+        ("prepared.o", compiled[1].object()),
+        ("foreign.o", foreign.object()),
+        ("count.o", count.object()),
+        ("span.o", span.object()),
+    ];
+    let mut paths = Vec::new();
+    for (name, object) in objects {
+        let path = directory.join(name);
+        fs::write(&path, object).expect("write real-runtime object");
+        paths.push(path);
+    }
+    let source = format!(
+        r#"#include <stddef.h>
+#include <stdint.h>
+typedef void *handle_t;
+typedef struct {{uint32_t struct_size;uint32_t config_version;uint64_t operation_flags;uint64_t max_start_filter_setup_work;uint64_t max_grep_count_workspace_bytes;uint64_t v2_reserved[4];uint64_t max_handle_bytes;uint64_t max_ordered_nfa_scratch_bytes;uint64_t max_ordered_nfa_setup_work;uint64_t required_capabilities;uint64_t reserved[2];}} prepare_v3_t;
+extern const unsigned char {program}[];
+extern const unsigned char {foreign_program}[];
+extern uint32_t {count}(handle_t const*,size_t,const unsigned char*,size_t,uint64_t*);
+extern uint32_t {span}(handle_t const*,size_t,const unsigned char*,size_t,uint64_t*);
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v3(const unsigned char*,size_t,const prepare_v3_t*,handle_t*);
+extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);
+static int run(uint32_t(*f)(handle_t const*,size_t,const unsigned char*,size_t,uint64_t*),handle_t const*t,const unsigned char*h,size_t n,uint64_t expected){{uint64_t out=UINT64_C(0xa55ac33cf00f9669);uint32_t s=f(t,2,h,n,&out);return s||out!=expected;}}
+int main(void){{
+  const prepare_v3_t config={{112U,3U,UINT64_C(2),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C(1),{{0,0}}}};
+  handle_t right=0,wrong=0;if(fre_aot_regex_runtime_prepare_exclusive_v3({program},{program_len}U,&config,&right)!=0U||!right)return 1;if(fre_aot_regex_runtime_prepare_exclusive_v3({foreign_program},{foreign_program_len}U,&config,&wrong)!=0U||!wrong)return 2;
+  handle_t table[2]={{0,right}},wrong_table[2]={{0,wrong}};
+  static const unsigned char empty[]={{0}},a[]={{'a'}},foo[]={{'!','f','o','o'}},many[]={{'a',' ','!','f','o','o',' ','a','a'}},negative[]={{'!','f','o','o','d'}};
+  for(unsigned round=0;round<8U;round++){{if(run({count},table,empty,0,0)||run({span},table,empty,0,0))return 3;if(run({count},table,a,sizeof(a),1)||run({span},table,a,sizeof(a),1))return 4;if(run({count},table,foo,sizeof(foo),1)||run({span},table,foo,sizeof(foo),4))return 5;if(run({count},table,many,sizeof(many),4)||run({span},table,many,sizeof(many),7))return 6;if(run({count},table,negative,sizeof(negative),0)||run({span},table,negative,sizeof(negative),0))return 7;}}
+  uint64_t out=UINT64_C(0x1122334455667788);if({count}(wrong_table,2,foo,sizeof(foo),&out)!=3U||out!=UINT64_C(0x1122334455667788))return 8;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(right)!=0U)return 9;if(fre_aot_regex_runtime_destroy_exclusive_v1(wrong)!=0U)return 10;return 0;
+}}
+"#,
+        count = count.receipt().reducer_symbol(),
+        span = span.receipt().reducer_symbol(),
+    );
+    let source_path = directory.join("real-runtime.c");
+    let executable = directory.join("real-runtime");
+    fs::write(&source_path, source).expect("write real-runtime C harness");
+    let output = host_cc_command(target)
+        .arg("-O2")
+        .arg(&source_path)
+        .args(&paths)
+        .arg(&static_runtime)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .expect("link real-runtime mixed harness");
+    assert!(
+        output.status.success(),
+        "real-runtime mixed link failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let output = Command::new(&executable)
+        .output()
+        .expect("run real-runtime mixed harness");
+    assert!(
+        output.status.success(),
+        "real-runtime mixed harness failed: status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove real-runtime fixture directory");
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]

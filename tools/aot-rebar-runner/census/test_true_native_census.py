@@ -2634,6 +2634,11 @@ class TrueNativeCensusTests(unittest.TestCase):
             "linked-native-row-scalar-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
+            "linked-native-row-scalar-helper-backed-reducer": (
+                False,
+                False,
+                "single-call-native-reducer-retains-semantic-runtime-helpers",
+            ),
             "linked-uniform-capture-row-adapter-loop": (
                 True,
                 False,
@@ -3270,6 +3275,9 @@ class TrueNativeCensusTests(unittest.TestCase):
                 "native_row_scalar_reducer": "true",
                 "row_scalar_reducer_abi_version": "1",
                 "row_scalar_reducer_operation": operation_name,
+                "row_scalar_reducer_mixed_handle_table": "false",
+                "row_scalar_reducer_required_handle_count": "0",
+                "row_scalar_reducer_row_routes": "0,0",
                 "row_scalar_reducer_source_cardinality": "3",
                 "row_scalar_reducer_source_bytes": "12",
                 "row_scalar_reducer_ordered_sources_sha256": "d" * 64,
@@ -3365,6 +3373,188 @@ class TrueNativeCensusTests(unittest.TestCase):
                 CENSUS.validate_provenance_record(
                     poisoned_scalar, "poisoned native row-scalar reducer"
                 )
+
+        mixed = dict(fields)
+        prepared_identity = "8" * 64
+        mixed.update({
+            "model": "count",
+            "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedNfa)",
+            "adapter": (
+                "general-aot-native-row-count-mixed-prepared-"
+                "whole-operation-reducer-v1"
+            ),
+            "aggregate_strategy": (
+                "native-independent-mixed-span-row-whole-scalar-reducer-v1"
+            ),
+            "boundary": "single-call-native-mixed-row-scalar-reducer",
+            "prepare_max_handle_bytes": str(CENSUS.PREPARED_V15_MAX_HANDLE_BYTES),
+            "prepare_max_scratch_bytes": str(CENSUS.PREPARED_V15_MAX_SCRATCH_BYTES),
+            "prepare_max_setup_work": str(CENSUS.PREPARED_V15_MAX_SETUP_WORK),
+            "component_1_entry_symbol": (
+                f"fre_aot_regex_search_exclusive_v1_{prepared_identity}"
+            ),
+            "component_1_runtime_symbols": ",".join(
+                CENSUS.PREPARED_V15_RUNTIME_SYMBOLS
+            ),
+            "component_1_required_prepare_capabilities": "0000000000000001",
+            "component_1_prepare_config_version": "3",
+            "component_1_prepare_operation_flags": "0000000000000002",
+            "component_1_runtime_program_symbol": (
+                f"fre_aot_regex_runtime_program_v1_{prepared_identity}"
+            ),
+            "component_1_runtime_program_len": "4096",
+            "component_1_span_fill_symbol": (
+                f"fre_aot_regex_fill_spans_exclusive_v1_{prepared_identity}"
+            ),
+            "component_1_prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+            "native_row_scalar_reducer": "true",
+            "row_scalar_reducer_abi_version": "1",
+            "row_scalar_reducer_operation": "count",
+            "row_scalar_reducer_mixed_handle_table": "true",
+            "row_scalar_reducer_required_handle_count": "2",
+            "row_scalar_reducer_row_routes": "0,1",
+            "row_scalar_reducer_source_cardinality": "3",
+            "row_scalar_reducer_source_bytes": "12",
+            "row_scalar_reducer_ordered_sources_sha256": "d" * 64,
+            "row_scalar_reducer_code_sha256": "e" * 64,
+            "row_scalar_reducer_object_sha256": "f" * 64,
+            "row_scalar_reducer_relocation_count": "2",
+            "row_scalar_reducer_relocation_sections": "0,0",
+            "row_scalar_reducer_relocation_offsets": "64,128",
+            "row_scalar_reducer_relocation_kinds": "1,1",
+            "row_scalar_reducer_relocation_symbols": "1,2",
+            "row_scalar_reducer_relocation_addends": "-4,-4",
+            "row_scalar_reducer_semantic_runtime_calls": "0",
+            "row_scalar_reducer_object_bytes": "1232",
+            "row_scalar_reducer_max_object_bytes": str(268435456 - 4096),
+        })
+        operation_digest = hashlib.sha256()
+        operation_digest.update(
+            b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer/v1\0"
+        )
+        operation_digest.update((1).to_bytes(4, "little"))
+        operation_digest.update(bytes((1, 0, 0, 0)))
+        operation_digest.update((0).to_bytes(8, "little"))
+        operation_digest.update((3).to_bytes(8, "little"))
+        operation_digest.update((12).to_bytes(8, "little"))
+        operation_digest.update(bytes.fromhex("d" * 64))
+        operation_digest.update((3).to_bytes(8, "little"))
+        for row in (0, 1, 0):
+            operation_digest.update(row.to_bytes(8, "little"))
+        operation_digest.update((2).to_bytes(8, "little"))
+        for index, (first_source, route) in enumerate(((0, 0), (1, 1))):
+            operation_digest.update(first_source.to_bytes(8, "little"))
+            operation_digest.update(bytes((route,)))
+            entry = mixed[f"component_{index}_entry_symbol"].encode("ascii")
+            operation_digest.update(len(entry).to_bytes(8, "little"))
+            operation_digest.update(entry)
+            for suffix in ("automaton_sha256", "program_sha256", "object_sha256"):
+                operation_digest.update(bytes.fromhex(
+                    mixed[f"component_{index}_{suffix}"]
+                ))
+        mixed_identity = operation_digest.hexdigest()
+        mixed_symbol = f"fre_aot_regex_rebar_mixed_row_scalar_v1_{mixed_identity}"
+        mixed["row_scalar_reducer_operation_identity_sha256"] = mixed_identity
+        mixed["row_scalar_reducer_symbol"] = mixed_symbol
+        artifact = hashlib.sha256()
+        artifact.update(
+            b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer-artifact/v1\0"
+        )
+        artifact.update(bytes.fromhex(mixed_identity))
+        symbol_bytes = mixed_symbol.encode("ascii")
+        artifact.update(len(symbol_bytes).to_bytes(8, "little"))
+        artifact.update(symbol_bytes)
+        artifact.update(bytes.fromhex("e" * 64))
+        artifact.update(bytes.fromhex("f" * 64))
+        artifact.update((2).to_bytes(8, "little"))
+        for offset, symbol in ((64, 1), (128, 2)):
+            artifact.update((0).to_bytes(8, "little"))
+            artifact.update(offset.to_bytes(8, "little"))
+            artifact.update(bytes((1,)))
+            artifact.update(symbol.to_bytes(8, "little"))
+            artifact.update((-4).to_bytes(8, "little", signed=True))
+        artifact.update((1232).to_bytes(8, "little"))
+        artifact.update((268435456 - 4096).to_bytes(8, "little"))
+        artifact.update((2).to_bytes(8, "little"))
+        artifact.update(bytes((0, 1)))
+        mixed["row_scalar_reducer_artifact_identity_sha256"] = artifact.hexdigest()
+        mixed_receipt = CENSUS.provenance_receipt(CENSUS.parse_provenance(
+            " ".join(f"{key}={value}" for key, value in mixed.items()).encode()
+        ))
+        CENSUS.validate_provenance_record(
+            mixed_receipt, "synthetic mixed native row-scalar reducer"
+        )
+        self.assertTrue(mixed_receipt["row_scalar_reducer"]["mixed_handle_table"])
+        self.assertEqual(mixed_receipt["row_scalar_reducer"]["row_routes"], [0, 1])
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(mixed_receipt),
+            ([mixed_symbol], "linked-native-row-scalar-helper-backed-reducer"),
+        )
+        prepared_identity_symbols = [
+            mixed["component_1_entry_symbol"],
+            mixed["component_1_span_fill_symbol"],
+            mixed["component_1_runtime_program_symbol"],
+        ]
+        identity_symbols = sorted([
+            mixed["component_0_entry_symbol"],
+            *prepared_identity_symbols,
+        ])
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(mixed_receipt),
+            identity_symbols,
+        )
+        self.assertEqual(
+            CENSUS.authenticate_identity_defined_symbol_inventory(
+                mixed_receipt, set(identity_symbols), set(identity_symbols)
+            ),
+            identity_symbols,
+        )
+        for missing_symbol in prepared_identity_symbols:
+            for missing_from_replica in (False, True):
+                with self.subTest(
+                    identity=missing_symbol,
+                    binary="replica" if missing_from_replica else "primary",
+                ):
+                    primary = set(identity_symbols)
+                    replica = set(identity_symbols)
+                    (replica if missing_from_replica else primary).remove(
+                        missing_symbol
+                    )
+                    with self.assertRaisesRegex(
+                        CENSUS.CensusError, "identity symbols are absent"
+                    ):
+                        CENSUS.authenticate_identity_defined_symbol_inventory(
+                            mixed_receipt, primary, replica
+                        )
+
+        missing_identity = copy.deepcopy(mixed_receipt)
+        del missing_identity["components"][1]["prepared_v15"][
+            "runtime_program_symbol"
+        ]
+        with self.assertRaisesRegex(CENSUS.CensusError, "identit.*malformed"):
+            CENSUS.identity_defined_symbols_from_provenance(missing_identity)
+
+        wrong_identity = copy.deepcopy(mixed_receipt)
+        wrong_identity["components"][1]["prepared_v15"][
+            "runtime_program_symbol"
+        ] = f"fre_aot_regex_runtime_program_v1_{'9' * 64}"
+        with self.assertRaisesRegex(CENSUS.CensusError, "component identity differs"):
+            CENSUS.identity_defined_symbols_from_provenance(wrong_identity)
+
+        duplicate_identity = copy.deepcopy(mixed_receipt)
+        duplicate_prepared = duplicate_identity["components"][1]["prepared_v15"]
+        duplicate_prepared["runtime_program_symbol"] = duplicate_prepared[
+            "span_fill_symbol"
+        ]
+        with self.assertRaisesRegex(CENSUS.CensusError, "repeats a linked identity"):
+            CENSUS.identity_defined_symbols_from_provenance(duplicate_identity)
+
+        wrong_route = copy.deepcopy(mixed_receipt)
+        wrong_route["components"][1]["entry_symbol"] = (
+            f"fre_aot_regex_search_v1_{prepared_identity}"
+        )
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.identity_defined_symbols_from_provenance(wrong_route)
 
         poisoned_grep = dict(grep_fields)
         poisoned_grep["aggregate_strategy"] = "native-independent-span-row-selector-v1"

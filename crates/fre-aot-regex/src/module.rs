@@ -32288,8 +32288,16 @@ fn native_rebar_row_scalar_module_v1(
     code: Vec<u8>,
     row_entries: &[String],
     relocations: Vec<ModuleRelocation>,
+    mixed_handle_table: bool,
 ) -> Result<CompiledModule, ObjectError> {
-    let entry_name = identity_symbol("fre_aot_regex_rebar_row_scalar_v1_", &identity)?;
+    let entry_name = identity_symbol(
+        if mixed_handle_table {
+            "fre_aot_regex_rebar_mixed_row_scalar_v1_"
+        } else {
+            "fre_aot_regex_rebar_row_scalar_v1_"
+        },
+        &identity,
+    )?;
     let mut symbols = Vec::new();
     symbols
         .try_reserve_exact(REBAR_ROW_SCALAR_ROW_SYMBOL_BASE + row_entries.len())
@@ -32323,7 +32331,11 @@ fn native_rebar_row_scalar_module_v1(
                 data: code.into_boxed_slice(),
             },
             ModuleSection {
-                name: ".rodata.fre.rebar-row-scalar",
+                name: if mixed_handle_table {
+                    ".rodata.fre.rebar-mixed-row-scalar"
+                } else {
+                    ".rodata.fre.rebar-row-scalar"
+                },
                 kind: SectionKind::ReadOnlyData,
                 alignment: 1,
                 data: Box::default(),
@@ -32401,12 +32413,16 @@ pub(crate) fn lower_native_rebar_row_scalar_reducer_v1(
         ));
     }
     let (code, call_offsets) = match target.architecture {
-        Architecture::X86_64 => {
-            lower_x86_64_native_rebar_row_scalar_v1(row_entries.len(), operation)?
-        }
-        Architecture::Aarch64 => {
-            lower_aarch64_native_rebar_row_scalar_v1(row_entries.len(), operation)?
-        }
+        Architecture::X86_64 => lower_x86_64_native_rebar_row_scalar_v1(
+            row_entries.len(),
+            operation,
+            None,
+        )?,
+        Architecture::Aarch64 => lower_aarch64_native_rebar_row_scalar_v1(
+            row_entries.len(),
+            operation,
+            None,
+        )?,
     };
     if call_offsets.len() != row_entries.len() {
         return Err(ObjectError::InvalidModule(
@@ -32435,7 +32451,86 @@ pub(crate) fn lower_native_rebar_row_scalar_reducer_v1(
             })
         })
         .collect::<Result<Vec<_>, ObjectError>>()?;
-    native_rebar_row_scalar_module_v1(target, identity, code, row_entries, relocations)
+    native_rebar_row_scalar_module_v1(target, identity, code, row_entries, relocations, false)
+}
+
+pub(crate) fn lower_native_rebar_mixed_row_scalar_reducer_v1(
+    target: Target,
+    operation: crate::RebarNativeRowScalarOperationV1,
+    identity: [u8; 32],
+    row_entries: &[String],
+    row_routes: &[crate::RebarMixedNativeRowScalarRouteV1],
+) -> Result<CompiledModule, ObjectError> {
+    if row_entries.is_empty()
+        || row_entries.len() != row_routes.len()
+        || row_entries.len() > crate::ORDERED_MANY_AOT_MAX_ROWS
+        || !row_routes.iter().any(|route| route.is_prepared())
+        || row_entries.iter().any(String::is_empty)
+        || row_entries
+            .iter()
+            .enumerate()
+            .any(|(row, entry)| row_entries[..row].iter().any(|prior| prior == entry))
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "Rebar mixed row-scalar target or row closure",
+        ));
+    }
+    let prepared_rows = row_routes
+        .iter()
+        .map(|route| route.is_prepared())
+        .collect::<Vec<_>>();
+    let (code, call_offsets) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_rebar_row_scalar_v1(
+            row_entries.len(),
+            operation,
+            Some(&prepared_rows),
+        )?,
+        Architecture::Aarch64 => lower_aarch64_native_rebar_row_scalar_v1(
+            row_entries.len(),
+            operation,
+            Some(&prepared_rows),
+        )?,
+    };
+    if call_offsets.len() != row_entries.len() {
+        return Err(ObjectError::InvalidModule(
+            "Rebar mixed row-scalar row-call cardinality",
+        ));
+    }
+    let relocations = call_offsets
+        .iter()
+        .enumerate()
+        .map(|(row, &offset)| {
+            Ok(ModuleRelocation {
+                section: REBAR_ROW_SCALAR_TEXT_SECTION,
+                offset: offset_u64(offset, "Rebar mixed row-scalar call relocation")?,
+                kind: match target.architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                symbol: REBAR_ROW_SCALAR_ROW_SYMBOL_BASE.checked_add(row).ok_or(
+                    ObjectError::ArithmeticOverflow("Rebar mixed row-scalar row symbol"),
+                )?,
+                addend: if target.architecture == Architecture::X86_64 {
+                    -4
+                } else {
+                    0
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ObjectError>>()?;
+    native_rebar_row_scalar_module_v1(
+        target,
+        identity,
+        code,
+        row_entries,
+        relocations,
+        true,
+    )
 }
 
 type X86Label = usize;
@@ -46991,6 +47086,66 @@ fn lower_x86_64_native_rebar_multi_grep_v1(
     Ok((finished.code, offsets.into_boxed_slice()))
 }
 
+fn x86_mixed_row_scalar_boundary(
+    assembler: &mut X86Assembler,
+    prepared_rows: &[bool],
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    let row_count = u32::try_from(prepared_rows.len())
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 mixed row handle count"))?;
+    let table_bytes = prepared_rows
+        .len()
+        .checked_mul(core::mem::size_of::<usize>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mixed row handle table extent",
+        ))?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // handle table
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 0x07])?; // table alignment
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut exact_count = vec![0x48, 0x81, 0xfe];
+    exact_count.extend_from_slice(&row_count.to_le_bytes());
+    assembler.instruction(&exact_count)?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    let mut table_extent = vec![0x48, 0x05];
+    table_extent.extend_from_slice(&table_bytes.to_le_bytes());
+    assembler.instruction(&table_extent)?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    for (row, prepared) in prepared_rows.iter().copied().enumerate() {
+        let displacement = row
+            .checked_mul(core::mem::size_of::<usize>())
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 mixed row handle slot",
+            ))?;
+        let mut load = vec![0x48, 0x8b, 0x87]; // rax = table[row]
+        load.extend_from_slice(&displacement.to_le_bytes());
+        assembler.instruction(&load)?;
+        assembler.instruction(&[0x48, 0x85, 0xc0])?;
+        assembler.branch(
+            if prepared { &[0x0f, 0x84] } else { &[0x0f, 0x85] },
+            invalid,
+        )?;
+    }
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // haystack
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?; // signed-domain length
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xd0])?;
+    assembler.instruction(&[0x48, 0x01, 0xc8])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // scalar output
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 8])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    Ok(())
+}
+
 fn x86_rebar_row_scalar_accumulate(
     assembler: &mut X86Assembler,
     operation: crate::RebarNativeRowScalarOperationV1,
@@ -47021,20 +47176,28 @@ fn x86_rebar_row_scalar_accumulate(
 fn lower_x86_64_native_rebar_row_scalar_v1(
     row_count: usize,
     operation: crate::RebarNativeRowScalarOperationV1,
+    prepared_rows: Option<&[bool]>,
 ) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
-    const FRAME_BYTES: u8 = 40;
+    const ORDINARY_FRAME_BYTES: u8 = 40;
+    const MIXED_FRAME_BYTES: u8 = 56;
     const RESULT_END_OFFSET: u8 = 8;
     const SELECTED_START_OFFSET: u8 = 16;
     const SELECTED_END_OFFSET: u8 = 24;
     const STATE_OFFSET: u8 = 32;
+    const HANDLE_TABLE_OFFSET: u8 = 40;
     const HAVE_LAST: u8 = 1;
     const PENDING_EMPTY: u8 = 2;
     const HAVE_SELECTED: u8 = 4;
-    if row_count == 0 {
+    if row_count == 0 || prepared_rows.is_some_and(|routes| routes.len() != row_count) {
         return Err(ObjectError::InvalidModule(
             "x86 Rebar row-scalar cardinality",
         ));
     }
+    let frame_bytes = if prepared_rows.is_some() {
+        MIXED_FRAME_BYTES
+    } else {
+        ORDINARY_FRAME_BYTES
+    };
     let mut assembler = X86Assembler::new();
     let iteration = assembler.label()?;
     let search_rows = assembler.label()?;
@@ -47046,17 +47209,28 @@ fn lower_x86_64_native_rebar_row_scalar_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    if let Some(routes) = prepared_rows {
+        x86_mixed_row_scalar_boundary(&mut assembler, routes, invalid)?;
+    } else {
+        x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    }
     assembler.instruction(&[0x55])?; // rbp
     assembler.instruction(&[0x53])?; // rbx
     assembler.instruction(&[0x41, 0x54])?; // r12
     assembler.instruction(&[0x41, 0x55])?; // r13
     assembler.instruction(&[0x41, 0x56])?; // r14
     assembler.instruction(&[0x41, 0x57])?; // r15
-    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
-    assembler.instruction(&[0x49, 0x89, 0xfc])?; // base
-    assembler.instruction(&[0x49, 0x89, 0xf5])?; // length
-    assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+    if prepared_rows.is_some() {
+        assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, HANDLE_TABLE_OFFSET])?;
+        assembler.instruction(&[0x49, 0x89, 0xd4])?; // base
+        assembler.instruction(&[0x49, 0x89, 0xcd])?; // length
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?; // output
+    } else {
+        assembler.instruction(&[0x49, 0x89, 0xfc])?; // base
+        assembler.instruction(&[0x49, 0x89, 0xf5])?; // length
+        assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    }
     assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
     assembler.instruction(&[0x48, 0x31, 0xdb])?; // next start
     assembler.instruction(&[0x48, 0x31, 0xed])?; // last end
@@ -47077,7 +47251,7 @@ fn lower_x86_64_native_rebar_row_scalar_v1(
     call_labels
         .try_reserve_exact(row_count)
         .map_err(|_| ObjectError::Allocation("x86 Rebar row-scalar calls"))?;
-    for _ in 0..row_count {
+    for row in 0..row_count {
         let next_row = assembler.label()?;
         let select_row = assembler.label()?;
         assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0xff, 0xff, 0xff, 0xff])?;
@@ -47092,11 +47266,29 @@ fn lower_x86_64_native_rebar_row_scalar_v1(
             0xff,
             0xff,
         ])?;
-        assembler.instruction(&[0x4c, 0x89, 0xe7])?; // base
-        assembler.instruction(&[0x4c, 0x89, 0xee])?; // length
-        assembler.instruction(&[0x48, 0x89, 0xda])?; // window start
-        assembler.instruction(&[0x4c, 0x89, 0xe9])?; // window end
-        assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // result
+        if prepared_rows.is_some_and(|routes| routes[row]) {
+            assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, HANDLE_TABLE_OFFSET])?;
+            let displacement = row
+                .checked_mul(core::mem::size_of::<usize>())
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 mixed row handle load",
+                ))?;
+            let mut load_handle = vec![0x48, 0x8b, 0xb8]; // rdi = table[row]
+            load_handle.extend_from_slice(&displacement.to_le_bytes());
+            assembler.instruction(&load_handle)?;
+            assembler.instruction(&[0x4c, 0x89, 0xe6])?; // base
+            assembler.instruction(&[0x4c, 0x89, 0xea])?; // length
+            assembler.instruction(&[0x48, 0x89, 0xd9])?; // window start
+            assembler.instruction(&[0x4d, 0x89, 0xe8])?; // window end
+            assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // result
+        } else {
+            assembler.instruction(&[0x4c, 0x89, 0xe7])?; // base
+            assembler.instruction(&[0x4c, 0x89, 0xee])?; // length
+            assembler.instruction(&[0x48, 0x89, 0xda])?; // window start
+            assembler.instruction(&[0x4c, 0x89, 0xe9])?; // window end
+            assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // result
+        }
         assembler.instruction(&[0xe8])?;
         let call = assembler.label()?;
         assembler.bind(call)?;
@@ -47200,7 +47392,7 @@ fn lower_x86_64_native_rebar_row_scalar_v1(
     assembler.bind(runtime_failure)?;
     assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
     assembler.bind(returned)?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0x41, 0x5f])?;
     assembler.instruction(&[0x41, 0x5e])?;
     assembler.instruction(&[0x41, 0x5d])?;
@@ -49855,6 +50047,59 @@ fn lower_aarch64_native_rebar_multi_grep_v1(
     Ok((code, offsets.into_boxed_slice()))
 }
 
+fn aarch64_mixed_row_scalar_boundary(
+    assembler: &mut Aarch64Assembler,
+    prepared_rows: &[bool],
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let row_count = u16::try_from(prepared_rows.len())
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 mixed row handle count"))?;
+    let table_bytes = prepared_rows
+        .len()
+        .checked_mul(core::mem::size_of::<usize>())
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mixed row handle table extent",
+        ))?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 0, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_movz_x(5, row_count, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(1, 5)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_movz_x(5, table_bytes, 0)?)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 5)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 0)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    for (row, prepared) in prepared_rows.iter().copied().enumerate() {
+        let offset = row
+            .checked_mul(core::mem::size_of::<usize>())
+            .and_then(|offset| u16::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 mixed row handle slot",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(5, 0, offset)?)?;
+        if prepared {
+            assembler.branch_zero_x(5, invalid)?;
+        } else {
+            assembler.branch_nonzero_x(5, invalid)?;
+        }
+    }
+    assembler.branch_zero_x(2, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(3, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(5, 2, 3)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 2)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(5, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 4)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    Ok(())
+}
+
 fn aarch64_rebar_row_scalar_accumulate(
     assembler: &mut Aarch64Assembler,
     operation: crate::RebarNativeRowScalarOperationV1,
@@ -49880,14 +50125,28 @@ fn aarch64_rebar_row_scalar_accumulate(
 fn lower_aarch64_native_rebar_row_scalar_v1(
     row_count: usize,
     operation: crate::RebarNativeRowScalarOperationV1,
+    prepared_rows: Option<&[bool]>,
 ) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
-    const FRAME_BYTES: u16 = 112;
-    const RESULT_OFFSET: u16 = 96;
-    if row_count == 0 {
+    const ORDINARY_FRAME_BYTES: u16 = 112;
+    const MIXED_FRAME_BYTES: u16 = 128;
+    const ORDINARY_RESULT_OFFSET: u16 = 96;
+    const MIXED_HANDLE_TABLE_OFFSET: u16 = 96;
+    const MIXED_RESULT_OFFSET: u16 = 112;
+    if row_count == 0 || prepared_rows.is_some_and(|routes| routes.len() != row_count) {
         return Err(ObjectError::InvalidModule(
             "AArch64 Rebar row-scalar cardinality",
         ));
     }
+    let frame_bytes = if prepared_rows.is_some() {
+        MIXED_FRAME_BYTES
+    } else {
+        ORDINARY_FRAME_BYTES
+    };
+    let result_offset = if prepared_rows.is_some() {
+        MIXED_RESULT_OFFSET
+    } else {
+        ORDINARY_RESULT_OFFSET
+    };
     let mut assembler = Aarch64Assembler::new();
     let iteration = assembler.label()?;
     let search_rows = assembler.label()?;
@@ -49898,11 +50157,22 @@ fn lower_aarch64_native_rebar_row_scalar_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
-    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
-    assembler.instruction(aarch64_mov_x(19, 0)?)?; // base
-    assembler.instruction(aarch64_mov_x(20, 1)?)?; // length
-    assembler.instruction(aarch64_mov_x(21, 2)?)?; // output
+    if let Some(routes) = prepared_rows {
+        aarch64_mixed_row_scalar_boundary(&mut assembler, routes, invalid)?;
+    } else {
+        aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    }
+    aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
+    if prepared_rows.is_some() {
+        assembler.instruction(aarch64_store_x(0, 31, MIXED_HANDLE_TABLE_OFFSET)?)?;
+        assembler.instruction(aarch64_mov_x(19, 2)?)?; // base
+        assembler.instruction(aarch64_mov_x(20, 3)?)?; // length
+        assembler.instruction(aarch64_mov_x(21, 4)?)?; // output
+    } else {
+        assembler.instruction(aarch64_mov_x(19, 0)?)?; // base
+        assembler.instruction(aarch64_mov_x(20, 1)?)?; // length
+        assembler.instruction(aarch64_mov_x(21, 2)?)?; // output
+    }
     assembler.instruction(aarch64_movz_x(22, 0, 0)?)?; // total
     assembler.instruction(aarch64_movz_x(23, 0, 0)?)?; // next start
     assembler.instruction(aarch64_movz_x(24, 0, 0)?)?; // last end
@@ -49923,22 +50193,42 @@ fn lower_aarch64_native_rebar_row_scalar_v1(
     call_offsets
         .try_reserve_exact(row_count)
         .map_err(|_| ObjectError::Allocation("AArch64 Rebar row-scalar calls"))?;
-    for _ in 0..row_count {
+    for row in 0..row_count {
         let next_row = assembler.label()?;
         assembler.instruction(0x9280_0005)?; // movn x5, #0
         assembler.instruction(aarch64_store_pair_x(
             5,
             5,
             31,
-            i16::try_from(RESULT_OFFSET).map_err(|_| {
+            i16::try_from(result_offset).map_err(|_| {
                 ObjectError::ArithmeticOverflow("AArch64 row-scalar result offset")
             })?,
         )?)?;
-        assembler.instruction(aarch64_mov_x(0, 19)?)?;
-        assembler.instruction(aarch64_mov_x(1, 20)?)?;
-        assembler.instruction(aarch64_mov_x(2, 23)?)?;
-        assembler.instruction(aarch64_mov_x(3, 20)?)?;
-        assembler.instruction(aarch64_add_x_imm(4, 31, RESULT_OFFSET)?)?;
+        if prepared_rows.is_some_and(|routes| routes[row]) {
+            let handle_offset = row
+                .checked_mul(core::mem::size_of::<usize>())
+                .and_then(|offset| u16::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 mixed row handle load",
+                ))?;
+            assembler.instruction(aarch64_load_x_imm(
+                0,
+                31,
+                MIXED_HANDLE_TABLE_OFFSET,
+            )?)?;
+            assembler.instruction(aarch64_load_x_imm(0, 0, handle_offset)?)?;
+            assembler.instruction(aarch64_mov_x(1, 19)?)?;
+            assembler.instruction(aarch64_mov_x(2, 20)?)?;
+            assembler.instruction(aarch64_mov_x(3, 23)?)?;
+            assembler.instruction(aarch64_mov_x(4, 20)?)?;
+            assembler.instruction(aarch64_add_x_imm(5, 31, result_offset)?)?;
+        } else {
+            assembler.instruction(aarch64_mov_x(0, 19)?)?;
+            assembler.instruction(aarch64_mov_x(1, 20)?)?;
+            assembler.instruction(aarch64_mov_x(2, 23)?)?;
+            assembler.instruction(aarch64_mov_x(3, 20)?)?;
+            assembler.instruction(aarch64_add_x_imm(4, 31, result_offset)?)?;
+        }
         call_offsets.push(assembler.instruction(0x9400_0000)?);
         assembler.branch_zero_w(0, next_row)?;
         assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
@@ -49947,7 +50237,7 @@ fn lower_aarch64_native_rebar_row_scalar_v1(
             5,
             6,
             31,
-            i16::try_from(RESULT_OFFSET).map_err(|_| {
+            i16::try_from(result_offset).map_err(|_| {
                 ObjectError::ArithmeticOverflow("AArch64 row-scalar result offset")
             })?,
         )?)?;
@@ -50000,7 +50290,7 @@ fn lower_aarch64_native_rebar_row_scalar_v1(
     assembler.bind(runtime_failure)?;
     assembler.instruction(aarch64_movz_w(0, 3)?)?;
     assembler.bind(returned)?;
-    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(0xd65f_03c0)?;
@@ -77151,6 +77441,7 @@ mod tests {
         let (x86, calls) = lower_x86_64_native_rebar_row_scalar_v1(
             2,
             crate::RebarNativeRowScalarOperationV1::SpanSum,
+            None,
         )
         .expect("lower x86 SpanSum row reducer");
         assert_eq!(calls.len(), 2);
@@ -77190,6 +77481,7 @@ mod tests {
         let (aarch64, calls) = lower_aarch64_native_rebar_row_scalar_v1(
             2,
             crate::RebarNativeRowScalarOperationV1::SpanSum,
+            None,
         )
         .expect("lower AArch64 SpanSum row reducer");
         assert_eq!(calls.len(), 2);
@@ -77219,6 +77511,26 @@ mod tests {
             assert_eq!(words[offset + 3], aarch64_mov_x(23, 28).unwrap());
             assert_eq!(words[offset + 4], aarch64_mov_x(24, 28).unwrap());
         }
+    }
+
+    #[test]
+    fn aarch64_mixed_row_boundary_accepts_the_public_row_limit() {
+        let mut prepared_rows = vec![false; crate::ORDERED_MANY_AOT_MAX_ROWS];
+        prepared_rows[crate::ORDERED_MANY_AOT_MAX_ROWS - 1] = true;
+        let mut assembler = Aarch64Assembler::new();
+        let invalid = assembler.label().expect("allocate invalid label");
+        aarch64_mixed_row_scalar_boundary(&mut assembler, &prepared_rows, invalid)
+            .expect("lower maximum-cardinality mixed handle boundary");
+        assembler.bind(invalid).expect("bind invalid label");
+        assembler
+            .instruction(0xd65f_03c0)
+            .expect("append return instruction");
+        assert!(
+            !assembler
+                .finish()
+                .expect("finish maximum-cardinality boundary")
+                .is_empty()
+        );
     }
 
     #[test]
