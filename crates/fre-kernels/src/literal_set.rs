@@ -1621,7 +1621,19 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         while at < self.end {
             state = self.automaton.next_state(anchored, state, self.haystack[at]);
             at += 1;
-            if self.automaton.is_special(state) {
+            // The exactly pinned aho-corasick 1.1.4 concrete DFA orders dead
+            // and match states before the unanchored start, followed by its
+            // ordinary states. With no prefilter that start is deliberately
+            // non-special, so the bound start is also the exact special-state
+            // boundary. Reusing it avoids loading the DFA's private maximum
+            // on every byte. The reachable-state closure test is the upgrade
+            // tripwire for this concrete dependency invariant.
+            debug_assert_eq!(
+                self.automaton.is_special(state),
+                state < self.start_state,
+                "Aho's concrete DFA special-state ordering changed",
+            );
+            if state < self.start_state {
                 if self.automaton.is_dead(state) {
                     break;
                 }
@@ -5022,11 +5034,12 @@ mod folded_long_tail_tests {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::{BTreeSet, VecDeque};
     use std::sync::Arc;
 
     use aho_corasick::automaton::{Automaton, StateID};
     use aho_corasick::dfa::DFA;
-    use aho_corasick::{Input, MatchKind};
+    use aho_corasick::{Anchored, Input, MatchKind};
 
     use super::{
         LiteralSetBuildLimits, LiteralSetDfaRootRange, LiteralSetError,
@@ -6356,6 +6369,66 @@ mod tests {
                 pattern
             })
             .collect()
+    }
+
+    fn assert_pinned_direct_dfa_special_boundary(plan: &LiteralSetPlan) {
+        let automaton = plan.automaton.as_ref();
+        assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert!(automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        let start_state = ordinary
+            .direct_dfa_start_state
+            .map(decode_direct_dfa_start_state)
+            .expect("direct DFA retains its unanchored start");
+
+        let mut seen = BTreeSet::from([start_state]);
+        let mut pending = VecDeque::from([start_state]);
+        while let Some(state) = pending.pop_front() {
+            assert_eq!(
+                automaton.is_special(state),
+                state < start_state,
+                "the aho-corasick 1.1.4 state order changed at {state:?}",
+            );
+            for byte in u8::MIN..=u8::MAX {
+                let next = automaton.next_state(Anchored::No, state, byte);
+                if seen.insert(next) {
+                    pending.push_back(next);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_start_orders_every_reachable_special_state() {
+        let ranged_patterns = root_range_patterns();
+        let ranged = LiteralSetPlan::new_stable(
+            &ranged_patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(ranged
+            .ordinary_executor()
+            .unwrap()
+            .direct_dfa_root_range
+            .is_some());
+        assert_pinned_direct_dfa_special_boundary(&ranged);
+
+        let mut gapped_patterns = (0_u8..131)
+            .filter(|&byte| byte != 64)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        gapped_patterns[0].push(0);
+        let gapped = LiteralSetPlan::new(
+            &gapped_patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(gapped
+            .ordinary_executor()
+            .unwrap()
+            .direct_dfa_root_range
+            .is_none());
+        assert_pinned_direct_dfa_special_boundary(&gapped);
     }
 
     #[test]
