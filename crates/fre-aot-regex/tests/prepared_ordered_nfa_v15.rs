@@ -1055,6 +1055,16 @@ fn linked_aarch64_sparse_prefix_count_and_span_sum_match_stock() {
         haystack[position] = b'Z';
         haystack
     };
+    let density_transition = |sparse_tail: usize| {
+        let mut haystack = b"_".repeat(64);
+        haystack.extend_from_slice(&b"Qy".repeat(32));
+        // The dense single-vector probe over this candidate-free block must
+        // clear hysteresis before the sparse tail and late match.
+        haystack.extend_from_slice(&b"_".repeat(16));
+        haystack.extend_from_slice(&b"_".repeat(sparse_tail));
+        haystack.extend_from_slice(b"QQQQZ");
+        haystack
+    };
     let cases = [
         Vec::new(),
         b"_".repeat(15),
@@ -1076,6 +1086,10 @@ fn linked_aarch64_sparse_prefix_count_and_span_sum_match_stock() {
         batch_hit(48),
         batch_hit(54),
         batch_hit(64),
+        density_transition(15),
+        density_transition(16),
+        density_transition(63),
+        density_transition(64),
     ];
     let stock = regex::bytes::Regex::new(PATTERN).expect("stock exact-prefix fixture");
     let expected = cases

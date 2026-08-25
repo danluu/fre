@@ -177,10 +177,11 @@ const L_ASSERT_CACHE_KNOWN: u16 = 216;
 const L_ASSERT_CACHE_ENABLED: u16 = 224;
 const L_ASSERT_CACHE_BIT: u16 = 232;
 const L_START_PREFIX_VECTOR_READY: u16 = 240;
+const L_START_PREFIX_VECTOR_DENSE: u16 = 248;
 
 const _: () = assert!(FRAME_BYTES.is_multiple_of(16));
 const _: () = assert!(STACK_BYTES.is_multiple_of(16));
-const _: () = assert!(L_START_PREFIX_VECTOR_READY + 8 <= FRAME_BYTES);
+const _: () = assert!(L_START_PREFIX_VECTOR_DENSE + 8 <= FRAME_BYTES);
 
 /// One complete AArch64 public/private Ordered-NFA text fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2307,6 +2308,12 @@ fn emit_semantic_body(
         // complete vector. Immediate positives and short windows therefore
         // retain the scalar prefix path's setup cost exactly.
         a.store_w(31, 31, usize::from(L_START_PREFIX_VECTOR_READY))?;
+        // A four-vector hit switches the next idle probe to one vector. One
+        // empty single-vector probe returns to the sparse four-vector path.
+        // This search-invocation-local hysteresis protects clustered/adversarial
+        // prefix densities without changing the compiler's unknown-input
+        // sparse admission model.
+        a.store_w(31, 31, usize::from(L_START_PREFIX_VECTOR_DENSE))?;
     }
     a.branch(boundary)?;
 
@@ -2535,6 +2542,7 @@ fn emit_semantic_body(
             scan_hit = a.asm.label()?;
             a.add_x_imm(9, 9, 1)?;
             let scan_vector = a.asm.label()?;
+            let scan_batch = a.asm.label()?;
             let scan_single = a.asm.label()?;
             let scan_scalar = a.asm.label()?;
             let scan_scalar_next = a.asm.label()?;
@@ -2564,6 +2572,9 @@ fn emit_semantic_body(
             a.asm.bind(constants_ready)?;
             a.i(aarch64_cmp_x_imm(10, 64))?;
             a.branch_cond(AARCH64_LO, scan_single)?;
+            a.load_w(12, 31, usize::from(L_START_PREFIX_VECTOR_DENSE))?;
+            a.cbnz_w(12, scan_single)?;
+            a.asm.bind(scan_batch)?;
             a.add_x(12, 20, 9)?;
             a.i(aarch64_ld1_four_16b(24, 12))?;
             for block in 0_u8..4 {
@@ -2585,9 +2596,18 @@ fn emit_semantic_body(
             aarch64_emit_candidate_batch_any(a.asm, 0)?;
             a.branch_cond(AARCH64_NE, batch_hit)?;
             a.add_x_imm(9, 9, 64)?;
+            // No hit means the density receipt is still clear and all filter
+            // constants remain live. Stay inside the sparse batch loop while
+            // another complete cache line is available instead of repeating
+            // mode and lazy-constant checks for every 64-byte miss.
+            a.sub_x(10, 22, 9)?;
+            a.i(aarch64_cmp_x_imm(10, 64))?;
+            a.branch_cond(AARCH64_HS, scan_batch)?;
             a.branch(scan_vector)?;
 
             a.asm.bind(batch_hit)?;
+            a.constant32(12, 1)?;
+            a.store_w(12, 31, usize::from(L_START_PREFIX_VECTOR_DENSE))?;
             aarch64_emit_candidate_any(a.asm, 0)?;
             a.branch_cond(AARCH64_NE, batch_block0)?;
             aarch64_emit_candidate_any(a.asm, 1)?;
@@ -2628,6 +2648,7 @@ fn emit_semantic_body(
             a.i(aarch64_umov_b0(12, 7))?;
             a.cmp_w_imm(12, 0)?;
             a.branch_cond(AARCH64_NE, vector_hit)?;
+            a.store_w(31, 31, usize::from(L_START_PREFIX_VECTOR_DENSE))?;
             a.add_x_imm(9, 9, 16)?;
             a.branch(scan_vector)?;
 
@@ -3743,6 +3764,55 @@ mod tests {
                 .iter()
                 .all(|word| word & 0xfc00_0000 != 0x9400_0000),
             "the ready interval must not cross a local or external call",
+        );
+        let density_clear =
+            aarch64_store_w(31, 31, L_START_PREFIX_VECTOR_DENSE).unwrap();
+        let density_load =
+            aarch64_load_w_imm(12, 31, L_START_PREFIX_VECTOR_DENSE).unwrap();
+        let density_set =
+            aarch64_store_w(12, 31, L_START_PREFIX_VECTOR_DENSE).unwrap();
+        let density_clear_positions = exact_words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| (word == density_clear).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(density_clear_positions.len(), 2);
+        assert!(density_clear_positions[0] < first_constant);
+        let density_load_positions = exact_words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| (word == density_load).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(density_load_positions.len(), 1);
+        let density_load_position = density_load_positions[0];
+        assert_eq!(
+            exact_words[density_load_position + 1] & 0xff00_001f,
+            0x3500_000c,
+            "a dense receipt must select the one-vector probe",
+        );
+        let density_set_position = exact_words
+            .iter()
+            .position(|&word| word == density_set)
+            .unwrap();
+        assert_eq!(
+            exact_words[density_set_position - 1],
+            crate::module::aarch64_movz_x(12, 1, 0).unwrap(),
+        );
+        assert!(density_load_position < density_set_position);
+        assert_eq!(
+            exact_words[density_clear_positions[1] + 1],
+            aarch64_add_x_imm(9, 9, 16).unwrap(),
+            "one empty dense probe must immediately restore sparse batching",
+        );
+        assert!(
+            exact_words.windows(5).any(|window| {
+                window[0] == aarch64_add_x_imm(9, 9, 64).unwrap()
+                    && window[1] == crate::module::aarch64_sub_x_reg(10, 22, 9).unwrap()
+                    && window[2] == aarch64_cmp_x_imm(10, 64).unwrap()
+                    && window[3] & 0xff00_001f == 0x5400_0002
+                    && window[4] & 0xfc00_0000 == 0x1400_0000
+            }),
+            "a sparse miss must remain in the batch loop while 64 bytes remain",
         );
         assert!(exact_entry.start_prefix_vector_lowered);
         let scalar_exact = lower_aarch64_with_vector_policies(&exact, false, true).unwrap();
