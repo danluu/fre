@@ -134,10 +134,10 @@ pub use module::{
     ExactFiniteSelectedEndTeddyIncumbentSourceV2, ExactFiniteSelectedEndTeddySelectionBasisV2,
     ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
     ExactSingleLiteralTwoWayShift, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
-    OperatingSystem, OrderedFiniteLanguageAotReport, PreparedAggregateExports,
-    PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits,
-    SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
-    PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    OperatingSystem, OrderedFiniteLanguageAotReport, OrderedFiniteRootScannerReport,
+    PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind,
+    SectionKind, SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator,
+    SymbolBinding, SymbolKind, Target, PREPARED_CAPABILITY_ORDERED_NFA_V15,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use operation_set::{
@@ -1653,7 +1653,7 @@ fn append_prepared_aggregate_exports_to_compiled(
         & PREPARED_CAPABILITY_ORDERED_NFA_V15
         != 0;
     let format = ObjectFormat::for_target(target);
-    let (mut module, mut object) = match emit_with_ordered_nfa_accelerator_retries(
+    let aggregate_attempt = emit_with_ordered_nfa_accelerator_retries(
         module,
         format,
         max_object_bytes,
@@ -1720,7 +1720,22 @@ fn append_prepared_aggregate_exports_to_compiled(
             )?;
             append_exports(scalar_base)
         },
-    )? {
+    )?;
+    let aggregate_attempt = emit_ordered_finite_root_scanner_scalar_retry(
+        aggregate_attempt,
+        format,
+        max_object_bytes,
+        |selected_report| {
+            let scalar = CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+                &program,
+                target,
+                effective_native_data_limit_bytes,
+                selected_report,
+            )?;
+            append_exports(scalar)
+        },
+    )?;
+    let (mut module, mut object) = match aggregate_attempt {
         FinalObjectAttempt::Fit { module, object } => (module, object),
         FinalObjectAttempt::ObjectBytes {
             module,
@@ -3113,6 +3128,58 @@ enum FinalObjectAttempt {
     },
 }
 
+fn emit_ordered_finite_root_scanner_scalar_retry(
+    attempt: FinalObjectAttempt,
+    format: ObjectFormat,
+    max_object_bytes: usize,
+    rebuild_scalar: impl FnOnce(
+        OrderedFiniteLanguageAotReport,
+    ) -> Result<CompiledModule, CompileError>,
+) -> Result<FinalObjectAttempt, CompileError> {
+    let FinalObjectAttempt::ObjectBytes {
+        module,
+        first_error,
+    } = attempt
+    else {
+        return Ok(attempt);
+    };
+    let Some(selected_report) = module
+        .ordered_finite_language_aot_report()
+        .copied()
+        .filter(|_| module.ordered_finite_root_scanner_report().is_some())
+    else {
+        return Ok(FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        });
+    };
+    if !is_proven_object_byte_limit(&first_error) {
+        return Err(first_error.into());
+    }
+    let fallback_permission = module.optimizing_fallbacks_may_continue();
+    let scalar = rebuild_scalar(selected_report)?
+        .with_optimizing_fallbacks_may_continue(fallback_permission);
+    if !module.ordered_finite_root_scanner_scalar_ablation_is_exact(&scalar) {
+        return Err(CompileError::InternalInvariant(
+            "finite root-scanner ObjectBytes retry changed its scalar leaf",
+        ));
+    }
+    match emit_object(&scalar, format, max_object_bytes) {
+        Ok(object) => Ok(FinalObjectAttempt::Fit {
+            module: scalar,
+            object,
+        }),
+        Err(error @ ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) if is_proven_object_byte_limit(&error) => Ok(FinalObjectAttempt::ObjectBytes {
+            module: scalar,
+            first_error: error,
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Emit one selected module and retry its compositional Ordered-NFA
 /// accelerators in exact additive order. Compiler-only fragmented terminal-set
 /// aggregate text is removed first, followed by the whole-window width gate,
@@ -3794,18 +3861,35 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
         )? else {
             return Ok(RawCompileDisposition::WideFiniteDeclined);
         };
-        let object = match emit_object(&module, format, limits.max_object_bytes) {
-            Ok(object) => object,
-            Err(ObjectError::Resource {
+        let initial = match emit_object(&module, format, limits.max_object_bytes) {
+            Ok(object) => FinalObjectAttempt::Fit { module, object },
+            Err(error @ ObjectError::Resource {
                 resource: CompileResource::ObjectBytes,
-                limit,
-                required,
-            }) if required > limit => {
-                return Ok(RawCompileDisposition::WideFiniteDeclined);
-            }
+                ..
+            }) if is_proven_object_byte_limit(&error) => FinalObjectAttempt::ObjectBytes {
+                module,
+                first_error: error,
+            },
             Err(error) => return Err(error.into()),
         };
-        (module, object)
+        match emit_ordered_finite_root_scanner_scalar_retry(
+            initial,
+            format,
+            limits.max_object_bytes,
+            |selected_report| {
+                CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+                    &program,
+                    target,
+                    effective_native_data_limit_bytes,
+                    selected_report,
+                )
+            },
+        )? {
+            FinalObjectAttempt::Fit { module, object } => (module, object),
+            FinalObjectAttempt::ObjectBytes { .. } => {
+                return Ok(RawCompileDisposition::WideFiniteDeclined);
+            }
+        }
     } else {
         match mode {
         CompileMode::Fast => lower_ordinary_with_endpoint_oracle_object_retry(
@@ -3840,7 +3924,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
                 true,
                 teddy_policy,
             )?;
-            match emit_with_ordered_nfa_accelerator_retries(
+            let optimized_attempt = emit_with_ordered_nfa_accelerator_retries(
                 optimized,
                 format,
                 limits.max_object_bytes,
@@ -3899,7 +3983,21 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
                         effective_native_data_limit_bytes,
                     )
                 },
-            )? {
+            )?;
+            let optimized_attempt = emit_ordered_finite_root_scanner_scalar_retry(
+                optimized_attempt,
+                format,
+                limits.max_object_bytes,
+                |selected_report| {
+                    CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+                        &program,
+                        target,
+                        effective_native_data_limit_bytes,
+                        selected_report,
+                    )
+                },
+            )?;
+            match optimized_attempt {
                 FinalObjectAttempt::Fit { module, object } => (module, object),
                 FinalObjectAttempt::ObjectBytes {
                     module: optimized,
@@ -4251,6 +4349,9 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                     .is_some()
             {
                 passes.push(OptimizationPass::ExactFiniteSelectedEndTeddyLowering);
+            }
+            if module.start_accelerator() != StartAccelerator::None {
+                passes.push(OptimizationPass::StartStateScanAcceleration);
             }
             passes.extend_from_slice(&[
                 OptimizationPass::TargetInstructionSelection,

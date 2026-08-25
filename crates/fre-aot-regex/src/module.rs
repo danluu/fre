@@ -376,6 +376,50 @@ pub struct OrderedFiniteLanguageAotReport {
     pub native_data_bytes: usize,
 }
 
+/// Authenticated exact root-membership scanner for a sparse ordered finite
+/// language. A hit is only a candidate transition; the retained trie remains
+/// authoritative for every match and output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderedFiniteRootScannerReport {
+    pub membership: [u64; 4],
+    pub candidate_bytes: u16,
+    pub scanner: StartAccelerator,
+    pub vector_bytes: u8,
+    pub data_offset: usize,
+    pub data_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OrderedFiniteRootScannerExtent {
+    bitmap_start: usize,
+    bitmap_end: usize,
+    lut_end: usize,
+    nibble_start: usize,
+    nibble_end: usize,
+    lane_index_end: usize,
+}
+
+fn ordered_finite_root_scanner_extent(
+    data_offset: usize,
+) -> Option<OrderedFiniteRootScannerExtent> {
+    let bitmap_start = data_offset
+        .checked_add(core::mem::align_of::<u64>() - 1)?
+        & !(core::mem::align_of::<u64>() - 1);
+    let bitmap_end = bitmap_start.checked_add(4 * core::mem::size_of::<u64>())?;
+    let lut_end = bitmap_end.checked_add(256)?;
+    let nibble_start = lut_end.checked_add(15)? & !15;
+    let nibble_end = nibble_start.checked_add(3 * 16)?;
+    let lane_index_end = nibble_end.checked_add(AARCH64_FIRST_LANE_INDEX.len())?;
+    Some(OrderedFiniteRootScannerExtent {
+        bitmap_start,
+        bitmap_end,
+        lut_end,
+        nibble_start,
+        nibble_end,
+        lane_index_end,
+    })
+}
+
 /// Authenticated exact one-byte finite language selected as a direct
 /// call-free `Exists` leaf.
 ///
@@ -657,9 +701,9 @@ fn exact_finite_exists_byte_set_report_is_valid(
         && report.vectorized == (report.scanner != StartAccelerator::Scalar)
 }
 
-fn ordered_finite_language_report_has_valid_geometry(
+fn ordered_finite_language_report_base_data_bytes(
     report: &OrderedFiniteLanguageAotReport,
-) -> bool {
+) -> Option<usize> {
     if report.states == 0
         || report.classes == 0
         || report.classes > 256
@@ -670,25 +714,27 @@ fn ordered_finite_language_report_has_valid_geometry(
         || report.source_count == 0
         || report.source_count > report.source_bytes
     {
-        return false;
+        return None;
     }
-    if report.sparse_failure {
+    let base_data_bytes = if report.sparse_failure {
         let edge_stride = if report.cell_bytes == 2 { 4 } else { 8 };
         let expected_edges = report.states.saturating_sub(1);
         let expected_edge_offset = 256_usize
             .checked_mul(report.cell_bytes)
             .and_then(|root| root.checked_add(report.states.checked_mul(16)?));
-        report.row_stride == 16
+        if !(report.row_stride == 16
             && report.output_in_row_offset == 8
             && report.stored_transition_records == expected_edges
-            && Some(report.sparse_edges_offset) == expected_edge_offset
-            && report
-                .stored_transition_records
-                .checked_mul(edge_stride)
-                .and_then(|edges| report.sparse_edges_offset.checked_add(edges))
-                == Some(report.native_data_bytes)
+            && Some(report.sparse_edges_offset) == expected_edge_offset)
+        {
+            return None;
+        }
+        report
+            .stored_transition_records
+            .checked_mul(edge_stride)
+            .and_then(|edges| report.sparse_edges_offset.checked_add(edges))
     } else {
-        report.stored_transition_records == report.transition_cells
+        if !(report.stored_transition_records == report.transition_cells
             && report.sparse_edges_offset == 0
             && report
                 .classes
@@ -696,13 +742,177 @@ fn ordered_finite_language_report_has_valid_geometry(
                 .is_some_and(|transition_bytes| {
                     transition_bytes <= report.output_in_row_offset
                 })
-            && report.output_in_row_offset.checked_add(8) == Some(report.row_stride)
-            && report
-                .states
-                .checked_mul(report.row_stride)
-                .and_then(|rows| rows.checked_add(256))
-                == Some(report.native_data_bytes)
+            && report.output_in_row_offset.checked_add(8) == Some(report.row_stride))
+        {
+            return None;
+        }
+        report
+            .states
+            .checked_mul(report.row_stride)
+            .and_then(|rows| rows.checked_add(256))
+    };
+    base_data_bytes
+}
+
+fn ordered_finite_language_report_has_valid_geometry(
+    report: &OrderedFiniteLanguageAotReport,
+) -> bool {
+    let Some(base_data_bytes) = ordered_finite_language_report_base_data_bytes(report) else {
+        return false;
+    };
+    report.native_data_bytes == base_data_bytes
+        || report.sparse_failure
+            && ordered_finite_root_scanner_extent(base_data_bytes)
+                .is_some_and(|extent| report.native_data_bytes == extent.lane_index_end)
+}
+
+fn ordered_finite_language_scalar_report_for_root_scanner_retry(
+    mut report: OrderedFiniteLanguageAotReport,
+) -> Option<OrderedFiniteLanguageAotReport> {
+    let base_data_bytes = ordered_finite_language_report_base_data_bytes(&report)?;
+    if !report.sparse_failure
+        || !ordered_finite_root_scanner_extent(base_data_bytes)
+            .is_some_and(|extent| report.native_data_bytes == extent.lane_index_end)
+    {
+        return None;
     }
+    report.native_data_bytes = base_data_bytes;
+    ordered_finite_language_report_has_valid_geometry(&report).then_some(report)
+}
+
+fn ordered_finite_language_root_scanner_data_is_exact(
+    report: &OrderedFiniteLanguageAotReport,
+    scanner: OrderedFiniteRootScannerReport,
+    data: &[u8],
+) -> bool {
+    let Some(extent) = ordered_finite_root_scanner_extent(scanner.data_offset) else {
+        return false;
+    };
+    let Some(set) = NativeExactByteSet::from_membership(scanner.membership, 0, false) else {
+        return false;
+    };
+    if set.cardinality != scanner.candidate_bytes
+        || scanner.scanner != StartAccelerator::Aarch64Asimd
+        || scanner.vector_bytes != 16
+        || !(1..=16).contains(&scanner.candidate_bytes)
+        || scanner.data_offset
+            != ordered_finite_language_report_base_data_bytes(report).unwrap_or(usize::MAX)
+        || scanner.data_bytes != extent.lane_index_end.saturating_sub(scanner.data_offset)
+        || extent.lane_index_end != report.native_data_bytes
+        || data.len() != report.native_data_bytes
+        || data
+            .get(scanner.data_offset..extent.bitmap_start)
+            .is_none_or(|padding| padding.iter().any(|&byte| byte != 0))
+    {
+        return false;
+    }
+    for (index, word) in scanner.membership.iter().enumerate() {
+        let Some(offset) = index
+            .checked_mul(core::mem::size_of::<u64>())
+            .and_then(|delta| extent.bitmap_start.checked_add(delta))
+        else {
+            return false;
+        };
+        if data.get(offset..offset + core::mem::size_of::<u64>())
+            != Some(word.to_le_bytes().as_slice())
+        {
+            return false;
+        }
+    }
+    for byte in 0_usize..256 {
+        let Some(offset) = byte.checked_mul(report.cell_bytes) else {
+            return false;
+        };
+        let token = match report.cell_bytes {
+            2 => {
+                let Some(bytes) = data.get(offset..offset + 2) else {
+                    return false;
+                };
+                u32::from(u16::from_le_bytes(bytes.try_into().unwrap()))
+            }
+            4 => {
+                let Some(bytes) = data.get(offset..offset + 4) else {
+                    return false;
+                };
+                u32::from_le_bytes(bytes.try_into().unwrap())
+            }
+            _ => return false,
+        };
+        if (token != 0) != set.contains(byte as u8) {
+            return false;
+        }
+    }
+    let Some(lut) = data.get(extent.bitmap_end..extent.lut_end) else {
+        return false;
+    };
+    if lut
+        .iter()
+        .enumerate()
+        .any(|(byte, &actual)| actual != u8::from(set.contains(byte as u8)))
+        || data
+            .get(extent.lut_end..extent.nibble_start)
+            .is_none_or(|padding| padding.iter().any(|&byte| byte != 0))
+    {
+        return false;
+    }
+    let tables = NativeExactNibbleTables::from_set(set);
+    if data.get(extent.nibble_start..extent.nibble_start + 16)
+        != Some(tables.low_rows.as_slice())
+        || data.get(extent.nibble_start + 16..extent.nibble_start + 32)
+            != Some(tables.high_rows.as_slice())
+        || data.get(extent.nibble_start + 32..extent.nibble_end)
+            != Some(tables.high_bits.as_slice())
+    {
+        return false;
+    }
+    data.get(extent.nibble_end..extent.lane_index_end)
+        == Some(AARCH64_FIRST_LANE_INDEX.as_slice())
+}
+
+fn ordered_finite_language_root_scanner_report_from_data(
+    report: &OrderedFiniteLanguageAotReport,
+    data: &[u8],
+    target: Target,
+    start_accelerator: StartAccelerator,
+) -> Option<Option<OrderedFiniteRootScannerReport>> {
+    if !ordered_finite_language_report_has_valid_geometry(report)
+        || data.len() != report.native_data_bytes
+    {
+        return None;
+    }
+    let base_data_bytes = ordered_finite_language_report_base_data_bytes(report)?;
+    if report.native_data_bytes == base_data_bytes {
+        return (start_accelerator == StartAccelerator::None).then_some(None);
+    }
+    if !report.sparse_failure
+        || target.architecture != Architecture::Aarch64
+        || !target.features.has(CpuFeature::Aarch64Asimd)
+        || start_accelerator != StartAccelerator::Aarch64Asimd
+    {
+        return None;
+    }
+    let extent = ordered_finite_root_scanner_extent(base_data_bytes)?;
+    let mut membership = [0_u64; 4];
+    for (index, word) in membership.iter_mut().enumerate() {
+        let start = extent
+            .bitmap_start
+            .checked_add(index.checked_mul(core::mem::size_of::<u64>())?)?;
+        let end = start.checked_add(core::mem::size_of::<u64>())?;
+        *word = u64::from_le_bytes(data.get(start..end)?.try_into().ok()?);
+    }
+    let candidate_bytes = membership.iter().try_fold(0_u16, |count, word| {
+        count.checked_add(u16::try_from(word.count_ones()).ok()?)
+    })?;
+    let scanner = OrderedFiniteRootScannerReport {
+        membership,
+        candidate_bytes,
+        scanner: start_accelerator,
+        vector_bytes: 16,
+        data_offset: base_data_bytes,
+        data_bytes: extent.lane_index_end.checked_sub(base_data_bytes)?,
+    };
+    ordered_finite_language_root_scanner_data_is_exact(report, scanner, data)
+        .then_some(Some(scanner))
 }
 
 #[path = "module_context.rs"]
@@ -2359,6 +2569,7 @@ pub struct CompiledModule {
     exact_finite_selected_end_grep_count_aot_report:
         Option<ExactFiniteSelectedEndGrepCountAotReport>,
     ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
+    ordered_finite_root_scanner_report: Option<OrderedFiniteRootScannerReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
     bit_parallel_endpoint_oracle_lowered: bool,
@@ -2699,6 +2910,22 @@ struct NativeFiniteLanguageLayout {
     maximum_width: u32,
     root_member_count: u16,
     cells: NativeFiniteLanguageCellWidth,
+    root_scanner: Option<NativeFiniteRootScannerLayout>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFiniteRootScannerLayout {
+    set: NativeExactByteSet,
+    storage: NativeExactByteSetStorage,
+    lane_index_offset: u32,
+    data_offset: u32,
+    data_bytes: u32,
+}
+
+struct NativeFiniteLanguageEmission {
+    code: Vec<u8>,
+    relocations: Vec<ModuleRelocation>,
+    start_accelerator: StartAccelerator,
 }
 
 impl NativeFiniteLanguageLayout {
@@ -2737,6 +2964,8 @@ impl NativeFiniteLanguageLayout {
 }
 
 const NATIVE_FINITE_ROOT_BATCH_BYTES: usize = 4;
+const NATIVE_FINITE_ROOT_SCANNER_DENSE_HITS: u16 = 4;
+const NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES: u16 = 1024;
 
 /// The scalar root loop necessarily probes the first byte. Batch only when a
 /// uniform byte prior predicts at most one root transition among the three
@@ -3280,7 +3509,12 @@ impl NativeFiniteLanguageCost {
     fn report(
         self,
         layout: NativeFiniteLanguageLayout,
+        emitted_start_accelerator: StartAccelerator,
     ) -> Option<OrderedFiniteLanguageAotReport> {
+        match (layout.root_scanner.is_some(), emitted_start_accelerator) {
+            (false, StartAccelerator::None) | (true, StartAccelerator::Aarch64Asimd) => {}
+            _ => return None,
+        }
         Some(OrderedFiniteLanguageAotReport {
             states: self.states,
             classes: self.classes,
@@ -5119,6 +5353,86 @@ impl CompiledModule {
         Ok(module)
     }
 
+    /// Rebuild the exact scalar sparse-failure incumbent authenticated by a
+    /// selected recurring-root-scanner receipt. This bypasses every portfolio
+    /// choice: final `ObjectBytes` may remove only the additive scanner and
+    /// may not earn a different route.
+    pub(crate) fn lower_ordered_finite_language_scalar_incumbent(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+        selected_report: OrderedFiniteLanguageAotReport,
+    ) -> Result<Self, CompileError> {
+        target.validate()?;
+        let expected = ordered_finite_language_scalar_report_for_root_scanner_retry(
+            selected_report,
+        )
+        .ok_or(CompileError::InternalInvariant(
+            "finite root-scanner retry received no valid scalar incumbent",
+        ))?;
+        let view = program.native_finite_language_view().ok_or(
+            CompileError::InternalInvariant(
+                "finite root-scanner retry lost its authenticated source view",
+            ),
+        )?;
+        let layout = native_finite_language_sparse_layout(view).ok_or(
+            CompileError::InternalInvariant(
+                "finite root-scanner retry lost its sparse-failure layout",
+            ),
+        )?;
+        if layout.required_data_bytes > max_native_data_bytes
+            || layout.required_data_bytes != expected.native_data_bytes
+        {
+            return Err(CompileError::InternalInvariant(
+                "finite root-scanner retry changed its scalar data extent",
+            ));
+        }
+        let cost = NativeFiniteLanguageCost::estimate(view, layout).ok_or(
+            CompileError::InternalInvariant(
+                "finite root-scanner retry lost its scalar cost receipt",
+            ),
+        )?;
+        let (lowering, actual) = lower_selected_native_finite_language(
+            view,
+            target,
+            max_native_data_bytes,
+            layout,
+            cost,
+            false,
+        )?;
+        if actual != expected {
+            return Err(CompileError::InternalInvariant(
+                "finite root-scanner retry changed its scalar report",
+            ));
+        }
+        let module = Self::lower_serialized_with_prelowered(
+            program.serialize()?,
+            Some(lowering),
+            None,
+            None,
+            None,
+            None,
+            Some(actual),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            target,
+        )?;
+        if module.ordered_finite_language_aot_report() != Some(&expected)
+            || module.required_runtime_symbols().next().is_some()
+        {
+            return Err(CompileError::InternalInvariant(
+                "finite root-scanner retry lost its closed scalar route",
+            ));
+        }
+        Ok(module)
+    }
+
     /// Lower only the independently authenticated compact finite-language
     /// sidecar. This is the early wide-language transaction used by prepared
     /// Count/SpanSum compilation before an ordinary DFA is materialized.
@@ -5871,16 +6185,27 @@ impl CompiledModule {
                 ));
             }
         }
-        if ordered_finite_language_aot_report.as_ref().is_some_and(|report| {
-            !ordered_finite_language_report_has_valid_geometry(report)
-                || prelowered
-                    .as_ref()
-                    .is_none_or(|lowering| lowering.data.len() != report.native_data_bytes)
-        }) {
-            return Err(ObjectError::InvalidModule(
-                "ordered finite-language provenance has inconsistent geometry",
-            ));
-        }
+        let ordered_finite_root_scanner_report =
+            if let Some(report) = ordered_finite_language_aot_report.as_ref() {
+                let Some(lowering) = prelowered.as_ref() else {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered finite-language provenance has no native lowering",
+                    ));
+                };
+                let Some(scanner) = ordered_finite_language_root_scanner_report_from_data(
+                    report,
+                    &lowering.data,
+                    target,
+                    lowering.start_accelerator,
+                ) else {
+                    return Err(ObjectError::InvalidModule(
+                        "ordered finite-language provenance has inconsistent geometry",
+                    ));
+                };
+                scanner
+            } else {
+                None
+            };
         if slow_aot_report.as_ref().is_some_and(|report| {
             let quotient_work = report
                 .partial_quotient
@@ -7173,6 +7498,7 @@ impl CompiledModule {
             exact_finite_selected_end_teddy_aot_report_v2: None,
             exact_finite_selected_end_grep_count_aot_report: None,
             ordered_finite_language_aot_report,
+            ordered_finite_root_scanner_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered,
@@ -7443,6 +7769,126 @@ impl CompiledModule {
         &self,
     ) -> Option<&OrderedFiniteLanguageAotReport> {
         self.ordered_finite_language_aot_report.as_ref()
+    }
+
+    /// Return the exact target-emitted recurring root scanner attached to an
+    /// ordered finite-language leaf. This additive accessor keeps the stable
+    /// V1 finite-language receipt shape unchanged.
+    #[must_use]
+    pub const fn ordered_finite_root_scanner_report(
+        &self,
+    ) -> Option<&OrderedFiniteRootScannerReport> {
+        self.ordered_finite_root_scanner_report.as_ref()
+    }
+
+    pub(crate) fn ordered_finite_root_scanner_scalar_ablation_is_exact(
+        &self,
+        scalar: &Self,
+    ) -> bool {
+        let runtime_program_is_exact = match (
+            self.runtime_program_symbol_index,
+            scalar.runtime_program_symbol_index,
+        ) {
+            (None, None) => true,
+            (Some(selected_index), Some(scalar_index)) => self
+                .symbols
+                .get(selected_index)
+                .zip(scalar.symbols.get(scalar_index))
+                .is_some_and(|(selected_symbol, scalar_symbol)| {
+                    if selected_symbol.binding != SymbolBinding::Global
+                        || scalar_symbol.binding != SymbolBinding::Global
+                        || selected_symbol.kind != SymbolKind::Object
+                        || scalar_symbol.kind != SymbolKind::Object
+                        || selected_symbol.section != Some(PROGRAM_SECTION)
+                        || scalar_symbol.section != Some(PROGRAM_SECTION)
+                        || selected_symbol.size == 0
+                        || selected_symbol.size != scalar_symbol.size
+                    {
+                        return false;
+                    }
+                    let Some(selected_start) =
+                        usize::try_from(selected_symbol.offset).ok()
+                    else {
+                        return false;
+                    };
+                    let Some(scalar_start) = usize::try_from(scalar_symbol.offset).ok() else {
+                        return false;
+                    };
+                    let Some(size) = usize::try_from(selected_symbol.size).ok() else {
+                        return false;
+                    };
+                    let Some(selected_end) = selected_start.checked_add(size) else {
+                        return false;
+                    };
+                    let Some(scalar_end) = scalar_start.checked_add(size) else {
+                        return false;
+                    };
+                    self.sections.get(PROGRAM_SECTION).is_some_and(|section| {
+                        scalar.sections.get(PROGRAM_SECTION).is_some_and(|scalar_section| {
+                            section.data.get(selected_start..selected_end)
+                                == scalar_section.data.get(scalar_start..scalar_end)
+                        })
+                    })
+                }),
+            _ => false,
+        };
+        let (Some(selected), Some(actual)) = (
+            self.ordered_finite_language_aot_report,
+            scalar.ordered_finite_language_aot_report.as_ref(),
+        ) else {
+            return false;
+        };
+        let Some(scanner) = self.ordered_finite_root_scanner_report else {
+            return false;
+        };
+        let Some(expected) =
+            ordered_finite_language_scalar_report_for_root_scanner_retry(selected)
+        else {
+            return false;
+        };
+        self.target == scalar.target
+            && self.start_accelerator == scanner.scanner
+            && scalar.start_accelerator == StartAccelerator::None
+            && actual == &expected
+            && self.symbols.get(PROGRAM_SYMBOL).map(|symbol| symbol.name.as_str())
+                == scalar
+                    .symbols
+                    .get(PROGRAM_SYMBOL)
+                    .map(|symbol| symbol.name.as_str())
+            && self.sections.get(PROGRAM_SECTION).is_some_and(|section| {
+                scalar.sections.get(PROGRAM_SECTION).is_some_and(|scalar_section| {
+                    section.data.get(..scanner.data_offset)
+                        == scalar_section.data.get(..expected.native_data_bytes)
+                })
+            })
+            && self.required_prepare_capabilities == 0
+            && scalar.required_prepare_capabilities == 0
+            && self.runtime_symbol_index.is_none()
+            && scalar.runtime_symbol_index.is_none()
+            && runtime_program_is_exact
+            && self.prepared_entry_symbol_index.is_none()
+            && scalar.prepared_entry_symbol_index.is_none()
+            && self.prepared_count_symbol_index.is_some()
+                == scalar.prepared_count_symbol_index.is_some()
+            && self.prepared_span_sum_symbol_index.is_some()
+                == scalar.prepared_span_sum_symbol_index.is_some()
+            && self.prepared_grep_count_symbol_index.is_some()
+                == scalar.prepared_grep_count_symbol_index.is_some()
+            && self.prepared_bulk_strategy == scalar.prepared_bulk_strategy
+            && self.prepared_aggregate_exports == scalar.prepared_aggregate_exports
+            && self.prepared_aggregate_strategy == scalar.prepared_aggregate_strategy
+            && self.slow_aot_report.is_none()
+            && scalar.slow_aot_report.is_none()
+            && self.slow_context_aot_report.is_none()
+            && scalar.slow_context_aot_report.is_none()
+            && self.compiler_k0_aot_report.is_none()
+            && scalar.compiler_k0_aot_report.is_none()
+            && self.exact_finite_exists_leaf_report.is_none()
+            && scalar.exact_finite_exists_leaf_report.is_none()
+            && self.exact_finite_selected_end_teddy_aot_report.is_none()
+            && scalar.exact_finite_selected_end_teddy_aot_report.is_none()
+            && self.exact_finite_selected_end_teddy_aot_report_v2.is_none()
+            && scalar.exact_finite_selected_end_teddy_aot_report_v2.is_none()
     }
 
     pub(crate) const fn optimizing_fallbacks_may_continue(&self) -> bool {
@@ -24480,6 +24926,7 @@ fn native_finite_language_dense_layout(
         maximum_width: view.maximum_width,
         root_member_count,
         cells,
+        root_scanner: None,
     };
     (layout.maximum_row_offset()? == u32::try_from(maximum_row_offset).ok()?)
         .then_some(layout)
@@ -24546,6 +24993,7 @@ fn native_finite_language_sparse_layout(
         maximum_width: view.maximum_width,
         root_member_count,
         cells,
+        root_scanner: None,
     };
     (layout.maximum_row_offset()? == u32::try_from(maximum_row_offset).ok()?)
         .then_some(layout)
@@ -25211,25 +25659,98 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
     let Some((layout, cost)) = selected else {
         return Ok(None);
     };
-    let Some(report) = cost.report(layout) else {
-        return Ok(None);
+    // The recurring scanner is an additive last-resort optimization, not a
+    // new authority to displace an already available complete-DFA incumbent.
+    // Price its final immutable data extent against every alternate finite
+    // representation before allocating it. If the additive bytes change the
+    // scalar selection, replay the exact pre-feature leaf.
+    let install_root_scanner = if competitor.is_none()
+        && let Some((_, extent)) = plan_aarch64_native_finite_root_scanner(
+            view,
+            target,
+            max_native_data_bytes,
+            layout,
+        )?
+    {
+        let scanner_cost = NativeFiniteLanguageCost {
+            data_bytes: extent.lane_index_end,
+            ..cost
+        };
+        layouts.into_iter().flatten().all(|alternative| {
+            alternative == layout
+                || alternative.required_data_bytes > max_native_data_bytes
+                || NativeFiniteLanguageCost::estimate(view, alternative)
+                    .is_none_or(|alternative_cost| {
+                        scanner_cost.preferred_to(Some(alternative_cost))
+                    })
+        })
+    } else {
+        false
     };
-    let data = selected_native_finite_language_data(materialize_native_finite_language_data(
+    lower_selected_native_finite_language(
+        view,
+        target,
+        max_native_data_bytes,
+        layout,
+        cost,
+        install_root_scanner,
+    )
+    .map(Some)
+}
+
+fn lower_selected_native_finite_language(
+    view: NativeFiniteLanguageView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+    mut layout: NativeFiniteLanguageLayout,
+    cost: NativeFiniteLanguageCost,
+    install_root_scanner: bool,
+) -> Result<(NativeLowering, OrderedFiniteLanguageAotReport), ObjectError> {
+    let mut data = selected_native_finite_language_data(materialize_native_finite_language_data(
         view, layout,
     ))?;
+    if install_root_scanner {
+        install_aarch64_native_finite_root_scanner(
+            view,
+            target,
+            max_native_data_bytes,
+            &mut layout,
+            &mut data,
+        )?;
+        if layout.root_scanner.is_none() {
+            return Err(ObjectError::InvalidModule(
+                "admitted finite root scanner was not installed",
+            ));
+        }
+    }
     let emitted = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_native_finite_language(view.output, layout),
-        Architecture::Aarch64 => lower_aarch64_native_finite_language(view.output, layout),
+        Architecture::X86_64 => {
+            let (code, relocations) =
+                lower_x86_64_native_finite_language(view.output, layout)?;
+            NativeFiniteLanguageEmission {
+                code,
+                relocations,
+                start_accelerator: StartAccelerator::None,
+            }
+        }
+        Architecture::Aarch64 => {
+            lower_aarch64_native_finite_language_emission(view.output, layout)?
+        }
     };
-    let (code, relocations) = emitted?;
-    Ok(Some((
+    let Some(mut report) = cost.report(layout, emitted.start_accelerator) else {
+        return Err(ObjectError::InvalidModule(
+            "finite-language backend scanner disagrees with the selected layout",
+        ));
+    };
+    report.native_data_bytes = data.len();
+    Ok((
         NativeLowering {
-            code,
+            code: emitted.code,
             data,
-            relocations,
+            relocations: emitted.relocations,
             slow_partial_table: None,
             needs_runtime: false,
-            start_accelerator: StartAccelerator::None,
+            start_accelerator: emitted.start_accelerator,
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
@@ -25237,7 +25758,121 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
             complete_span_reduce_source: None,
         },
         report,
-    )))
+    ))
+}
+
+fn reserve_native_finite_root_scanner_data(
+    data: &mut Vec<u8>,
+    additional: usize,
+) -> Result<(), ObjectError> {
+    data.try_reserve_exact(additional)
+        .map_err(|_| ObjectError::Allocation("ordered finite-language root scanner data"))
+}
+
+fn plan_aarch64_native_finite_root_scanner(
+    view: NativeFiniteLanguageView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+    layout: NativeFiniteLanguageLayout,
+) -> Result<Option<(NativeExactByteSet, OrderedFiniteRootScannerExtent)>, ObjectError> {
+    const MAX_ROOT_BYTES: u16 = 16;
+
+    if target.architecture != Architecture::Aarch64
+        || !target.features.has(CpuFeature::Aarch64Asimd)
+        || layout.representation != NativeFiniteLanguageRepresentation::SparseFailure
+        || layout.root_scanner.is_some()
+        || layout.root_member_count == 0
+        || layout.root_member_count > MAX_ROOT_BYTES
+    {
+        return Ok(None);
+    }
+    let set = NativeExactByteSet::from_membership(view.root_members, 0, false).ok_or(
+        ObjectError::InvalidModule("finite root scanner membership is inconsistent"),
+    )?;
+    if set.cardinality != layout.root_member_count {
+        return Err(ObjectError::InvalidModule(
+            "finite root scanner disagrees with the sparse root table",
+        ));
+    }
+    let extent = ordered_finite_root_scanner_extent(layout.required_data_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("finite root scanner table extent"),
+    )?;
+    Ok((extent.lane_index_end <= max_native_data_bytes).then_some((set, extent)))
+}
+
+/// Install one recurring exact root scanner without changing the retained
+/// failure-link trie. The fixed cardinality envelope prices at most one
+/// uniform-prior candidate per 16-byte block. A data-cap refusal preserves the
+/// byte-identical scalar leaf; once that cap fits, failure to reserve the
+/// canonical tables is a terminal host allocator failure.
+fn install_aarch64_native_finite_root_scanner(
+    view: NativeFiniteLanguageView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+    layout: &mut NativeFiniteLanguageLayout,
+    data: &mut Vec<u8>,
+) -> Result<(), ObjectError> {
+    let Some((set, extent)) = plan_aarch64_native_finite_root_scanner(
+        view,
+        target,
+        max_native_data_bytes,
+        *layout,
+    )?
+    else {
+        return Ok(());
+    };
+    if data.len() != layout.required_data_bytes {
+        return Err(ObjectError::InvalidModule(
+            "finite root scanner disagrees with the sparse root table",
+        ));
+    }
+
+    let data_offset = data.len();
+    debug_assert_eq!(data_offset, layout.required_data_bytes);
+
+    let additional = extent.lane_index_end.checked_sub(data.len()).ok_or(
+        ObjectError::ArithmeticOverflow("finite root scanner reservation"),
+    )?;
+    reserve_native_finite_root_scanner_data(data, additional)?;
+
+    let Some(storage) = append_native_exact_byte_set_with_sve2_policy(
+        data,
+        set,
+        Architecture::Aarch64,
+        max_native_data_bytes,
+        false,
+    )? else {
+        return Err(ObjectError::Allocation(
+            "ordered finite-language root scanner data",
+        ));
+    };
+    if data.len() != extent.nibble_end {
+        return Err(ObjectError::InvalidModule(
+            "finite root scanner nibble-table extent changed",
+        ));
+    }
+    let lane_index_offset = u32::try_from(data.len()).map_err(|_| {
+        ObjectError::ArithmeticOverflow("finite root scanner lane-index offset")
+    })?;
+    data.extend_from_slice(&AARCH64_FIRST_LANE_INDEX);
+    if data.len() != extent.lane_index_end {
+        return Err(ObjectError::InvalidModule(
+            "finite root scanner table extent changed",
+        ));
+    }
+    let data_bytes = extent.lane_index_end.checked_sub(data_offset).ok_or(
+        ObjectError::ArithmeticOverflow("finite root scanner retained bytes"),
+    )?;
+    layout.root_scanner = Some(NativeFiniteRootScannerLayout {
+        set,
+        storage,
+        lane_index_offset,
+        data_offset: u32::try_from(data_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("finite root scanner data offset"))?,
+        data_bytes: u32::try_from(data_bytes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("finite root scanner data bytes"))?,
+    });
+    Ok(())
 }
 
 fn selected_native_finite_language_data(
@@ -32319,6 +32954,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         exact_finite_selected_end_teddy_aot_report_v2: None,
         exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
@@ -32657,6 +33293,7 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         exact_finite_selected_end_teddy_aot_report_v2: None,
         exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
@@ -33181,6 +33818,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         exact_finite_selected_end_teddy_aot_report_v2: None,
         exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
@@ -33337,6 +33975,7 @@ fn native_regex_redux_module(
         exact_finite_selected_end_teddy_aot_report_v2: None,
         exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
@@ -33690,6 +34329,7 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         exact_finite_selected_end_teddy_aot_report_v2: None,
         exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
@@ -33804,6 +34444,7 @@ fn native_weighted_capture_module(
         exact_finite_selected_end_teddy_aot_report_v2: None,
         exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
@@ -34261,6 +34902,7 @@ fn native_rebar_multi_grep_module_v1(
         exact_finite_selected_end_teddy_aot_report_v2: None,
         exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
@@ -34508,6 +35150,7 @@ fn native_rebar_row_scalar_module_v1(
         exact_finite_selected_end_teddy_aot_report_v2: None,
         exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
         bit_parallel_endpoint_oracle_lowered: false,
@@ -71823,14 +72466,22 @@ fn lower_aarch64_native_finite_exists_exact(
     })
 }
 
-/// Scalar AAPCS64 leaf for the authenticated ordered finite-language graph.
-/// It avoids x18 (reserved by Apple platforms), uses no callee-saved register,
-/// and is call-free. ASIMD/SVE/SVE2 scanning remains a later additive layer on
-/// top of this equivalence baseline.
+/// AAPCS64 leaf for the authenticated ordered finite-language graph. It avoids
+/// x18 (reserved by Apple platforms), uses no callee-saved register, and is
+/// call-free. A sparse graph may add an exact ASIMD root scanner while the
+/// retained failure-link trie remains authoritative for every result.
 fn lower_aarch64_native_finite_language(
     output: OutputContract,
     layout: NativeFiniteLanguageLayout,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let emitted = lower_aarch64_native_finite_language_emission(output, layout)?;
+    Ok((emitted.code, emitted.relocations))
+}
+
+fn lower_aarch64_native_finite_language_emission(
+    output: OutputContract,
+    layout: NativeFiniteLanguageLayout,
+) -> Result<NativeFiniteLanguageEmission, ObjectError> {
     match layout.representation {
         NativeFiniteLanguageRepresentation::Dense
         | NativeFiniteLanguageRepresentation::SparseFailure => {
@@ -71842,7 +72493,7 @@ fn lower_aarch64_native_finite_language(
 fn lower_aarch64_native_finite_language_impl(
     output: OutputContract,
     layout: NativeFiniteLanguageLayout,
-) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+) -> Result<NativeFiniteLanguageEmission, ObjectError> {
     let mut assembler = Aarch64Assembler::new();
     let scan = assembler.label()?;
     let replace = assembler.label()?;
@@ -71870,7 +72521,19 @@ fn lower_aarch64_native_finite_language_impl(
     } else {
         None
     };
-    let root_batch = native_finite_root_batch_is_admitted(layout);
+    let root_scanner = layout.root_scanner;
+    let root_scanner_labels = if root_scanner.is_some() {
+        Some((
+            assembler.label()?, // scalar tail for a sub-vector remainder
+            assembler.label()?, // vector hit
+            assembler.label()?, // sparse vector hit after density sampling
+            assembler.label()?, // dense backoff reaches the window end
+            assembler.label()?, // bounded direct-root scalar backoff
+        ))
+    } else {
+        None
+    };
+    let root_batch = root_scanner.is_none() && native_finite_root_batch_is_admitted(layout);
     let root_scalar_only = if root_batch {
         Some(assembler.label()?)
     } else {
@@ -71889,18 +72552,141 @@ fn lower_aarch64_native_finite_language_impl(
     let program_page = assembler.instruction(0x9000_0005)?; // adrp x5, program@PAGE
     let program_page_offset =
         assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?; // program@PAGEOFF
-    assembler.instruction(aarch64_mov_x(16, 5)?)?;
+    if root_scanner.is_some() {
+        // Sparse-failure lowering never consumes the dense class-map alias in
+        // X16. Reuse it as the exclusive end of a bounded scalar backoff.
+        assembler.instruction(aarch64_mov_x(16, 2)?)?;
+    } else {
+        assembler.instruction(aarch64_mov_x(16, 5)?)?;
+    }
     aarch64_set_table_address(&mut assembler, 17, layout.row_offset)?;
     if layout.representation == NativeFiniteLanguageRepresentation::SparseFailure {
         aarch64_set_table_address(&mut assembler, 13, layout.sparse_edges_offset)?;
+    }
+    if let Some(root_scanner) = root_scanner {
+        if !root_scanner.set.is_valid()
+            || root_scanner.set.cardinality != layout.root_member_count
+            || root_scanner.set.membership.iter().map(|word| word.count_ones()).sum::<u32>()
+                != u32::from(layout.root_member_count)
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 finite root scanner geometry is inconsistent",
+            ));
+        }
     }
     aarch64_load_u32_constant(&mut assembler, 15, layout.maximum_width)?;
     assembler.instruction(aarch64_mov_x(6, 17)?)?; // current row = rows base
     assembler.instruction(aarch64_mov_x(9, 3)?)?; // pending start sentinel
     aarch64_load_u32_constant(&mut assembler, 11, u32::MAX)?;
+    if let Some(root_scanner) = root_scanner {
+        let (root_scalar_tail, ..) = root_scanner_labels.ok_or(
+            ObjectError::InvalidModule("finite root-scanner labels are absent"),
+        )?;
+        // Remaining bytes only decrease. A short initial window can never use
+        // SIMD later, so avoid all table loads and vector-constant setup.
+        assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(1, 16)?)?;
+        assembler.branch_cond(AARCH64_LO, root_scalar_tail)?;
+        aarch64_emit_exact_asimd_constants(&mut assembler, root_scanner.storage)?;
+        aarch64_emit_first_lane_constants(&mut assembler, root_scanner.lane_index_offset)?;
+        // Exact-set setup borrows X6 for table addresses.
+        assembler.instruction(aarch64_mov_x(6, 17)?)?;
+    }
 
     if let Some((root_scan, _, _, _, _, _, _, _, _, transitioned)) = sparse_labels {
-        if let Some(root_scalar_only) = root_scalar_only {
+        if root_scanner.is_some() {
+            let (
+                root_scalar_tail,
+                root_vector_hit,
+                root_vector_hit_sparse,
+                root_vector_hit_backoff_to_end,
+                root_scalar_backoff,
+            ) = root_scanner_labels.ok_or(ObjectError::InvalidModule(
+                "finite root-scanner labels are absent",
+            ))?;
+            assembler.bind(root_scan)?;
+            assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(1, 16)?)?;
+            assembler.branch_cond(AARCH64_LO, root_scalar_tail)?;
+            aarch64_emit_exact_asimd_candidates(&mut assembler, 0)?;
+            assembler.branch_cond(AARCH64_NE, root_vector_hit)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+            assembler.branch(root_scan)?;
+
+            assembler.bind(root_vector_hit)?;
+            // Four or more exact root candidates in one block make repeated
+            // classification more expensive than direct sparse-root probes.
+            // Install a bounded public backoff, then resample so a later
+            // distribution shift can regain vector skipping.
+            assembler.instruction(aarch64_ushr_16b_by_7(7, 24)?)?;
+            assembler.instruction(aarch64_addv_16b(7, 7)?)?;
+            assembler.instruction(aarch64_umov_b0(12, 7)?)?;
+            assembler.instruction(aarch64_cmp_w_imm(
+                12,
+                NATIVE_FINITE_ROOT_SCANNER_DENSE_HITS,
+            )?)?;
+            assembler.branch_cond(AARCH64_LO, root_vector_hit_sparse)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(
+                12,
+                NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+            )?)?;
+            assembler.branch_cond(AARCH64_LO, root_vector_hit_backoff_to_end)?;
+            assembler.instruction(aarch64_add_x_imm(
+                16,
+                2,
+                NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+            )?)?;
+            assembler.branch(root_vector_hit_sparse)?;
+            assembler.bind(root_vector_hit_backoff_to_end)?;
+            assembler.instruction(aarch64_add_x_imm(16, 3, 0)?)?;
+
+            assembler.bind(root_vector_hit_sparse)?;
+            aarch64_emit_first_candidate_lane(&mut assembler, 24)?;
+            assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
+                }
+            }
+            assembler.branch_zero_w(14, invalid)?;
+            assembler.branch(transitioned)?;
+
+            assembler.bind(root_scalar_backoff)?;
+            assembler.instruction(aarch64_cmp_x(2, 16)?)?;
+            assembler.branch_cond(AARCH64_HS, root_scan)?;
+            assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
+                }
+            }
+            assembler.branch_nonzero_w(14, transitioned)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(root_scalar_backoff)?;
+
+            assembler.bind(root_scalar_tail)?;
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_HS, finish)?;
+            assembler.instruction(aarch64_load_byte_reg(7, 0, 2)?)?;
+            match layout.cells {
+                NativeFiniteLanguageCellWidth::U16 => {
+                    assembler.instruction(aarch64_load_h_uxtw(14, 5, 7)?)?;
+                }
+                NativeFiniteLanguageCellWidth::U32 => {
+                    assembler.instruction(aarch64_load_w_uxtw(14, 5, 7)?)?;
+                }
+            }
+            assembler.branch_nonzero_w(14, transitioned)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(root_scalar_tail)?;
+        } else if let Some(root_scalar_only) = root_scalar_only {
             let root_scalar_tail = assembler.label()?;
             assembler.bind(root_scan)?;
             assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
@@ -72164,6 +72950,10 @@ fn lower_aarch64_native_finite_language_impl(
             assembler.instruction(aarch64_load_w_imm(1, 31, 0)?)?;
             assembler.branch_nonzero_w(1, root_scalar_only)?;
         }
+        if let Some((_, _, _, _, root_scalar_backoff)) = root_scanner_labels {
+            assembler.instruction(aarch64_cmp_x(2, 16)?)?;
+            assembler.branch_cond(AARCH64_LO, root_scalar_backoff)?;
+        }
         assembler.branch(root_scan)?;
         assembler.bind(pending)?;
     } else {
@@ -72211,9 +73001,9 @@ fn lower_aarch64_native_finite_language_impl(
 
     let mut relocation_offsets = [program_page, program_page_offset];
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
-    Ok((
+    Ok(NativeFiniteLanguageEmission {
         code,
-        vec![
+        relocations: vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(
@@ -72235,7 +73025,12 @@ fn lower_aarch64_native_finite_language_impl(
                 addend: 0,
             },
         ],
-    ))
+        start_accelerator: if root_scanner.is_some() {
+            StartAccelerator::Aarch64Asimd
+        } else {
+            StartAccelerator::None
+        },
+    })
 }
 
 fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
@@ -87460,6 +88255,7 @@ mod tests {
             maximum_width: 2,
             root_member_count: 2,
             cells: NativeFiniteLanguageCellWidth::U16,
+            root_scanner: None,
         };
         let sparse_batch = NativeFiniteLanguageLayout {
             representation: NativeFiniteLanguageRepresentation::SparseFailure,
@@ -87578,6 +88374,471 @@ mod tests {
                 "selected ordered finite-language layout could not be materialized",
             )),
         );
+    }
+
+    #[test]
+    fn ordered_finite_root_scanner_is_exact_transactional_and_target_final() {
+        let pattern = cache_large_branching_finite_pattern(16, 4, 16);
+        let compiled = ordered_finite_test_program(&pattern, OutputContract::Span);
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("finite root-scanner sidecar");
+        let sparse = native_finite_language_sparse_layout(view)
+            .expect("finite root-scanner sparse layout");
+        assert_eq!(sparse.root_member_count, 16);
+        let base_data = materialize_native_finite_language_data(view, sparse)
+            .expect("finite root-scanner allocation")
+            .expect("finite root-scanner base data");
+        let scalar_emission =
+            lower_aarch64_native_finite_language(OutputContract::Span, sparse).unwrap();
+        let asimd = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+
+        let mut vector_layout = sparse;
+        let mut vector_data = base_data.clone();
+        install_aarch64_native_finite_root_scanner(
+            view,
+            asimd,
+            usize::MAX,
+            &mut vector_layout,
+            &mut vector_data,
+        )
+        .expect("install finite root scanner");
+        let scanner = vector_layout
+            .root_scanner
+            .expect("ASIMD target admits finite root scanner");
+        assert_eq!(scanner.set.membership, view.root_members);
+        assert_eq!(scanner.set.cardinality, sparse.root_member_count);
+        assert_eq!(usize::try_from(scanner.data_offset).unwrap(), base_data.len());
+        assert_eq!(
+            usize::try_from(scanner.data_bytes).unwrap(),
+            vector_data.len() - base_data.len(),
+        );
+        assert_eq!(&vector_data[..base_data.len()], base_data.as_slice());
+        let vector_emission =
+            lower_aarch64_native_finite_language(OutputContract::Span, vector_layout).unwrap();
+        assert_ne!(vector_emission.0, scalar_emission.0);
+        assert_eq!(vector_emission.1.len(), scalar_emission.1.len());
+        for (vector, scalar) in vector_emission.1.iter().zip(&scalar_emission.1) {
+            assert_eq!(vector.section, scalar.section);
+            assert_eq!(vector.kind, scalar.kind);
+            assert_eq!(vector.symbol, scalar.symbol);
+            assert_eq!(vector.addend, scalar.addend);
+        }
+        let words = vector_emission
+            .0
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&aarch64_cmp_x_imm(1, 16).unwrap()));
+        assert!(words.contains(&aarch64_add_x_imm(2, 2, 16).unwrap()));
+        assert!(words.contains(&aarch64_ld1_three_16b(16, 6).unwrap()));
+        let short_cmp = words
+            .iter()
+            .position(|&word| word == aarch64_cmp_x_imm(1, 16).unwrap())
+            .expect("initial short-window comparison");
+        let short_branch = short_cmp + 1;
+        let (condition, short_tail) =
+            aarch64_test_branch_target(&vector_emission.0, short_branch * 4);
+        assert_eq!(condition, Some(AARCH64_LO));
+        assert_eq!(
+            words[short_tail / 4],
+            aarch64_cmp_x(2, 3).unwrap(),
+            "short initial windows must enter the scalar tail",
+        );
+        let vector_setup = words
+            .iter()
+            .position(|&word| word == aarch64_ld1_three_16b(16, 6).unwrap())
+            .expect("root-scanner SIMD setup");
+        assert!(short_tail / 4 > vector_setup);
+
+        let density = words
+            .windows(4)
+            .position(|window| {
+                window
+                    == [
+                        aarch64_ushr_16b_by_7(7, 24).unwrap(),
+                        aarch64_addv_16b(7, 7).unwrap(),
+                        aarch64_umov_b0(12, 7).unwrap(),
+                        aarch64_cmp_w_imm(
+                            12,
+                            NATIVE_FINITE_ROOT_SCANNER_DENSE_HITS,
+                        )
+                        .unwrap(),
+                    ]
+            })
+            .expect("root-candidate density sampling");
+        let sparse_branch = density + 4;
+        let (condition, sparse_target) =
+            aarch64_test_branch_target(&vector_emission.0, sparse_branch * 4);
+        assert_eq!(condition, Some(AARCH64_LO));
+        assert_eq!(
+            words[sparse_target / 4],
+            aarch64_bsl_16b(24, 29, 31).unwrap(),
+            "one through three candidates must retain sparse SIMD selection",
+        );
+        assert_eq!(
+            words[sparse_branch + 1],
+            aarch64_sub_x_reg(12, 3, 2).unwrap(),
+        );
+        assert_eq!(
+            words[sparse_branch + 2],
+            aarch64_cmp_x_imm(12, NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES)
+                .unwrap(),
+        );
+        assert_eq!(
+            words[sparse_branch + 4],
+            aarch64_add_x_imm(
+                16,
+                2,
+                NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+            )
+            .unwrap(),
+        );
+        let (condition, clamp_target) =
+            aarch64_test_branch_target(&vector_emission.0, (sparse_branch + 3) * 4);
+        assert_eq!(condition, Some(AARCH64_LO));
+        assert_eq!(
+            words[clamp_target / 4],
+            aarch64_add_x_imm(16, 3, 0).unwrap(),
+            "dense backoff must clamp at the public window end",
+        );
+
+        let exact_cap = vector_data.len();
+        let mut declined_layout = sparse;
+        let mut declined_data = base_data.clone();
+        install_aarch64_native_finite_root_scanner(
+            view,
+            asimd,
+            exact_cap - 1,
+            &mut declined_layout,
+            &mut declined_data,
+        )
+        .expect("finite root scanner cap decline");
+        assert_eq!(declined_layout, sparse);
+        assert_eq!(declined_data, base_data);
+        assert_eq!(
+            lower_aarch64_native_finite_language(OutputContract::Span, declined_layout).unwrap(),
+            scalar_emission,
+        );
+
+        let mut exact_layout = sparse;
+        let mut exact_data = base_data.clone();
+        install_aarch64_native_finite_root_scanner(
+            view,
+            asimd,
+            exact_cap,
+            &mut exact_layout,
+            &mut exact_data,
+        )
+        .expect("finite root scanner exact cap");
+        assert_eq!(exact_layout, vector_layout);
+        assert_eq!(exact_data, vector_data);
+
+        let mut portable_layout = sparse;
+        let mut portable_data = base_data.clone();
+        install_aarch64_native_finite_root_scanner(
+            view,
+            Target::aarch64_linux(),
+            usize::MAX,
+            &mut portable_layout,
+            &mut portable_data,
+        )
+        .expect("portable finite root-scanner decline");
+        assert_eq!(portable_layout, sparse);
+        assert_eq!(portable_data, base_data);
+
+        let over_pattern = cache_large_branching_finite_pattern(17, 4, 16);
+        let over_compiled = ordered_finite_test_program(&over_pattern, OutputContract::Span);
+        let over_view = over_compiled
+            .program()
+            .native_finite_language_view()
+            .expect("over-cardinality finite sidecar");
+        let mut over_layout = native_finite_language_sparse_layout(over_view)
+            .expect("over-cardinality sparse layout");
+        assert_eq!(over_layout.root_member_count, 17);
+        let over_scalar_layout = over_layout;
+        let mut over_data = materialize_native_finite_language_data(over_view, over_layout)
+            .expect("over-cardinality finite allocation")
+            .expect("over-cardinality finite data");
+        let over_scalar_data = over_data.clone();
+        install_aarch64_native_finite_root_scanner(
+            over_view,
+            asimd,
+            usize::MAX,
+            &mut over_layout,
+            &mut over_data,
+        )
+        .expect("over-cardinality finite decline");
+        assert_eq!(over_layout, over_scalar_layout);
+        assert_eq!(over_data, over_scalar_data);
+
+        let (lowering, report) = lower_optional_native_finite_language_with_data_limit(
+            view,
+            asimd,
+            exact_cap,
+        )
+        .unwrap()
+        .expect("selected finite root scanner");
+        assert!(report.sparse_failure);
+        let reported_scanner = ordered_finite_language_root_scanner_report_from_data(
+            &report,
+            &lowering.data,
+            asimd,
+            lowering.start_accelerator,
+        )
+        .flatten()
+        .expect("root-scanner receipt");
+        assert_eq!(reported_scanner.membership, view.root_members);
+        assert_eq!(reported_scanner.candidate_bytes, 16);
+        assert_eq!(reported_scanner.scanner, StartAccelerator::Aarch64Asimd);
+        assert_eq!(reported_scanner.vector_bytes, 16);
+        assert_eq!(reported_scanner.data_offset, base_data.len());
+        assert_eq!(report.native_data_bytes, exact_cap);
+        assert!(ordered_finite_language_report_has_valid_geometry(&report));
+        assert_eq!(lowering.start_accelerator, StartAccelerator::Aarch64Asimd);
+        assert_eq!(lowering.data, vector_data);
+        assert!(ordered_finite_language_root_scanner_data_is_exact(
+            &report,
+            reported_scanner,
+            &lowering.data,
+        ));
+        let extent = ordered_finite_root_scanner_extent(reported_scanner.data_offset).unwrap();
+        for offset in [
+            extent.bitmap_start,
+            extent.bitmap_end,
+            extent.nibble_start,
+            extent.nibble_end,
+        ] {
+            let mut damaged = lowering.data.clone();
+            damaged[offset] ^= 1;
+            assert!(!ordered_finite_language_root_scanner_data_is_exact(
+                &report,
+                reported_scanner,
+                &damaged,
+            ));
+        }
+        let mut damaged_root = lowering.data.clone();
+        damaged_root[..report.cell_bytes].fill(0);
+        assert!(!ordered_finite_language_root_scanner_data_is_exact(
+            &report,
+            reported_scanner,
+            &damaged_root,
+        ));
+
+        let full = compile_ordered_finite_sparse_native_fallback(
+            &pattern,
+            OutputContract::Span,
+            asimd,
+        );
+        assert!(
+            full.receipt()
+                .passes
+                .contains(&crate::OptimizationPass::StartStateScanAcceleration),
+        );
+        assert_eq!(
+            full.module().ordered_finite_root_scanner_report(),
+            Some(&reported_scanner),
+        );
+    }
+
+    #[test]
+    fn ordered_finite_root_scanner_allocator_failure_is_terminal() {
+        let mut data = Vec::new();
+        assert_eq!(
+            reserve_native_finite_root_scanner_data(&mut data, usize::MAX),
+            Err(ObjectError::Allocation(
+                "ordered finite-language root scanner data",
+            )),
+        );
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn ordered_finite_root_scanner_object_limit_restores_exact_scalar_incumbent() {
+        let pattern = cache_large_branching_finite_pattern(16, 4, 16);
+        let compiled = ordered_finite_test_program(&pattern, OutputContract::Span);
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let view = compiled.program().native_finite_language_view().unwrap();
+        let sparse = native_finite_language_sparse_layout(view).unwrap();
+        let exact_data_cap = ordered_finite_root_scanner_extent(sparse.required_data_bytes)
+            .unwrap()
+            .lane_index_end;
+        let vector = CompiledModule::lower_wide_finite_language_only(
+            compiled.program(),
+            target,
+            exact_data_cap,
+        )
+        .unwrap()
+        .expect("finite root-scanner module");
+        let selected_report = *vector
+            .ordered_finite_language_aot_report()
+            .expect("finite root-scanner report");
+        let scanner = *vector
+            .ordered_finite_root_scanner_report()
+            .expect("selected root scanner");
+        let scalar = CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+            compiled.program(),
+            target,
+            exact_data_cap,
+            selected_report,
+        )
+        .expect("exact scalar finite incumbent");
+        assert!(vector.ordered_finite_root_scanner_scalar_ablation_is_exact(&scalar));
+        assert_eq!(
+            vector.sections[PROGRAM_SECTION].data.get(..scanner.data_offset),
+            Some(scalar.sections[PROGRAM_SECTION].data.as_ref()),
+        );
+
+        let format = ObjectFormat::for_target(target);
+        let vector_object = emit_object(&vector, format, usize::MAX).unwrap();
+        let scalar_object = emit_object(&scalar, format, usize::MAX).unwrap();
+        assert!(scalar_object.len() < vector_object.len());
+        let rebuild = |report| {
+            CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+                compiled.program(),
+                target,
+                exact_data_cap,
+                report,
+            )
+        };
+
+        let vector_error = emit_object(&vector, format, scalar_object.len()).unwrap_err();
+        let fit = crate::emit_ordered_finite_root_scanner_scalar_retry(
+            crate::FinalObjectAttempt::ObjectBytes {
+                module: vector.clone(),
+                first_error: vector_error,
+            },
+            format,
+            scalar_object.len(),
+            rebuild,
+        )
+        .expect("exact scalar final-object retry");
+        let crate::FinalObjectAttempt::Fit { module, object } = fit else {
+            panic!("scalar finite incumbent did not fit its exact object ceiling");
+        };
+        assert_eq!(module, scalar);
+        assert_eq!(object, scalar_object);
+
+        let undersized_cap = scalar_object.len() - 1;
+        let scalar_error = emit_object(&scalar, format, undersized_cap).unwrap_err();
+        let decline = crate::emit_ordered_finite_root_scanner_scalar_retry(
+            crate::FinalObjectAttempt::ObjectBytes {
+                module: vector.clone(),
+                first_error: emit_object(&vector, format, undersized_cap).unwrap_err(),
+            },
+            format,
+            undersized_cap,
+            rebuild,
+        )
+        .expect("undersized scalar final-object retry");
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        } = decline
+        else {
+            panic!("undersized scalar finite incumbent unexpectedly fit");
+        };
+        assert_eq!(module, scalar);
+        assert_eq!(first_error, scalar_error);
+
+        let artifact_identity = compiled.program().artifact_identity();
+        let serialized_program = compiled.program().serialize().unwrap();
+        for exports in [
+            PreparedAggregateExports::COUNT,
+            PreparedAggregateExports::SPAN_SUM,
+            PreparedAggregateExports::GREP_COUNT,
+        ] {
+            let vector_aggregate = vector
+                .clone()
+                .append_prepared_aggregate_exports(
+                    exports,
+                    artifact_identity,
+                    &serialized_program,
+                )
+                .unwrap();
+            let scalar_aggregate = scalar
+                .clone()
+                .append_prepared_aggregate_exports(
+                    exports,
+                    artifact_identity,
+                    &serialized_program,
+                )
+                .unwrap();
+            assert!(vector_aggregate
+                .ordered_finite_root_scanner_scalar_ablation_is_exact(&scalar_aggregate));
+            let vector_aggregate_object =
+                emit_object(&vector_aggregate, format, usize::MAX).unwrap();
+            let scalar_aggregate_object =
+                emit_object(&scalar_aggregate, format, usize::MAX).unwrap();
+            assert!(scalar_aggregate_object.len() < vector_aggregate_object.len());
+            let retry = crate::emit_ordered_finite_root_scanner_scalar_retry(
+                crate::FinalObjectAttempt::ObjectBytes {
+                    module: vector_aggregate.clone(),
+                    first_error: emit_object(
+                        &vector_aggregate,
+                        format,
+                        scalar_aggregate_object.len(),
+                    )
+                    .unwrap_err(),
+                },
+                format,
+                scalar_aggregate_object.len(),
+                |report| {
+                    CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+                        compiled.program(),
+                        target,
+                        exact_data_cap,
+                        report,
+                    )?
+                    .append_prepared_aggregate_exports(
+                        exports,
+                        artifact_identity,
+                        &serialized_program,
+                    )
+                    .map_err(CompileError::from)
+                },
+            )
+            .expect("aggregate scalar final-object retry");
+            let crate::FinalObjectAttempt::Fit { module, object } = retry else {
+                panic!("scalar aggregate did not fit its exact object ceiling");
+            };
+            assert_eq!(module, scalar_aggregate);
+            assert_eq!(object, scalar_aggregate_object);
+        }
+
+        let retry_calls = std::cell::Cell::new(0_u8);
+        let malformed = ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: vector_object.len(),
+            required: vector_object.len(),
+        };
+        let error = match crate::emit_ordered_finite_root_scanner_scalar_retry(
+            crate::FinalObjectAttempt::ObjectBytes {
+                module: vector,
+                first_error: malformed.clone(),
+            },
+            format,
+            vector_object.len(),
+            |_| {
+                retry_calls.set(retry_calls.get() + 1);
+                Err(CompileError::InternalInvariant(
+                    "malformed resource receipt retried allocation",
+                ))
+            },
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed ObjectBytes receipt unexpectedly retried"),
+        };
+        assert!(matches!(
+            error,
+            CompileError::Object(ref actual) if actual == &malformed
+        ));
+        assert_eq!(retry_calls.get(), 0);
     }
 
     #[test]
@@ -87874,6 +89135,59 @@ mod tests {
     }
 
     #[test]
+    fn recurring_root_scanner_never_displaces_a_complete_dfa_incumbent() {
+        let pattern = cache_large_branching_finite_pattern(16, 4, 16);
+        let compiled = ordered_finite_test_program(&pattern, OutputContract::Span);
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("finite root-scanner sidecar");
+        let sparse = native_finite_language_sparse_layout(view)
+            .expect("finite root-scanner sparse layout");
+        let sparse_cost = NativeFiniteLanguageCost::estimate(view, sparse)
+            .expect("finite root-scanner scalar cost");
+        let scanner_end = ordered_finite_root_scanner_extent(sparse.required_data_bytes)
+            .expect("finite root-scanner extent")
+            .lane_index_end;
+        let competitor = NativeCompleteDfaCost {
+            transition_cells: sparse_cost.transition_cells + 1,
+            minimum_data_bytes: scanner_end - 1,
+            hot_loads_per_byte: 1_000,
+            hot_branches_per_byte: 1_000,
+            has_accelerator: false,
+        };
+        assert!(sparse_cost.preferred_to_complete_dfa(competitor));
+        assert!(sparse.required_data_bytes < competitor.minimum_data_bytes);
+        assert!(scanner_end > competitor.minimum_data_bytes);
+
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let (lowering, report) =
+            lower_optional_native_finite_language_with_data_limit_and_competitor(
+                view,
+                target,
+                scanner_end,
+                Some(competitor),
+            )
+            .unwrap()
+            .expect("scalar finite-language incumbent");
+        assert!(report.sparse_failure);
+        assert_eq!(report.native_data_bytes, sparse.required_data_bytes);
+        assert_eq!(lowering.data.len(), sparse.required_data_bytes);
+        assert_eq!(lowering.start_accelerator, StartAccelerator::None);
+        assert_eq!(
+            ordered_finite_language_root_scanner_report_from_data(
+                &report,
+                &lowering.data,
+                target,
+                lowering.start_accelerator,
+            ),
+            Some(None),
+        );
+    }
+
+    #[test]
     fn early_finite_portfolio_preserves_faster_complete_dfa_routes() {
         let fixed = compile(
             CompileRequest::new(
@@ -88058,7 +89372,20 @@ mod tests {
         if let Some(dense) = native_finite_language_dense_layout(view) {
             assert!(sparse.required_data_bytes < dense.required_data_bytes);
         }
-        let sparse_bytes = sparse.required_data_bytes;
+        let mut selected_layout = sparse;
+        let mut selected_data = materialize_native_finite_language_data(view, sparse)
+            .expect("compact finite-language probe allocation")
+            .expect("compact finite-language probe data");
+        install_aarch64_native_finite_root_scanner(
+            view,
+            target,
+            usize::MAX,
+            &mut selected_layout,
+            &mut selected_data,
+        )
+        .expect("compact finite-language target-final data");
+        let selected_bytes = selected_data.len();
+        let expected_root_scanner = selected_layout.root_scanner.is_some();
         drop(probe);
 
         let compiled = crate::compile_with_slow_aot_limits(
@@ -88079,7 +89406,7 @@ mod tests {
                     max_work: 0,
                 },
                 max_allocation_bytes: 32 * 1024 * 1024,
-                max_native_data_bytes: sparse_bytes,
+                max_native_data_bytes: selected_bytes,
             },
         )
         .expect("compile compact ordered finite-language fallback");
@@ -88089,10 +89416,17 @@ mod tests {
             .ordered_finite_language_aot
             .expect("compact finite-language receipt");
         assert!(report.sparse_failure);
-        assert_eq!(report.native_data_bytes, sparse_bytes);
+        assert_eq!(
+            compiled
+                .module()
+                .ordered_finite_root_scanner_report()
+                .is_some(),
+            expected_root_scanner,
+        );
+        assert_eq!(report.native_data_bytes, selected_bytes);
         assert_eq!(
             compiled.module().sections()[PROGRAM_SECTION].bytes().len(),
-            sparse_bytes,
+            selected_bytes,
         );
         assert!(compiled.module().required_runtime_symbol().is_none());
         compiled
@@ -88200,7 +89534,7 @@ mod tests {
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
-    #[ignore = "links and exhaustively executes ordered finite-language scalar objects on the host ISA"]
+    #[ignore = "links and exhaustively executes ordered finite-language native objects on the host ISA"]
     #[allow(
         clippy::too_many_lines,
         reason = "the opt-in linked differential keeps all output contracts, windows, and ABI assertions auditable"
@@ -88216,11 +89550,16 @@ mod tests {
             }
         } else if cfg!(target_os = "linux") {
             Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
         } else {
             Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
         };
         let sparse_pattern = dense_correlated_finite_pattern(true);
         let hybrid_pattern = cache_large_branching_finite_pattern(32, 4, 16);
+        let scanner_pattern = cache_large_branching_finite_pattern(16, 4, 16);
         let mut hybrid_last = vec![2_u8; 16];
         hybrid_last[0] = 31;
         hybrid_last[1] = 3;
@@ -88228,6 +89567,34 @@ mod tests {
         hybrid_near_miss[15] = 3;
         let mut hybrid_failure_retry = vec![5_u8, 2, 7, 6, 1];
         hybrid_failure_retry.extend(core::iter::repeat_n(7_u8, 14));
+        let mut scanner_late = vec![255_u8; 40];
+        scanner_late.extend([15, 3]);
+        scanner_late.extend(core::iter::repeat_n(2_u8, 14));
+        scanner_late.extend(core::iter::repeat_n(255_u8, 8));
+        let mut scanner_three_hits = vec![255_u8; 16];
+        scanner_three_hits[0] = 0;
+        scanner_three_hits[5] = 4;
+        scanner_three_hits[10] = 8;
+        scanner_three_hits.extend([15, 3]);
+        scanner_three_hits.extend(core::iter::repeat_n(2_u8, 14));
+        let mut scanner_four_hits = scanner_three_hits.clone();
+        scanner_four_hits[15] = 12;
+        let mut scanner_rearm = vec![255_u8; 1_080];
+        for (index, byte) in [0_u8, 4].into_iter().cycle().take(16).enumerate() {
+            scanner_rearm[index] = byte;
+        }
+        let mut failure_retry = vec![15_u8, 3];
+        failure_retry.extend(core::iter::repeat_n(2_u8, 13));
+        failure_retry.push(3);
+        scanner_rearm[500..516].copy_from_slice(&failure_retry);
+        let mut late_match = vec![15_u8, 3];
+        late_match.extend(core::iter::repeat_n(2_u8, 14));
+        scanner_rearm[1_040..1_056].copy_from_slice(&late_match);
+        let scanner_dense_decoys = [0_u8, 4]
+            .into_iter()
+            .cycle()
+            .take(48)
+            .collect::<Vec<_>>();
         let cases = vec![
             (
                 "a|ab|bab|ba",
@@ -88262,6 +89629,21 @@ mod tests {
                     hybrid_last,
                     hybrid_near_miss,
                     hybrid_failure_retry,
+                ],
+                true,
+            ),
+            (
+                scanner_pattern.as_str(),
+                vec![
+                    Vec::new(),
+                    vec![255; 15],
+                    vec![255; 16],
+                    vec![255; 64],
+                    scanner_late,
+                    scanner_three_hits,
+                    scanner_four_hits,
+                    scanner_rearm,
+                    scanner_dense_decoys,
                 ],
                 true,
             ),
@@ -88322,8 +89704,32 @@ mod tests {
                         "static const unsigned char h{artifact}_{haystack_index}[]={{{bytes}}};",
                     )
                     .expect("write ordered-finite haystack");
-                    for start in 0..=haystack.len() {
-                        for end in start..=haystack.len() {
+                    let windows = if haystack.len() > 256 {
+                        vec![
+                            (0, haystack.len()),
+                            (1, haystack.len()),
+                            (15, haystack.len()),
+                            (16, haystack.len()),
+                            (499, 516),
+                            (500, 516),
+                            (500, 515),
+                            (1_000, haystack.len()),
+                            (1_023, haystack.len()),
+                            (1_024, haystack.len()),
+                            (1_040, 1_056),
+                            (1_041, haystack.len()),
+                            (0, 1_040),
+                            (0, 1_055),
+                            (0, 1_056),
+                        ]
+                    } else {
+                        (0..=haystack.len())
+                            .flat_map(|start| {
+                                (start..=haystack.len()).map(move |end| (start, end))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    for (start, end) in windows {
                             let expected = reference
                                 .search(haystack, SearchWindow::new(start, end))
                                 .expect("fast ordered-finite expected result");
@@ -88356,7 +89762,6 @@ mod tests {
                                 }
                             }
                             .expect("write ordered-finite result assertion");
-                        }
                     }
                 }
                 writeln!(
@@ -124324,8 +125729,9 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 exact_finite_selected_end_teddy_aot_report: None,
                 exact_finite_selected_end_teddy_aot_report_v2: None,
                 exact_finite_selected_end_grep_count_aot_report: None,
-                ordered_finite_language_aot_report: None,
-                slow_retained_forward_minimized: false,
+        ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
+        slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
                 bit_parallel_endpoint_oracle_lowered: false,
                 bit_parallel_exact_endpoint_lowered: false,
@@ -124662,8 +126068,9 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             exact_finite_selected_end_teddy_aot_report: None,
             exact_finite_selected_end_teddy_aot_report_v2: None,
             exact_finite_selected_end_grep_count_aot_report: None,
-            ordered_finite_language_aot_report: None,
-            slow_retained_forward_minimized: false,
+        ordered_finite_language_aot_report: None,
+        ordered_finite_root_scanner_report: None,
+        slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,
             bit_parallel_endpoint_oracle_lowered: false,
             bit_parallel_exact_endpoint_lowered: false,
