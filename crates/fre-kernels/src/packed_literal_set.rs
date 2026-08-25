@@ -1485,10 +1485,7 @@ impl PackedLiteralSetPlan {
         })
     }
 
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "the validated slice and packed engine contracts prove these window-relative additions"
-    )]
+    #[inline]
     fn find_window_value_unmetered_with_native(
         &self,
         haystack: &[u8],
@@ -1496,6 +1493,21 @@ impl PackedLiteralSetPlan {
         iterator_native: Option<&Searcher>,
     ) -> Result<Option<(usize, usize)>, PackedLiteralSetError> {
         validate_window(window, haystack.len())?;
+        Ok(self.find_window_value_unmetered_validated(haystack, window, iterator_native))
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the validated slice and packed engine contracts prove these window-relative additions"
+    )]
+    #[inline(never)]
+    fn find_window_value_unmetered_validated(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        iterator_native: Option<&Searcher>,
+    ) -> Option<(usize, usize)> {
+        debug_assert!(window.start() <= window.end() && window.end() <= haystack.len());
         let window_bytes = &haystack[window.start()..window.end()];
         let matched = if let Some(native) = iterator_native {
             native
@@ -1527,12 +1539,12 @@ impl PackedLiteralSetPlan {
                 PackedLiteralEngine::Factored(factored) => factored.find(window_bytes),
             }
         };
-        Ok(matched.map(|(relative_start, relative_end)| {
+        matched.map(|(relative_start, relative_end)| {
             (
                 window.start() + relative_start,
                 window.start() + relative_end,
             )
-        }))
+        })
     }
 
     #[allow(
@@ -1797,11 +1809,18 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
                 cursor.last_start = Some(start);
                 cursor.find_at_value_unmetered_forward_validated(start)
             } else {
-                self.find_window_value(haystack, Window::new(start, window.end()))?
+                self.plan.find_window_value_unmetered_validated(
+                    haystack,
+                    Window::new(start, window.end()),
+                    None,
+                )
             };
             #[cfg(feature = "static-dispatch")]
-            let matched =
-                self.find_window_value(haystack, Window::new(start, window.end()))?;
+            let matched = self.plan.find_window_value_unmetered_validated(
+                haystack,
+                Window::new(start, window.end()),
+                None,
+            );
             let Some(matched) = matched else {
                 return Ok(Ok(()));
             };
@@ -6277,6 +6296,34 @@ mod tests {
                 ordinary.selected_end_window_value(haystack, window),
                 Err(PackedLiteralSetError::InvalidWindow { .. }),
             ));
+        }
+    }
+
+    #[test]
+    fn ordinary_executor_native_span_loop_preserves_windows_and_count() {
+        let patterns = [b"ab".as_slice(), b"a".as_slice(), b"ba".as_slice()];
+        let Some(plan) = plan(&patterns) else {
+            return;
+        };
+        let ordinary = plan.ordinary_executor();
+        let haystack = b"zababaq";
+        for (window, expected) in [
+            (Window::full(haystack), &[(1, 3), (3, 5), (5, 6)][..]),
+            (Window::new(2, 6), &[(2, 4), (4, 6)][..]),
+        ] {
+            let mut actual = Vec::new();
+            ordinary
+                .try_visit_spans_window_value(haystack, window, |matched| {
+                    actual.push(matched);
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, expected, "window={window:?}");
+            assert_eq!(
+                ordinary.count_spans_window_value(haystack, window),
+                Ok(u64::try_from(expected.len()).unwrap()),
+            );
         }
     }
 
