@@ -1974,6 +1974,7 @@ mod tests {
     static SINGLETON_EXISTS_SCALAR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SINGLETON_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXACT64_FIRST_ANY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXACT64_SELECTION_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
     const EXACT64_PUBLIC_RAW_SENTINELS: [&str; 3] = [
         "fixture_raw_sentinel_one",
         "fixture_raw_sentinel_one_suffix",
@@ -1998,6 +1999,17 @@ mod tests {
         };
         unsafe { position.write(result) };
         REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS
+    }
+
+    unsafe extern "C" fn exact64_selection_entry(
+        _haystack: *const u8,
+        _haystack_len: usize,
+        _window_start: usize,
+        _window_end: usize,
+        _position: *mut u64,
+    ) -> u32 {
+        EXACT64_SELECTION_ENTRY_CALLS.fetch_add(1, Ordering::Relaxed);
+        fre_aot_regex::REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_INVALID_ARGUMENT
     }
 
     unsafe extern "C" fn exact64_miss_entry(
@@ -2739,14 +2751,16 @@ mod tests {
 
     #[test]
     fn exact64_selection_authenticates_ordered_vector_and_receipt_before_haystack() {
-        EXACT64_FIRST_ANY_CALLS.store(0, Ordering::Relaxed);
+        // This counter belongs only to this test. The native-boundary test
+        // deliberately calls a different entry and may execute in parallel.
+        EXACT64_SELECTION_ENTRY_CALLS.store(0, Ordering::Relaxed);
         let patterns = [
             EXACT64_PUBLIC_RAW_SENTINELS[0],
             EXACT64_PUBLIC_RAW_SENTINELS[1],
             EXACT64_PUBLIC_RAW_SENTINELS[0],
         ];
         let profile = RipgrepAotExact64SetProfileV1::supported_rust_regex(false);
-        let spec = exact64_test_spec(&patterns, profile, exact64_candidate_entry);
+        let spec = exact64_test_spec(&patterns, profile, exact64_selection_entry);
         let selected = select_exact64_set_spec(
             std::slice::from_ref(&spec),
             AotMode::Optimizing,
@@ -2789,7 +2803,7 @@ mod tests {
                 .is_none()
             );
         }
-        assert_eq!(EXACT64_FIRST_ANY_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(EXACT64_SELECTION_ENTRY_CALLS.load(Ordering::Relaxed), 0);
 
         let mut corrupted = spec;
         corrupted.receipt.object_sha256 = [0; 32];
