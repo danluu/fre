@@ -1840,21 +1840,29 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
 
     /// Count non-overlapping positive-width selected spans without accounting.
     #[doc(hidden)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "positive-width non-overlapping spans are bounded by the validated window length"
+    )]
     pub fn count_spans_window_value(
         &self,
         haystack: &[u8],
         window: Window,
     ) -> Result<u64, PackedLiteralSetError> {
-        let mut count = 0_u64;
-        self.try_visit_spans_window_value(haystack, window, |_| {
-            count = count
-                .checked_add(1)
-                .ok_or(PackedLiteralSetError::ArithmeticOverflow {
-                    computation: "packed ordinary match count",
-                })?;
-            Ok::<bool, PackedLiteralSetError>(true)
-        })??;
-        Ok(count)
+        let mut count = 0_usize;
+        let outcome = self.try_visit_spans_window_value(haystack, window, |_| {
+            // Positive-width, non-overlapping spans bound the final count by
+            // this already-validated window's `usize` byte length.
+            count += 1;
+            Ok::<bool, core::convert::Infallible>(true)
+        })?;
+        match outcome {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+        u64::try_from(count).map_err(|_| PackedLiteralSetError::ArithmeticOverflow {
+            computation: "packed ordinary match count",
+        })
     }
 }
 
@@ -6325,6 +6333,13 @@ mod tests {
                 Ok(u64::try_from(expected.len()).unwrap()),
             );
         }
+
+        let dense = [b'a'; 257];
+        let dense_window = Window::new(7, 250);
+        assert_eq!(
+            ordinary.count_spans_window_value(&dense, dense_window),
+            Ok(u64::try_from(dense_window.end() - dense_window.start()).unwrap()),
+        );
     }
 
     #[test]
