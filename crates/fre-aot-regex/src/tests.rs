@@ -864,6 +864,12 @@ fn direct_exact_singleton_count_short_gate_preserves_the_hot_incumbent_layout() 
         &selected_relocations[..incumbent_relocations.len()],
         incumbent_relocations,
     );
+    let identity_symbol = incumbent
+        .module()
+        .symbols()
+        .iter()
+        .position(|symbol| symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity")
+        .expect("prepared aggregate identity symbol");
     for (relocation, kind) in selected_relocations[incumbent_relocations.len()..]
         .iter()
         .zip([
@@ -873,7 +879,7 @@ fn direct_exact_singleton_count_short_gate_preserves_the_hot_incumbent_layout() 
     {
         assert_eq!(relocation.section, incumbent_relocations[0].section);
         assert_eq!(relocation.kind, kind);
-        assert_eq!(relocation.symbol, incumbent_relocations[0].symbol);
+        assert_eq!(relocation.symbol, identity_symbol);
         assert_eq!(relocation.addend, 0);
         assert!((cold_offset..report.core_offset).contains(
             &usize::try_from(relocation.offset).expect("cold relocation offset"),
