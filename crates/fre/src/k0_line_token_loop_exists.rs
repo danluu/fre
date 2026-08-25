@@ -21,10 +21,12 @@
 //! authenticated before decoding the preceding token exactly in reverse.
 //! Selected-span execution authenticates the complete terminal before
 //! decoding the maximal valid token suffix for leftmost recovery. Both
-//! multi-byte direct routes bound rejected terminal leads; selected-span
-//! execution also bounds scalar decoding through unbounded atoms. Exhausting
-//! either applicable budget fails open to the retained canonical owner.
+//! multi-byte direct routes bound rejected terminal leads. Selected-span
+//! execution bounds scalar decoding through unbounded atoms, then completes
+//! any longer equality run with fixed-width classification. Exhausting the
+//! candidate budget fails open to the retained canonical owner.
 
+use fre_kernels::{BYTE_SET_BLOCK_BYTES, classify_byte_set1_16};
 use memchr::{memchr, memrchr};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
@@ -159,9 +161,10 @@ impl UnanchoredPlan {
     }
 
     /// Attempt the ordinary full-input leftmost-first span. A multi-byte route
-    /// may fail open after a bounded number of rejected terminal leads or
-    /// scalar bytes consumed by unbounded atoms, just like its predicate
-    /// counterpart.
+    /// may fail open after a bounded number of rejected terminal leads, just
+    /// like its predicate counterpart. Its body decoder separately bounds
+    /// scalar work through unbounded atoms and finishes excess equality runs
+    /// with fixed-width classification.
     #[inline]
     pub(crate) fn try_find_full(&self, haystack: &[u8]) -> Option<Option<(usize, usize)>> {
         let output = if self.0.terminal_len == 1 {
@@ -534,11 +537,13 @@ impl Plan {
         (tokens > 0).then_some(position)
     }
 
-    /// Bounded counterpart used only by the fail-open multi-byte span route.
-    /// The limit counts scalar bytes consumed by unbounded atoms; fixed and
-    /// bounded atoms cannot turn one rejected terminal into an unbounded retry
-    /// tax. At exhaustion, a vectorized reverse search may still prove that a
-    /// required globally unique branch start is absent.
+    /// Bounded-scalar counterpart used only by the fail-open multi-byte span
+    /// route. The limit counts scalar bytes consumed by unbounded atoms; fixed
+    /// and bounded atoms cannot turn one rejected terminal into an unbounded
+    /// scalar retry tax. At exhaustion, absence of the globally unique branch
+    /// start rejects cheaply; otherwise exact fixed-width classification
+    /// finishes the current equality run before ordinary reverse parsing
+    /// resumes.
     fn try_match_body_reverse_bounded(
         &self,
         haystack: &[u8],
@@ -595,11 +600,15 @@ impl Plan {
                 && haystack[position.saturating_sub(1)] == atom.byte
             {
                 if unbounded && *unbounded_bytes >= unbounded_limit {
-                    let first = self.atoms[usize::from(branch.start)].byte;
-                    if memrchr(first, &haystack[floor..position]).is_none() {
-                        return Some(None);
-                    }
-                    return None;
+                    let run_start = match finish_unbounded_reverse_overflow(
+                        self, branch, haystack, floor, position, atom.byte,
+                    )? {
+                        UnboundedReverseOverflow::BranchImpossible => return Some(None),
+                        UnboundedReverseOverflow::RunStart(run_start) => run_start,
+                    };
+                    consumed = consumed.checked_add(position.checked_sub(run_start)?)?;
+                    position = run_start;
+                    break;
                 }
                 consumed = consumed.checked_add(1)?;
                 position = position.checked_sub(1)?;
@@ -653,6 +662,59 @@ impl Plan {
         }
         Some(position)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnboundedReverseOverflow {
+    BranchImpossible,
+    RunStart(usize),
+}
+
+/// Resolve the complete uncommon transaction after the scalar unbounded-byte
+/// budget saturates.
+///
+/// A branch start is globally unique across this grammar. Its absence from the
+/// candidate-local corridor proves that the branch cannot complete and avoids
+/// classifying a long malformed equality run. Otherwise a non-full classifier
+/// mask identifies the last unequal lane, whose successor is exactly the
+/// maximal run start. The caller has already charged its scalar budget and
+/// proved that the byte immediately before `end` equals `member`.
+#[cold]
+#[inline(never)]
+fn finish_unbounded_reverse_overflow(
+    plan: &Plan,
+    branch: Branch,
+    haystack: &[u8],
+    floor: usize,
+    end: usize,
+    member: u8,
+) -> Option<UnboundedReverseOverflow> {
+    let branch_start = plan.atoms[usize::from(branch.start)].byte;
+    if memrchr(branch_start, haystack.get(floor..end)?).is_none() {
+        return Some(UnboundedReverseOverflow::BranchImpossible);
+    }
+    let mut position = end;
+    while position.checked_sub(floor)? >= BYTE_SET_BLOCK_BYTES {
+        let block_start = position.checked_sub(BYTE_SET_BLOCK_BYTES)?;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] =
+            haystack.get(block_start..position)?.try_into().ok()?;
+        let members = classify_byte_set1_16(member, block).member_mask();
+        if members != u16::MAX {
+            let nonmembers = !members;
+            debug_assert_ne!(nonmembers, 0);
+            let last_nonmember = u16::BITS
+                .checked_sub(nonmembers.leading_zeros())?
+                .checked_sub(1)?;
+            let last_nonmember = usize::try_from(last_nonmember).ok()?;
+            let run_start = block_start.checked_add(last_nonmember)?.checked_add(1)?;
+            return Some(UnboundedReverseOverflow::RunStart(run_start));
+        }
+        position = block_start;
+    }
+    while position > floor && *haystack.get(position.checked_sub(1)?)? == member {
+        position = position.checked_sub(1)?;
+    }
+    Some(UnboundedReverseOverflow::RunStart(position))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2265,8 +2327,8 @@ mod tests {
         );
         assert_eq!(
             variable.try_find_full(&long_valid),
-            None,
-            "an over-budget possible unbounded branch must fail open",
+            Some(valid_expected),
+            "an over-budget equality run completes by fixed-width classification",
         );
         assert_eq!(variable.find_multibyte_full_impl(&long_malformed), None,);
         assert_eq!(
@@ -2301,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn unanchored_multibyte_span_bounds_unbounded_reverse_work_exactly() {
+    fn unanchored_multibyte_span_bounds_unbounded_reverse_scalar_work_exactly() {
         const PATTERN: &str = r"(?-u:(?:ab+c|de?f)+XYZ)";
 
         fn token(bs: usize) -> Vec<u8> {
@@ -2351,6 +2413,12 @@ mod tests {
         cumulative_over.extend_from_slice(b"XYZ");
         let cumulative_over = admitted(cumulative_over);
 
+        let mut cumulative_saturated_next_run = token(257);
+        cumulative_saturated_next_run.extend_from_slice(&token(16));
+        cumulative_saturated_next_run.extend_from_slice(&token(16));
+        cumulative_saturated_next_run.extend_from_slice(b"XYZ");
+        let cumulative_saturated_next_run = admitted(cumulative_saturated_next_run);
+
         let mut later_candidate = malformed_token(33);
         later_candidate.extend_from_slice(b"XYZ!abcXYZ");
         let later_candidate = admitted(later_candidate);
@@ -2366,14 +2434,27 @@ mod tests {
 
         for (label, source, direct) in [
             ("scalar exact cap", scalar_exact, Some(Some((4_059, 4_096)))),
-            ("scalar cap plus one", scalar_over, None),
+            (
+                "scalar cap plus one",
+                scalar_over,
+                Some(Some((4_058, 4_096))),
+            ),
             ("scalar absent start", scalar_over_absent, Some(None)),
             (
                 "cumulative exact cap",
                 cumulative_exact,
                 Some(Some((4_057, 4_096))),
             ),
-            ("cumulative cap plus one", cumulative_over, None),
+            (
+                "cumulative cap plus one",
+                cumulative_over,
+                Some(Some((4_056, 4_096))),
+            ),
+            (
+                "cumulative saturation before a long run",
+                cumulative_saturated_next_run,
+                Some(Some((3_798, 4_096))),
+            ),
             (
                 "authoritative rejection then later candidate",
                 later_candidate,
@@ -2406,6 +2487,64 @@ mod tests {
                 expected,
                 "public facade: {label}",
             );
+        }
+    }
+
+    #[test]
+    fn cold_unbounded_overflow_is_exact_across_blocks_and_raw_bytes() {
+        for member in [0_u8, b'b', 0x80, 0xFF] {
+            let branch_start = member.wrapping_add(1);
+            let mut atoms = [super::Atom::EMPTY; super::MAX_ATOMS];
+            atoms[0] = super::Atom {
+                byte: branch_start,
+                minimum: 1,
+                maximum: 1,
+            };
+            atoms[1] = super::Atom {
+                byte: member,
+                minimum: 1,
+                maximum: super::UNBOUNDED,
+            };
+            let branch = super::Branch { start: 0, end: 2 };
+            let mut branches = [super::Branch::EMPTY; super::MAX_BRANCHES];
+            branches[0] = branch;
+            let plan = super::Plan {
+                atoms,
+                branches,
+                branch_count: 1,
+                terminal: [0; super::MAX_TERMINAL_BYTES],
+                terminal_len: 1,
+            };
+            for run_len in [1_usize, 15, 16, 17, 31, 32, 33, 257, 4_093] {
+                let mut source = vec![member; 3];
+                source.push(branch_start);
+                source.extend(core::iter::repeat_n(member, run_len));
+                assert_eq!(
+                    super::finish_unbounded_reverse_overflow(
+                        &plan,
+                        branch,
+                        &source,
+                        1,
+                        source.len(),
+                        member,
+                    ),
+                    Some(super::UnboundedReverseOverflow::RunStart(4)),
+                    "member={member:#04X}, run_len={run_len}",
+                );
+                source[3] = member;
+                assert_eq!(
+                    super::finish_unbounded_reverse_overflow(
+                        &plan,
+                        branch,
+                        &source,
+                        1,
+                        source.len(),
+                        member,
+                    ),
+                    Some(super::UnboundedReverseOverflow::BranchImpossible),
+                    "absent start: member={member:#04X}, run_len={run_len}",
+                );
+            }
         }
     }
 
@@ -2503,6 +2642,29 @@ mod tests {
             multi_oracle
                 .find(&multi_source)
                 .map(|matched| (matched.start(), matched.end())),
+        );
+
+        const RAW_LONG_PATTERN: &str = r"(?-u:(?:\xFF\x80+\xFE|\xFD\x81?\xFC)+\xFA\xFB)";
+        let raw_long = unanchored_plan_with_terminal(RAW_LONG_PATTERN, &[0xFA, 0xFB]);
+        let raw_long_oracle = regex::bytes::Regex::new(RAW_LONG_PATTERN).unwrap();
+        let mut raw_long_tail = vec![0xFF];
+        raw_long_tail.extend(core::iter::repeat_n(0x80, 257));
+        raw_long_tail.extend_from_slice(&[0xFE, 0xFA, 0xFB]);
+        let mut raw_long_source =
+            vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES - raw_long_tail.len()];
+        raw_long_source.extend_from_slice(&raw_long_tail);
+        let expected = raw_long_oracle
+            .find(&raw_long_source)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, Some((3_835, 4_096)));
+        assert_eq!(raw_long.try_find_full(&raw_long_source), Some(expected));
+
+        raw_long_source[3_835] = 0x80;
+        assert_eq!(raw_long_oracle.find(&raw_long_source), None);
+        assert_eq!(
+            raw_long.try_find_full(&raw_long_source),
+            Some(None),
+            "a long raw-high-byte equality run without its fixed start is authoritative",
         );
     }
 

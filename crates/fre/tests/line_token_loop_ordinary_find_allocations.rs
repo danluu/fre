@@ -79,6 +79,14 @@ fn line_token_loop_ordinary_values_allocate_nothing() {
     let cold_multibyte_miss = PortableBuilder::new(r"(?-u:(?:ab|cd)+XYZ)")
         .build()
         .unwrap();
+    let overflow = PortableBuilder::new(r"(?-u:(?:ab+c|de?f)+XYZ)")
+        .build()
+        .unwrap();
+    let mut overflow_long = vec![b'b'; 4_093];
+    overflow_long[0] = b'a';
+    overflow_long[4_092] = b'c';
+    overflow_long.extend_from_slice(b"XYZ");
+    assert_eq!(overflow_long.len(), 4_096);
 
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
@@ -138,6 +146,11 @@ fn line_token_loop_ordinary_values_allocate_nothing() {
         assert_eq!(
             black_box(cold_multibyte_miss.find(black_box(&multibyte_absent))),
             None,
+        );
+        assert_eq!(
+            black_box(overflow.find(black_box(&overflow_long)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((0, 4_096)),
         );
     }
     assert_eq!(measured.change(), Stats::default());
