@@ -52,7 +52,7 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
     assert_eq!(UPSTREAM_API_IDS.len(), 23);
     assert_eq!(EXPLAIN_SCHEMA_VERSION, 17);
-    assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 6);
+    assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 7);
 }
 
 #[test]
