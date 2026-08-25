@@ -1379,6 +1379,24 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     let _complete_span_reduce_recipe = module::complete_span_reduce_recipe_scope(
         exports == PreparedAggregateExports::COUNT,
     );
+    if mode == CompileMode::Optimizing
+        && matches!(
+            exports,
+            PreparedAggregateExports::COUNT | PreparedAggregateExports::SPAN_SUM
+        )
+    {
+        let early_request = request.clone();
+        match try_compile_wide_finite_prepared_aggregate(
+            early_request,
+            exports,
+            slow_aot_limits,
+        ) {
+            Ok(Some(compiled)) => return Ok(compiled),
+            Ok(None) => {}
+            Err(error) if wide_finite_early_numeric_decline(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
     let compiled = compile_with_slow_aot_limits(request, slow_aot_limits)?;
     append_prepared_aggregate_exports_to_compiled(
         compiled,
@@ -1388,6 +1406,136 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         max_object_bytes,
         slow_aot_limits,
     )
+}
+
+fn wide_finite_early_numeric_decline(error: &CompileError) -> bool {
+    let numeric_resource = |resource| {
+        matches!(
+            resource,
+            CompileResource::ProgramBytes
+                | CompileResource::ObjectBytes
+                | CompileResource::Work
+        )
+    };
+    match error {
+        CompileError::Resource {
+            resource,
+            limit,
+            required,
+        }
+        | CompileError::Object(ObjectError::Resource {
+            resource,
+            limit,
+            required,
+        }) => numeric_resource(*resource) && required > limit,
+        CompileError::Lower(LowerError::ResourceLimit { needed, limit, .. }) => needed > limit,
+        CompileError::Automaton(fre_automata::CompileError::ResourceLimit {
+            needed,
+            limit,
+            ..
+        }) => needed > limit,
+        _ => false,
+    }
+}
+
+/// Try the compact finite-language native leaf before ordinary DFA
+/// construction for a sole prepared Count or SpanSum export. The caller owns
+/// an untouched request and reruns the exact established compiler whenever
+/// this returns a clean decline. Every allocator, arithmetic,
+/// authentication, and backend failure remains an error.
+fn try_compile_wide_finite_prepared_aggregate(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<Option<CompiledRegex>, CompileError> {
+    let CompileRequest {
+        pattern,
+        profile,
+        output,
+        target,
+        mode,
+        mut limits,
+    } = request;
+    if mode != CompileMode::Optimizing
+        || output != OutputContract::Span
+        || !matches!(
+            exports,
+            PreparedAggregateExports::COUNT | PreparedAggregateExports::SPAN_SUM
+        )
+    {
+        return Ok(None);
+    }
+    if let Some(profile_limit) = rust_profile_compiled_size_limit(&profile) {
+        limits.max_program_bytes = limits.max_program_bytes.min(profile_limit);
+    }
+    let source_bytes = pattern.len();
+    let line_terminator = profile.options.line_terminator;
+    let profile = CompatibilityProfile::RustBytes(profile);
+    let parsed = fre_syntax::parse(ParseRequest::rust(pattern, profile))?;
+    let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+        return Err(CompileError::InternalInvariant(
+            "Rust byte request produced a non-Rust syntax tree",
+        ));
+    };
+    let Some(candidate) =
+        finite_language::NativeFiniteLanguageCandidate::analyze_for_wide_early(&parsed, output)?
+    else {
+        return Ok(None);
+    };
+    // The whole point of this lane is to avoid materializing the ordinary
+    // Thompson graph for a wide language. Build the independently checked,
+    // priority-preserving compact graph directly from the exact proof. A
+    // structural or numeric refusal is a clean decline; allocator,
+    // arithmetic, and invariant failures remain terminal.
+    let Some(raw) = candidate.priority_trie_raw_plan(limits.lower)? else {
+        return Ok(None);
+    };
+    let compiled = match compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        Some(candidate),
+        NativeFiniteLanguageAttachPolicy::FailClosed,
+        None,
+        target,
+        mode,
+        limits,
+        slow_aot_limits,
+        ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+        NativeFiniteCompilePolicy::WideFiniteOnly,
+    )? {
+        RawCompileDisposition::Compiled(compiled) => compiled,
+        RawCompileDisposition::WideFiniteDeclined => return Ok(None),
+    };
+    let compiled = append_prepared_aggregate_exports_to_compiled(
+        compiled,
+        exports,
+        target,
+        mode,
+        limits.max_object_bytes,
+        slow_aot_limits,
+    )?;
+    let module_report = compiled.module().ordered_finite_language_aot_report();
+    let receipt_report = compiled.receipt().ordered_finite_language_aot.as_ref();
+    if module_report.is_none() && receipt_report.is_none() {
+        // The final object transaction may have removed the optional finite
+        // leaf under its authenticated byte ceiling and returned a complete
+        // incumbent. Discard that provisional artifact and let the caller
+        // rebuild the exact established request from its untouched owner.
+        return Ok(None);
+    }
+    if module_report.copied() != receipt_report.copied()
+        || compiled.module().required_runtime_symbol().is_some()
+        || compiled.module().prepared_aggregate_exports() != exports
+        || compiled.module().prepared_aggregate_strategy()
+            != Some(PreparedAggregateStrategy::NativeFused)
+    {
+        return Err(CompileError::InternalInvariant(
+            "early wide finite-language aggregate lost its closed native receipt",
+        ));
+    }
+    Ok(Some(compiled))
 }
 
 fn validate_prepared_aggregate_exports(
@@ -1406,6 +1554,17 @@ fn validate_prepared_aggregate_exports(
 enum NativeFiniteLanguageAttachPolicy {
     Optional,
     FailClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeFiniteCompilePolicy {
+    OrdinaryPortfolio,
+    WideFiniteOnly,
+}
+
+enum RawCompileDisposition {
+    Compiled(CompiledRegex),
+    WideFiniteDeclined,
 }
 
 fn is_proven_object_byte_limit(error: &ObjectError) -> bool {
@@ -3520,19 +3679,63 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     output: OutputContract,
     native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
     native_finite_language_attach_policy: NativeFiniteLanguageAttachPolicy,
-    mut finite_lower_state_rescue: Option<LowerError>,
+    finite_lower_state_rescue: Option<LowerError>,
     target: Target,
     mode: CompileMode,
     limits: CompileLimitsV1,
     slow_aot_limits: SlowAotLimits,
     teddy_policy: ExactFiniteSelectedEndTeddyPolicyV2,
 ) -> Result<CompiledRegex, CompileError> {
+    match compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        native_finite_language_candidate,
+        native_finite_language_attach_policy,
+        finite_lower_state_rescue,
+        target,
+        mode,
+        limits,
+        slow_aot_limits,
+        teddy_policy,
+        NativeFiniteCompilePolicy::OrdinaryPortfolio,
+    )? {
+        RawCompileDisposition::Compiled(compiled) => Ok(compiled),
+        RawCompileDisposition::WideFiniteDeclined => Err(CompileError::InternalInvariant(
+            "ordinary compile reported a wide finite-only decline",
+        )),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the public request decomposition, lowering fallback order, and one final receipt stay one transaction"
+)]
+fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
+    native_finite_language_attach_policy: NativeFiniteLanguageAttachPolicy,
+    mut finite_lower_state_rescue: Option<LowerError>,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    slow_aot_limits: SlowAotLimits,
+    teddy_policy: ExactFiniteSelectedEndTeddyPolicyV2,
+    native_compile_policy: NativeFiniteCompilePolicy,
+) -> Result<RawCompileDisposition, CompileError> {
     let digest = program::automaton_digest(&raw, line_terminator);
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
         .with_line_terminator(line_terminator);
     let stats = automaton.stats();
     let is_lower_state_rescue = finite_lower_state_rescue.is_some();
-    let build_determinize_limits = if is_lower_state_rescue {
+    let build_determinize_limits = if is_lower_state_rescue
+        || native_compile_policy == NativeFiniteCompilePolicy::WideFiniteOnly
+    {
         DeterminizeLimits {
             max_states: 0,
             max_transitions: 0,
@@ -3575,7 +3778,36 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         .native_exact_singleton_count_literal()
         .is_some()
         .then(|| module::complete_span_reduce_recipe_scope(false));
-    let (module, object) = match mode {
+    let (module, object) = if native_compile_policy == NativeFiniteCompilePolicy::WideFiniteOnly {
+        if mode != CompileMode::Optimizing || is_lower_state_rescue {
+            return Err(CompileError::InternalInvariant(
+                "early wide finite-language route received an incompatible compile mode",
+            ));
+        }
+        let effective_native_data_limit_bytes = slow_aot_limits
+            .max_native_data_bytes
+            .min(limits.max_object_bytes);
+        let Some(module) = CompiledModule::lower_wide_finite_language_only(
+            &program,
+            target,
+            effective_native_data_limit_bytes,
+        )? else {
+            return Ok(RawCompileDisposition::WideFiniteDeclined);
+        };
+        let object = match emit_object(&module, format, limits.max_object_bytes) {
+            Ok(object) => object,
+            Err(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit,
+                required,
+            }) if required > limit => {
+                return Ok(RawCompileDisposition::WideFiniteDeclined);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        (module, object)
+    } else {
+        match mode {
         CompileMode::Fast => lower_ordinary_with_endpoint_oracle_object_retry(
             &program,
             target,
@@ -3789,6 +4021,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 }
             }
         }
+        }
     };
     let object_sha256 = Sha256::digest(&object).into();
     let engine_selection_reason =
@@ -3855,12 +4088,12 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
             .sum(),
         object_bytes: object.len(),
     };
-    Ok(CompiledRegex {
+    Ok(RawCompileDisposition::Compiled(CompiledRegex {
         program,
         module,
         object: object.into_boxed_slice(),
         receipt,
-    })
+    }))
 }
 
 fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<OptimizationPass> {

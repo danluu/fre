@@ -7,6 +7,7 @@ use fre_automata::{
     SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLayout,
     WorkspaceLimits, WorkspaceShape,
 };
+use fre_exact_alloc::{CopyError, try_box_preserve};
 use fre_lower::LowerError;
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -11179,12 +11180,27 @@ impl CompiledProgram {
                 detail: "checked finite-language sidecar reached a Fast-mode program",
             });
         }
-        self.native_finite_language = NativeFiniteLanguageProgram::bind_checked(
+        let Some(program) = NativeFiniteLanguageProgram::bind_checked(
             candidate,
             self.identity.artifact,
             self.output,
-        )?
-        .map(Box::new);
+        )? else {
+            return Ok(());
+        };
+        self.native_finite_language = Some(match try_box_preserve(program) {
+            Ok(program) => program,
+            Err((CopyError::LayoutOverflow, _)) => {
+                return Err(LowerError::ArithmeticOverflow {
+                    computation: "checked finite-language sidecar owner layout",
+                });
+            }
+            Err((CopyError::AllocationFailed, _)) => {
+                return Err(LowerError::AllocationFailed {
+                    structure: "checked finite-language sidecar owner",
+                    additional: 1,
+                });
+            }
+        });
         Ok(())
     }
 

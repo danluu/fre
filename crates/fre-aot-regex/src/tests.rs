@@ -23,6 +23,275 @@ use crate::{
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
+fn generated_wide_finite_pattern(count: usize) -> String {
+    (0..count)
+        .map(|index| format!("word{index:05}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn compile_pre_wide_finite_prepared_incumbent(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+    slow_aot_limits: SlowAotLimits,
+) -> crate::CompiledRegex {
+    let target = request.target;
+    let mode = request.mode;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let _recipe = crate::module::complete_span_reduce_recipe_scope(
+        exports == PreparedAggregateExports::COUNT,
+    );
+    let compiled = compile_with_slow_aot_limits(request, slow_aot_limits)
+        .expect("compile exact pre-wide finite incumbent");
+    crate::append_prepared_aggregate_exports_to_compiled(
+        compiled,
+        exports,
+        target,
+        mode,
+        max_object_bytes,
+        slow_aot_limits,
+    )
+    .expect("append exact pre-wide finite incumbent")
+}
+
+#[test]
+fn wide_finite_prepared_lane_is_exact_closed_native_and_declines_atomically() {
+    let pattern = generated_wide_finite_pattern(65);
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        for exports in [
+            PreparedAggregateExports::COUNT,
+            PreparedAggregateExports::SPAN_SUM,
+        ] {
+            let request = CompileRequest::new(pattern.clone(), target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span);
+            let compiled = compile_with_prepared_aggregate_exports(request.clone(), exports)
+                .expect("compile early wide finite aggregate");
+            let repeated = compile_with_prepared_aggregate_exports(request, exports)
+                .expect("repeat early wide finite aggregate");
+            let report = compiled
+                .module()
+                .ordered_finite_language_aot_report()
+                .expect("selected early wide finite report");
+            assert_eq!(report.source_count, 65);
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert_eq!(
+                compiled.receipt().engine_selection_reason,
+                EngineSelectionReason::DeterminizationResourceLimit,
+            );
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            assert!(compiled.module().required_runtime_symbol().is_none());
+            assert_eq!(compiled.object(), repeated.object());
+            assert_eq!(compiled.receipt(), repeated.receipt());
+
+            let oracle = Regex::new(&pattern).expect("generated wide finite oracle");
+            for haystack in [
+                b"none".as_slice(),
+                b"xxword00064yy".as_slice(),
+                b"word00000-word00064".as_slice(),
+            ] {
+                let expected = oracle
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                assert_eq!(
+                    compiled
+                        .search(haystack, SearchWindow::full(haystack))
+                        .expect("search generated wide finite program"),
+                    MatchResult::Span(expected),
+                );
+            }
+        }
+    }
+
+    // Prove the early lane does not first materialize the ordinary graph.
+    // This ceiling admits the compact priority trie but rejects the ordinary
+    // Thompson lowering for the same generated language.
+    let pattern = generated_prefix_dictionary(64, 16);
+    let parsed = parsed_rust_bytes(&pattern);
+    let ordinary = fre_lower::lower_raw_general(
+        &parsed,
+        fre_lower::OperationSemantics::CaptureFree,
+        fre_lower::LowerLimits::default(),
+    )
+    .expect("unconstrained wide finite ordinary lowering")
+    .into_plan();
+    let candidate = crate::finite_language::NativeFiniteLanguageCandidate::analyze_for_wide_early(
+        &parsed,
+        OutputContract::Span,
+    )
+    .expect("checked wide finite analysis")
+    .expect("wide finite candidate");
+    let compact = candidate
+        .priority_trie_raw_plan(fre_lower::LowerLimits::default())
+        .expect("compact wide finite lowering")
+        .expect("priority-compatible wide finite language");
+    assert!(compact.roles.len() < ordinary.roles.len());
+    let mut compact_only_limits = CompileLimitsV1::default();
+    compact_only_limits.lower.automata.max_states = compact.roles.len();
+    assert!(matches!(
+        fre_lower::lower_raw_general(
+            &parsed,
+            fre_lower::OperationSemantics::CaptureFree,
+            compact_only_limits.lower,
+        ),
+        Err(fre_lower::LowerError::ResourceLimit {
+            resource: fre_lower::LowerResource::States,
+            ..
+        })
+    ));
+    let compact_only = compile_with_prepared_aggregate_exports(
+        CompileRequest::new(&pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(compact_only_limits),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("early wide finite lane bypasses ordinary graph construction");
+    assert_eq!(compact_only.receipt().thompson_states, compact.roles.len());
+    assert!(compact_only.receipt().ordered_finite_language_aot.is_some());
+
+    let target = Target::x86_64_linux();
+    let request = CompileRequest::new(pattern, target)
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::Span);
+    let no_native_data = SlowAotLimits {
+        max_native_data_bytes: 0,
+        ..SlowAotLimits::default()
+    };
+    let incumbent = compile_pre_wide_finite_prepared_incumbent(
+        request.clone(),
+        PreparedAggregateExports::COUNT,
+        no_native_data,
+    );
+    let declined = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+        request,
+        PreparedAggregateExports::COUNT,
+        no_native_data,
+    )
+    .expect("numeric early-wide decline restores exact incumbent");
+    assert_eq!(declined.object(), incumbent.object());
+    assert_eq!(declined.module(), incumbent.module());
+    assert_eq!(declined.receipt(), incumbent.receipt());
+
+    let below = generated_wide_finite_pattern(64);
+    let request = CompileRequest::new(below, target)
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::Span);
+    let incumbent = compile_pre_wide_finite_prepared_incumbent(
+        request.clone(),
+        PreparedAggregateExports::COUNT,
+        SlowAotLimits::default(),
+    );
+    let declined =
+        compile_with_prepared_aggregate_exports(request, PreparedAggregateExports::COUNT)
+            .expect("below-threshold route retains exact incumbent");
+    assert_eq!(declined.object(), incumbent.object());
+    assert_eq!(declined.module(), incumbent.module());
+    assert_eq!(declined.receipt(), incumbent.receipt());
+}
+
+#[test]
+fn wide_finite_prepared_lane_scales_with_generated_shape_only_dictionaries() {
+    for (count, target) in [
+        (256, Target::x86_64_linux()),
+        (4_096, Target::aarch64_linux()),
+        (16_384, Target::x86_64_macos()),
+    ] {
+        let pattern = generated_wide_finite_pattern(count);
+        let compiled = compile_with_prepared_aggregate_exports(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("compile generated scalable wide finite Count");
+        let report = compiled
+            .module()
+            .ordered_finite_language_aot_report()
+            .expect("generated scalable finite report");
+        assert_eq!(report.source_count, count);
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_strategy,
+            Some(PreparedAggregateStrategy::NativeFused),
+        );
+        assert!(compiled.module().required_runtime_symbol().is_none());
+        assert!(report.stored_transition_records <= report.transition_cells);
+        if report.sparse_failure {
+            assert_eq!(report.stored_transition_records, report.states - 1);
+        }
+    }
+
+    let mut profile = RustProfile::default();
+    profile.options.case_insensitive = true;
+    let compiled = compile_with_prepared_aggregate_exports(
+        CompileRequest::new(generated_wide_finite_pattern(256), Target::aarch64_macos())
+            .profile(profile)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile exact case-expanded generated wide finite Count");
+    assert!(
+        compiled
+            .module()
+            .ordered_finite_language_aot_report()
+            .is_some_and(|report| report.source_count > 64)
+    );
+    let haystack = b"xxWORD00042yy";
+    assert_eq!(
+        compiled
+            .search(haystack, SearchWindow::full(haystack))
+            .expect("case-expanded wide finite semantic search"),
+        MatchResult::Span(Some((2, 11))),
+    );
+}
+
+#[test]
+fn wide_finite_early_fallback_classifier_never_swallows_hard_failures() {
+    assert!(crate::wide_finite_early_numeric_decline(
+        &CompileError::Resource {
+            resource: CompileResource::ProgramBytes,
+            limit: 31,
+            required: 32,
+        }
+    ));
+    assert!(crate::wide_finite_early_numeric_decline(
+        &CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 31,
+            required: 32,
+        })
+    ));
+    assert!(!crate::wide_finite_early_numeric_decline(
+        &CompileError::Object(ObjectError::Allocation(
+            "synthetic early wide finite allocation",
+        ))
+    ));
+    assert!(!crate::wide_finite_early_numeric_decline(
+        &CompileError::Lower(fre_lower::LowerError::AllocationFailed {
+            structure: "synthetic early wide finite proof",
+            additional: 1,
+        })
+    ));
+    assert!(!crate::wide_finite_early_numeric_decline(
+        &CompileError::Object(ObjectError::ArithmeticOverflow(
+            "synthetic early wide finite arithmetic",
+        ))
+    ));
+    assert!(!crate::wide_finite_early_numeric_decline(
+        &CompileError::Object(ObjectError::UnsupportedTarget)
+    ));
+}
+
 #[test]
 fn independent_exists_batch_allocator_failure_is_terminal_at_both_optional_seams() {
     const APPEND_SITE: &str = "injected direct Exists batch append allocation";

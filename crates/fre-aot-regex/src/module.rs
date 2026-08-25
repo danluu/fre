@@ -5119,6 +5119,59 @@ impl CompiledModule {
         Ok(module)
     }
 
+    /// Lower only the independently authenticated compact finite-language
+    /// sidecar. This is the early wide-language transaction used by prepared
+    /// Count/SpanSum compilation before an ordinary DFA is materialized.
+    /// Returning `None` is a clean structural or numeric candidate decline;
+    /// allocator, authentication, arithmetic and backend failures remain
+    /// terminal and therefore cannot be followed by a fresh allocation.
+    pub(crate) fn lower_wide_finite_language_only(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+    ) -> Result<Option<Self>, CompileError> {
+        target.validate()?;
+        let program_bytes = program.serialize()?;
+        let Some(view) = program.native_finite_language_view() else {
+            return Ok(None);
+        };
+        let Some((lowering, report)) =
+            lower_optional_native_finite_language_with_data_limit(
+                view,
+                target,
+                max_native_data_bytes,
+            )?
+        else {
+            return Ok(None);
+        };
+        let module = Self::lower_serialized_with_prelowered(
+            program_bytes,
+            Some(lowering),
+            None,
+            None,
+            None,
+            None,
+            Some(report),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            target,
+        )?;
+        if module.ordered_finite_language_aot_report().is_none()
+            || module.required_runtime_symbols().next().is_some()
+        {
+            return Err(CompileError::InternalInvariant(
+                "early wide finite-language lowering lost its closed native route",
+            ));
+        }
+        Ok(Some(module))
+    }
+
     pub(crate) fn lower_k0_optimizing_with_data_limit(
         program: &CompiledProgram,
         target: Target,
