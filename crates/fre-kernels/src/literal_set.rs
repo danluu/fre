@@ -1659,10 +1659,10 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         selected
     }
 
-    /// Seek one exact root only for the bulk span visitor, before entering the
-    /// unchanged shared DFA transition loop.
+    /// Seek one exact root before entering the unchanged selected-span DFA
+    /// transition loop.
     #[inline(always)]
-    fn seek_root_range_for_span_visit(&mut self) -> bool {
+    fn seek_root_range_for_selected_span(&mut self) -> bool {
         let at = self.restart;
         if self.end - at < ORDINARY_ROOT_RANGE_MIN_BYTES {
             return true;
@@ -1895,6 +1895,9 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     ) -> Result<Option<(usize, usize)>, LiteralSetError> {
         validate_window(window, haystack.len())?;
         if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
+            if !scanner.seek_root_range_for_selected_span() {
+                return Ok(None);
+            }
             return Ok(scanner.next_span());
         }
         self.plan.try_find_window_value(haystack, window)
@@ -2035,7 +2038,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         debug_assert!(window.start() <= window.end());
         debug_assert!(window.end() <= haystack.len());
         if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
-            while scanner.seek_root_range_for_span_visit() {
+            while scanner.seek_root_range_for_selected_span() {
                 let Some(matched) = scanner.next_span() else {
                     break;
                 };
@@ -6644,7 +6647,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_direct_dfa_root_range_is_bulk_span_only_with_exact_fallback() {
+    fn ordinary_direct_dfa_root_range_accelerates_selected_spans_with_exact_fallback() {
         let patterns = root_range_patterns();
         let plan = LiteralSetPlan::new_stable(
             &patterns,
@@ -6677,9 +6680,11 @@ mod tests {
             ordinary.find_window_value(&haystack, window),
             Ok(expected.first().copied()),
         );
-        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_range_skipped_bytes(), gap);
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
 
+        ordinary_direct_probe::reset();
         let mut actual = Vec::new();
         assert_eq!(
             ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
@@ -6694,7 +6699,7 @@ mod tests {
             ordinary_direct_probe::root_range_skipped_bytes(),
             gap * 2,
         );
-        assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
+        assert_eq!(ordinary_direct_probe::root_range_bindings(), 0);
 
         // Adjacent root starts do not pay the range leaf: the current-byte
         // guard recognizes membership with one wrapping-sub comparison.
@@ -6711,6 +6716,11 @@ mod tests {
             .collect::<Vec<_>>();
         let mut dense_spans = Vec::new();
         assert_eq!(
+            ordinary.find_window_value(&dense, Window::new(0, dense.len())),
+            Ok(dense_expected.first().copied()),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+        assert_eq!(
             ordinary.try_visit_spans_window_value(
                 &dense,
                 Window::new(0, dense.len()),
@@ -6723,6 +6733,27 @@ mod tests {
         );
         assert_eq!(dense_spans, dense_expected);
         assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        // The exact short-window boundary retains the scalar DFA without
+        // invoking the native range leaf.
+        ordinary_direct_probe::reset();
+        let short = vec![b'z'; ORDINARY_ROOT_RANGE_MIN_BYTES - 1];
+        assert_eq!(
+            ordinary.find_window_value(&short, Window::full(&short)),
+            Ok(None),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+        ordinary_direct_probe::reset();
+        let exact = vec![b'z'; ORDINARY_ROOT_RANGE_MIN_BYTES];
+        assert_eq!(
+            ordinary.find_window_value(&exact, Window::full(&exact)),
+            Ok(None),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 1);
+        assert_eq!(
+            ordinary_direct_probe::root_range_skipped_bytes(),
+            exact.len(),
+        );
 
         ordinary_direct_probe::reset();
         assert_eq!(
@@ -6746,6 +6777,42 @@ mod tests {
         assert!(fallback.direct_count_scanner_supported());
         assert!(fallback.direct_dfa_root_range.is_none());
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
+        let fallback_miss = vec![200_u8; ORDINARY_ROOT_RANGE_MIN_BYTES + 7];
+        assert_eq!(
+            fallback.find_window_value(&fallback_miss, Window::full(&fallback_miss)),
+            Ok(None),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        // Selected starts, truncated candidates and nonzero windows retain the
+        // complete canonical LeftmostFirst result around both sparse hits.
+        let starts = [0, frame, first_start - 1, first_start, first_start + 1];
+        let ends = [
+            first_start,
+            first_start + matched_pattern.len() - 1,
+            first_start + matched_pattern.len(),
+            second_start + matched_pattern.len(),
+            window_end,
+            haystack.len(),
+        ];
+        for start in starts {
+            for end in ends.into_iter().filter(|&end| end >= start) {
+                let differential_window = Window::new(start, end);
+                let expected = plan
+                    .find_window(
+                        &haystack,
+                        differential_window,
+                        LiteralSetSearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    ordinary.find_window_value(&haystack, differential_window),
+                    Ok(expected),
+                    "window={differential_window:?}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -6888,10 +6955,24 @@ mod tests {
             ordinary.selected_end_window_value(&delayed, window),
             Ok(Some(51)),
         );
+        ordinary_direct_probe::reset();
         assert_eq!(
             ordinary.find_window_value(&delayed, window),
             Ok(Some((47, 51))),
         );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_range_skipped_bytes(), 42);
+
+        // Truncating the higher-priority four-byte candidate at the window
+        // end still selects the complete three-byte alternative.
+        ordinary_direct_probe::reset();
+        let truncated = Window::new(5, 50);
+        assert_eq!(
+            ordinary.find_window_value(&delayed, truncated),
+            Ok(Some((47, 50))),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_range_skipped_bytes(), 42);
     }
 
     #[test]
