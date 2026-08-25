@@ -6521,6 +6521,58 @@ fn prepared_v15_grep_count_is_native_fail_closed_and_cross_target() {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the test decoder walks bounded generated reducer text",
+)]
+fn generated_local_call_sites(
+    architecture: Architecture,
+    text: &[u8],
+    start: usize,
+    end: usize,
+) -> Vec<(usize, usize)> {
+    match architecture {
+        Architecture::X86_64 => (start..end.saturating_sub(4))
+            .filter_map(|instruction| {
+                if text[instruction] != 0xe8 {
+                    return None;
+                }
+                let displacement = i32::from_le_bytes(
+                    text[instruction + 1..instruction + 5]
+                        .try_into()
+                        .expect("x86 local-call displacement"),
+                );
+                let after = instruction + 5;
+                let target = after.checked_add_signed(
+                    isize::try_from(displacement).expect("x86 call displacement fits isize"),
+                )?;
+                Some((instruction, target))
+            })
+            .collect(),
+        Architecture::Aarch64 => (start..end)
+            .step_by(4)
+            .filter_map(|instruction| {
+                let word = u32::from_le_bytes(
+                    text.get(instruction..instruction + 4)?
+                        .try_into()
+                        .expect("AArch64 local-call instruction"),
+                );
+                if word & 0xfc00_0000 != 0x9400_0000 {
+                    return None;
+                }
+                let immediate = i32::try_from(word & 0x03ff_ffff)
+                    .expect("AArch64 call immediate");
+                let signed = (immediate << 6) >> 6;
+                let displacement = isize::try_from(signed)
+                    .expect("AArch64 call displacement fits isize")
+                    .checked_mul(4)?;
+                let target = instruction.checked_add_signed(displacement)?;
+                Some((instruction, target))
+            })
+            .collect(),
+    }
+}
+
 #[test]
 fn prepared_v15_scalar_operation_is_one_closed_global_function_cross_isa() {
     for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
@@ -6593,6 +6645,98 @@ fn prepared_v15_scalar_operation_is_one_closed_global_function_cross_isa() {
                 .collect::<Vec<_>>();
             assert_eq!(global_functions.len(), 1);
             assert_eq!(global_functions[0].name, module.entry_symbol());
+            let fragment = module
+                .symbols()
+                .iter()
+                .find(|symbol| {
+                    symbol.name == ".Lfre_aot_regex_ordered_nfa_operation_fragment_v1"
+                })
+                .expect("operation-only Ordered-NFA fragment symbol");
+            let fragment_end = fragment
+                .offset
+                .checked_add(fragment.size)
+                .expect("operation-only fragment extent");
+            for internal_name in [
+                ".Lfre_aot_regex_ordered_nfa_operation_fragment_v1",
+                ".Lfre_aot_regex_ordered_nfa_operation_private_v1",
+                ".Lfre_aot_regex_ordered_nfa_private_v1",
+                ".Lfre_aot_regex_ordered_nfa_bulk_gate_v1",
+            ] {
+                let internal = module
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == internal_name)
+                    .unwrap_or_else(|| panic!("missing operation-only symbol {internal_name}"));
+                assert_eq!(internal.binding, crate::SymbolBinding::Local);
+                assert_eq!(internal.kind, crate::SymbolKind::Function);
+                assert_eq!(internal.section, fragment.section);
+                assert!(internal.offset >= fragment.offset);
+                assert!(
+                    internal
+                        .offset
+                        .checked_add(internal.size)
+                        .is_some_and(|end| end <= fragment_end),
+                    "operation-only internal escaped its local fragment: {internal_name}",
+                );
+            }
+            assert!(
+                module.symbols().iter().all(|symbol| !symbol.name.contains("trusted")),
+                "the trusted post-gate label must never become a symbol",
+            );
+            assert!(
+                global_functions[0].offset >= fragment_end,
+                "the only exported function must be the appended reducer",
+            );
+
+            let private = module
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_private_v1")
+                .expect("operation-only private search symbol");
+            let gate = module
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_bulk_gate_v1")
+                .expect("operation-only bulk gate symbol");
+            let reducer_start = usize::try_from(global_functions[0].offset)
+                .expect("operation-only reducer start");
+            let reducer_end = usize::try_from(
+                global_functions[0]
+                    .offset
+                    .checked_add(global_functions[0].size)
+                    .expect("operation-only reducer extent"),
+            )
+            .expect("operation-only reducer end");
+            let calls = generated_local_call_sites(
+                target.architecture,
+                module.sections()[0].bytes(),
+                reducer_start,
+                reducer_end,
+            );
+            let calls_to = |target_offset: u64| {
+                calls
+                    .iter()
+                    .filter_map(|&(site, target)| {
+                        (u64::try_from(target).ok() == Some(target_offset)).then_some(site)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let gate_calls = calls_to(gate.offset);
+            let private_calls = calls_to(private.offset);
+            assert_eq!(
+                gate_calls.len(),
+                1,
+                "one required gate call: {target:?}/{export:?}",
+            );
+            assert_eq!(
+                private_calls.len(),
+                1,
+                "one private search call site: {target:?}/{export:?}",
+            );
+            assert!(
+                gate_calls[0] < private_calls[0],
+                "the private loop must be reachable only after its required gate",
+            );
             assert!(module.relocations().iter().all(|relocation| {
                 module
                     .symbols()

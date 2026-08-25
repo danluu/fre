@@ -77805,35 +77805,304 @@ mod tests {
         );
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the test decoder checks already-bounded generated branch immediates",
+    )]
+    fn x86_test_branch_target(
+        code: &[u8],
+        instruction: usize,
+    ) -> (Option<u8>, usize, usize) {
+        let opcode = code[instruction];
+        let (condition, displacement, end) = match opcode {
+            0xeb | 0x70..=0x7f => (
+                (opcode != 0xeb).then_some(opcode & 0x0f),
+                isize::from(i8::from_le_bytes([code[instruction + 1]])),
+                instruction + 2,
+            ),
+            0xe9 => (
+                None,
+                isize::try_from(i32::from_le_bytes(
+                    code[instruction + 1..instruction + 5]
+                        .try_into()
+                        .expect("x86 rel32 branch"),
+                ))
+                .expect("x86 rel32 fits isize"),
+                instruction + 5,
+            ),
+            0x0f if matches!(code[instruction + 1], 0x80..=0x8f) => (
+                Some(code[instruction + 1] & 0x0f),
+                isize::try_from(i32::from_le_bytes(
+                    code[instruction + 2..instruction + 6]
+                        .try_into()
+                        .expect("x86 conditional rel32 branch"),
+                ))
+                .expect("x86 conditional rel32 fits isize"),
+                instruction + 6,
+            ),
+            _ => panic!("unexpected x86 branch opcode {opcode:#x} at {instruction}"),
+        };
+        let target = end
+            .checked_add_signed(displacement)
+            .expect("x86 generated branch target");
+        assert!(target < code.len(), "x86 branch target escapes reducer");
+        (condition, target, end)
+    }
+
+    fn x86_required_ordered_nfa_reducer_is_closed(
+        wrapper: &NativePreparedBulkWrapper,
+        grep_count: bool,
+    ) {
+        let gate = wrapper
+            .ordered_nfa_gate_call_offset
+            .expect("required x86 Ordered-NFA gate call");
+        let Some(NativePreparedIdentityRelocation::X86PcRelative32(identity)) =
+            wrapper.identity_relocation
+        else {
+            panic!("required x86 reducer identity relocation");
+        };
+        assert!(gate < identity);
+        assert!(identity < wrapper.prepared_call_offset);
+        assert_eq!(wrapper.bulk_runtime_fallback_offset, None);
+        assert_eq!(wrapper.compatibility_identity_relocation, None);
+
+        let mut cursor = wrapper
+            .prepared_call_offset
+            .checked_add(4)
+            .expect("x86 private call extent");
+        let terminal = if grep_count {
+            assert_eq!(
+                wrapper.code.get(cursor..cursor + 3),
+                Some([0x83, 0xf8, 0x01].as_slice()),
+            );
+            cursor += 3;
+            let (condition, _, end) = x86_test_branch_target(&wrapper.code, cursor);
+            assert_eq!(condition, Some(4), "status one must enter matched-line");
+            cursor = end;
+            assert_eq!(
+                wrapper.code.get(cursor..cursor + 2),
+                Some([0x85, 0xc0].as_slice()),
+            );
+            cursor += 2;
+            let (condition, _, end) = x86_test_branch_target(&wrapper.code, cursor);
+            assert_eq!(condition, Some(4), "status zero must complete the line");
+            let (condition, target, _) = x86_test_branch_target(&wrapper.code, end);
+            assert_eq!(condition, None, "every other private status is terminal");
+            target
+        } else {
+            assert_eq!(
+                wrapper.code.get(cursor..cursor + 2),
+                Some([0x85, 0xc0].as_slice()),
+            );
+            cursor += 2;
+            let (condition, _, end) = x86_test_branch_target(&wrapper.code, cursor);
+            assert_eq!(condition, Some(4), "status zero must finish the reduction");
+            cursor = end;
+            assert_eq!(
+                wrapper.code.get(cursor..cursor + 3),
+                Some([0x83, 0xf8, 0x01].as_slice()),
+            );
+            cursor += 3;
+            let (condition, target, end) = x86_test_branch_target(&wrapper.code, cursor);
+            match condition {
+                // The assembler may retain JE matched + JMP error or invert
+                // the pair to JNE error with matched as fallthrough.
+                Some(4) => {
+                    let (jump_condition, error, _) =
+                        x86_test_branch_target(&wrapper.code, end);
+                    assert_eq!(jump_condition, None);
+                    error
+                }
+                Some(5) => target,
+                other => panic!("unexpected x86 private-status condition {other:?}"),
+            }
+        };
+        let frame = if grep_count { 48_u8 } else { 64_u8 };
+        let expected: [u8; 14] = [
+            0x48, 0x83, 0xc4, frame, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5b,
+            0xc3,
+        ];
+        assert_eq!(
+            wrapper.code.get(terminal..terminal + expected.len()),
+            Some(expected.as_slice()),
+            "a non-Boolean private status must reach the epilogue unchanged",
+        );
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the test decoder checks one bounded AArch64 branch immediate",
+    )]
+    fn aarch64_test_branch_target(
+        code: &[u8],
+        instruction: usize,
+    ) -> (Option<u8>, usize) {
+        let word = u32::from_le_bytes(
+            code[instruction..instruction + 4]
+                .try_into()
+                .expect("AArch64 branch instruction"),
+        );
+        let (condition, signed) = if word & 0xfc00_0000 == 0x1400_0000 {
+            let immediate =
+                i32::try_from(word & 0x03ff_ffff).expect("AArch64 B immediate");
+            (None, (immediate << 6) >> 6)
+        } else {
+            assert_eq!(
+                word & 0xff00_0010,
+                0x5400_0000,
+                "AArch64 B.cond expected",
+            );
+            let immediate =
+                i32::try_from((word >> 5) & 0x0007_ffff).expect("AArch64 B.cond immediate");
+            (
+                Some(u8::try_from(word & 0x0f).expect("AArch64 condition")),
+                (immediate << 13) >> 13,
+            )
+        };
+        let target = instruction
+            .checked_add_signed(
+                isize::try_from(signed)
+                    .expect("AArch64 branch immediate fits isize")
+                    .checked_mul(4)
+                    .expect("AArch64 branch byte displacement"),
+            )
+            .expect("AArch64 generated branch target");
+        assert!(target < code.len(), "AArch64 branch target escapes reducer");
+        (condition, target)
+    }
+
+    fn aarch64_required_ordered_nfa_reducer_is_closed(
+        wrapper: &NativePreparedBulkWrapper,
+        grep_count: bool,
+        terminal_exact_set: bool,
+    ) {
+        let gate = wrapper
+            .ordered_nfa_gate_call_offset
+            .expect("required AArch64 Ordered-NFA gate call");
+        let Some(NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+            page,
+            page_offset,
+        }) = wrapper.identity_relocation
+        else {
+            panic!("required AArch64 reducer identity relocation");
+        };
+        assert!(gate < page);
+        assert!(page <= page_offset);
+        assert!(page_offset < wrapper.prepared_call_offset);
+        assert_eq!(wrapper.bulk_runtime_fallback_offset, None);
+        assert_eq!(wrapper.compatibility_identity_relocation, None);
+
+        let private_status_branch = wrapper
+            .prepared_call_offset
+            .checked_add(if grep_count { 16 } else { 12 })
+            .expect("AArch64 private status branch");
+        let (condition, target) =
+            aarch64_test_branch_target(&wrapper.code, private_status_branch);
+        let terminal = if grep_count {
+            assert_eq!(condition, None, "every other private status is terminal");
+            target
+        } else {
+            match condition {
+                // The assembler may retain B.EQ matched + B error or invert
+                // the pair to B.NE error with matched as fallthrough.
+                Some(AARCH64_EQ) => {
+                    let (jump_condition, error) = aarch64_test_branch_target(
+                        &wrapper.code,
+                        private_status_branch + 4,
+                    );
+                    assert_eq!(jump_condition, None);
+                    error
+                }
+                Some(AARCH64_NE) => target,
+                other => panic!("unexpected AArch64 private-status condition {other:?}"),
+            }
+        };
+        let expected = if grep_count {
+            vec![
+                aarch64_load_pair_x(19, 20, 31, 16).unwrap(),
+                aarch64_load_pair_x(21, 22, 31, 32).unwrap(),
+                aarch64_load_pair_x(23, 24, 31, 48).unwrap(),
+                aarch64_load_pair_x(25, 26, 31, 64).unwrap(),
+                aarch64_load_pair_x(27, 28, 31, 80).unwrap(),
+                aarch64_load_pair_x(29, 30, 31, 96).unwrap(),
+                aarch64_add_x_imm(31, 31, 128).unwrap(),
+                0xd65f_03c0,
+            ]
+        } else {
+            vec![
+                aarch64_load_pair_x(19, 20, 31, 16).unwrap(),
+                aarch64_load_pair_x(21, 22, 31, 32).unwrap(),
+                aarch64_load_pair_x(23, 24, 31, 48).unwrap(),
+                aarch64_load_pair_x(25, 26, 31, 64).unwrap(),
+                aarch64_load_pair_x(29, 30, 31, 80).unwrap(),
+                aarch64_add_x_imm(
+                    31,
+                    31,
+                    if terminal_exact_set { 128 } else { 112 },
+                )
+                .unwrap(),
+                0xd65f_03c0,
+            ]
+        };
+        let actual = wrapper.code[terminal..]
+            .chunks_exact(4)
+            .take(expected.len())
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "a non-Boolean private status must reach the epilogue unchanged",
+        );
+    }
+
     #[test]
     fn required_ordered_nfa_scalar_gate_has_no_compatibility_edge_cross_isa() {
         for sink in [PreparedSpanSink::Count, PreparedSpanSink::SpanSum] {
-            let x86 = lower_x86_64_required_ordered_nfa_span_reduce(sink, None)
+            for terminal_exact_set in [None, Some([0x8000_0000_0000_0001; 4])] {
+                let x86 = lower_x86_64_required_ordered_nfa_span_reduce(
+                    sink,
+                    terminal_exact_set,
+                )
                 .expect("x86 required Ordered-NFA scalar reducer");
-            assert!(x86.ordered_nfa_gate_call_offset.is_some());
-            assert_eq!(x86.bulk_runtime_fallback_offset, None);
-            assert_eq!(x86.compatibility_identity_relocation, None);
-            assert!(x86.identity_relocation.is_some());
-            assert!(x86.code.windows(6).any(|window| {
-                window == [0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3]
-            }));
+                x86_required_ordered_nfa_reducer_is_closed(&x86, false);
+                assert!(x86.code.windows(6).any(|window| {
+                    window == [0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3]
+                }));
 
-            let aarch64 = lower_aarch64_required_ordered_nfa_span_reduce(sink, None)
+                let aarch64 = lower_aarch64_required_ordered_nfa_span_reduce(
+                    sink,
+                    terminal_exact_set,
+                )
                 .expect("AArch64 required Ordered-NFA scalar reducer");
-            assert!(aarch64.ordered_nfa_gate_call_offset.is_some());
-            assert_eq!(aarch64.bulk_runtime_fallback_offset, None);
-            assert_eq!(aarch64.compatibility_identity_relocation, None);
-            assert!(aarch64.identity_relocation.is_some());
-            let status_three = aarch64_movz_w(0, 3)
-                .expect("AArch64 status-three instruction")
-                .to_le_bytes();
-            assert!(
-                aarch64
-                    .code
-                    .windows(status_three.len())
-                    .any(|window| window == status_three),
-            );
+                aarch64_required_ordered_nfa_reducer_is_closed(
+                    &aarch64,
+                    false,
+                    terminal_exact_set.is_some(),
+                );
+                let status_three = aarch64_movz_w(0, 3)
+                    .expect("AArch64 status-three instruction")
+                    .to_le_bytes();
+                assert!(
+                    aarch64
+                        .code
+                        .windows(status_three.len())
+                        .any(|window| window == status_three),
+                );
+            }
         }
+
+        let x86_grep = lower_x86_64_prepared_grep_count(
+            NativeSpanReducerCallKind::PreparedPrivate,
+            true,
+        )
+        .expect("x86 required Ordered-NFA GrepCount reducer");
+        x86_required_ordered_nfa_reducer_is_closed(&x86_grep, true);
+        let aarch64_grep = lower_aarch64_prepared_grep_count(
+            NativeSpanReducerCallKind::PreparedPrivate,
+            true,
+        )
+        .expect("AArch64 required Ordered-NFA GrepCount reducer");
+        aarch64_required_ordered_nfa_reducer_is_closed(&aarch64_grep, true, false);
     }
 
     #[test]

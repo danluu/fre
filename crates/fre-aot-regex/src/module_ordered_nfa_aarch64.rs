@@ -189,6 +189,8 @@ pub(super) struct Aarch64OrderedNfaNativeEntry {
 enum OrderedNfaEntrySurface {
     Compatibility,
     OperationOnly,
+    #[cfg(test)]
+    OperationOnlyReauthenticate,
 }
 
 fn scratch_bytes(layout: NativeOrderedNfaObjectLayout) -> Result<usize, ObjectError> {
@@ -1238,6 +1240,33 @@ fn emit_exact_scratch_auth(
         FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_VALID_OFFSET + 4,
         invalid,
     )?;
+    Ok(())
+}
+
+/// Restore the scratch/payload register view proved by the enclosing
+/// aggregate wrapper's one-shot operation gate. This entry is text-local and
+/// the exclusive handle contract keeps all write-once addresses stable until
+/// the wrapper's reduction returns.
+fn emit_trusted_aggregate_scratch_setup(a: &mut A<'_>) -> Result<(), ObjectError> {
+    a.load_x(8, 19, FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET)?;
+    a.mov_x(19, 8)?;
+    a.store_x(19, 31, usize::from(L_SCRATCH))?;
+    for ((offset, local), register) in [
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_SEEN_ADDRESS_OFFSET, L_SEEN),
+        (
+            FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_ADDRESS_OFFSET,
+            L_CURRENT,
+        ),
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_ADDRESS_OFFSET, L_ROOTS),
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_ADDRESS_OFFSET, L_STACK),
+    ]
+    .into_iter()
+    .zip([25, 26, 27, 28])
+    {
+        a.load_x(8, 19, offset)?;
+        a.store_x(8, 31, usize::from(local))?;
+        a.mov_x(register, 8)?;
+    }
     Ok(())
 }
 
@@ -2642,6 +2671,7 @@ fn lower_aarch64_with_surface(
     let clear_generation_loop = asm.label()?;
     let clear_generation_store = asm.label()?;
     let after_generation_clear = asm.label()?;
+    let authenticated_search = asm.label()?;
     let search_entry = asm.label()?;
     let terminal_scan = if layout.terminal_range.is_some() {
         Some(asm.label()?)
@@ -2672,7 +2702,12 @@ fn lower_aarch64_with_surface(
     let private_table = emit_prologue_and_raw_checks(&mut asm, invalid_argument, invalid_handle)?;
     {
         let mut a = A { asm: &mut asm };
-        a.branch(shared_auth)?;
+        if surface == OrderedNfaEntrySurface::OperationOnly {
+            emit_trusted_aggregate_scratch_setup(&mut a)?;
+            a.branch(authenticated_search)?;
+        } else {
+            a.branch(shared_auth)?;
+        }
     }
 
     asm.bind(bulk_gate_entry)?;
@@ -2708,6 +2743,10 @@ fn lower_aarch64_with_surface(
         a.mov_x(19, 8)?;
         a.store_x(19, 31, usize::from(L_SCRATCH))?;
         emit_exact_scratch_auth(&mut a, layout, expected_scratch_bytes, runtime_failure)?;
+    }
+    asm.bind(authenticated_search)?;
+    {
+        let mut a = A { asm: &mut asm };
 
         if let Some(bounds) = layout.whole_window_width_bounds {
             emit_whole_window_width_gate(&mut a, bounds, no_match)?;
@@ -2973,6 +3012,7 @@ fn lower_aarch64_with_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     fn optimizing_ordered_nfa(pattern: &str) -> crate::CompiledProgram {
         let parsed = fre_syntax::parse(fre_syntax::ParseRequest::rust(
@@ -3278,6 +3318,11 @@ mod tests {
     #[test]
     fn ordered_nfa_aarch64_entry_has_exact_relocation_shape() {
         let entry = lower_aarch64(&minimal_image()).unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&entry.code)),
+            "0c5bc7859f552f1fca254929173ac8144cc7b81f1f0501674f680979e9b1da75",
+            "compatibility text must remain byte-identical to 979fc26e8",
+        );
         assert!(!entry.code.is_empty());
         assert!(entry.code.len().is_multiple_of(4));
         assert!(entry.private_entry_offset > 0);
@@ -3337,6 +3382,11 @@ mod tests {
     fn ordered_nfa_aarch64_operation_only_entry_has_closed_local_relocations() {
         let compatibility = lower_aarch64(&minimal_image()).unwrap();
         let operation = lower_aarch64_operation_only(&minimal_image()).unwrap();
+        let reauthenticated = lower_aarch64_with_surface(
+            &minimal_image(),
+            OrderedNfaEntrySurface::OperationOnlyReauthenticate,
+        )
+        .unwrap();
 
         assert!(!operation.code.is_empty());
         assert!(operation.code.len() < compatibility.code.len());
@@ -3359,6 +3409,22 @@ mod tests {
             .relocations
             .iter()
             .all(|relocation| relocation.symbol != PREPARED_FALLBACK_RUNTIME_SYMBOL));
+        assert_ne!(operation.code, reauthenticated.code);
+        assert!(operation.bulk_gate_entry_offset > reauthenticated.bulk_gate_entry_offset);
+        assert!(operation.code.len() > reauthenticated.code.len());
+        assert_eq!(operation.relocations.len(), reauthenticated.relocations.len());
+        assert_eq!(
+            operation
+                .relocations
+                .iter()
+                .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
+                .collect::<Vec<_>>(),
+            reauthenticated
+                .relocations
+                .iter()
+                .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

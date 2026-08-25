@@ -127,6 +127,8 @@ pub(super) struct OrderedNfaNativeEntry {
 enum OrderedNfaEntrySurface {
     Compatibility,
     OperationOnly,
+    #[cfg(test)]
+    OperationOnlyReauthenticate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1364,6 +1366,36 @@ fn emit_exact_scratch_auth(
         FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_VALID_OFFSET + 4,
     )?;
     branch_not_equal(x, invalid)?;
+    Ok(())
+}
+
+/// Rehydrate the per-invocation register/local view from a capability already
+/// authenticated by the enclosing aggregate wrapper's one-shot bulk gate.
+///
+/// This entry is never published and the wrapper makes no external calls
+/// between the gate and its local search loop. The exclusive prepared-handle
+/// contract therefore keeps these write-once addresses stable for the whole
+/// reduction while ordinary/private search continues to authenticate them on
+/// every independent invocation.
+fn emit_trusted_aggregate_scratch_setup(x: &mut X<'_>) -> Result<(), ObjectError> {
+    x.load64(
+        R::Ax,
+        R::Bx,
+        FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET,
+    )?;
+    x.mov64(R::Bx, R::Ax)?;
+    for (offset, local) in [
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_SEEN_ADDRESS_OFFSET, L_SEEN),
+        (
+            FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_ADDRESS_OFFSET,
+            L_CURRENT,
+        ),
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_ADDRESS_OFFSET, L_ROOTS),
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_ADDRESS_OFFSET, L_STACK),
+    ] {
+        x.load64(R::Ax, R::Bx, offset)?;
+        x.store64(R::Sp, local, R::Ax)?;
+    }
     Ok(())
 }
 
@@ -2867,6 +2899,7 @@ fn lower_x86_64_with_surface(
     let bulk_gate_claimed = asm.label()?;
     let bulk_gate_legacy = asm.label()?;
     let assertion = asm.label()?;
+    let authenticated_search = asm.label()?;
     let unicode_helpers = if image.layout.unicode_ranges_offset.is_some() {
         Some((asm.label()?, asm.label()?, asm.label()?, asm.label()?))
     } else {
@@ -2901,7 +2934,12 @@ fn lower_x86_64_with_surface(
     )?;
     {
         let mut x = X { asm: &mut asm };
-        x.jump(shared_auth)?;
+        if surface == OrderedNfaEntrySurface::OperationOnly {
+            emit_trusted_aggregate_scratch_setup(&mut x)?;
+            x.jump(authenticated_search)?;
+        } else {
+            x.jump(shared_auth)?;
+        }
     }
 
     asm.bind(bulk_gate_entry)?;
@@ -2944,7 +2982,10 @@ fn lower_x86_64_with_surface(
         )?;
         x.mov64(R::Bx, R::Ax)?;
         emit_exact_scratch_auth(&mut x, layout, expected_scratch_bytes, runtime_failure)?;
-
+    }
+    asm.bind(authenticated_search)?;
+    {
+        let mut x = X { asm: &mut asm };
         if let Some(bounds) = layout.whole_window_width_bounds {
             emit_whole_window_width_gate(&mut x, bounds, no_match)?;
         }
@@ -3156,6 +3197,7 @@ fn lower_x86_64_with_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     fn optimizing_ordered_nfa(pattern: &str) -> crate::CompiledProgram {
         let parsed = fre_syntax::parse(fre_syntax::ParseRequest::rust(
@@ -3458,6 +3500,11 @@ mod tests {
     #[test]
     fn ordered_nfa_x86_entry_has_public_private_gate_and_fallback_relocations() {
         let entry = lower_x86_64(&minimal_image()).unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&entry.code)),
+            "8cdf9553af134536984f1e998684714d3980bdd827346adccdb9a9fa8ae647b6",
+            "compatibility text must remain byte-identical to 979fc26e8",
+        );
         assert!(!entry.code.is_empty());
         assert!(entry.private_entry_offset > 0);
         assert!(entry.private_entry_offset < entry.code.len());
@@ -3508,6 +3555,11 @@ mod tests {
     fn ordered_nfa_x86_operation_only_entry_has_closed_local_relocations() {
         let compatibility = lower_x86_64(&minimal_image()).unwrap();
         let operation = lower_x86_64_operation_only(&minimal_image()).unwrap();
+        let reauthenticated = lower_x86_64_with_surface(
+            &minimal_image(),
+            OrderedNfaEntrySurface::OperationOnlyReauthenticate,
+        )
+        .unwrap();
 
         assert!(!operation.code.is_empty());
         assert!(operation.code.len() < compatibility.code.len());
@@ -3525,6 +3577,22 @@ mod tests {
             .relocations
             .iter()
             .all(|relocation| relocation.symbol != PREPARED_FALLBACK_RUNTIME_SYMBOL));
+        assert_ne!(operation.code, reauthenticated.code);
+        assert!(operation.bulk_gate_entry_offset > reauthenticated.bulk_gate_entry_offset);
+        assert_ne!(operation.code.len(), reauthenticated.code.len());
+        assert_eq!(operation.relocations.len(), reauthenticated.relocations.len());
+        assert_eq!(
+            operation
+                .relocations
+                .iter()
+                .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
+                .collect::<Vec<_>>(),
+            reauthenticated
+                .relocations
+                .iter()
+                .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]
