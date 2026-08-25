@@ -22,8 +22,8 @@ pub use fre_simd_kernels::{
     BYTE_PAIR_BARRIER_GROUP_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, BYTE_SET_WIDE_BLOCK_BYTES,
     BytePairBarrierScan, BytePairBarrierScanner, ByteSet256, ByteSetClassifier, DispatchPolicy,
     DispatchProfile, Feature, FeatureSet, SelectionReceipt, SimdDispatchContext, TuningClass,
-    UnsupportedRequiredFeatures, VectorKind, classify_byte_delta_16, classify_byte_set4_16,
-    classify_byte_set4_32, dispatch_profile, find_byte_delta,
+    UnsupportedRequiredFeatures, VectorKind, classify_byte_delta_16, classify_byte_set1_16,
+    classify_byte_set4_16, classify_byte_set4_32, dispatch_profile, find_byte_delta,
 };
 
 mod anchored_line_capture;
@@ -471,7 +471,7 @@ pub use literal_set::{
     LiteralSetAccounting, LiteralSetBuildAccounting, LiteralSetBuildLimits, LiteralSetError,
     LiteralSetFoldAttachment, LiteralSetIterationAccounting, LiteralSetMatchSemantics,
     LiteralSetMatches, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
-    LiteralSetUniformStandardOrdinaryExecutor,
+    LiteralSetStablePattern, LiteralSetUniformStandardOrdinaryExecutor,
 };
 pub use literal_set_compact::{
     LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,

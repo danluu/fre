@@ -2498,14 +2498,25 @@ fn checked_mul(
 }
 
 // Stable construction may use only pattern carriers whose bytes cannot
-// change between preflight and DFA construction. Keep this trait private so
-// an arbitrary `AsRef<[u8]>` provider cannot opt into that authority.
+// change between preflight and DFA construction. Keep the sealing trait
+// private so an arbitrary `AsRef<[u8]>` provider cannot opt into that
+// authority.
 mod stable_pattern {
-    pub(super) trait Sealed: AsRef<[u8]> {}
+    pub trait Sealed: AsRef<[u8]> {}
 
     impl Sealed for Vec<u8> {}
     impl Sealed for &[u8] {}
+    impl Sealed for &str {}
 }
+
+/// Immutable pattern carriers accepted by stable borrowed construction.
+///
+/// This trait is sealed so an arbitrary `AsRef<[u8]>` implementation cannot
+/// change its bytes between preflight and automaton construction.
+#[doc(hidden)]
+pub trait LiteralSetStablePattern: stable_pattern::Sealed {}
+
+impl<P: stable_pattern::Sealed> LiteralSetStablePattern for P {}
 
 impl LiteralSetPlan {
     /// Compile stable owned literal alternatives into a DFA.
@@ -2534,10 +2545,10 @@ impl LiteralSetPlan {
 
     /// Compile stable borrowed literal alternatives into a DFA.
     ///
-    /// The shared byte slices inspected here remain immutable for this call,
-    /// so they carry the same construction authority as the owned values
-    /// accepted by [`Self::new_stable`]. Equal, positive-width alternatives
-    /// may therefore use standard earliest-acceptance construction while the
+    /// The sealed borrowed carriers inspected here remain immutable for this
+    /// call, so they carry the same construction authority as the owned values
+    /// accepted by [`Self::new_stable`]. Equal, positive-width alternatives may
+    /// therefore use standard earliest-acceptance construction while the
     /// receipt and exposed spans retain leftmost-first semantics.
     ///
     /// # Errors
@@ -2546,8 +2557,8 @@ impl LiteralSetPlan {
     #[doc(hidden)]
     #[cold]
     #[inline(never)]
-    pub fn new_stable_borrowed(
-        patterns: &[&[u8]],
+    pub fn new_stable_borrowed<P: LiteralSetStablePattern>(
+        patterns: &[P],
         limits: LiteralSetBuildLimits,
     ) -> Result<Self, LiteralSetError> {
         Self::new_stable_patterns(patterns, limits)
@@ -6147,7 +6158,10 @@ mod tests {
             Err(LiteralSetError::EmptyPatternSet)
         ));
         assert!(matches!(
-            LiteralSetPlan::new_stable_borrowed(&[], LiteralSetBuildLimits::default()),
+            LiteralSetPlan::new_stable_borrowed(
+                &[] as &[&[u8]],
+                LiteralSetBuildLimits::default(),
+            ),
             Err(LiteralSetError::EmptyPatternSet)
         ));
         let patterns = [b"abc".as_slice(), b"def".as_slice()];

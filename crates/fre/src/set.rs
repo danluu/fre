@@ -2,16 +2,20 @@
 
 use core::{fmt, mem::size_of};
 
+use fre_kernels::{
+    LiteralSetBuildAccounting, LiteralSetBuildLimits, LiteralSetPlan, Window as LiteralWindow,
+};
 use fre_syntax::RustProfile;
 
 use crate::{
-    BuildError, BuildLimits, BuildReport, PortableBuilder, PortableRegex, PortableSearchSession,
-    SearchError, SearchLimits, SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow,
-    rust_profile_size_limit, set_rust_profile_size_limit,
+    BuildError, BuildLimits, BuildReport, PortableBuilder, PortablePlan, PortableRegex,
+    PortableSearchSession, SearchError, SearchLimits, SearchSessionLimits,
+    SearchSessionSetupAccounting, SearchWindow, rust_profile_size_limit,
+    set_rust_profile_size_limit,
 };
 
 /// Stable schema for portable regex-set construction and execution reports.
-pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 6;
+pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 7;
 
 /// Stable schema for reusable regex-set session construction reports.
 pub const PORTABLE_REGEX_SET_SESSION_SCHEMA_VERSION: u32 = 1;
@@ -23,10 +27,14 @@ pub struct PortableRegexSetBuildLimits {
     pub max_patterns: usize,
     /// Maximum sum of source bytes across every pattern.
     pub max_pattern_bytes: usize,
-    /// Maximum charged retained bytes for source storage, matcher slots and
-    /// the logical plan storage reported by each matcher.
+    /// Maximum charged retained bytes for source storage, matcher slots,
+    /// constituent plan storage and any optional fused existence sidecar.
+    /// The mandatory independently executable set may still be published
+    /// when only the optional sidecar exceeds the residual budget.
     pub max_persistent_bytes: usize,
-    /// Complete per-pattern construction limits.
+    /// Complete per-pattern construction limits. For byte sets, the nested
+    /// `literal_set` limits also bound the optional set-wide fused suffix
+    /// existence sidecar. Text sets do not construct that sidecar.
     pub pattern: BuildLimits,
 }
 
@@ -53,7 +61,19 @@ pub struct PortableRegexSetBuildReport {
     pub regex_capacity_bytes: usize,
     pub matcher_source_bytes: usize,
     pub capture_name_storage_bytes: usize,
+    /// Sum of constituent matcher plan storage. The optional fused existence
+    /// sidecar is reported separately below.
     pub plan_storage_bytes: usize,
+    /// Complete construction receipt for the optional exact-literal suffix
+    /// existence sidecar. Its pattern and byte counts exclude source-order
+    /// constituent zero. `None` records either structural ineligibility or a
+    /// fail-open construction/resource refusal.
+    pub fused_literal_set_build: Option<LiteralSetBuildAccounting>,
+    /// Kernel-reported logical plan payload bytes for the optional
+    /// exact-literal suffix existence sidecar. Zero means construction
+    /// declined or the set shape was ineligible; this is not an
+    /// allocator-footprint measurement.
+    pub fused_literal_set_storage_bytes: usize,
     pub charged_persistent_bytes: usize,
 }
 
@@ -295,7 +315,12 @@ impl<'a> PortableRegexSetBuilder<'a> {
     /// Compile every pattern independently and publish one immutable set.
     ///
     /// Empty sets are valid and never match. Pattern IDs always correspond to
-    /// source order, including duplicate patterns.
+    /// source order, including duplicate patterns. A set of at least eight
+    /// positive exact literals additionally attempts one fused full-haystack
+    /// existence plan for every constituent after pattern zero. Its
+    /// construction and persistent limits are inherited from the configured
+    /// constituent literal-set limits and the residual aggregate byte budget;
+    /// any refusal simply retains the independent matcher implementation.
     ///
     /// # Errors
     ///
@@ -414,7 +439,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
             source_buffer_capacity,
             "complete source capacity bytes",
         )?;
-        let charged_persistent_bytes = checked_sum(
+        let incumbent_charged_persistent_bytes = checked_sum(
             [
                 source_capacity_bytes,
                 regex_capacity_bytes,
@@ -424,6 +449,31 @@ impl<'a> PortableRegexSetBuilder<'a> {
             ],
             "complete charged persistent bytes",
         )?;
+        enforce_persistent(
+            incumbent_charged_persistent_bytes,
+            self.limits.max_persistent_bytes,
+        )?;
+        let remaining_persistent_bytes = self
+            .limits
+            .max_persistent_bytes
+            .checked_sub(incumbent_charged_persistent_bytes)
+            .expect("the mandatory set charge was enforced before computing residual bytes");
+        let fused_literal_set = try_build_fused_exact_literal_exists(
+            &regexes,
+            self.limits.pattern.literal_set,
+            remaining_persistent_bytes,
+        );
+        let fused_literal_set_build = fused_literal_set
+            .as_ref()
+            .map(|fused| fused.plan.build_accounting());
+        let fused_literal_set_storage_bytes =
+            fused_literal_set_build.map_or(0, |build| build.persistent_bytes);
+        let charged_persistent_bytes = checked_add(
+            incumbent_charged_persistent_bytes,
+            fused_literal_set_storage_bytes,
+            "complete charged persistent bytes with fused literal set",
+        )?;
+        enforce_persistent(charged_persistent_bytes, self.limits.max_persistent_bytes)?;
         let report = PortableRegexSetBuildReport {
             schema_version: PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION,
             profile: self.profile.clone(),
@@ -435,11 +485,14 @@ impl<'a> PortableRegexSetBuilder<'a> {
             matcher_source_bytes,
             capture_name_storage_bytes,
             plan_storage_bytes,
+            fused_literal_set_build,
+            fused_literal_set_storage_bytes,
             charged_persistent_bytes,
         };
         Ok(PortableRegexSet {
             patterns,
             regexes,
+            fused_literal_set,
             report,
         })
     }
@@ -449,7 +502,26 @@ impl<'a> PortableRegexSetBuilder<'a> {
 pub struct PortableRegexSet {
     patterns: Vec<String>,
     regexes: Vec<PortableRegex>,
+    fused_literal_set: Option<FusedExactLiteralExists>,
     report: PortableRegexSetBuildReport,
+}
+
+#[derive(Clone, Debug)]
+struct FusedExactLiteralExists {
+    plan: LiteralSetPlan,
+    origin_first_bytes: [u64; 4],
+}
+
+impl FusedExactLiteralExists {
+    #[inline(always)]
+    fn origin_may_match(&self, haystack: &[u8]) -> bool {
+        let Some(&byte) = haystack.first() else {
+            return false;
+        };
+        let word = usize::from(byte) / u64::BITS as usize;
+        let bit = usize::from(byte) % u64::BITS as usize;
+        self.origin_first_bytes[word] & (1_u64 << bit) != 0
+    }
 }
 
 impl Clone for PortableRegexSet {
@@ -635,7 +707,14 @@ impl PortableRegexSet {
     /// Whether any pattern matches the full haystack without constructing set
     /// or constituent execution reports.
     ///
-    /// This operation deliberately has unlimited execution resources. Use
+    /// This operation deliberately has unlimited execution resources. Sets
+    /// that retained an all-positive exact-literal suffix sidecar may use a
+    /// leading-byte-gated origin probe, then search pattern zero independently
+    /// and use the sidecar after those misses. Short inputs whose leading byte
+    /// could begin a literal retain source-ordered constituent execution.
+    /// Ranged, accounted and session APIs always execute their independent
+    /// constituents. The unlimited caller-buffer all-ID route may use the
+    /// same sidecar only to certify that no suffix ID can match. Use
     /// [`Self::is_match`] when finite work, scratch, or pattern-count limits
     /// must be enforced.
     #[inline(always)]
@@ -643,6 +722,46 @@ impl PortableRegexSet {
         &self,
         haystack: &[u8],
     ) -> Result<bool, PortableRegexSetExecutionError> {
+        if let Some(fused) = &self.fused_literal_set {
+            let origin_may_match = fused.origin_may_match(haystack);
+            if origin_may_match && haystack.len() < FUSED_LITERAL_SET_ORIGIN_PROBE_MIN_BYTES {
+                return self.is_match_value_at_unlimited(haystack, 0);
+            }
+            // Preserve the cheapest common positive case before entering the
+            // aggregate automaton. The sidecar's construction eligibility
+            // proves that every constituent is one positive exact literal.
+            if origin_may_match {
+                for regex in &self.regexes {
+                    let PortablePlan::ExactLiteral(literal) = &regex.plan else {
+                        unreachable!("the fused suffix admits only exact literals");
+                    };
+                    if haystack.starts_with(literal.needle()) {
+                        return Ok(true);
+                    }
+                }
+            }
+            let first = is_match_window_value_unlimited(
+                &self.regexes[0],
+                haystack,
+                SearchWindow::new(0, haystack.len()),
+            )
+            .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                index: 0,
+                total_work_before: 0,
+                remaining_total_work: u64::MAX,
+                source,
+            })?;
+            if first {
+                return Ok(true);
+            }
+            let executor = fused
+                .plan
+                .ordinary_executor()
+                .expect("the fused suffix plan retains only positive exact literals");
+            return Ok(executor
+                .exists_window_value(haystack, LiteralWindow::full(haystack))
+                .expect("a complete-haystack fused literal-set window is valid"));
+        }
         self.is_match_value_at_unlimited(haystack, 0)
     }
 
@@ -717,13 +836,14 @@ impl PortableRegexSet {
         validate_start(start, haystack.len())?;
         let window = SearchWindow::new(start, haystack.len());
         for (index, regex) in self.regexes.iter().enumerate() {
-            let matched = regex
-                .is_match_window_value(haystack, window, SearchLimits::unlimited())
-                .map_err(|source| PortableRegexSetExecutionError::Pattern {
-                    index,
-                    total_work_before: 0,
-                    remaining_total_work: u64::MAX,
-                    source,
+            let matched =
+                is_match_window_value_unlimited(regex, haystack, window).map_err(|source| {
+                    PortableRegexSetExecutionError::Pattern {
+                        index,
+                        total_work_before: 0,
+                        remaining_total_work: u64::MAX,
+                        source,
+                    }
                 })?;
             if matched {
                 return Ok(true);
@@ -884,7 +1004,11 @@ impl PortableRegexSet {
     /// Calls with any finite set or constituent limit retain the exact
     /// accounted implementation, including cumulative work, partial flag
     /// mutation, and refusal precedence. The value route is selected only
-    /// when every field equals [`PortableRegexSetRunLimits::unlimited`].
+    /// when every field equals [`PortableRegexSetRunLimits::unlimited`]. An
+    /// eligible exact-literal set on a long complete-haystack search executes
+    /// ID zero once, then uses its fused suffix only as a negative certificate.
+    /// A certified miss avoids all remaining constituent searches; a possible
+    /// suffix match retains the source-ID loop.
     ///
     /// # Errors
     ///
@@ -920,7 +1044,38 @@ impl PortableRegexSet {
         }
         let window = SearchWindow::new(start, haystack.len());
         let mut any = false;
-        for (index, regex) in self.regexes.iter().enumerate() {
+        let mut first_unsearched = 0_usize;
+        if start == 0
+            && haystack.len() >= FUSED_LITERAL_SET_ALL_ID_NEGATIVE_MIN_BYTES
+            && let Some(fused) = &self.fused_literal_set
+        {
+            let first = self.regexes[0]
+                .is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                    index: 0,
+                    total_work_before: 0,
+                    remaining_total_work: u64::MAX,
+                    source,
+                })?;
+            first_unsearched = 1;
+            if first {
+                match_flags[0] = true;
+                any = true;
+            } else {
+                let suffix_may_match = fused.plan.ordinary_executor().and_then(|executor| {
+                    executor
+                        .exists_window_value(
+                            haystack,
+                            LiteralWindow::new(window.start(), window.end()),
+                        )
+                        .ok()
+                });
+                if suffix_may_match == Some(false) {
+                    return Ok(false);
+                }
+            }
+        }
+        for (index, regex) in self.regexes.iter().enumerate().skip(first_unsearched) {
             let matched = regex
                 .is_match_window_value(haystack, window, SearchLimits::unlimited())
                 .map_err(|source| PortableRegexSetExecutionError::Pattern {
@@ -2092,6 +2247,80 @@ const fn set_value_route_is_unlimited(limits: PortableRegexSetRunLimits) -> bool
     limits.max_total_work == u64::MAX
         && limits.pattern.max_work == u64::MAX
         && limits.pattern.max_scratch_bytes == usize::MAX
+}
+
+// Below 128 bytes, a possible literal prefix is cheaper to resolve with the
+// already retained source-ordered exact finders than with an O(K) origin probe
+// followed by aggregate setup. A leading-byte impossibility still takes the
+// fused route at every length.
+const FUSED_LITERAL_SET_ORIGIN_PROBE_MIN_BYTES: usize = 128;
+
+// A possible suffix hit pays for the certificate and then retains the
+// constituent ID loop. Keep that speculative extra scan off short inputs;
+// the stable all-ID gap is on long haystacks where a global miss replaces K
+// independent passes.
+const FUSED_LITERAL_SET_ALL_ID_NEGATIVE_MIN_BYTES: usize = 128;
+
+#[inline(always)]
+fn is_match_window_value_unlimited(
+    regex: &PortableRegex,
+    haystack: &[u8],
+    window: SearchWindow,
+) -> Result<bool, SearchError> {
+    if let PortablePlan::ExactLiteral(literal) = &regex.plan
+        && let Some(executor) = literal.ordinary_executor()
+    {
+        return executor
+            .exists_window_value(haystack, LiteralWindow::new(window.start(), window.end()))
+            .map_err(SearchError::from);
+    }
+    regex.is_match_window_value(haystack, window, SearchLimits::unlimited())
+}
+
+#[cold]
+#[inline(never)]
+fn try_build_fused_exact_literal_exists(
+    regexes: &[PortableRegex],
+    mut limits: LiteralSetBuildLimits,
+    remaining_persistent_bytes: usize,
+) -> Option<FusedExactLiteralExists> {
+    if regexes.len() < 8 {
+        return None;
+    }
+    let PortablePlan::ExactLiteral(first) = &regexes[0].plan else {
+        return None;
+    };
+    if first.needle().is_empty() {
+        return None;
+    }
+    let mut origin_first_bytes = [0_u64; 4];
+    record_first_byte(&mut origin_first_bytes, first.needle()[0]);
+    let suffix = &regexes[1..];
+    let mut needles = Vec::new();
+    needles.try_reserve_exact(suffix.len()).ok()?;
+    for regex in suffix {
+        let PortablePlan::ExactLiteral(literal) = &regex.plan else {
+            return None;
+        };
+        let needle = literal.needle();
+        if needle.is_empty() {
+            return None;
+        }
+        record_first_byte(&mut origin_first_bytes, needle[0]);
+        needles.push(needle);
+    }
+    limits.max_persistent_bytes = limits.max_persistent_bytes.min(remaining_persistent_bytes);
+    let plan = LiteralSetPlan::new_stable_borrowed(&needles, limits).ok()?;
+    Some(FusedExactLiteralExists {
+        plan,
+        origin_first_bytes,
+    })
+}
+
+fn record_first_byte(words: &mut [u64; 4], byte: u8) {
+    let word = usize::from(byte) / u64::BITS as usize;
+    let bit = usize::from(byte) % u64::BITS as usize;
+    words[word] |= 1_u64 << bit;
 }
 
 fn enforce<E>(needed: usize, limit: usize, error: impl FnOnce(usize, usize) -> E) -> Result<(), E> {

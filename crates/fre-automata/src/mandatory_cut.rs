@@ -23,7 +23,7 @@ use core::{cmp::Ordering, mem::size_of};
 use crate::{EdgeKind, RawPlan, StateRole};
 
 /// Stable identity for this mandatory-cut proof and its accounting rules.
-pub const MANDATORY_CUT_ACCOUNTING_ID: &str = "fre.automata.mandatory-cut.v1";
+pub const MANDATORY_CUT_ACCOUNTING_ID: &str = "fre.automata.mandatory-cut.v2";
 /// Default maximum abstract work for one optional mandatory-cut analysis.
 pub const DEFAULT_MANDATORY_CUT_MAX_WORK: u64 = 2_000_000;
 /// Default maximum cumulative logical scratch-allocation items.
@@ -505,6 +505,43 @@ fn analyze_mandatory_cut_inner(
     budget.stats.accepting_states = graph.accepts.len();
     if graph.accepts.is_empty() {
         return Ok(None);
+    }
+    let start = to_usize(raw.start, "mandatory-cut singleton start")?;
+    let productive_start_incoming = graph
+        .incoming
+        .by_target
+        .get(start)
+        .ok_or(MandatoryCutDeclineReason::InternalInvariant {
+            detail: "mandatory-cut singleton start lost its incoming row",
+        })?
+        .iter()
+        .try_fold(false, |present, edge| {
+            budget.charge(1)?;
+            let source = to_usize(edge.source, "mandatory-cut singleton incoming source")?;
+            Ok::<_, MandatoryCutDeclineReason>(
+                present || graph.productive.get(source) == Some(&true),
+            )
+        })?;
+    if graph.productive.get(start) == Some(&true)
+        && raw.roles.get(start) == Some(&StateRole::Consume)
+        && !productive_start_incoming
+    {
+        let byte_class = first_byte_class(raw, &graph.productive, start, budget)?;
+        // A productive consuming start with no productive incoming edge is
+        // itself a mandatory root at exact consumed distance zero. When its
+        // productive byte class is a singleton, no later root can outrank it:
+        // cardinality and finite distance are both already at their non-empty
+        // minima. Publish that exact stable winner without constructing
+        // dominator or SCC-distance tables.
+        if byte_class.cardinality() == 1 {
+            budget.stats.mandatory_roots = 1;
+            budget.charge(1)?;
+            return Ok(Some(MandatoryCutCandidate {
+                root_state: raw.start,
+                byte_class,
+                maximum_before_root: MaximumConsumedDistance::Finite(0),
+            }));
+        }
     }
     let dominators = DominatorFacts::build(raw, &graph, budget)?;
     let distances = DistanceFacts::build(raw, &graph, budget)?;
@@ -2021,14 +2058,24 @@ mod tests {
                     );
                     let report = complete(&graph);
                     let expected_roots = brute_roots(&graph);
+                    let expected_candidate = brute_candidate(&graph);
+                    let expected_inspected_roots = if expected_candidate.is_some_and(|candidate| {
+                        candidate.root_state() == graph.start
+                            && candidate.byte_class().cardinality() == 1
+                            && candidate.maximum_before_root() == MaximumConsumedDistance::Finite(0)
+                    }) {
+                        1
+                    } else {
+                        expected_roots.len()
+                    };
                     assert_eq!(
                         report.stats().mandatory_roots(),
-                        expected_roots.len(),
+                        expected_inspected_roots,
                         "roles={roles:?} edge={edge_mask:#x} start={start}"
                     );
                     assert_eq!(
                         report.candidate(),
-                        brute_candidate(&graph),
+                        expected_candidate,
                         "roles={roles:?} edge={edge_mask:#x} start={start}"
                     );
                     assert!(report.stats().closes(MandatoryCutAnalysisLimits::default()));
@@ -2071,8 +2118,63 @@ mod tests {
         }
         rows.push(Vec::new());
         let report = complete(&raw(0, roles, rows));
-        assert_eq!(report.stats().mandatory_roots(), CONSUMING);
+        assert_eq!(report.stats().mandatory_roots(), 1);
         assert_eq!(candidate(report, 0).byte_class().cardinality(), 1);
+    }
+
+    #[test]
+    fn singleton_start_incoming_scan_is_exactly_charged() {
+        let graph = raw(
+            0,
+            vec![StateRole::Consume, StateRole::Accept, StateRole::Consume],
+            vec![vec![byte(1, b'a')], vec![], vec![byte(0, b'z')]],
+        );
+        let full = complete(&graph);
+        assert_eq!(candidate(full, 0).byte_class().cardinality(), 1);
+
+        // After the incoming-edge inspection, the shortcut has seven work
+        // units left: one productive start edge, one singleton byte, four
+        // bitmap words, and one selected-root charge. A limit eight below the
+        // complete receipt therefore stops exactly on the incoming edge.
+        let max_work = full
+            .stats()
+            .work()
+            .checked_sub(8)
+            .expect("shortcut work includes its charged suffix");
+        let limits = MandatoryCutAnalysisLimits {
+            max_work,
+            ..MandatoryCutAnalysisLimits::default()
+        };
+        let MandatoryCutAnalysis::Declined(decline) = analyze_mandatory_cut(&graph, limits) else {
+            panic!("uncharged singleton-start incoming scan")
+        };
+        assert_eq!(
+            decline.reason(),
+            MandatoryCutDeclineReason::Resource {
+                resource: MandatoryCutResource::Work,
+                needed: max_work.checked_add(1).expect("small test work"),
+                limit: max_work,
+            }
+        );
+        assert_eq!(decline.stats().accepting_states(), 1);
+        assert!(decline.stats().closes(limits));
+    }
+
+    #[test]
+    fn broad_productive_start_falls_through_to_a_later_singleton() {
+        let graph = raw(
+            0,
+            vec![StateRole::Consume, StateRole::Consume, StateRole::Accept],
+            vec![vec![byte_range(1, b'a', b'b')], vec![byte(2, b'x')], vec![]],
+        );
+        let report = complete(&graph);
+        assert_eq!(report.stats().mandatory_roots(), 2);
+        let selected = candidate(report, 1);
+        assert_eq!(selected.byte_class().cardinality(), 1);
+        assert_eq!(
+            selected.maximum_before_root(),
+            MaximumConsumedDistance::Finite(1)
+        );
     }
 
     #[test]

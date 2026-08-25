@@ -895,7 +895,7 @@ use fre_kernels::{
     LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
     LiteralSetCompactOrdinaryExecutor, LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
     LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
-    LiteralSetUniformStandardOrdinaryExecutor,
+    LiteralSetStablePattern, LiteralSetUniformStandardOrdinaryExecutor,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetOrdinaryExecutor,
     PackedLiteralSetPlan, PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
@@ -6068,6 +6068,12 @@ pub struct RipgrepStandardLiteralByteCensus {
     matching_bytes: [u64; 4],
 }
 
+// Switch before validating the pattern that brings the authenticated literal
+// byte total to this boundary. The byte-indexed accumulator removes one
+// variable shift and one word read-modify-write from every later byte while
+// retaining a bounded conversion back to the exact public receipt.
+const RIPGREP_STANDARD_LITERAL_CENSUS_PRESENCE_THRESHOLD_BYTES: u64 = 1_024;
+
 impl RipgrepStandardLiteralByteCensus {
     fn empty() -> RipgrepStandardLiteralByteCensus {
         RipgrepStandardLiteralByteCensus {
@@ -6088,6 +6094,70 @@ impl RipgrepStandardLiteralByteCensus {
         let word = usize::from(byte >> 6);
         let bit = byte & 0x3F;
         self.matching_bytes[word] & (1_u64 << bit) != 0
+    }
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "inline presence avoids allocation and per-byte bit arithmetic"
+)]
+enum RipgrepStandardLiteralByteCensusAccumulator {
+    Bitset(RipgrepStandardLiteralByteCensus),
+    Presence([bool; 256]),
+}
+
+impl RipgrepStandardLiteralByteCensusAccumulator {
+    fn empty() -> Self {
+        Self::Bitset(RipgrepStandardLiteralByteCensus::empty())
+    }
+
+    fn prepare_for_cumulative_bytes(&mut self, cumulative_bytes: u64) {
+        if cumulative_bytes < RIPGREP_STANDARD_LITERAL_CENSUS_PRESENCE_THRESHOLD_BYTES {
+            return;
+        }
+        let Self::Bitset(census) = self else {
+            return;
+        };
+        let census = *census;
+        let mut presence = [false; 256];
+        for byte in 0..=u8::MAX {
+            presence[usize::from(byte)] = census.contains(byte);
+        }
+        *self = Self::Presence(presence);
+    }
+
+    #[inline]
+    fn classify(&mut self, text: &str, forbidden_byte: Option<u8>) -> Option<bool> {
+        match self {
+            Self::Bitset(census) => {
+                classify_ripgrep_standard_literal_text_with_census(text, forbidden_byte, census)
+            }
+            Self::Presence(presence) => {
+                classify_ripgrep_standard_literal_text_with_recorder(text, forbidden_byte, |byte| {
+                    presence[usize::from(byte)] = true
+                })
+            }
+        }
+    }
+
+    fn into_census(self) -> RipgrepStandardLiteralByteCensus {
+        match self {
+            Self::Bitset(census) => census,
+            Self::Presence(presence) => {
+                let mut census = RipgrepStandardLiteralByteCensus::empty();
+                for byte in 0..=u8::MAX {
+                    if presence[usize::from(byte)] {
+                        census.insert(byte);
+                    }
+                }
+                census
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn uses_presence(&self) -> bool {
+        matches!(self, Self::Presence(_))
     }
 }
 
@@ -6249,9 +6319,9 @@ fn ripgrep_flat_literal_build_report(
 
 #[cold]
 #[inline(never)]
-fn publish_ripgrep_borrowed_flat_literal_set(
+fn publish_ripgrep_borrowed_flat_literal_set<P: LiteralSetStablePattern>(
     builder: &PortableBuilder,
-    patterns: &[&[u8]],
+    patterns: &[P],
     planner_work: u64,
     publication: RipgrepFlatLiteralPublication,
 ) -> Result<PortableRegex, BuildError> {
@@ -6346,7 +6416,7 @@ fn publish_ripgrep_canonical_flat_literal_set(
 #[inline(never)]
 fn publish_ripgrep_borrowed_flat_literal_set_ordinary(
     builder: &PortableBuilder,
-    patterns: &[&[u8]],
+    patterns: &[&str],
     planner_work: u64,
     publication: RipgrepFlatLiteralPublication,
 ) -> Result<RipgrepStandardLiteralsBuild, BuildError> {
@@ -6614,6 +6684,17 @@ fn classify_ripgrep_standard_literal_text_with_census(
     forbidden_byte: Option<u8>,
     census: &mut RipgrepStandardLiteralByteCensus,
 ) -> Option<bool> {
+    classify_ripgrep_standard_literal_text_with_recorder(text, forbidden_byte, |byte| {
+        census.insert(byte);
+    })
+}
+
+#[inline]
+fn classify_ripgrep_standard_literal_text_with_recorder(
+    text: &str,
+    forbidden_byte: Option<u8>,
+    mut record: impl FnMut(u8),
+) -> Option<bool> {
     let first = text.chars().next()?;
     for &byte in text.as_bytes() {
         if byte == b'\n'
@@ -6622,7 +6703,7 @@ fn classify_ripgrep_standard_literal_text_with_census(
         {
             return None;
         }
-        census.insert(byte);
+        record(byte);
     }
     Some(first.len_utf8() < text.len())
 }
@@ -6758,7 +6839,7 @@ where
     }
     let mut all_single_character = true;
     let mut literal_byte_census =
-        REJECT_META_CHARACTERS.then_some(RipgrepStandardLiteralByteCensus::empty());
+        REJECT_META_CHARACTERS.then_some(RipgrepStandardLiteralByteCensusAccumulator::empty());
     for index in 0..pattern_count {
         let literal = literal_at(index)?;
         let bytes_slice = literal.bytes();
@@ -6779,10 +6860,8 @@ where
             let Some(census) = literal_byte_census.as_mut() else {
                 return None;
             };
-            (
-                0_u64,
-                classify_ripgrep_standard_literal_text_with_census(text, forbidden_byte, census)?,
-            )
+            census.prepare_for_cumulative_bytes(next_literal_bytes);
+            (0_u64, census.classify(text, forbidden_byte)?)
         } else {
             // Raw HIR bytes independently validate UTF-8 above and retain
             // the incumbent scalar scan and exact escaping calculation.
@@ -6867,7 +6946,7 @@ where
                 guarantees_valid_utf8_nonempty: true,
             },
         },
-        literal_byte_census,
+        literal_byte_census.map(RipgrepStandardLiteralByteCensusAccumulator::into_census),
     ))
 }
 
@@ -7479,7 +7558,14 @@ impl PortableBuilder {
             patterns,
             canonical_source_limit,
             None,
-            publish_ripgrep_borrowed_flat_literal_set,
+            |builder, patterns, planner_work, publication| {
+                publish_ripgrep_borrowed_flat_literal_set(
+                    builder,
+                    patterns,
+                    planner_work,
+                    publication,
+                )
+            },
         )
         .map(|built| built.map(|(regex, _census)| regex))
     }
@@ -7544,7 +7630,7 @@ impl PortableBuilder {
     where
         F: FnOnce(
             &PortableBuilder,
-            &[&[u8]],
+            &[&str],
             u64,
             RipgrepFlatLiteralPublication,
         ) -> Result<T, BuildError>,
@@ -7566,12 +7652,7 @@ impl PortableBuilder {
         let census = literal_byte_census.ok_or(BuildError::InternalInvariant(
             "typed ripgrep literal context omitted its byte census",
         ))?;
-        let mut borrowed: [&[u8]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS] =
-            [&[]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS];
-        for (slot, pattern) in borrowed.iter_mut().zip(pattern_texts) {
-            *slot = pattern.as_bytes();
-        }
-        let patterns = &borrowed[..pattern_texts.len()];
+        let patterns = pattern_texts;
         let literal_bytes = usize::try_from(context.syntax.literal_bytes).map_err(|_| {
             BuildError::InternalInvariant("ripgrep literal bytes do not fit usize")
         })?;
@@ -30412,6 +30493,112 @@ mod tests {
                 .expect("resource refusal completes")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ripgrep_literal_census_presence_threshold_is_exact() {
+        let threshold = super::RIPGREP_STANDARD_LITERAL_CENSUS_PRESENCE_THRESHOLD_BYTES;
+        let below_threshold = threshold
+            .checked_sub(1)
+            .expect("the focused census threshold is positive");
+        let above_threshold = threshold
+            .checked_add(1)
+            .expect("the focused census threshold has a successor");
+
+        let mut below = super::RipgrepStandardLiteralByteCensusAccumulator::empty();
+        below.prepare_for_cumulative_bytes(below_threshold);
+        assert!(!below.uses_presence());
+        below.prepare_for_cumulative_bytes(threshold);
+        assert!(below.uses_presence());
+
+        let mut exact = super::RipgrepStandardLiteralByteCensusAccumulator::empty();
+        assert_eq!(exact.classify("azé", None), Some(true));
+        exact.prepare_for_cumulative_bytes(threshold);
+        assert!(exact.uses_presence());
+        assert_eq!(exact.classify("界\0", None), Some(true));
+        let exact = exact.into_census();
+        let mut expected = [false; 256];
+        for &byte in "azé界\0".as_bytes() {
+            expected[usize::from(byte)] = true;
+        }
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                exact.contains(byte),
+                expected[usize::from(byte)],
+                "presence census differs for byte {byte:#04x}",
+            );
+        }
+
+        let mut above = super::RipgrepStandardLiteralByteCensusAccumulator::empty();
+        above.prepare_for_cumulative_bytes(above_threshold);
+        assert!(above.uses_presence());
+    }
+
+    #[test]
+    fn ripgrep_literal_census_switches_at_pattern_boundaries_and_refuses_exactly() {
+        let threshold =
+            usize::try_from(super::RIPGREP_STANDARD_LITERAL_CENSUS_PRESENCE_THRESHOLD_BYTES)
+                .expect("the focused census threshold fits usize");
+        assert!(threshold > 129);
+        let below_threshold = threshold
+            .checked_sub(1)
+            .expect("the focused census threshold is positive");
+        let above_threshold = threshold
+            .checked_add(1)
+            .expect("the focused census threshold has a successor");
+
+        let patterns_with_total = |total: usize| {
+            let mut patterns = vec!["a".to_owned(); 128];
+            let tail_len = total
+                .checked_sub(patterns.len())
+                .expect("the focused total exceeds the fixed prefix");
+            let tail = "bcdefghijklmnopqrstuvwxyz0123456789_/"
+                .chars()
+                .cycle()
+                .take(tail_len)
+                .collect::<String>();
+            patterns.push(tail);
+            patterns
+        };
+        let census = |patterns: &[String], forbidden_byte| {
+            super::ripgrep_standard_literal_context_from_with_census::<_, _, true>(
+                patterns.len(),
+                |index| patterns.get(index).map(String::as_str),
+                BuildLimits::default(),
+                usize::MAX,
+                forbidden_byte,
+            )
+            .and_then(|(_context, census)| census)
+        };
+
+        for total in [below_threshold, threshold, above_threshold] {
+            let patterns = patterns_with_total(total);
+            let observed = census(&patterns, None).expect("focused literals are admitted");
+            let mut expected = [false; 256];
+            for &byte in patterns.iter().flat_map(String::as_bytes) {
+                expected[usize::from(byte)] = true;
+            }
+            for byte in 0..=u8::MAX {
+                assert_eq!(
+                    observed.contains(byte),
+                    expected[usize::from(byte)],
+                    "total={total}, byte={byte:#04x}",
+                );
+            }
+        }
+
+        for (invalid, forbidden_byte) in [('[', None), ('\n', None), ('\0', Some(b'\0'))] {
+            let mut patterns = patterns_with_total(threshold);
+            let tail = patterns
+                .last_mut()
+                .expect("the focused pattern set is nonempty");
+            tail.pop();
+            tail.push(invalid);
+            assert!(
+                census(&patterns, forbidden_byte).is_none(),
+                "post-switch invalid byte {invalid:?} was admitted",
+            );
+        }
     }
 
     #[test]

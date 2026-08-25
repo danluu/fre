@@ -210,7 +210,7 @@ fn authenticated_bytes_regex_set_doctest_inventory_has_no_silent_omissions() {
 
 #[test]
 fn aggregate_size_limit_uses_the_reported_fre_boundary_and_retains_identity() {
-    let patterns = sources(&["a", "b"]);
+    let patterns = sources(&["a", "b", "c", "d", "e", "f", "g", "h"]);
     let mut limits = PortableRegexSetBuildLimits::default();
     limits.pattern.max_persistent_bytes = usize::MAX;
     let measured = PortableRegexSetBuilder::new(&patterns)
@@ -220,6 +220,9 @@ fn aggregate_size_limit_uses_the_reported_fre_boundary_and_retains_identity() {
         .build()
         .expect("unbounded FRE set measurement");
     let needed = measured.build_report().charged_persistent_bytes;
+    let fused = measured.build_report().fused_literal_set_storage_bytes;
+    assert!(fused > 0);
+    let mandatory = needed - fused;
 
     let fre_exact = PortableRegexSetBuilder::new(&patterns)
         .unicode(false)
@@ -228,6 +231,10 @@ fn aggregate_size_limit_uses_the_reported_fre_boundary_and_retains_identity() {
         .build()
         .expect("exact FRE aggregate boundary");
     assert_eq!(fre_exact.build_report().charged_persistent_bytes, needed);
+    assert_eq!(
+        fre_exact.build_report().fused_literal_set_storage_bytes,
+        fused
+    );
     assert_eq!(fre_exact.build_report().limits.max_persistent_bytes, needed);
     let profiles = core::iter::once(&fre_exact.build_report().profile).chain(
         (0..fre_exact.len()).map(|index| {
@@ -247,7 +254,35 @@ fn aggregate_size_limit_uses_the_reported_fre_boundary_and_retains_identity() {
         assert_eq!(*size_limit, u64::try_from(needed).unwrap_or(u64::MAX));
     }
 
-    let one_below = needed.checked_sub(1).expect("nonzero aggregate charge");
+    let attachment_below = needed.checked_sub(1).expect("nonzero aggregate charge");
+    let degraded = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .limits(limits)
+        .size_limit(attachment_below)
+        .build()
+        .expect("optional existence sidecar degrades below its boundary");
+    assert_eq!(degraded.build_report().fused_literal_set_storage_bytes, 0);
+    assert_eq!(degraded.build_report().charged_persistent_bytes, mandatory);
+
+    let incumbent_exact = PortableRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .limits(limits)
+        .size_limit(mandatory)
+        .build()
+        .expect("exact mandatory incumbent boundary");
+    assert_eq!(
+        incumbent_exact
+            .build_report()
+            .fused_literal_set_storage_bytes,
+        0
+    );
+    assert_eq!(
+        incumbent_exact.build_report().charged_persistent_bytes,
+        mandatory
+    );
+    let one_below = mandatory
+        .checked_sub(1)
+        .expect("nonzero mandatory aggregate charge");
     assert!(matches!(
         PortableRegexSetBuilder::new(&patterns)
             .unicode(false)
@@ -257,7 +292,7 @@ fn aggregate_size_limit_uses_the_reported_fre_boundary_and_retains_identity() {
         Err(PortableRegexSetBuildError::PersistentLimit {
             needed: rejected,
             limit,
-        }) if rejected == needed && limit == one_below
+        }) if rejected == mandatory && limit == one_below
     ));
 }
 
@@ -1032,7 +1067,7 @@ fn upstream_bytes_set_builder_line_terminator_applies_to_every_pattern_and_range
 
 #[test]
 fn construction_limits_are_preflighted_and_pattern_failures_keep_their_id() {
-    let patterns = sources(&["a", "b"]);
+    let patterns = sources(&["a", "b", "c", "d", "e", "f", "g", "h"]);
     let defaults = PortableRegexSetBuildLimits::default();
 
     let error = PortableRegexSetBuilder::new(&patterns)
@@ -1045,7 +1080,7 @@ fn construction_limits_are_preflighted_and_pattern_failures_keep_their_id() {
     assert!(matches!(
         error,
         PortableRegexSetBuildError::PatternLimit {
-            needed: 2,
+            needed: 8,
             limit: 1
         }
     ));
@@ -1060,13 +1095,16 @@ fn construction_limits_are_preflighted_and_pattern_failures_keep_their_id() {
     assert!(matches!(
         error,
         PortableRegexSetBuildError::PatternBytesLimit {
-            needed: 2,
+            needed: 8,
             limit: 1
         }
     ));
 
     let probe = PortableRegexSetBuilder::new(&patterns).build().unwrap();
     let exact = probe.build_report().charged_persistent_bytes;
+    let fused = probe.build_report().fused_literal_set_storage_bytes;
+    assert!(fused > 0);
+    let mandatory = exact - fused;
     let rebuilt = PortableRegexSetBuilder::new(&patterns)
         .limits(PortableRegexSetBuildLimits {
             max_persistent_bytes: exact,
@@ -1075,9 +1113,41 @@ fn construction_limits_are_preflighted_and_pattern_failures_keep_their_id() {
         .build()
         .expect("exact persistent limit");
     assert_eq!(rebuilt.build_report().charged_persistent_bytes, exact);
-    let error = PortableRegexSetBuilder::new(&patterns)
+    assert_eq!(
+        rebuilt.build_report().fused_literal_set_storage_bytes,
+        fused
+    );
+
+    let degraded = PortableRegexSetBuilder::new(&patterns)
         .limits(PortableRegexSetBuildLimits {
             max_persistent_bytes: exact - 1,
+            ..defaults
+        })
+        .build()
+        .expect("optional existence sidecar degrades below its boundary");
+    assert_eq!(degraded.build_report().fused_literal_set_storage_bytes, 0);
+    assert_eq!(degraded.build_report().charged_persistent_bytes, mandatory);
+
+    let mandatory_exact = PortableRegexSetBuilder::new(&patterns)
+        .limits(PortableRegexSetBuildLimits {
+            max_persistent_bytes: mandatory,
+            ..defaults
+        })
+        .build()
+        .expect("exact mandatory persistent limit");
+    assert_eq!(
+        mandatory_exact
+            .build_report()
+            .fused_literal_set_storage_bytes,
+        0
+    );
+    assert_eq!(
+        mandatory_exact.build_report().charged_persistent_bytes,
+        mandatory
+    );
+    let error = PortableRegexSetBuilder::new(&patterns)
+        .limits(PortableRegexSetBuildLimits {
+            max_persistent_bytes: mandatory - 1,
             ..defaults
         })
         .build()
@@ -1085,7 +1155,7 @@ fn construction_limits_are_preflighted_and_pattern_failures_keep_their_id() {
     assert!(matches!(
         error,
         PortableRegexSetBuildError::PersistentLimit { needed, limit }
-            if needed == exact && limit == exact - 1
+            if needed == mandatory && limit == mandatory - 1
     ));
 
     let invalid = sources(&["a", "(", "b"]);
