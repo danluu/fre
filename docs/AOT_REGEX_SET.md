@@ -121,6 +121,38 @@ geometry, generated code, relocation-closed object, and every ceiling. This
 entry remains opt-in; `compile_regex_set`, `compile_regex_set_exact64_reported`,
 and all of their defaults are unchanged.
 
+### Additive first-any-position lowering
+
+`compile_regex_set_exact64_first_any_aot_v1` is a separate opt-in consumer of
+the same target-neutral exact64 program. It does not change or wrap the v1
+complete-mask entry. Before allocating dense data, it reauthenticates every
+source-terminal parent chain and declines with the unchanged program if any
+exact singleton contains LF. Nonempty exact-singleton admission is inherited
+from the target-neutral exact64 proof.
+
+The helper-free AArch64 ABI is:
+
+```text
+u32 entry(const u8 *haystack, usize len, usize start, usize end, u64 *position)
+```
+
+Status zero publishes exactly one word. `u64::MAX` means no row matched.
+Otherwise the word is the original-haystack offset of the final byte consumed
+by the first graph state, in forward scan order, whose authenticated owner
+mask is nonzero. It is therefore a byte inside at least one match and, because
+all source literals are nonempty and LF-free, inside its matching LF-delimited
+line. It is not a selected span, a leftmost-start result, or a source-pattern
+priority result. A raw-argument failure leaves the output word unchanged.
+
+The new receipt binds the source graph, LF exclusion, position semantics,
+no-match sentinel, target, dense geometry and data, code, relocation-closed
+object, and all resource ceilings. Unsupported architecture, LF presence, and
+the four numeric ceilings are the only safe declines. Authentication,
+allocation, arithmetic, target incoherence, construction, and object failures
+remain terminal. A future ripgrep adapter may use the returned byte only as a
+`Candidate`; stock matching remains responsible for verification, spans, and
+captures.
+
 ## Next layer
 
 The native object is deliberately a separate exact64 artifact rather than a

@@ -392,7 +392,7 @@ pub(crate) struct RegexSetExact64DenseLayoutV1 {
     pub(crate) output_offset: usize,
 }
 
-enum DenseBuildDisposition {
+pub(crate) enum DenseBuildDisposition {
     Built(RegexSetExact64DenseLayoutV1),
     Declined {
         resource: RegexSetExact64AotResourceV1,
@@ -479,7 +479,7 @@ fn transition_offset(
     clippy::too_many_lines,
     reason = "one authenticated depth order, complete dense transition closure, and output publication table form a single fail-closed construction transaction"
 )]
-fn build_dense_layout(
+pub(crate) fn build_dense_layout(
     program: &RegexSetExact64Program,
     limits: RegexSetExact64AotLimitsV1,
 ) -> Result<DenseBuildDisposition, RegexSetExact64AotErrorV1> {

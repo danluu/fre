@@ -45,6 +45,7 @@ mod program;
 mod regex_set;
 mod regex_set_exact64;
 mod regex_set_exact64_aot;
+mod regex_set_exact64_first_any_aot;
 mod regex_redux_aot;
 mod rebar_multi_grep;
 mod rebar_single_capture;
@@ -352,6 +353,18 @@ pub use regex_set_exact64_aot::{
     RegexSetExact64AotCompileDispositionV1, RegexSetExact64AotDeclineV1,
     RegexSetExact64AotErrorV1, RegexSetExact64AotLimitsV1, RegexSetExact64AotReceiptV1,
     RegexSetExact64AotResourceV1, compile_regex_set_exact64_aot_v1,
+};
+pub use regex_set_exact64_first_any_aot::{
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_IDENTITY_DOMAIN,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_INVALID_ARGUMENT,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS,
+    RegexSetExact64FirstAnyAotArtifactV1, RegexSetExact64FirstAnyAotCompileDispositionV1,
+    RegexSetExact64FirstAnyAotDeclineV1, RegexSetExact64FirstAnyAotReceiptV1,
+    compile_regex_set_exact64_first_any_aot_v1,
 };
 pub use regex_redux_aot::{
     NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION, NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS,

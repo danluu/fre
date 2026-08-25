@@ -435,6 +435,44 @@ impl RegexSetExact64GraphView<'_> {
             .ok()
             .map(|edge| edges[edge].target)
     }
+
+    /// Return the first source ordinal whose authenticated exact singleton
+    /// contains `byte`.
+    ///
+    /// The complete graph authentication performed before this view is lent
+    /// proves that every source terminal has a strictly depth-decreasing
+    /// parent chain to the root. Walking those chains therefore inspects the
+    /// exact proof bytes without retaining or reparsing source spelling.
+    pub(crate) fn first_source_literal_containing(
+        &self,
+        byte: u8,
+    ) -> Result<Option<usize>, RegexSetExact64AuthenticationError> {
+        let pattern_count = usize::from(self.program.receipt.pattern_count);
+        for ordinal in 0..pattern_count {
+            let mut state = *self.program.source_terminals.get(ordinal).ok_or(
+                RegexSetExact64AuthenticationError::Shape(
+                    "source-byte proof omitted one source terminal",
+                ),
+            )?;
+            while state != 0 {
+                let state_index = usize::try_from(state).map_err(|_| {
+                    RegexSetExact64AuthenticationError::Shape(
+                        "source-byte proof state does not fit usize",
+                    )
+                })?;
+                let record = self.program.states.get(state_index).ok_or(
+                    RegexSetExact64AuthenticationError::Shape(
+                        "source-byte proof state is outside the graph",
+                    ),
+                )?;
+                if record.incoming_byte == byte {
+                    return Ok(Some(ordinal));
+                }
+                state = record.parent;
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl RegexSetExact64Program {
