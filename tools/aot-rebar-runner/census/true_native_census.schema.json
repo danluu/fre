@@ -418,6 +418,12 @@
         "native": { "const": true },
         "source_ordinal": { "type": ["integer", "null"], "minimum": 0 },
         "entry_symbol": { "type": "string", "minLength": 1 },
+        "entry_abi": {
+          "enum": ["SpanSearchV1", "PreparedSpanSearchV1"]
+        },
+        "prepared_surface": {
+          "enum": ["None", "Compatibility", "RowSearchOnly"]
+        },
         "required_runtime_symbols": {
           "type": "array", "items": { "type": "string" }, "uniqueItems": true
         },
@@ -463,12 +469,55 @@
         },
         "runtime_program_len": { "type": "integer", "minimum": 1, "maximum": 268435456 },
         "span_fill_symbol": {
-          "type": "string",
-          "pattern": "^fre_aot_regex_fill_spans_exclusive_v1_[0-9a-f]{64}$"
+          "type": "string"
         },
-        "prepared_bulk_strategy": { "const": "Some(NativeOrderedNfaLoop)" },
-        "artifact_identity_sha256": { "$ref": "#/$defs/sha256" }
-      }
+        "prepared_bulk_strategy": {
+          "enum": ["Some(NativeOrderedNfaLoop)", "None"]
+        },
+        "artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "entry_abi": {
+          "enum": ["SpanSearchV1", "PreparedSpanSearchV1"]
+        },
+        "prepared_surface": {
+          "enum": ["Compatibility", "RowSearchOnly"]
+        }
+      },
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              { "required": ["entry_abi"] },
+              { "required": ["prepared_surface"] }
+            ]
+          },
+          "properties": {
+            "span_fill_symbol": {
+              "pattern": "^fre_aot_regex_fill_spans_exclusive_v1_[0-9a-f]{64}$"
+            },
+            "prepared_bulk_strategy": { "const": "Some(NativeOrderedNfaLoop)" }
+          }
+        },
+        {
+          "required": ["entry_abi", "prepared_surface"],
+          "properties": {
+            "entry_abi": { "const": "SpanSearchV1" },
+            "prepared_surface": { "const": "Compatibility" },
+            "span_fill_symbol": {
+              "pattern": "^fre_aot_regex_fill_spans_exclusive_v1_[0-9a-f]{64}$"
+            },
+            "prepared_bulk_strategy": { "const": "Some(NativeOrderedNfaLoop)" }
+          }
+        },
+        {
+          "required": ["entry_abi", "prepared_surface"],
+          "properties": {
+            "entry_abi": { "const": "PreparedSpanSearchV1" },
+            "prepared_surface": { "const": "RowSearchOnly" },
+            "span_fill_symbol": { "const": "" },
+            "prepared_bulk_strategy": { "const": "None" }
+          }
+        }
+      ]
     },
     "preparedGrepV15Provenance": {
       "type": "object",
@@ -1230,7 +1279,7 @@
         },
         "row_routes": {
           "type": "array", "minItems": 1, "maxItems": 4096,
-          "items": { "enum": [0, 1] }
+          "items": { "enum": [0, 1, 2] }
         },
         "source_cardinality": { "type": "integer", "minimum": 2 },
         "source_bytes": { "type": "integer", "minimum": 0 },
@@ -1271,7 +1320,7 @@
         },
         "row_routes": {
           "type": "array", "minItems": 1, "maxItems": 4096,
-          "items": { "enum": [0, 1] }
+          "items": { "enum": [0, 1, 2] }
         },
         "source_cardinality": { "type": "integer", "minimum": 2 },
         "source_bytes": { "type": "integer", "minimum": 0 },

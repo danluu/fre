@@ -5,8 +5,9 @@
 //! Ordered-NFA V15 artifacts. Distinct mixed ABIs consume one sealed handle
 //! table slot per row. The reducers own the operation traversal, validate every
 //! returned status and span, and publish the final `u64` only after the complete
-//! operation succeeds. Prepared rows retain their authenticated semantic-runtime
-//! route; handle preparation, ownership, and destruction stay outside the call.
+//! operation succeeds. A route tag distinguishes the legacy compatibility
+//! envelope from strict `PreparedSpanSearchV1`; handle preparation, ownership,
+//! and destruction stay outside the call.
 
 use core::fmt;
 
@@ -14,8 +15,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileMode, CompileResource, CompiledModule, CompiledRegex, EngineKind, EntryAbi,
-    ModuleRelocation, ObjectError, ObjectFormat, OutputContract, PREPARED_CAPABILITY_ORDERED_NFA_V15,
-    PreparedBulkStrategy, SectionKind, SymbolBinding, SymbolKind, Target, emit_object,
+    ModuleRelocation, ObjectError, ObjectFormat, OutputContract,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedBulkStrategy, SectionKind, SymbolBinding,
+    SymbolKind, Target, emit_object,
 };
 
 /// Domain separator for the immutable reducer identity.
@@ -645,7 +647,9 @@ pub fn compile_rebar_multi_grep_reducer_aot_v1(
     ))? {
         MultiGrepReducerObjectOutcome::Selected(object) => object,
         MultiGrepReducerObjectOutcome::Declined(decline) => {
-            return Ok(RebarMultiGrepReducerAotCompileDispositionV1::Declined(decline));
+            return Ok(RebarMultiGrepReducerAotCompileDispositionV1::Declined(
+                decline,
+            ));
         }
     };
     let text = module
@@ -684,8 +688,7 @@ pub fn compile_rebar_multi_grep_reducer_aot_v1(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         mixed_handle_table: false,
-        row_routes: vec![RebarMixedNativeRowScalarRouteV1::Ordinary; rows.len()]
-            .into_boxed_slice(),
+        row_routes: vec![RebarMixedNativeRowScalarRouteV1::Ordinary; rows.len()].into_boxed_slice(),
         operation_identity_sha256: identity,
         reducer_symbol: module.entry_symbol().to_owned(),
         reducer_code_sha256: Sha256::digest(text.bytes()).into(),
@@ -742,6 +745,9 @@ pub enum RebarMixedNativeRowScalarRouteV1 {
     Ordinary,
     /// `u32 row(handle, const u8 *, usize, usize, usize, result *)`.
     PreparedOrderedNfaV15,
+    /// The same exclusive-handle ABI, with the strict one-function
+    /// `PreparedSpanSearchV1` topology and no semantic runtime helper.
+    PreparedOrderedNfaV15RowSearch,
 }
 
 impl RebarMixedNativeRowScalarRouteV1 {
@@ -749,13 +755,17 @@ impl RebarMixedNativeRowScalarRouteV1 {
         match self {
             Self::Ordinary => 0,
             Self::PreparedOrderedNfaV15 => 1,
+            Self::PreparedOrderedNfaV15RowSearch => 2,
         }
     }
 
     /// Return whether this row consumes its corresponding opaque handle slot.
     #[must_use]
     pub const fn is_prepared(self) -> bool {
-        matches!(self, Self::PreparedOrderedNfaV15)
+        matches!(
+            self,
+            Self::PreparedOrderedNfaV15 | Self::PreparedOrderedNfaV15RowSearch
+        )
     }
 }
 
@@ -801,7 +811,8 @@ impl<'a> RebarMixedNativeRowScalarReducerRowV1<'a> {
             RebarMixedNativeRowScalarRouteV1::Ordinary => {
                 Some(self.compiled.module().entry_symbol())
             }
-            RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15 => {
+            RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15
+            | RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch => {
                 self.compiled.module().prepared_entry_symbol()
             }
         }
@@ -813,8 +824,7 @@ impl<'a> RebarMixedNativeRowScalarReducerRowV1<'a> {
 /// GrepCount and scalar reducers intentionally share the exact sealed route
 /// descriptor: only their whole-operation ABI, identity, symbol, and native
 /// traversal differ.
-pub type RebarMixedMultiGrepReducerRowV1<'a> =
-    RebarMixedNativeRowScalarReducerRowV1<'a>;
+pub type RebarMixedMultiGrepReducerRowV1<'a> = RebarMixedNativeRowScalarReducerRowV1<'a>;
 
 /// Scalar operation owned by a native independent-row wrapper.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1109,7 +1119,10 @@ fn classify_scalar_reducer_object_outcome(
 
 impl fmt::Display for RebarNativeRowScalarReducerAotErrorV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Rebar native-row scalar reducer AOT failed: {self:?}")
+        write!(
+            formatter,
+            "Rebar native-row scalar reducer AOT failed: {self:?}"
+        )
     }
 }
 
@@ -1161,9 +1174,7 @@ fn prepared_row_symbol_identities_are_closed(
     span_fill: &str,
     program: &str,
 ) -> bool {
-    let Some(ordinary) =
-        native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
-    else {
+    let Some(ordinary) = native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_") else {
         return false;
     };
     let Some(prepared) =
@@ -1171,17 +1182,24 @@ fn prepared_row_symbol_identities_are_closed(
     else {
         return false;
     };
-    let Some(fill) =
-        native_symbol_identity(span_fill, "fre_aot_regex_fill_spans_exclusive_v1_")
+    let Some(fill) = native_symbol_identity(span_fill, "fre_aot_regex_fill_spans_exclusive_v1_")
     else {
         return false;
     };
-    let Some(program) =
-        native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
-    else {
+    let Some(program) = native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_") else {
         return false;
     };
     ordinary == prepared && ordinary == fill && ordinary == program
+}
+
+fn strict_prepared_row_symbol_identities_are_closed(entry: &str, program: &str) -> bool {
+    let Some(entry) = native_symbol_identity(entry, "fre_aot_regex_search_exclusive_v1_") else {
+        return false;
+    };
+    let Some(program) = native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_") else {
+        return false;
+    };
+    entry == program
 }
 
 fn mixed_scalar_source_shape(
@@ -1199,11 +1217,9 @@ fn mixed_scalar_source_shape(
         || rows.len() > crate::ORDERED_MANY_AOT_MAX_ROWS
         || !rows.iter().any(|row| row.route.is_prepared())
     {
-        return Err(
-            RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
-                "mixed source cardinality, identity, or route",
-            ),
-        );
+        return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+            "mixed source cardinality, identity, or route",
+        ));
     }
     let target = rows[0].compiled.receipt().target;
     let expected_prepared_runtime = [
@@ -1219,11 +1235,9 @@ fn mixed_scalar_source_shape(
         let receipt = compiled.receipt();
         let module = compiled.module();
         let Some(entry) = descriptor.entry_symbol() else {
-            return Err(
-                RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
-                    "mixed row entry",
-                ),
-            );
+            return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+                "mixed row entry",
+            ));
         };
         let defined = |name: &str, kind: SymbolKind, exact_size: Option<usize>| {
             module.symbols().iter().any(|symbol| {
@@ -1232,9 +1246,7 @@ fn mixed_scalar_source_shape(
                     && symbol.kind == kind
                     && symbol.section.is_some()
                     && symbol.size != 0
-                    && exact_size.is_none_or(|size| {
-                        usize::try_from(symbol.size).ok() == Some(size)
-                    })
+                    && exact_size.is_none_or(|size| usize::try_from(symbol.size).ok() == Some(size))
             })
         };
         let unresolved = module
@@ -1256,7 +1268,16 @@ fn mixed_scalar_source_shape(
             && module.target() == target
             && receipt.mode == CompileMode::Optimizing
             && receipt.output == OutputContract::Span
-            && receipt.entry_abi == EntryAbi::SpanSearchV1
+            && receipt.entry_abi
+                == match descriptor.route {
+                    RebarMixedNativeRowScalarRouteV1::Ordinary
+                    | RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15 => {
+                        EntryAbi::SpanSearchV1
+                    }
+                    RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch => {
+                        EntryAbi::PreparedSpanSearchV1
+                    }
+                }
             && receipt.automaton_sha256 != [0; 32]
             && receipt.program_sha256 != [0; 32]
             && receipt.object_sha256 != [0; 32]
@@ -1280,25 +1301,19 @@ fn mixed_scalar_source_shape(
             }
             RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15 => {
                 let Some(prepared_entry) = module.prepared_entry_symbol() else {
-                    return Err(
-                        RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
-                            "prepared mixed row entry",
-                        ),
-                    );
+                    return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+                        "prepared mixed row entry",
+                    ));
                 };
                 let Some(span_fill) = module.prepared_span_fill_symbol() else {
-                    return Err(
-                        RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
-                            "prepared mixed row SpanFill",
-                        ),
-                    );
+                    return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+                        "prepared mixed row SpanFill",
+                    ));
                 };
                 let Some((program, program_len)) = module.required_runtime_program() else {
-                    return Err(
-                        RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
-                            "prepared mixed row program",
-                        ),
-                    );
+                    return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+                        "prepared mixed row program",
+                    ));
                 };
                 let unresolved_names = unresolved
                     .iter()
@@ -1312,10 +1327,8 @@ fn mixed_scalar_source_shape(
                     && receipt.runtime_helper_required
                     && receipt.prepared_aggregate_exports.is_empty()
                     && receipt.prepared_aggregate_strategy.is_none()
-                    && receipt.required_prepare_capabilities
-                        == PREPARED_CAPABILITY_ORDERED_NFA_V15
-                    && module.required_prepare_capabilities()
-                        == PREPARED_CAPABILITY_ORDERED_NFA_V15
+                    && receipt.required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15
+                    && module.required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15
                     && module.prepared_bulk_strategy()
                         == Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
                     && module.prepared_aggregate_strategy().is_none()
@@ -1339,23 +1352,83 @@ fn mixed_scalar_source_shape(
                         .len()
                         == 4
             }
+            RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch => {
+                let Some(prepared_entry) = module.prepared_entry_symbol() else {
+                    return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+                        "strict prepared mixed row entry",
+                    ));
+                };
+                let Some((program, program_len)) = module.required_runtime_program() else {
+                    return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+                        "strict prepared mixed row program",
+                    ));
+                };
+                let global_functions = module
+                    .symbols()
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.binding == SymbolBinding::Global
+                            && symbol.kind == SymbolKind::Function
+                            && symbol.section.is_some()
+                    })
+                    .collect::<Vec<_>>();
+                let global_objects = module
+                    .symbols()
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.binding == SymbolBinding::Global
+                            && symbol.kind == SymbolKind::Object
+                            && symbol.section.is_some()
+                    })
+                    .collect::<Vec<_>>();
+                receipt.engine == EngineKind::OrderedNfa
+                    && !receipt.runtime_helper_required
+                    && receipt.prepared_aggregate_exports.is_empty()
+                    && receipt.prepared_aggregate_strategy.is_none()
+                    && receipt.required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15
+                    && module.required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15
+                    && module.entry_symbol() == prepared_entry
+                    && module.prepared_bulk_strategy().is_none()
+                    && module.prepared_span_fill_symbol().is_none()
+                    && module.prepared_aggregate_strategy().is_none()
+                    && module.prepared_exists_batch_symbol().is_none()
+                    && module.required_runtime_symbols().next().is_none()
+                    && unresolved.is_empty()
+                    && program_len != 0
+                    && program_len == receipt.program_bytes
+                    && receipt.program_sha256 == compiled.program().artifact_identity()
+                    && defined(prepared_entry, SymbolKind::Function, None)
+                    && defined(program, SymbolKind::Object, Some(program_len))
+                    && global_functions.len() == 1
+                    && global_functions[0].name == prepared_entry
+                    && global_objects.len() == 1
+                    && global_objects[0].name == program
+                    && module
+                        .symbols()
+                        .iter()
+                        .all(|symbol| symbol.section.is_some())
+                    && module.relocations().iter().all(|relocation| {
+                        module
+                            .symbols()
+                            .get(relocation.symbol)
+                            .is_some_and(|symbol| symbol.section.is_some())
+                    })
+                    && strict_prepared_row_symbol_identities_are_closed(prepared_entry, program)
+                    && prepared_entry != program
+            }
         };
         if !common || !route_is_closed {
-            return Err(
-                RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
-                    "mixed ordinary/prepared row closure",
-                ),
-            );
+            return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+                "mixed ordinary/prepared row closure",
+            ));
         }
         prior_first = Some(descriptor.first_source_ordinal);
     }
     for (source, &row) in source_to_row.iter().enumerate() {
         if row >= rows.len() || rows[row].first_source_ordinal > source {
-            return Err(
-                RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
-                    "mixed source-to-row topology",
-                ),
-            );
+            return Err(RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(
+                "mixed source-to-row topology",
+            ));
         }
     }
     Ok(target)
@@ -1450,9 +1523,7 @@ fn scalar_artifact_identity(
 ) -> Result<[u8; 32], ObjectError> {
     let mut hasher = Sha256::new();
     if receipt.mixed_handle_table {
-        hasher.update(
-            b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer-artifact/v1\0",
-        );
+        hasher.update(b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer-artifact/v1\0");
     } else {
         hasher.update(b"fre-aot-regex/rebar-native-row-scalar-reducer-artifact/v1\0");
     }
@@ -1592,10 +1663,8 @@ pub fn compile_rebar_native_row_scalar_reducer_aot_v1(
     source_to_row: &[usize],
     rows: &[RebarMultiGrepReducerRowV1<'_>],
     max_object_bytes: usize,
-) -> Result<
-    RebarNativeRowScalarReducerAotCompileDispositionV1,
-    RebarNativeRowScalarReducerAotErrorV1,
-> {
+) -> Result<RebarNativeRowScalarReducerAotCompileDispositionV1, RebarNativeRowScalarReducerAotErrorV1>
+{
     let target = scalar_source_shape(
         ordered_sources_sha256,
         source_cardinality,
@@ -1626,9 +1695,7 @@ pub fn compile_rebar_native_row_scalar_reducer_aot_v1(
     ))? {
         ScalarReducerObjectOutcome::Selected(object) => object,
         ScalarReducerObjectOutcome::Declined(decline) => {
-            return Ok(
-                RebarNativeRowScalarReducerAotCompileDispositionV1::Declined(decline),
-            );
+            return Ok(RebarNativeRowScalarReducerAotCompileDispositionV1::Declined(decline));
         }
     };
     let text = module
@@ -1668,8 +1735,7 @@ pub fn compile_rebar_native_row_scalar_reducer_aot_v1(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         mixed_handle_table: false,
-        row_routes: vec![RebarMixedNativeRowScalarRouteV1::Ordinary; rows.len()]
-            .into_boxed_slice(),
+        row_routes: vec![RebarMixedNativeRowScalarRouteV1::Ordinary; rows.len()].into_boxed_slice(),
         operation_identity_sha256: identity,
         reducer_symbol: module.entry_symbol().to_owned(),
         reducer_code_sha256: Sha256::digest(text.bytes()).into(),
@@ -1695,9 +1761,7 @@ pub fn compile_rebar_native_row_scalar_reducer_aot_v1(
         source_to_row,
         rows,
     )?;
-    Ok(RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(
-        artifact,
-    ))
+    Ok(RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(artifact))
 }
 
 fn authenticate_mixed_scalar_artifact(
@@ -1729,11 +1793,9 @@ fn authenticate_mixed_scalar_artifact(
         .iter()
         .copied()
         .map(|row| {
-            row.entry_symbol()
-                .map(str::to_owned)
-                .ok_or(RebarNativeRowScalarReducerAotErrorV1::Authentication(
-                    "mixed reducer row entry",
-                ))
+            row.entry_symbol().map(str::to_owned).ok_or(
+                RebarNativeRowScalarReducerAotErrorV1::Authentication("mixed reducer row entry"),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let routes = rows.iter().map(|row| row.route).collect::<Vec<_>>();
@@ -1820,10 +1882,8 @@ pub fn compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
     source_to_row: &[usize],
     rows: &[RebarMixedNativeRowScalarReducerRowV1<'_>],
     max_object_bytes: usize,
-) -> Result<
-    RebarNativeRowScalarReducerAotCompileDispositionV1,
-    RebarNativeRowScalarReducerAotErrorV1,
-> {
+) -> Result<RebarNativeRowScalarReducerAotCompileDispositionV1, RebarNativeRowScalarReducerAotErrorV1>
+{
     let target = mixed_scalar_source_shape(
         ordered_sources_sha256,
         source_cardinality,
@@ -1844,11 +1904,9 @@ pub fn compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
         .iter()
         .copied()
         .map(|row| {
-            row.entry_symbol()
-                .map(str::to_owned)
-                .ok_or(RebarNativeRowScalarReducerAotErrorV1::Authentication(
-                    "mixed reducer row entry",
-                ))
+            row.entry_symbol().map(str::to_owned).ok_or(
+                RebarNativeRowScalarReducerAotErrorV1::Authentication("mixed reducer row entry"),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let routes = rows.iter().map(|row| row.route).collect::<Vec<_>>();
@@ -1862,9 +1920,7 @@ pub fn compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
     ))? {
         ScalarReducerObjectOutcome::Selected(object) => object,
         ScalarReducerObjectOutcome::Declined(decline) => {
-            return Ok(
-                RebarNativeRowScalarReducerAotCompileDispositionV1::Declined(decline),
-            );
+            return Ok(RebarNativeRowScalarReducerAotCompileDispositionV1::Declined(decline));
         }
     };
     let text = module
@@ -1930,9 +1986,7 @@ pub fn compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
         source_to_row,
         rows,
     )?;
-    Ok(RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(
-        artifact,
-    ))
+    Ok(RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(artifact))
 }
 
 fn mixed_grep_source_shape(
@@ -2029,11 +2083,9 @@ fn authenticate_mixed_grep_artifact(
     let entries = rows
         .iter()
         .map(|row| {
-            row.entry_symbol()
-                .map(str::to_owned)
-                .ok_or(RebarMultiGrepReducerAotErrorV1::SourceAuthentication(
-                    "mixed grep row entry",
-                ))
+            row.entry_symbol().map(str::to_owned).ok_or(
+                RebarMultiGrepReducerAotErrorV1::SourceAuthentication("mixed grep row entry"),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let routes = rows
@@ -2085,8 +2137,7 @@ fn authenticate_mixed_grep_artifact(
                 .map(|row| row.compiled.receipt().object_sha256)
                 .collect::<Vec<_>>()
         || !receipt.mixed_handle_table
-        || receipt.row_routes.as_ref()
-            != rows.iter().map(|row| row.route).collect::<Vec<_>>()
+        || receipt.row_routes.as_ref() != rows.iter().map(|row| row.route).collect::<Vec<_>>()
         || receipt.operation_identity_sha256 != identity
         || receipt.reducer_symbol != rebuilt.entry_symbol()
         || receipt.reducer_code_sha256 != rebuilt_code_sha256
@@ -2139,11 +2190,9 @@ pub fn compile_rebar_mixed_multi_grep_reducer_aot_v1(
     let entries = rows
         .iter()
         .map(|row| {
-            row.entry_symbol()
-                .map(str::to_owned)
-                .ok_or(RebarMultiGrepReducerAotErrorV1::SourceAuthentication(
-                    "mixed grep row entry",
-                ))
+            row.entry_symbol().map(str::to_owned).ok_or(
+                RebarMultiGrepReducerAotErrorV1::SourceAuthentication("mixed grep row entry"),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let prepared_routes = rows
@@ -2163,7 +2212,9 @@ pub fn compile_rebar_mixed_multi_grep_reducer_aot_v1(
     ))? {
         MultiGrepReducerObjectOutcome::Selected(object) => object,
         MultiGrepReducerObjectOutcome::Declined(decline) => {
-            return Ok(RebarMultiGrepReducerAotCompileDispositionV1::Declined(decline));
+            return Ok(RebarMultiGrepReducerAotCompileDispositionV1::Declined(
+                decline,
+            ));
         }
     };
     let text = module
@@ -2268,9 +2319,7 @@ mod scalar_reducer_failure_tests {
                 "injected multi-grep lowering/authentication failure"
             ))),
             Err(RebarMultiGrepReducerAotErrorV1::Object(
-                ObjectError::InvalidModule(
-                    "injected multi-grep lowering/authentication failure"
-                )
+                ObjectError::InvalidModule("injected multi-grep lowering/authentication failure")
             ))
         ));
     }
@@ -2303,9 +2352,7 @@ mod scalar_reducer_failure_tests {
                 "injected row-scalar lowering/authentication failure"
             ))),
             Err(RebarNativeRowScalarReducerAotErrorV1::Object(
-                ObjectError::InvalidModule(
-                    "injected row-scalar lowering/authentication failure"
-                )
+                ObjectError::InvalidModule("injected row-scalar lowering/authentication failure")
             ))
         ));
     }

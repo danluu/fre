@@ -66,8 +66,12 @@ PREPARED_V15_CAPABILITY = 1
 PREPARED_V2_CONFIG_VERSION = 2
 PREPARED_V15_CONFIG_VERSION = 3
 SPAN_SEARCH_ENTRY_ABI = "SpanSearchV1"
+PREPARED_SPAN_SEARCH_ENTRY_ABI = "PreparedSpanSearchV1"
 EXISTS_SEARCH_ENTRY_ABI = "ExistsSearchV1"
 PREPARED_SCALAR_REDUCE_ENTRY_ABI = "PreparedScalarReduceV1"
+NO_PREPARED_SURFACE = "None"
+PREPARED_V15_COMPATIBILITY_SURFACE = "Compatibility"
+PREPARED_V15_ROW_SEARCH_SURFACE = "RowSearchOnly"
 PREPARED_V15_SPAN_OPERATION_FLAGS = 1 << 1
 PREPARED_V15_SPAN_SUM_OPERATION_FLAGS = 1 << 2
 ORDERED_MANY_RECEIPT_VERSION = 1
@@ -311,6 +315,10 @@ OPERATION_ROUTE_POLICIES = {
         OperationBoundary.SEMANTIC_HELPER_BACKED,
         "single-call-native-reducer-retains-semantic-runtime-helpers",
     ),
+    "linked-native-strict-mixed-multi-grep-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
+    ),
     "linked-native-row-scalar-reducer": OperationRoutePolicy(
         OperationBoundary.WHOLE_OPERATION,
         "whole-operation-native-authenticated",
@@ -318,6 +326,10 @@ OPERATION_ROUTE_POLICIES = {
     "linked-native-row-scalar-helper-backed-reducer": OperationRoutePolicy(
         OperationBoundary.SEMANTIC_HELPER_BACKED,
         "single-call-native-reducer-retains-semantic-runtime-helpers",
+    ),
+    "linked-native-strict-mixed-row-scalar-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
     ),
     "linked-uniform-capture-row-adapter-loop": OperationRoutePolicy(
         OperationBoundary.RUST_ADAPTER_LOOP,
@@ -2963,6 +2975,24 @@ def component_field(fields: dict[str, str], index: int, suffixes: tuple[str, ...
     return fields[candidates[0]]
 
 
+def optional_component_field(
+    fields: dict[str, str], index: int, suffixes: tuple[str, ...]
+) -> Optional[str]:
+    """Read one additive component field without weakening alias closure."""
+    prefixes = tuple(dict.fromkeys(
+        (f"component_{index}_", f"component_{index:02d}_", f"component{index}_")
+    ))
+    candidates = [
+        f"{prefix}{suffix}" for prefix in prefixes for suffix in suffixes
+        if f"{prefix}{suffix}" in fields
+    ]
+    if len(candidates) > 1:
+        raise CensusError(
+            f"composite provenance component {index} has multiple {suffixes!r} fields"
+        )
+    return fields[candidates[0]] if candidates else None
+
+
 def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]]:
     schema = fields.get("schema")
     if schema not in {"fre.aot.rebar-runner.v3", "fre.aot.rebar-runner.v4"}:
@@ -2980,6 +3010,7 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
     native_row = fields.get("native_row_bridge") == "true"
     has_automaton = schema == "fre.aot.rebar-runner.v3" and native_row
     components = []
+    component_surface_presence = []
     for index in range(count):
         native = component_field(fields, index, ("native",))
         entry = component_field(fields, index, ("entry_symbol",))
@@ -3007,6 +3038,8 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
             raise CensusError(f"component {index} runtime symbol list is malformed")
         source_ordinal = None
         prepared_v15 = None
+        entry_abi = None
+        prepared_surface = None
         if native_row:
             source_ordinal_text = component_field(fields, index, ("source_ordinal",))
             source_ordinal = parse_canonical_decimal(
@@ -3016,8 +3049,17 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
                 MAX_NATIVE_ROW_COMPONENTS - 1,
             )
             if schema == "fre.aot.rebar-runner.v3":
+                entry_abi = optional_component_field(fields, index, ("entry_abi",))
+                prepared_surface = optional_component_field(
+                    fields, index, ("prepared_surface",)
+                )
+                if (entry_abi is None) != (prepared_surface is None):
+                    raise CensusError(
+                        f"native-row component {index} has a partial ABI/surface receipt"
+                    )
+                component_surface_presence.append(entry_abi is not None)
                 prepared_v15 = prepared_v15_component_from_provenance(
-                    fields, index, entry, runtime_symbols
+                    fields, index, entry, runtime_symbols, entry_abi, prepared_surface
                 )
         components.append({
             "ordinal": index,
@@ -3028,9 +3070,17 @@ def components_from_provenance(fields: dict[str, str]) -> list[dict[str, object]
             "automaton_sha256": automaton_sha256,
             "program_sha256": program_sha256,
             "object_sha256": object_sha256,
+            **({
+                "entry_abi": entry_abi,
+                "prepared_surface": prepared_surface,
+            } if entry_abi is not None else {}),
             **({"prepared_v15": prepared_v15} if schema == "fre.aot.rebar-runner.v3"
                and native_row else {}),
         })
+    if component_surface_presence and any(component_surface_presence) and not all(
+        component_surface_presence
+    ):
+        raise CensusError("native-row ABI/surface receipt is only partially populated")
     return components
 
 
@@ -3057,6 +3107,8 @@ def prepared_v15_component_from_provenance(
     index: int,
     entry_symbol: str,
     runtime_symbols: list[str],
+    entry_abi: Optional[str] = None,
+    prepared_surface: Optional[str] = None,
 ) -> Optional[dict[str, object]]:
     """Close one native-row component's ordinary or prepared V15 state."""
     capabilities = parse_fixed_hex_u64(
@@ -3082,6 +3134,9 @@ def prepared_v15_component_from_provenance(
     bulk_strategy = component_field(fields, index, ("prepared_bulk_strategy",))
     if capabilities == 0:
         if (
+            (entry_abi is not None and entry_abi != SPAN_SEARCH_ENTRY_ABI)
+            or (prepared_surface is not None and prepared_surface != NO_PREPARED_SURFACE)
+            or
             config_version != 0
             or operation_flags != 0
             or runtime_program_symbol
@@ -3097,12 +3152,26 @@ def prepared_v15_component_from_provenance(
         return None
     if capabilities != PREPARED_V15_CAPABILITY:
         raise CensusError(f"native-row component {index} requires unknown capabilities")
+    if entry_abi is None:
+        legacy_compatibility = True
+        strict_row_search = False
+    else:
+        legacy_compatibility = (
+            entry_abi == SPAN_SEARCH_ENTRY_ABI
+            and prepared_surface == PREPARED_V15_COMPATIBILITY_SURFACE
+        )
+        strict_row_search = (
+            entry_abi == PREPARED_SPAN_SEARCH_ENTRY_ABI
+            and prepared_surface == PREPARED_V15_ROW_SEARCH_SURFACE
+        )
+        if not legacy_compatibility and not strict_row_search:
+            raise CensusError(
+                f"prepared V15 component {index} has an unknown ABI/surface pair"
+            )
     if (
         config_version != PREPARED_V15_CONFIG_VERSION
         or operation_flags != PREPARED_V15_SPAN_OPERATION_FLAGS
         or runtime_program_len == 0
-        or bulk_strategy != "Some(NativeOrderedNfaLoop)"
-        or tuple(runtime_symbols) != PREPARED_V15_RUNTIME_SYMBOLS
     ):
         raise CensusError(f"prepared V15 component {index} has a noncanonical ABI closure")
     entry_suffix = symbol_identity_suffix(
@@ -3113,13 +3182,29 @@ def prepared_v15_component_from_provenance(
         runtime_program_symbol, NATIVE_RUNTIME_PROGRAM_SYMBOL,
         f"prepared V15 component {index} runtime program",
     )
-    span_fill_suffix = symbol_identity_suffix(
-        span_fill_symbol, NATIVE_SPAN_FILL_ENTRY_SYMBOL,
-        f"prepared V15 component {index} SpanFill",
-    )
-    if len({entry_suffix, program_suffix, span_fill_suffix}) != 1:
-        raise CensusError(f"prepared V15 component {index} symbol identities disagree")
-    return {
+    if legacy_compatibility:
+        span_fill_suffix = symbol_identity_suffix(
+            span_fill_symbol, NATIVE_SPAN_FILL_ENTRY_SYMBOL,
+            f"prepared V15 component {index} SpanFill",
+        )
+        if (
+            bulk_strategy != "Some(NativeOrderedNfaLoop)"
+            or tuple(runtime_symbols) != PREPARED_V15_RUNTIME_SYMBOLS
+            or len({entry_suffix, program_suffix, span_fill_suffix}) != 1
+        ):
+            raise CensusError(
+                f"prepared V15 component {index} compatibility closure differs"
+            )
+    elif (
+        bulk_strategy != "None"
+        or runtime_symbols
+        or span_fill_symbol
+        or entry_suffix != program_suffix
+    ):
+        raise CensusError(
+            f"prepared V15 component {index} strict RowSearch closure differs"
+        )
+    result = {
         "required_prepare_capabilities": capabilities,
         "prepare_config_version": config_version,
         "prepare_operation_flags": operation_flags,
@@ -3129,6 +3214,38 @@ def prepared_v15_component_from_provenance(
         "prepared_bulk_strategy": bulk_strategy,
         "artifact_identity_sha256": entry_suffix,
     }
+    if entry_abi is not None:
+        result["entry_abi"] = entry_abi
+        result["prepared_surface"] = prepared_surface
+    return result
+
+
+def prepared_v15_component_route(component: dict[str, object]) -> int:
+    """Return the reducer route tag authenticated by one normalized component."""
+    prepared = component.get("prepared_v15")
+    if prepared is None:
+        return 0
+    if (
+        isinstance(prepared, dict)
+        and prepared.get("entry_abi") == PREPARED_SPAN_SEARCH_ENTRY_ABI
+        and prepared.get("prepared_surface") == PREPARED_V15_ROW_SEARCH_SURFACE
+    ):
+        return 2
+    return 1
+
+
+def every_prepared_component_is_strict(components: list[dict[str, object]]) -> bool:
+    """True only for a mixed table whose every prepared child is RowSearch-only."""
+    prepared = [
+        component.get("prepared_v15") for component in components
+        if component.get("prepared_v15") is not None
+    ]
+    return bool(prepared) and all(
+        isinstance(proof, dict)
+        and proof.get("entry_abi") == PREPARED_SPAN_SEARCH_ENTRY_ABI
+        and proof.get("prepared_surface") == PREPARED_V15_ROW_SEARCH_SURFACE
+        for proof in prepared
+    )
 
 
 def parse_canonical_decimal_list(
@@ -3253,10 +3370,10 @@ def row_scalar_reducer_proof_from_provenance(
     )
     row_routes = parse_canonical_decimal_list(
         fields.get("row_scalar_reducer_row_routes"),
-        "row-scalar reducer row routes", len(components), 0, 1,
+        "row-scalar reducer row routes", len(components), 0, 2,
     )
     expected_routes = [
-        1 if component.get("prepared_v15") is not None else 0
+        prepared_v15_component_route(component)
         for component in components
     ]
     if row_routes != expected_routes:
@@ -3610,10 +3727,10 @@ def multi_grep_reducer_proof_from_provenance(
     )
     row_routes = parse_canonical_decimal_list(
         fields.get("multi_grep_reducer_row_routes"),
-        "multi-grep reducer row routes", len(components), 0, 1,
+        "multi-grep reducer row routes", len(components), 0, 2,
     )
     expected_routes = [
-        1 if component.get("prepared_v15") is not None else 0
+        prepared_v15_component_route(component)
         for component in components
     ]
     if row_routes != expected_routes:
@@ -4937,6 +5054,18 @@ def validate_v3_provenance(
                 "prepared_bulk_strategy", "automaton_sha256",
             )
         }
+        additive_surface_fields = {
+            f"component_{index}_{suffix}"
+            for index in range(len(components))
+            for suffix in ("entry_abi", "prepared_surface")
+        }
+        present_surface_fields = additive_surface_fields & set(fields)
+        if present_surface_fields:
+            if present_surface_fields != additive_surface_fields:
+                raise CensusError(
+                    "runner v3 native-row ABI/surface fields are only partially present"
+                )
+            component_fields |= additive_surface_fields
         expected = base | component_fields | {
             "native_row_bridge", "uniform_capture_bridge", "source_pattern_count",
             "row_total_object_bytes", "source_to_artifact",
@@ -5956,9 +6085,12 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
                 provenance, components, source_count, row_bytes, source_map
             )
             route = (
-                "linked-native-row-scalar-helper-backed-reducer"
-                if proof["mixed_handle_table"] else
-                "linked-native-row-scalar-reducer"
+                "linked-native-strict-mixed-row-scalar-reducer"
+                if proof["mixed_handle_table"]
+                and every_prepared_component_is_strict(components)
+                else "linked-native-row-scalar-helper-backed-reducer"
+                if proof["mixed_handle_table"]
+                else "linked-native-row-scalar-reducer"
             )
             return [str(proof["reducer_symbol"])], route
         if provenance.get("native_multi_grep_reducer") == "true":
@@ -5969,9 +6101,12 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
                 provenance, components, source_count, row_bytes, source_map
             )
             route = (
-                "linked-native-mixed-multi-grep-reducer"
-                if proof["mixed_handle_table"] else
-                "linked-native-multi-grep-reducer"
+                "linked-native-strict-mixed-multi-grep-reducer"
+                if proof["mixed_handle_table"]
+                and every_prepared_component_is_strict(components)
+                else "linked-native-mixed-multi-grep-reducer"
+                if proof["mixed_handle_table"]
+                else "linked-native-multi-grep-reducer"
             )
             return [str(proof["reducer_symbol"])], route
         if provenance.get("native_row_bridge") == "true" and model in {
@@ -6522,9 +6657,12 @@ def operation_route_from_provenance_record(
                 "normalized multi-Grep reducer provenance",
             )
             route = (
-                "linked-native-mixed-multi-grep-reducer"
-                if proof["mixed_handle_table"] else
-                "linked-native-multi-grep-reducer"
+                "linked-native-strict-mixed-multi-grep-reducer"
+                if proof["mixed_handle_table"]
+                and every_prepared_component_is_strict(components)
+                else "linked-native-mixed-multi-grep-reducer"
+                if proof["mixed_handle_table"]
+                else "linked-native-multi-grep-reducer"
             )
             return [proof["reducer_symbol"]], route
         if provenance["composite_kind"] == "native-row-scalar-reducer-v1":
@@ -6533,9 +6671,12 @@ def operation_route_from_provenance_record(
                 "normalized row-scalar reducer provenance",
             )
             route = (
-                "linked-native-row-scalar-helper-backed-reducer"
-                if proof["mixed_handle_table"] else
-                "linked-native-row-scalar-reducer"
+                "linked-native-strict-mixed-row-scalar-reducer"
+                if proof["mixed_handle_table"]
+                and every_prepared_component_is_strict(components)
+                else "linked-native-row-scalar-helper-backed-reducer"
+                if proof["mixed_handle_table"]
+                else "linked-native-row-scalar-reducer"
             )
             return [proof["reducer_symbol"]], route
         if provenance["composite_kind"] == "strict-capture-next-v1":
@@ -6723,11 +6864,10 @@ def identity_defined_symbols_from_provenance(
         for component, route in zip(components, proof["row_routes"]):
             symbols.append(component.get("entry_symbol"))
             prepared = component.get("prepared_v15")
-            if route == 1 and isinstance(prepared, dict):
-                symbols.extend((
-                    prepared.get("span_fill_symbol"),
-                    prepared.get("runtime_program_symbol"),
-                ))
+            if route in {1, 2} and isinstance(prepared, dict):
+                symbols.append(prepared.get("runtime_program_symbol"))
+                if route == 1:
+                    symbols.append(prepared.get("span_fill_symbol"))
         if not all(isinstance(symbol, str) for symbol in symbols):
             raise CensusError("multi-Grep reducer linked identity symbols are malformed")
         if len(symbols) != len(set(symbols)):
@@ -6745,9 +6885,10 @@ def identity_defined_symbols_from_provenance(
                     raise CensusError(
                         "multi-Grep reducer ordinary row identity route is malformed"
                     )
-            elif route == 1:
+            elif route in {1, 2}:
                 if (
                     not isinstance(prepared, dict)
+                    or prepared_v15_component_route(component) != route
                     or NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL.fullmatch(entry) is None
                 ):
                     raise CensusError(
@@ -6775,11 +6916,10 @@ def identity_defined_symbols_from_provenance(
         for component, route in zip(components, proof["row_routes"]):
             symbols.append(component.get("entry_symbol"))
             prepared = component.get("prepared_v15")
-            if route == 1 and isinstance(prepared, dict):
-                symbols.extend((
-                    prepared.get("span_fill_symbol"),
-                    prepared.get("runtime_program_symbol"),
-                ))
+            if route in {1, 2} and isinstance(prepared, dict):
+                symbols.append(prepared.get("runtime_program_symbol"))
+                if route == 1:
+                    symbols.append(prepared.get("span_fill_symbol"))
         if not all(isinstance(symbol, str) for symbol in symbols):
             raise CensusError("row-scalar reducer linked identity symbols are malformed")
         if len(symbols) != len(set(symbols)):
@@ -6797,9 +6937,10 @@ def identity_defined_symbols_from_provenance(
                     raise CensusError(
                         "row-scalar reducer ordinary row identity route is malformed"
                     )
-            elif route == 1:
+            elif route in {1, 2}:
                 if (
                     not isinstance(prepared, dict)
+                    or prepared_v15_component_route(component) != route
                     or NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL.fullmatch(entry) is None
                 ):
                     raise CensusError(
@@ -6877,15 +7018,18 @@ def identity_defined_symbols_from_provenance(
             symbols.append(provenance["span_fill_symbol"])
         return sorted(symbols)
     if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
-        symbols = [
-            symbol
-            for component in provenance["components"]
-            if component["prepared_v15"] is not None
-            for symbol in (
-                component["prepared_v15"]["span_fill_symbol"],
-                component["prepared_v15"]["runtime_program_symbol"],
+        symbols = []
+        for index, component in enumerate(provenance["components"]):
+            prepared = component["prepared_v15"]
+            if prepared is None:
+                continue
+            validate_normalized_prepared_v15_component(
+                prepared, component,
+                f"normalized mixed prepared component {index}",
             )
-        ]
+            symbols.append(prepared["runtime_program_symbol"])
+            if prepared_v15_component_route(component) == 1:
+                symbols.append(prepared["span_fill_symbol"])
         if len(symbols) != len(set(symbols)):
             raise CensusError("mixed prepared V15 route repeats a linked identity symbol")
         return sorted(symbols)
@@ -7757,16 +7901,15 @@ def validate_normalized_prepared_v15_component(
 ) -> None:
     if not isinstance(proof, dict):
         raise CensusError(f"{context} prepared V15 component proof is not an object")
-    require_exact_keys(
-        proof,
-        {
-            "required_prepare_capabilities", "prepare_config_version",
-            "prepare_operation_flags", "runtime_program_symbol",
-            "runtime_program_len", "span_fill_symbol", "prepared_bulk_strategy",
-            "artifact_identity_sha256",
-        },
-        f"{context} prepared V15 component proof",
-    )
+    legacy_keys = {
+        "required_prepare_capabilities", "prepare_config_version",
+        "prepare_operation_flags", "runtime_program_symbol",
+        "runtime_program_len", "span_fill_symbol", "prepared_bulk_strategy",
+        "artifact_identity_sha256",
+    }
+    enhanced_keys = legacy_keys | {"entry_abi", "prepared_surface"}
+    if frozenset(proof) not in {frozenset(legacy_keys), frozenset(enhanced_keys)}:
+        raise CensusError(f"{context} prepared V15 component proof fields differ")
     entry = component["entry_symbol"]
     entry_suffix = (
         symbol_identity_suffix(entry, NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL, context)
@@ -7774,6 +7917,16 @@ def validate_normalized_prepared_v15_component(
     )
     program = proof["runtime_program_symbol"]
     span_fill = proof["span_fill_symbol"]
+    entry_abi = proof.get("entry_abi")
+    prepared_surface = proof.get("prepared_surface")
+    legacy_compatibility = entry_abi is None or (
+        entry_abi == SPAN_SEARCH_ENTRY_ABI
+        and prepared_surface == PREPARED_V15_COMPATIBILITY_SURFACE
+    )
+    strict_row_search = (
+        entry_abi == PREPARED_SPAN_SEARCH_ENTRY_ABI
+        and prepared_surface == PREPARED_V15_ROW_SEARCH_SURFACE
+    )
     if (
         proof["required_prepare_capabilities"] != PREPARED_V15_CAPABILITY
         or proof["prepare_config_version"] != PREPARED_V15_CONFIG_VERSION
@@ -7781,18 +7934,38 @@ def validate_normalized_prepared_v15_component(
         or not isinstance(proof["runtime_program_len"], int)
         or isinstance(proof["runtime_program_len"], bool)
         or not 1 <= proof["runtime_program_len"] <= MAX_SERIALIZED_PROGRAM_BYTES
-        or proof["prepared_bulk_strategy"] != "Some(NativeOrderedNfaLoop)"
-        or component["required_runtime_symbols"] != list(PREPARED_V15_RUNTIME_SYMBOLS)
         or not isinstance(program, str)
         or not isinstance(span_fill, str)
+        or not (legacy_compatibility or strict_row_search)
+        or (
+            "entry_abi" in component
+            and (
+                component.get("entry_abi") != entry_abi
+                or component.get("prepared_surface") != prepared_surface
+            )
+        )
     ):
         raise CensusError(f"{context} prepared V15 component proof differs")
     program_suffix = symbol_identity_suffix(program, NATIVE_RUNTIME_PROGRAM_SYMBOL, context)
-    span_fill_suffix = symbol_identity_suffix(span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, context)
-    if (
-        entry_suffix is None
-        or len({entry_suffix, program_suffix, span_fill_suffix}) != 1
-        or proof["artifact_identity_sha256"] != entry_suffix
+    if legacy_compatibility:
+        span_fill_suffix = symbol_identity_suffix(
+            span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, context
+        )
+        surface_closed = (
+            proof["prepared_bulk_strategy"] == "Some(NativeOrderedNfaLoop)"
+            and component["required_runtime_symbols"]
+                == list(PREPARED_V15_RUNTIME_SYMBOLS)
+            and len({entry_suffix, program_suffix, span_fill_suffix}) == 1
+        )
+    else:
+        surface_closed = (
+            proof["prepared_bulk_strategy"] == "None"
+            and component["required_runtime_symbols"] == []
+            and span_fill == ""
+            and entry_suffix == program_suffix
+        )
+    if entry_suffix is None or not surface_closed or (
+        proof["artifact_identity_sha256"] != entry_suffix
     ):
         raise CensusError(f"{context} prepared V15 component identity differs")
 
@@ -9141,6 +9314,14 @@ def validate_provenance_record(provenance: object, context: str) -> None:
     )
     if not isinstance(provenance["components"], list):
         raise CensusError(f"{context} components are not a list")
+    component_surface_presence = [
+        "entry_abi" in component or "prepared_surface" in component
+        for component in provenance["components"] if isinstance(component, dict)
+    ]
+    if component_surface_presence and any(component_surface_presence) and not all(
+        component_surface_presence
+    ):
+        raise CensusError(f"{context} component ABI/surface receipts are partial")
     for index, component in enumerate(provenance["components"]):
         if not isinstance(component, dict):
             raise CensusError(f"{context} component {index} is not an object")
@@ -9149,6 +9330,8 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             "required_runtime_symbols", "automaton_sha256",
             "program_sha256", "object_sha256",
         }
+        if "entry_abi" in component or "prepared_surface" in component:
+            component_keys.update({"entry_abi", "prepared_surface"})
         scalar_proof = provenance.get("row_scalar_reducer")
         multi_grep_proof = provenance.get("multi_grep_reducer")
         if (
@@ -9188,7 +9371,21 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         if runtime_symbols != sorted(set(runtime_symbols)) or not all(
             isinstance(symbol, str) and SYMBOL.fullmatch(symbol) for symbol in runtime_symbols
         ):
-            raise CensusError(f"{context} component {index} runtime symbols are not canonical")
+            raise CensusError(f"{context} component {index} runtime symbols differ")
+        if "entry_abi" in component:
+            proof = component.get("prepared_v15")
+            if proof is None:
+                expected_pair = (SPAN_SEARCH_ENTRY_ABI, NO_PREPARED_SURFACE)
+            elif isinstance(proof, dict):
+                expected_pair = (
+                    proof.get("entry_abi"), proof.get("prepared_surface")
+                )
+            else:
+                raise CensusError(f"{context} component {index} prepared proof differs")
+            if (
+                component.get("entry_abi"), component.get("prepared_surface")
+            ) != expected_pair:
+                raise CensusError(f"{context} component {index} ABI/surface differs")
     required_runtime = provenance["required_runtime_symbols"]
     if required_runtime != sorted(set(required_runtime)) or not all(
         isinstance(symbol, str) and SYMBOL.fullmatch(symbol) for symbol in required_runtime
@@ -9371,9 +9568,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                     or (
                         component.get("prepared_v15") is not None
                         and (
-                            component["required_runtime_symbols"]
-                            != sorted(PREPARED_V15_RUNTIME_SYMBOLS)
-                            or NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL.fullmatch(
+                            NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL.fullmatch(
                                 component["entry_symbol"]
                             ) is None
                         )
@@ -9392,7 +9587,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 for index, (component, route) in enumerate(
                     zip(components, proof["row_routes"])
                 ):
-                    if route == 1:
+                    if route in {1, 2}:
                         validate_normalized_prepared_v15_component(
                             component["prepared_v15"], component,
                             f"{context} component {index}",
@@ -9454,11 +9649,10 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                         )
                     )
                     or (
-                        route == 1
+                        route in {1, 2}
                         and (
                             component.get("prepared_v15") is None
-                            or component["required_runtime_symbols"]
-                            != sorted(PREPARED_V15_RUNTIME_SYMBOLS)
+                            or prepared_v15_component_route(component) != route
                             or NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL.fullmatch(
                                 component["entry_symbol"]
                             ) is None
@@ -9478,7 +9672,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 for index, (component, route) in enumerate(
                     zip(components, proof["row_routes"])
                 ):
-                    if route == 1:
+                    if route in {1, 2}:
                         validate_normalized_prepared_v15_component(
                             component["prepared_v15"], component,
                             f"{context} mixed multi-Grep component {index}",

@@ -55,10 +55,13 @@ whole-operation reducer once, so its LF/CRLF split and checked scalar reduction
 do not retain that Rust outer loop. An all-ordinary multi-pattern `grep` table
 now does the same through `linked-native-multi-grep-reducer`; its child rows
 remain authenticated identities, while the single wrapper owns both line and
-row loops. A mixed table instead uses
-`linked-native-mixed-multi-grep-reducer`: the same single-call boundary owns
-both loops, while formal classification remains semantic-helper-backed because
-prepared children retain their sealed runtime-helper closure. After a typed
+row loops. A mixed table uses one of two closed classifications. New rows use
+`PreparedSpanSearchV1` / `RowSearchOnly`; when every prepared child has that
+helper-free surface, `linked-native-strict-mixed-multi-grep-reducer` credits
+the same single-call boundary as whole-operation native. A legacy
+`SpanSearchV1` / `Compatibility` child instead selects
+`linked-native-mixed-multi-grep-reducer` and remains semantic-helper-backed.
+After a typed
 shared ordered-many decline, an all-ordinary
 multi-pattern `count` or `count-spans` table may likewise use
 `linked-native-row-scalar-reducer`; one helper-free wrapper owns source-priority
@@ -357,24 +360,29 @@ exact relocation closure, wrapper code/object identities, empty semantic
 runtime-call surface, and the row-plus-wrapper object envelope. A mixed receipt
 also authenticates the exact handle cardinality and row route vector under
 distinct Grep operation/artifact/symbol domains. Route-aware identity inventory
-requires ordinary search symbols on ordinary rows and the exclusive search,
-Span-fill, and serialized-program identities on prepared rows; no prepared
-child is credited as helper-free.
+requires ordinary search symbols on ordinary rows. A legacy prepared row
+requires the exclusive search, SpanFill, and serialized-program identities. A
+strict prepared row requires exactly the exclusive search and
+serialized-program identities and rejects every SpanFill, bulk, aggregate, or
+runtime-helper surface. The mixed reducer is credited as helper-free only when
+every prepared child is strict.
 `native-row-scalar-reducer-v1` uses the same object order and final-wrapper
 operation boundary for Count and SpanSum. Its receipt additionally binds the
 operation tag and every relocation section, offset, kind, child-symbol index,
-and addend. Prepared rows retain the legacy adapter; only the final numeric
-wrapper object cap is a safe post-row decline.
+and addend. Legacy and strict prepared routes remain distinct; only the final
+numeric wrapper object cap is a safe post-row decline.
 Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row
 now also seals its selector automaton hash and the explicit
 `uniform_capture_bridge` boolean. Ordinary rows must publish `false`.
 An additive mixed V15 route may retain both ordinary helper-free entries and
-prepared native Ordered-NFA entries. Each row then seals its exact engine,
-capability/config/operation flags, complete runtime-symbol set, prepared bulk
-strategy, serialized-program symbol and extent, Span-fill identity, and
-ordinary/prepared state. The top-level record seals the 8 MiB handle and
+prepared native Ordered-NFA entries. Each row seals its exact entry ABI and
+prepared surface in addition to its engine, capability/config/operation flags,
+complete runtime-symbol set, prepared bulk strategy, serialized-program symbol
+and extent, SpanFill identity, and ordinary/prepared state. Compatibility rows
+retain their legacy three-helper/SpanFill closure; strict RowSearch-only rows
+must have no helper or SpanFill closure. The top-level record seals the 8 MiB handle and
 scratch ceilings and two-million-unit setup-work ceiling. A scalar prepared
 `grep` seals one of two exact V15 topologies in normalized v2 provenance. The
 legacy `SpanSearchV1` form binds one native entry/SpanFill/program identity, a
@@ -483,8 +491,9 @@ Three fresh processes authenticate each job:
    `native-multi-grep-reducer-v1` instead traps exactly its final wrapper; its
    child rows are inventoried as required defined identities and are not
    substituted as Rust-loop operation entries. Ordinary routes require the
-   ordinary search symbol; mixed prepared routes require the exclusive search,
-   Span-fill, and serialized-program identities for every prepared child.
+   ordinary search symbol. Compatibility prepared routes require exclusive
+   search, SpanFill, and serialized-program identities; strict RowSearch-only
+   routes require exactly exclusive search plus serialized program.
    `native-row-scalar-reducer-v1` follows the same rule: trap its final Count or
    SpanSum wrapper, and inventory each route-specific child identity rather
    than treating the rows as separate operation entries.

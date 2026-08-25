@@ -6,6 +6,7 @@ use fre_aot_regex::{
     RebarMultiGrepReducerRowV1, RelocationKind, SectionKind, SymbolBinding, SymbolKind, Target,
     compile, compile_rebar_mixed_multi_grep_reducer_aot_v1,
     compile_rebar_multi_grep_reducer_aot_v1, compile_with_prepared_ordered_nfa_v15_reported,
+    compile_with_prepared_ordered_nfa_v15_row_search_reported,
 };
 use fre_syntax::RustProfile;
 
@@ -35,6 +36,19 @@ fn compile_prepared_source(source: &str, target: Target) -> fre_aot_regex::Compi
     .expect("compile public prepared grep row");
     let PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) = disposition else {
         panic!("public prepared grep row unexpectedly declined");
+    };
+    compiled
+}
+
+fn compile_strict_prepared_source(source: &str, target: Target) -> fre_aot_regex::CompiledRegex {
+    let disposition = compile_with_prepared_ordered_nfa_v15_row_search_reported(
+        CompileRequest::new(source, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+    )
+    .expect("compile public strict prepared grep row");
+    let PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) = disposition else {
+        panic!("public strict prepared grep row unexpectedly declined");
     };
     compiled
 }
@@ -72,6 +86,43 @@ fn mixed_selected_for(
     .expect("compile public mixed multi-grep reducer");
     let RebarMultiGrepReducerAotCompileDispositionV1::Selected(artifact) = disposition else {
         panic!("public mixed multi-grep reducer unexpectedly declined");
+    };
+    (compiled, artifact)
+}
+
+fn strict_mixed_selected_for(
+    target: Target,
+) -> (
+    [fre_aot_regex::CompiledRegex; 2],
+    fre_aot_regex::RebarMultiGrepReducerAotArtifactV1,
+) {
+    let compiled = [
+        compile_row("^ordinary$", target),
+        compile_strict_prepared_source(r"(?-u:[\x00-\xFF])\bfoo\b", target),
+    ];
+    let rows = [
+        RebarMixedMultiGrepReducerRowV1::new(
+            &compiled[0],
+            0,
+            RebarMixedNativeRowScalarRouteV1::Ordinary,
+        ),
+        RebarMixedMultiGrepReducerRowV1::new(
+            &compiled[1],
+            1,
+            RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch,
+        ),
+    ];
+    let disposition = compile_rebar_mixed_multi_grep_reducer_aot_v1(
+        [0x72; 32],
+        2,
+        40,
+        &[0, 1],
+        &rows,
+        MAX_OBJECT_BYTES,
+    )
+    .expect("compile public strict mixed multi-grep reducer");
+    let RebarMultiGrepReducerAotCompileDispositionV1::Selected(artifact) = disposition else {
+        panic!("public strict mixed multi-grep reducer unexpectedly declined");
     };
     (compiled, artifact)
 }
@@ -526,13 +577,13 @@ int main(void){{
     any(target_os = "linux", target_os = "macos")
 ))]
 #[test]
-#[ignore = "requires the runtime static library; links a real prepared V15 handle"]
+#[ignore = "requires the runtime static library; links a real strict RowSearch V15 handle"]
 fn linked_host_mixed_reducer_matches_the_prior_adapter_with_real_prepared_handles() {
     use std::{fs, process::Command, time::SystemTime};
 
     let target = host_target();
-    let (compiled, artifact) = mixed_selected_for(target);
-    let foreign = compile_prepared_source(r"(?-u:[\x00-\xFF])\bbar\b", target);
+    let (compiled, artifact) = strict_mixed_selected_for(target);
+    let foreign = compile_strict_prepared_source(r"(?-u:[\x00-\xFF])\bbar\b", target);
     let (program, program_len) = compiled[1]
         .module()
         .required_runtime_program()

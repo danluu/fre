@@ -8,6 +8,7 @@ use fre_aot_regex::{
     SymbolKind, Target, compile, compile_rebar_mixed_native_row_scalar_reducer_aot_v1,
     compile_rebar_native_row_scalar_reducer_aot_v1,
     compile_with_prepared_ordered_nfa_v15_reported,
+    compile_with_prepared_ordered_nfa_v15_row_search_reported,
 };
 use fre_syntax::RustProfile;
 
@@ -37,6 +38,19 @@ fn compile_prepared_source(source: &str, target: Target) -> fre_aot_regex::Compi
     .expect("compile public prepared scalar row");
     let PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) = disposition else {
         panic!("public prepared scalar row unexpectedly declined");
+    };
+    compiled
+}
+
+fn compile_strict_prepared_source(source: &str, target: Target) -> fre_aot_regex::CompiledRegex {
+    let disposition = compile_with_prepared_ordered_nfa_v15_row_search_reported(
+        CompileRequest::new(source, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+    )
+    .expect("compile public strict prepared scalar row");
+    let PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) = disposition else {
+        panic!("public strict prepared scalar row unexpectedly declined");
     };
     compiled
 }
@@ -77,6 +91,45 @@ fn mixed_selected_for(
     .expect("compile public mixed row-scalar reducer");
     let RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(artifact) = disposition else {
         panic!("public mixed row-scalar reducer unexpectedly declined");
+    };
+    (compiled, artifact)
+}
+
+fn strict_mixed_selected_for(
+    target: Target,
+    operation: RebarNativeRowScalarOperationV1,
+) -> (
+    [fre_aot_regex::CompiledRegex; 2],
+    RebarNativeRowScalarReducerAotArtifactV1,
+) {
+    let compiled = [
+        compile_row("a", target),
+        compile_strict_prepared_source(r"(?-u:[\x00-\xFF])\bfoo\b", target),
+    ];
+    let rows = [
+        RebarMixedNativeRowScalarReducerRowV1::new(
+            &compiled[0],
+            0,
+            RebarMixedNativeRowScalarRouteV1::Ordinary,
+        ),
+        RebarMixedNativeRowScalarReducerRowV1::new(
+            &compiled[1],
+            1,
+            RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch,
+        ),
+    ];
+    let disposition = compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
+        operation,
+        [0x63; 32],
+        2,
+        32,
+        &[0, 1],
+        &rows,
+        MAX_OBJECT_BYTES,
+    )
+    .expect("compile public strict mixed row-scalar reducer");
+    let RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(artifact) = disposition else {
+        panic!("public strict mixed row-scalar reducer unexpectedly declined");
     };
     (compiled, artifact)
 }
@@ -849,14 +902,15 @@ int main(void){{
     any(target_os = "linux", target_os = "macos")
 ))]
 #[test]
-#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links a real prepared V15 handle"]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links a real strict RowSearch V15 handle"]
 fn linked_host_mixed_scalar_reducer_uses_one_prepared_handle_table() {
     use std::{fs, process::Command, time::SystemTime};
 
     let target = host_target();
-    let (compiled, count) = mixed_selected_for(target, RebarNativeRowScalarOperationV1::Count);
-    let (_, span) = mixed_selected_for(target, RebarNativeRowScalarOperationV1::SpanSum);
-    let foreign = compile_prepared_source(r"(?-u:[\x00-\xFF])\bbar\b", target);
+    let (compiled, count) =
+        strict_mixed_selected_for(target, RebarNativeRowScalarOperationV1::Count);
+    let (_, span) = strict_mixed_selected_for(target, RebarNativeRowScalarOperationV1::SpanSum);
+    let foreign = compile_strict_prepared_source(r"(?-u:[\x00-\xFF])\bbar\b", target);
     let (program, program_len) = compiled[1]
         .module()
         .required_runtime_program()

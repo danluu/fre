@@ -830,7 +830,9 @@ def shared_ordered_many_provenance_fields(
     }
 
 
-def mixed_prepared_grep_provenance_fields() -> dict[str, str]:
+def mixed_prepared_grep_provenance_fields(
+    strict_row_search: bool = False,
+) -> dict[str, str]:
     ordinary_identity = "a" * 64
     prepared_identity = "b" * 64
     fields = {
@@ -903,11 +905,26 @@ def mixed_prepared_grep_provenance_fields() -> dict[str, str]:
         "component_1_program_sha256": "5" * 64,
         "component_1_object_sha256": "6" * 64,
     })
+    if strict_row_search:
+        fields.update({
+            "component_0_entry_abi": CENSUS.SPAN_SEARCH_ENTRY_ABI,
+            "component_0_prepared_surface": CENSUS.NO_PREPARED_SURFACE,
+            "component_1_entry_abi": CENSUS.PREPARED_SPAN_SEARCH_ENTRY_ABI,
+            "component_1_prepared_surface": (
+                CENSUS.PREPARED_V15_ROW_SEARCH_SURFACE
+            ),
+            "component_1_runtime_symbols": "",
+            "component_1_span_fill_symbol": "",
+            "component_1_prepared_bulk_strategy": "None",
+        })
     return fields
 
 
-def mixed_multi_grep_reducer_provenance_fields() -> dict[str, str]:
-    fields = mixed_prepared_grep_provenance_fields()
+def mixed_multi_grep_reducer_provenance_fields(
+    strict_row_search: bool = False,
+) -> dict[str, str]:
+    fields = mixed_prepared_grep_provenance_fields(strict_row_search)
+    routes = (0, 2 if strict_row_search else 1)
     fields.update({
         "adapter": (
             "general-aot-native-mixed-prepared-ordered-nfa-v15-"
@@ -921,7 +938,7 @@ def mixed_multi_grep_reducer_provenance_fields() -> dict[str, str]:
         "multi_grep_reducer_abi_version": "1",
         "multi_grep_reducer_mixed_handle_table": "true",
         "multi_grep_reducer_required_handle_count": "2",
-        "multi_grep_reducer_row_routes": "0,1",
+        "multi_grep_reducer_row_routes": ",".join(map(str, routes)),
         "multi_grep_reducer_source_cardinality": "2",
         "multi_grep_reducer_source_bytes": "12",
         "multi_grep_reducer_ordered_sources_sha256": "c" * 64,
@@ -944,7 +961,7 @@ def mixed_multi_grep_reducer_provenance_fields() -> dict[str, str]:
     for row in (0, 1):
         operation.update(row.to_bytes(8, "little"))
     operation.update((2).to_bytes(8, "little"))
-    for index, route in enumerate((0, 1)):
+    for index, route in enumerate(routes):
         operation.update(index.to_bytes(8, "little"))
         operation.update(bytes((route,)))
         entry = fields[f"component_{index}_entry_symbol"].encode("ascii")
@@ -968,7 +985,7 @@ def mixed_multi_grep_reducer_provenance_fields() -> dict[str, str]:
     artifact.update((1208).to_bytes(8, "little"))
     artifact.update((268435456 - 8192).to_bytes(8, "little"))
     artifact.update((2).to_bytes(8, "little"))
-    artifact.update(bytes((0, 1)))
+    artifact.update(bytes(routes))
     fields["multi_grep_reducer_artifact_identity_sha256"] = artifact.hexdigest()
     return fields
 
@@ -1871,7 +1888,7 @@ class TrueNativeCensusTests(unittest.TestCase):
         )
         self.assertIn("mixed_handle_table", multi_grep["required"])
         self.assertEqual(
-            multi_grep["properties"]["row_routes"]["items"]["enum"], [0, 1]
+            multi_grep["properties"]["row_routes"]["items"]["enum"], [0, 1, 2]
         )
         row_scalar = definitions["rowScalarReducerProvenance"]
         self.assertFalse(row_scalar["additionalProperties"])
@@ -1879,6 +1896,14 @@ class TrueNativeCensusTests(unittest.TestCase):
             row_scalar["properties"]["semantic_runtime_calls"]["const"], 0
         )
         self.assertIn("mixed_handle_table", row_scalar["required"])
+        self.assertEqual(
+            row_scalar["properties"]["row_routes"]["items"]["enum"], [0, 1, 2]
+        )
+        component = definitions["componentProvenance"]
+        self.assertIn("PreparedSpanSearchV1", component["properties"]["entry_abi"]["enum"])
+        self.assertIn("RowSearchOnly", component["properties"]["prepared_surface"]["enum"])
+        prepared_component = definitions["preparedV15ComponentProvenance"]
+        self.assertEqual(len(prepared_component["oneOf"]), 3)
         prepared_condition = next(
             item for item in definitions["provenance"]["allOf"]
             if item.get("then", {}).get("required") == ["prepared_v15_limits"]
@@ -2715,6 +2740,9 @@ class TrueNativeCensusTests(unittest.TestCase):
                 False,
                 "single-call-native-reducer-retains-semantic-runtime-helpers",
             ),
+            "linked-native-strict-mixed-multi-grep-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
             "linked-native-row-scalar-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
@@ -2722,6 +2750,9 @@ class TrueNativeCensusTests(unittest.TestCase):
                 False,
                 False,
                 "single-call-native-reducer-retains-semantic-runtime-helpers",
+            ),
+            "linked-native-strict-mixed-row-scalar-reducer": (
+                False, True, "whole-operation-native-authenticated"
             ),
             "linked-uniform-capture-row-adapter-loop": (
                 True,
@@ -4402,6 +4433,92 @@ class TrueNativeCensusTests(unittest.TestCase):
                 numeric_boolean["multi_grep_reducer"],
                 numeric_boolean,
                 "numeric mixed multi-Grep boolean",
+            )
+
+    def test_strict_row_search_mixed_reducer_is_whole_native_and_fail_closed(self) -> None:
+        fields = mixed_multi_grep_reducer_provenance_fields(strict_row_search=True)
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        expected_route = (
+            [fields["multi_grep_reducer_symbol"]],
+            "linked-native-strict-mixed-multi-grep-reducer",
+        )
+        self.assertEqual(CENSUS.selected_operation_entries(parsed), expected_route)
+        receipt = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(receipt, "strict mixed multi-Grep")
+        self.assertEqual(receipt["multi_grep_reducer"]["row_routes"], [0, 2])
+        self.assertEqual(
+            receipt["components"][1]["prepared_v15"]["entry_abi"],
+            CENSUS.PREPARED_SPAN_SEARCH_ENTRY_ABI,
+        )
+        self.assertEqual(
+            receipt["components"][1]["prepared_v15"]["prepared_surface"],
+            CENSUS.PREPARED_V15_ROW_SEARCH_SURFACE,
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt), expected_route
+        )
+        self.assertEqual(
+            CENSUS.OPERATION_ROUTE_POLICIES[expected_route[1]].boundary,
+            CENSUS.OperationBoundary.WHOLE_OPERATION,
+        )
+        identity_symbols = sorted([
+            fields["component_0_entry_symbol"],
+            fields["component_1_entry_symbol"],
+            fields["component_1_runtime_program_symbol"],
+        ])
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(receipt),
+            identity_symbols,
+        )
+        self.assertNotIn("", identity_symbols)
+        self.assertFalse(CENSUS.every_prepared_component_is_strict([
+            receipt["components"][1],
+            CENSUS.provenance_receipt(CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}"
+                    for key, value in mixed_prepared_grep_provenance_fields().items()
+                ).encode()
+            ))["components"][1],
+        ]))
+
+        poisons = {
+            "component_1_entry_abi": CENSUS.SPAN_SEARCH_ENTRY_ABI,
+            "component_1_prepared_surface": CENSUS.PREPARED_V15_COMPATIBILITY_SURFACE,
+            "component_1_runtime_symbols": ",".join(
+                CENSUS.PREPARED_V15_RUNTIME_SYMBOLS
+            ),
+            "component_1_span_fill_symbol": (
+                f"fre_aot_regex_fill_spans_exclusive_v1_{'b' * 64}"
+            ),
+            "component_1_prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+            "multi_grep_reducer_row_routes": "0,1",
+        }
+        for name, value in poisons.items():
+            with self.subTest(name=name):
+                poisoned = dict(fields)
+                poisoned[name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+
+        partial = dict(fields)
+        del partial["component_0_entry_abi"]
+        with self.assertRaisesRegex(CENSUS.CensusError, "partial"):
+            CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in partial.items()).encode()
+            )
+
+        normalized_poison = copy.deepcopy(receipt)
+        normalized_poison["components"][1]["prepared_v15"][
+            "prepared_surface"
+        ] = CENSUS.PREPARED_V15_COMPATIBILITY_SURFACE
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.validate_provenance_record(
+                normalized_poison, "poisoned strict mixed multi-Grep"
             )
 
     def test_uniform_capture_v3_seals_proof_lists_and_mapped_selector_digests(self) -> None:

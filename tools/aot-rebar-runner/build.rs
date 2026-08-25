@@ -250,9 +250,7 @@ fn main() {
             shared::UniformCaptureBridgeDisposition::Proven(bridge) => {
                 let weighted = if benchmark.patterns.len() > 1 {
                     match shared::try_compile_weighted_capture_reducer_bridge(
-                        &benchmark,
-                        target,
-                        &bridge,
+                        &benchmark, target, &bridge,
                     )
                     .expect("compile helper-free weighted capture reducer")
                     {
@@ -562,7 +560,11 @@ fn main() {
         let scalar_artifact = row_scalar_reducer
             .as_ref()
             .map(|artifact| artifact.object())
-            .or_else(|| multi_grep_reducer.as_ref().map(|artifact| artifact.object()));
+            .or_else(|| {
+                multi_grep_reducer
+                    .as_ref()
+                    .map(|artifact| artifact.object())
+            });
         if let Some(artifact) = scalar_artifact {
             fs::write(&object_path, artifact).expect("write linked native row reducer object");
         } else {
@@ -576,7 +578,9 @@ fn main() {
                 row_scalar_reducer
                     .as_ref()
                     .map(|artifact| artifact.receipt()),
-                multi_grep_reducer.as_ref().map(|artifact| artifact.receipt()),
+                multi_grep_reducer
+                    .as_ref()
+                    .map(|artifact| artifact.receipt()),
                 None,
                 None,
                 None,
@@ -830,9 +834,8 @@ fn configured_source(
             .iter()
             .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
             .expect("shared ordered-many source byte sum overflowed");
-        let expected_sources_sha256 =
-            shared::ordered_many_source_sha256(&benchmark.patterns)
-                .expect("shared ordered-many source identity failed");
+        let expected_sources_sha256 = shared::ordered_many_source_sha256(&benchmark.patterns)
+            .expect("shared ordered-many source identity failed");
         assert_eq!(
             ordered.schema_version,
             fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
@@ -906,8 +909,8 @@ fn configured_source(
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
     let shared_uniform_capture_operation_only = shared_uniform_capture
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
-    let native_uniform_capture_operation_only = single_native_uniform_capture_operation_only
-        || shared_uniform_capture_operation_only;
+    let native_uniform_capture_operation_only =
+        single_native_uniform_capture_operation_only || shared_uniform_capture_operation_only;
     let scalar_operation_only = (native_scalar_reducer
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1)
         || native_uniform_capture_operation_only;
@@ -932,9 +935,18 @@ fn configured_source(
             uniform.aggregate_strategy(),
             fre_aot_regex::PreparedAggregateStrategy::NativeOrderedNfaFused
         );
-        assert_eq!(uniform.required_prepare_capabilities(), required_prepare_capabilities);
+        assert_eq!(
+            uniform.required_prepare_capabilities(),
+            required_prepare_capabilities
+        );
         assert_ne!(reducer_symbol, Some(entry_symbol));
-        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
         assert!(!receipt.runtime_helper_required);
     } else if shared_uniform_capture_operation_only {
         let shared = shared_uniform_capture_reducer_receipt
@@ -943,15 +955,24 @@ fn configured_source(
             shared.aggregate_strategy(),
             fre_aot_regex::PreparedAggregateStrategy::NativeOrderedNfaFused
         );
-        assert_eq!(shared.required_prepare_capabilities(), required_prepare_capabilities);
+        assert_eq!(
+            shared.required_prepare_capabilities(),
+            required_prepare_capabilities
+        );
         let count_symbol_sha256: [u8; 32] = Sha256::digest(entry_symbol.as_bytes()).into();
         assert_eq!(shared.count_symbol_sha256(), count_symbol_sha256);
-        let reducer_symbol = reducer_symbol
-            .expect("operation-only shared uniform capture has no reducer symbol");
+        let reducer_symbol =
+            reducer_symbol.expect("operation-only shared uniform capture has no reducer symbol");
         let reducer_symbol_sha256: [u8; 32] = Sha256::digest(reducer_symbol.as_bytes()).into();
         assert_eq!(shared.reducer_symbol_sha256(), reducer_symbol_sha256);
         assert_ne!(reducer_symbol, entry_symbol);
-        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
         assert!(!receipt.runtime_helper_required);
     } else if scalar_operation_only {
         assert_eq!(reducer_symbol, Some(entry_symbol));
@@ -1051,9 +1072,7 @@ fn configured_source(
             match benchmark.model {
                 shared::Model::Count => "general-aot-shared-ordered-many-native-count-v1",
                 shared::Model::SpanSum => "general-aot-shared-ordered-many-native-span-sum-v1",
-                shared::Model::GrepCount => {
-                    "general-aot-shared-ordered-many-native-grep-count-v1"
-                }
+                shared::Model::GrepCount => "general-aot-shared-ordered-many-native-grep-count-v1",
                 _ => unreachable!("shared ordered-many binding has a non-scalar model"),
             }
         } else if native_uniform_capture {
@@ -2171,10 +2190,7 @@ fn configured_participation_capture_source(
         ("DFA_STATES", receipt.dfa_states),
         ("TRANSITION_CELLS", receipt.transition_cells),
         ("ORDERED_NFA_STATES", receipt.ordered_nfa_states),
-        (
-            "ORDERED_NFA_BYTE_RANGES",
-            receipt.ordered_nfa_byte_ranges,
-        ),
+        ("ORDERED_NFA_BYTE_RANGES", receipt.ordered_nfa_byte_ranges),
         ("DFA_FALLBACK_REQUIRED", receipt.dfa_fallback_required),
         ("DFA_FALLBACK_LIMIT", receipt.dfa_fallback_limit),
         ("BUILD_WORK", receipt.build_work),
@@ -2717,6 +2733,35 @@ fn configured_native_row_source(
                 assert!(compiled.module().prepared_span_fill_symbol().is_some());
                 assert!(compiled.module().required_runtime_program().is_some());
             }
+            shared::NativeRowRoute::PreparedOrderedNfaV15RowSearch => {
+                assert_eq!(
+                    compiled.receipt().entry_abi,
+                    fre_aot_regex::EntryAbi::PreparedSpanSearchV1
+                );
+                assert!(!compiled.receipt().runtime_helper_required);
+                assert_eq!(
+                    compiled.receipt().required_prepare_capabilities,
+                    fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+                );
+                assert_eq!(
+                    compiled.module().required_prepare_capabilities(),
+                    fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+                );
+                assert_eq!(
+                    compiled.module().prepared_entry_symbol(),
+                    Some(compiled.module().entry_symbol())
+                );
+                assert!(compiled.module().prepared_span_fill_symbol().is_none());
+                assert!(compiled.module().prepared_bulk_strategy().is_none());
+                assert!(
+                    compiled
+                        .module()
+                        .required_runtime_symbols()
+                        .next()
+                        .is_none()
+                );
+                assert!(compiled.module().required_runtime_program().is_some());
+            }
         }
     }
 
@@ -2857,6 +2902,20 @@ fn configured_native_row_source(
         .iter()
         .map(shared::NativeRowArtifact::entry_symbol)
         .collect::<Vec<_>>();
+    let row_entry_abis = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| format!("{:?}", artifact.compiled.receipt().entry_abi))
+        .collect::<Vec<_>>();
+    let row_prepared_surfaces = bridge
+        .artifacts
+        .iter()
+        .map(|artifact| match artifact.route {
+            shared::NativeRowRoute::Ordinary => "None",
+            shared::NativeRowRoute::PreparedOrderedNfaV15 => "Compatibility",
+            shared::NativeRowRoute::PreparedOrderedNfaV15RowSearch => "RowSearchOnly",
+        })
+        .collect::<Vec<_>>();
     let row_required_prepare_capabilities = bridge
         .artifacts
         .iter()
@@ -2977,8 +3036,7 @@ fn configured_native_row_source(
                     .expect("capture multiplier fits u64"),
             );
             source_minimum_match_bytes.push(participation.minimum_match_bytes().get());
-            source_participating_user_captures
-                .push(participation.participating_user_captures());
+            source_participating_user_captures.push(participation.participating_user_captures());
             source_canonical_capture_annotations
                 .push(participation.canonical_capture_annotations());
             source_proof_work.push(participation.work());
@@ -3140,6 +3198,16 @@ fn configured_native_row_source(
     writeln!(
         source,
         "pub const ROW_ENTRY_SYMBOLS: &[&str] = &{entry_symbols:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_ENTRY_ABIS: &[&str] = &{row_entry_abis:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARED_SURFACES: &[&str] = &{row_prepared_surfaces:?};"
     )
     .unwrap();
     writeln!(
@@ -3342,7 +3410,11 @@ fn configured_native_row_source(
     let object_sha256 = weighted_capture_reducer
         .map(|weighted| weighted.artifact.receipt().reducer_object_sha256())
         .unwrap_or(first_object_sha256);
-    writeln!(source, "pub const OBJECT_SHA256: [u8; 32] = {object_sha256:?};").unwrap();
+    writeln!(
+        source,
+        "pub const OBJECT_SHA256: [u8; 32] = {object_sha256:?};"
+    )
+    .unwrap();
     source.push_str("pub const REGEX_REDUX_COMPONENT_COUNT: usize = 0;\n");
     source.push_str("pub const REGEX_REDUX_ENTRY_SYMBOLS: &[&str] = &[];\n");
     source.push_str("pub const REGEX_REDUX_RUNTIME_SYMBOLS: &[&str] = &[];\n");
@@ -3392,7 +3464,8 @@ fn configured_native_row_source(
             shared::NativeRowRoute::Ordinary => {
                 writeln!(source, "    fn LINKED_ROW_ENTRY_{index}(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;").unwrap();
             }
-            shared::NativeRowRoute::PreparedOrderedNfaV15 => {
+            shared::NativeRowRoute::PreparedOrderedNfaV15
+            | shared::NativeRowRoute::PreparedOrderedNfaV15RowSearch => {
                 writeln!(source, "    fn LINKED_ROW_ENTRY_{index}(handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize, result_out: *mut fre_aot_regex_runtime::FreAotRegexResultV1) -> u32;").unwrap();
                 let (program_symbol, _) = artifact
                     .compiled
@@ -3686,19 +3759,31 @@ fn push_empty_weighted_capture_reducer_receipt(source: &mut String) {
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_PATTERN_BYTES: usize = 0;\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES: usize = 0;\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_MAX_OBJECT_BYTES: usize = 0;\n");
-    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str(
+        "pub const WEIGHTED_CAPTURE_REDUCER_ORDERED_SOURCES_SHA256: [u8; 32] = [0; 32];\n",
+    );
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_SOURCE_TO_COMPONENT: &[usize] = &[];\n");
-    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_FIRST_SOURCE_ORDINALS: &[usize] = &[];\n");
+    source.push_str(
+        "pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_FIRST_SOURCE_ORDINALS: &[usize] = &[];\n",
+    );
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_WEIGHTS: &[u64] = &[];\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_ENTRY_SYMBOLS: &[&str] = &[];\n");
-    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256: &[[u8; 32]] = &[];\n");
-    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256: &[[u8; 32]] = &[];\n");
-    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str(
+        "pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_PROGRAM_SHA256: &[[u8; 32]] = &[];\n",
+    );
+    source.push_str(
+        "pub const WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256: &[[u8; 32]] = &[];\n",
+    );
+    source.push_str(
+        "pub const WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n",
+    );
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_SYMBOL: &str = \"\";\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str(
+        "pub const WEIGHTED_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n",
+    );
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_COMPONENTS: &[usize] = &[];\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_OFFSETS: &[u64] = &[];\n");
     source.push_str("pub const WEIGHTED_CAPTURE_REDUCER_RELOCATION_KINDS: &[u8] = &[];\n");
@@ -3846,7 +3931,9 @@ fn push_empty_single_capture_reducer_bindings(source: &mut String) {
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_CAN_MATCH_EMPTY: bool = false;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_SEMANTIC_RUNTIME_CALLS: usize = 0;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_CALLER_SCRATCH_BYTES: usize = 0;\n");
-    source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES: usize = 0;\n");
+    source.push_str(
+        "pub const SINGLE_CAPTURE_REDUCER_PRIVATE_PARTICIPATION_SCRATCH_BYTES: usize = 0;\n",
+    );
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_ITERATOR_STATE_BYTES: usize = 0;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_COUNT: usize = 0;\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_PRIVATE_RESULT_SLOT_BYTES: usize = 0;\n");
@@ -3862,7 +3949,9 @@ fn push_empty_single_capture_reducer_bindings(source: &mut String) {
     source
         .push_str("pub const SINGLE_CAPTURE_REDUCER_REDUCER_SYMBOL_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const SINGLE_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub const SINGLE_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source.push_str(
+        "pub const SINGLE_CAPTURE_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n",
+    );
     source.push_str("pub unsafe fn capture_reduce(_haystack: *const u8, _haystack_len: usize, _scratch: *mut u8, _scratch_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
 }
 
@@ -3941,7 +4030,11 @@ fn push_multi_grep_reducer_receipt(
         ("OBJECT_BYTES", receipt.object_bytes()),
         ("MAX_OBJECT_BYTES", receipt.max_object_bytes()),
     ] {
-        writeln!(source, "pub const MULTI_GREP_REDUCER_{name}: usize = {value};").unwrap();
+        writeln!(
+            source,
+            "pub const MULTI_GREP_REDUCER_{name}: usize = {value};"
+        )
+        .unwrap();
     }
     writeln!(
         source,
@@ -3967,6 +4060,7 @@ fn push_multi_grep_reducer_receipt(
         .map(|route| match route {
             fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary => 0_u8,
             fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15 => 1_u8,
+            fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch => 2_u8,
         })
         .collect::<Vec<_>>();
     writeln!(
@@ -4006,7 +4100,11 @@ fn push_row_scalar_reducer_receipt(
         ("OBJECT_BYTES", receipt.object_bytes()),
         ("MAX_OBJECT_BYTES", receipt.max_object_bytes()),
     ] {
-        writeln!(source, "pub const ROW_SCALAR_REDUCER_{name}: usize = {value};").unwrap();
+        writeln!(
+            source,
+            "pub const ROW_SCALAR_REDUCER_{name}: usize = {value};"
+        )
+        .unwrap();
     }
     writeln!(
         source,
@@ -4041,6 +4139,7 @@ fn push_row_scalar_reducer_receipt(
         .map(|route| match route {
             fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary => 0_u8,
             fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15 => 1_u8,
+            fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch => 2_u8,
         })
         .collect::<Vec<_>>();
     writeln!(
@@ -4133,7 +4232,8 @@ fn push_empty_row_scalar_reducer_receipt(source: &mut String) {
     source.push_str("pub const ROW_SCALAR_REDUCER_RELOCATION_SYMBOLS: &[usize] = &[];\n");
     source.push_str("pub const ROW_SCALAR_REDUCER_RELOCATION_ADDENDS: &[i64] = &[];\n");
     source.push_str("pub const ROW_SCALAR_REDUCER_ORDERED_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub const ROW_SCALAR_REDUCER_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source
+        .push_str("pub const ROW_SCALAR_REDUCER_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const ROW_SCALAR_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const ROW_SCALAR_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const ROW_SCALAR_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
@@ -4158,7 +4258,8 @@ fn push_empty_multi_grep_reducer_receipt(source: &mut String) {
     source.push_str("pub const MULTI_GREP_REDUCER_MAX_OBJECT_BYTES: usize = 0;\n");
     source.push_str("pub const MULTI_GREP_REDUCER_SYMBOL: &str = \"\";\n");
     source.push_str("pub const MULTI_GREP_REDUCER_ORDERED_SOURCES_SHA256: [u8; 32] = [0; 32];\n");
-    source.push_str("pub const MULTI_GREP_REDUCER_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
+    source
+        .push_str("pub const MULTI_GREP_REDUCER_OPERATION_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const MULTI_GREP_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const MULTI_GREP_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str("pub const MULTI_GREP_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
@@ -4179,6 +4280,16 @@ fn push_empty_prepared_row_bindings(source: &mut String, row_count: usize) {
     writeln!(
         source,
         "pub const ROW_REQUIRED_PREPARE_CAPABILITIES: &[u64] = &{zeros_u64:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_ENTRY_ABIS: &[&str] = &{empty_strings:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const ROW_PREPARED_SURFACES: &[&str] = &{none_strategies:?};"
     )
     .unwrap();
     writeln!(
@@ -4403,6 +4514,8 @@ pub const ROW_TOTAL_OBJECT_BYTES: usize = 0;
 pub const SOURCE_TO_ARTIFACT: &[usize] = &[];
 pub const ROW_FIRST_SOURCE_ORDINALS: &[usize] = &[];
 pub const ROW_ENTRY_SYMBOLS: &[&str] = &[];
+pub const ROW_ENTRY_ABIS: &[&str] = &[];
+pub const ROW_PREPARED_SURFACES: &[&str] = &[];
 pub const ROW_REQUIRED_PREPARE_CAPABILITIES: &[u64] = &[];
 pub const ROW_PREPARE_CONFIG_VERSIONS: &[u32] = &[];
 pub const ROW_PREPARE_OPERATION_FLAGS: &[u64] = &[];

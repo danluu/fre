@@ -482,16 +482,20 @@ entry, the final wrapper symbol/code/object identities, its exact
 architecture-specific call relocations, zero semantic runtime calls, and the
 row-plus-wrapper object envelope. Mixed receipts additionally seal the exact
 handle count and ordinary/prepared route vector under distinct operation,
-artifact, and symbol domains. The census admits only the final wrapper as the
-operation entry; child row entries remain identity-defined link targets. A
-mixed wrapper is still classified as semantic-helper-backed because each V15
-child retains its authenticated runtime-symbol surface, rather than being
-misreported in the helper-free whole-operation numerator.
+artifact, and symbol domains. New prepared rows use the strict
+`PreparedSpanSearchV1` / `RowSearchOnly` surface: exactly one exclusive-handle
+function and one exact serialized-program object, with no SpanFill, bulk,
+aggregate, or unresolved runtime-helper symbol. The census admits the final
+mixed wrapper to the whole-operation numerator only when every prepared child
+has that strict surface. Legacy `SpanSearchV1` / `Compatibility` receipts
+remain accepted byte-for-byte, but a wrapper containing one remains
+semantic-helper-backed. Child row entries remain identity-defined link targets
+in both cases.
 `native-multi-grep-reducer-v1` uses the same mixed route vector and handle-table
 closure under its own Grep-specific operation, artifact, symbol, and ABI
-domains. Its final reducer is one native operation call, but the census labels
-the mixed form semantic-helper-backed because prepared children retain their
-closed V15 runtime-helper surface.
+domains. Its final reducer is one native operation call; strict mixed children
+qualify as whole-operation native, while a legacy Compatibility child keeps
+the semantic-helper-backed classification.
 Uniform-capture v3 row-adapter routes additionally publish `capture_resolution` as
 `static-uniform-multiplier`, both proof-identity versions, every source's
 multiplier/minimum/census/accounting, and the selector digests that bind it to
