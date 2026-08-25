@@ -864,12 +864,17 @@ fn direct_exact_singleton_count_short_gate_preserves_the_hot_incumbent_layout() 
         &selected_relocations[..incumbent_relocations.len()],
         incumbent_relocations,
     );
-    let identity_symbol = incumbent
+    let mut identity_symbols = selected
         .module()
         .symbols()
         .iter()
-        .position(|symbol| symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity")
-        .expect("prepared aggregate identity symbol");
+        .enumerate()
+        .filter(|(_, symbol)| symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity")
+        .map(|(index, _)| index);
+    let identity_symbol = identity_symbols
+        .next()
+        .expect("unique prepared aggregate identity symbol");
+    assert!(identity_symbols.next().is_none());
     for (relocation, kind) in selected_relocations[incumbent_relocations.len()..]
         .iter()
         .zip([
