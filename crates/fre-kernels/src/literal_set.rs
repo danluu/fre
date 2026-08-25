@@ -2,7 +2,7 @@
 
 use core::fmt;
 use core::mem;
-use core::num::{NonZeroU16, NonZeroU32};
+use core::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 
 use aho_corasick::automaton::{Automaton, StateID};
@@ -268,8 +268,7 @@ pub struct LiteralSetPlan {
 #[derive(Clone, Copy, Debug)]
 pub struct LiteralSetOrdinaryExecutor<'a> {
     plan: &'a LiteralSetPlan,
-    direct_dfa_start_state: Option<NonZeroU32>,
-    direct_dfa_root_range: Option<NonZeroU16>,
+    direct_dfa_identity: Option<LiteralSetDirectDfaIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,6 +302,62 @@ impl LiteralSetDfaRootRange {
     }
 }
 
+/// One scalar identity for the direct ordinary DFA and its optional root
+/// accelerator.
+///
+/// The nonzero encoded start occupies the high 32 bits, making the complete
+/// value nonzero even when no exact root range is available. The low 16 bits
+/// retain that range's existing zero-niche encoding. Binding both pieces once
+/// keeps the executor at two machine words and gives direct operations one
+/// prepared capability to pass across their outlined engine boundary.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiteralSetDirectDfaIdentity(NonZeroU64);
+
+impl LiteralSetDirectDfaIdentity {
+    const START_SHIFT: u32 = u32::BITS;
+
+    #[inline]
+    fn new(start_state: StateID, root_range: Option<NonZeroU16>) -> Self {
+        let encoded_start = encode_direct_dfa_start_state(start_state);
+        let encoded_root = root_range.map_or(0, NonZeroU16::get);
+        let raw = (u64::from(encoded_start.get()) << Self::START_SHIFT)
+            | u64::from(encoded_root);
+        Self(
+            NonZeroU64::new(raw)
+                .expect("the high direct-DFA start encoding is nonzero"),
+        )
+    }
+
+    #[inline(always)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::as_conversions,
+        clippy::inline_always,
+        reason = "the high 32 bits fit u32, retain a nonzero bias, and decode on the hot boundary"
+    )]
+    fn start_state(self) -> StateID {
+        let encoded = (self.0.get() >> Self::START_SHIFT) as u32;
+        debug_assert_ne!(encoded, 0);
+        let raw = encoded - 1;
+        StateID::must(
+            usize::try_from(raw)
+                .expect("a valid encoded StateID always fits in usize"),
+        )
+    }
+
+    #[inline(always)]
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::inline_always,
+        reason = "the low 16 bits deliberately retain the root range and decode on the hot boundary"
+    )]
+    fn root_range(self) -> Option<NonZeroU16> {
+        NonZeroU16::new(self.0.get() as u16)
+    }
+}
+
 /// Find the first exact root after the caller has rejected the current byte.
 ///
 /// Both the selected-span scanner and the post-native Exists continuation use
@@ -332,6 +387,7 @@ fn encode_direct_dfa_start_state(state: StateID) -> NonZeroU32 {
     .expect("biasing a StateID excludes zero")
 }
 
+#[cfg(test)]
 #[inline]
 fn decode_direct_dfa_start_state(encoded: NonZeroU32) -> StateID {
     let raw = encoded.get() - 1;
@@ -765,14 +821,14 @@ impl LiteralSetPlan {
         } else {
             None
         };
-        let direct_dfa_root_range = direct_dfa_start_state
-            .and_then(|start_state| direct_dfa_root_range(automaton, start_state))
-            .map(LiteralSetDfaRootRange::encode);
+        let direct_dfa_identity = direct_dfa_start_state.map(|start_state| {
+            let root_range = direct_dfa_root_range(automaton, start_state)
+                .map(LiteralSetDfaRootRange::encode);
+            LiteralSetDirectDfaIdentity::new(start_state, root_range)
+        });
         Some(LiteralSetOrdinaryExecutor {
             plan: self,
-            direct_dfa_start_state: direct_dfa_start_state
-                .map(encode_direct_dfa_start_state),
-            direct_dfa_root_range,
+            direct_dfa_identity,
         })
     }
 
@@ -1619,9 +1675,8 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     ) -> Option<Self> {
         let plan = executor.plan;
         let automaton = plan.automaton.as_ref();
-        let start_state = executor
-            .direct_dfa_start_state
-            .map(decode_direct_dfa_start_state)?;
+        let identity = executor.direct_dfa_identity?;
+        let start_state = identity.start_state();
         debug_assert!(automaton.prefilter().is_none());
         debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
         // Aho's special-state taxonomy is dead, match or start. Requiring an
@@ -1631,9 +1686,7 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         debug_assert!(!automaton.is_match(start_state));
         Some(Self {
             automaton,
-            root_range: executor
-                .direct_dfa_root_range
-                .map(LiteralSetDfaRootRange::decode),
+            root_range: identity.root_range().map(LiteralSetDfaRootRange::decode),
             haystack,
             start_state,
             restart: window.start(),
@@ -1917,7 +1970,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     #[must_use]
     #[inline]
     pub fn direct_count_scanner_supported(&self) -> bool {
-        self.direct_dfa_start_state.is_some()
+        self.direct_dfa_identity.is_some()
     }
 
     /// Bind the capability to select first acceptance by scanning this same
@@ -1996,14 +2049,14 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         window: Window,
     ) -> Result<Option<usize>, LiteralSetError> {
         validate_window(window, haystack.len())?;
-        if let Some(encoded) = self.direct_dfa_start_state {
+        if let Some(identity) = self.direct_dfa_identity {
             let base = window.start();
             let window_bytes = window.end() - base;
             let relative_end = ordinary_direct_dfa_first_acceptance_end(
                 self.plan.automaton.as_ref(),
-                decode_direct_dfa_start_state(encoded),
+                identity.start_state(),
                 &haystack[base..window.end()],
-                self.direct_dfa_root_range,
+                identity.root_range(),
             );
             return Ok(relative_end.map(|end| {
                 debug_assert!(end <= window_bytes);
@@ -2269,8 +2322,7 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
     pub const fn ordinary_executor(self) -> LiteralSetOrdinaryExecutor<'a> {
         LiteralSetOrdinaryExecutor {
             plan: self.plan,
-            direct_dfa_start_state: None,
-            direct_dfa_root_range: None,
+            direct_dfa_identity: None,
         }
     }
 
@@ -5224,6 +5276,7 @@ mod folded_long_tail_tests {
 
 #[cfg(test)]
 mod tests {
+    use core::num::NonZeroU16;
     use std::cell::Cell;
     use std::collections::{BTreeSet, VecDeque};
     use std::sync::Arc;
@@ -5233,7 +5286,8 @@ mod tests {
     use aho_corasick::{Anchored, Input, MatchKind};
 
     use super::{
-        LiteralSetBuildLimits, LiteralSetDfaRootRange, LiteralSetError,
+        LiteralSetBuildLimits, LiteralSetDfaRootRange, LiteralSetDirectDfaIdentity,
+        LiteralSetError,
         LiteralSetMatchSemantics, LiteralSetOrdinaryExecutor, LiteralSetPlan,
         LiteralSetSearchLimits, ORDINARY_DIRECT_DFA_BULK_BYTES,
         ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
@@ -6571,8 +6625,8 @@ mod tests {
         assert!(automaton.prefilter().is_none());
         let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
         let start_state = ordinary
-            .direct_dfa_start_state
-            .map(decode_direct_dfa_start_state)
+            .direct_dfa_identity
+            .map(LiteralSetDirectDfaIdentity::start_state)
             .expect("direct DFA retains its unanchored start");
 
         let mut seen = BTreeSet::from([start_state]);
@@ -6603,7 +6657,8 @@ mod tests {
         assert!(ranged
             .ordinary_executor()
             .unwrap()
-            .direct_dfa_root_range
+            .direct_dfa_identity
+            .and_then(LiteralSetDirectDfaIdentity::root_range)
             .is_some());
         assert_pinned_direct_dfa_special_boundary(&ranged);
 
@@ -6620,7 +6675,8 @@ mod tests {
         assert!(gapped
             .ordinary_executor()
             .unwrap()
-            .direct_dfa_root_range
+            .direct_dfa_identity
+            .and_then(LiteralSetDirectDfaIdentity::root_range)
             .is_none());
         assert_pinned_direct_dfa_special_boundary(&gapped);
     }
@@ -6644,11 +6700,24 @@ mod tests {
             core::mem::size_of::<Option<core::num::NonZeroU16>>(),
             core::mem::size_of::<u16>(),
         );
+        assert_eq!(
+            core::mem::size_of::<LiteralSetDirectDfaIdentity>(),
+            core::mem::size_of::<u64>(),
+        );
+        assert_eq!(
+            core::mem::size_of::<Option<LiteralSetDirectDfaIdentity>>(),
+            core::mem::size_of::<u64>(),
+        );
         for state in [StateID::ZERO, StateID::MAX] {
             assert_eq!(
                 decode_direct_dfa_start_state(encode_direct_dfa_start_state(state)),
                 state,
             );
+            for root_range in [None, NonZeroU16::new(1), NonZeroU16::new(u16::MAX)] {
+                let identity = LiteralSetDirectDfaIdentity::new(state, root_range);
+                assert_eq!(identity.start_state(), state);
+                assert_eq!(identity.root_range(), root_range);
+            }
         }
         for origin in 0_u8..=u8::MAX {
             for end in origin..=u8::MAX {
@@ -6676,7 +6745,8 @@ mod tests {
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
         assert_eq!(
             ordinary
-                .direct_dfa_root_range
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root_range)
                 .map(LiteralSetDfaRootRange::decode),
             Some(LiteralSetDfaRootRange {
                 origin: b'A',
@@ -6699,7 +6769,8 @@ mod tests {
         assert!(exact
             .ordinary_executor()
             .unwrap()
-            .direct_dfa_root_range
+            .direct_dfa_identity
+            .and_then(LiteralSetDirectDfaIdentity::root_range)
             .is_some());
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
     }
@@ -6833,7 +6904,12 @@ mod tests {
         ordinary_direct_probe::reset();
         let fallback = fallback.ordinary_executor().unwrap();
         assert!(fallback.direct_count_scanner_supported());
-        assert!(fallback.direct_dfa_root_range.is_none());
+        assert!(
+            fallback
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root_range)
+                .is_none(),
+        );
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
         let fallback_miss = vec![200_u8; ORDINARY_ROOT_RANGE_MIN_BYTES + 7];
         assert_eq!(
@@ -7047,8 +7123,8 @@ mod tests {
         assert!(plan.automaton.prefilter().is_none());
         let ordinary = plan.ordinary_executor().unwrap();
         let start_state = ordinary
-            .direct_dfa_start_state
-            .map(decode_direct_dfa_start_state)
+            .direct_dfa_identity
+            .map(LiteralSetDirectDfaIdentity::start_state)
             .unwrap();
         let automaton = plan.automaton.as_ref();
         const BASE: usize = 5;
@@ -7185,7 +7261,8 @@ mod tests {
         let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
         assert_eq!(
             ordinary
-                .direct_dfa_root_range
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root_range)
                 .map(LiteralSetDfaRootRange::decode),
             Some(LiteralSetDfaRootRange {
                 origin: 1,
@@ -7318,10 +7395,15 @@ mod tests {
         assert!(plan.automaton.prefilter().is_none());
         let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
         let start_state = ordinary
-            .direct_dfa_start_state
-            .map(decode_direct_dfa_start_state)
+            .direct_dfa_identity
+            .map(LiteralSetDirectDfaIdentity::start_state)
             .unwrap();
-        assert!(ordinary.direct_dfa_root_range.is_some());
+        assert!(
+            ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root_range)
+                .is_some(),
+        );
 
         let miss = vec![200_u8; 72];
         let mut boundary_hits = vec![200_u8; 72];
