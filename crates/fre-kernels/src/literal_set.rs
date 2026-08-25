@@ -305,27 +305,28 @@ impl LiteralSetDfaRootRange {
 /// One scalar identity for the direct ordinary DFA and its optional root
 /// accelerator.
 ///
-/// The nonzero encoded start occupies the high 32 bits, making the complete
-/// value nonzero even when no exact root range is available. The low 16 bits
-/// retain that range's existing zero-niche encoding. Binding both pieces once
-/// keeps the executor at two machine words and gives direct operations one
-/// prepared capability to pass across their outlined engine boundary.
+/// The nonzero encoded start occupies the low 32 bits, making the complete
+/// value nonzero even when no exact root range is available. The high 16-bit
+/// payload above it retains that range's existing zero-niche encoding. Binding
+/// both pieces once keeps the executor at two machine words, lets every direct
+/// operation decode its mandatory start without a shift, and gives the optional
+/// accelerator one prepared capability to pass across outlined boundaries.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LiteralSetDirectDfaIdentity(NonZeroU64);
 
 impl LiteralSetDirectDfaIdentity {
-    const START_SHIFT: u32 = u32::BITS;
+    const ROOT_SHIFT: u32 = u32::BITS;
 
     #[inline]
     fn new(start_state: StateID, root_range: Option<NonZeroU16>) -> Self {
         let encoded_start = encode_direct_dfa_start_state(start_state);
         let encoded_root = root_range.map_or(0, NonZeroU16::get);
-        let raw = (u64::from(encoded_start.get()) << Self::START_SHIFT)
-            | u64::from(encoded_root);
+        let raw = u64::from(encoded_start.get())
+            | (u64::from(encoded_root) << Self::ROOT_SHIFT);
         Self(
             NonZeroU64::new(raw)
-                .expect("the high direct-DFA start encoding is nonzero"),
+                .expect("the low direct-DFA start encoding is nonzero"),
         )
     }
 
@@ -333,11 +334,12 @@ impl LiteralSetDirectDfaIdentity {
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::as_conversions,
+        clippy::cast_possible_truncation,
         clippy::inline_always,
-        reason = "the high 32 bits fit u32, retain a nonzero bias, and decode on the hot boundary"
+        reason = "the low 32 bits deliberately retain the nonzero biased start and decode on the hot boundary"
     )]
     fn start_state(self) -> StateID {
-        let encoded = (self.0.get() >> Self::START_SHIFT) as u32;
+        let encoded = self.0.get() as u32;
         debug_assert_ne!(encoded, 0);
         let raw = encoded - 1;
         StateID::must(
@@ -351,10 +353,10 @@ impl LiteralSetDirectDfaIdentity {
         clippy::as_conversions,
         clippy::cast_possible_truncation,
         clippy::inline_always,
-        reason = "the low 16 bits deliberately retain the root range and decode on the hot boundary"
+        reason = "the shifted optional root payload is confined to 16 bits and decodes on the hot boundary"
     )]
     fn root_range(self) -> Option<NonZeroU16> {
-        NonZeroU16::new(self.0.get() as u16)
+        NonZeroU16::new((self.0.get() >> Self::ROOT_SHIFT) as u16)
     }
 }
 
@@ -6715,6 +6717,15 @@ mod tests {
             );
             for root_range in [None, NonZeroU16::new(1), NonZeroU16::new(u16::MAX)] {
                 let identity = LiteralSetDirectDfaIdentity::new(state, root_range);
+                let raw = identity.0.get();
+                assert_eq!(
+                    raw & u64::from(u32::MAX),
+                    u64::from(encode_direct_dfa_start_state(state).get()),
+                );
+                assert_eq!(
+                    raw >> LiteralSetDirectDfaIdentity::ROOT_SHIFT,
+                    u64::from(root_range.map_or(0, NonZeroU16::get)),
+                );
                 assert_eq!(identity.start_state(), state);
                 assert_eq!(identity.root_range(), root_range);
             }
