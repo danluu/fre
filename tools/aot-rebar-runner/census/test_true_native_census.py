@@ -456,6 +456,24 @@ def prepared_scalar_grep_provenance_fields() -> dict[str, str]:
     }
 
 
+def operation_only_prepared_scalar_grep_provenance_fields() -> dict[str, str]:
+    fields = prepared_scalar_grep_provenance_fields()
+    operation_identity = "e" * 64
+    reducer = f"fre_aot_regex_grep_count_exclusive_v1_{operation_identity}"
+    fields.update({
+        "program_symbol": (
+            f"fre_aot_regex_runtime_program_v1_{operation_identity}"
+        ),
+        "entry_symbol": reducer,
+        "entry_abi": CENSUS.PREPARED_SCALAR_REDUCE_ENTRY_ABI,
+        "reducer_symbol": reducer,
+        "span_fill_symbol": "",
+        "prepared_bulk_strategy": "None",
+        "required_runtime_symbols": "",
+    })
+    return fields
+
+
 def direct_scalar_grep_provenance_fields() -> dict[str, str]:
     fields = prepared_scalar_grep_provenance_fields()
     aggregate_identity = "e" * 64
@@ -3284,6 +3302,122 @@ class TrueNativeCensusTests(unittest.TestCase):
                         " ".join(
                             f"{key}={item}" for key, item in poisoned.items()
                         ).encode()
+                    )
+
+    def test_operation_only_prepared_grep_v15_closes_exact_topology(self) -> None:
+        fields = operation_only_prepared_scalar_grep_provenance_fields()
+        parsed = CENSUS.parse_provenance(
+            " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        )
+        receipt = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(
+            receipt, "synthetic operation-only prepared grep"
+        )
+        self.assertEqual(receipt["kind"], "prepared-grep-v15-v2")
+        self.assertEqual(
+            receipt["prepared_grep_v15"]["artifact_identity_sha256"],
+            "e" * 64,
+        )
+        self.assertEqual(
+            receipt["prepared_grep_v15"]["reducer_identity_sha256"],
+            "e" * 64,
+        )
+        self.assertEqual(
+            CENSUS.selected_operation_entries(parsed),
+            ([fields["reducer_symbol"]], "linked-native-grep-count-reducer"),
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt),
+            ([fields["reducer_symbol"]], "linked-native-grep-count-reducer"),
+        )
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(receipt),
+            [fields["program_symbol"]],
+        )
+        self.assertEqual(
+            CENSUS.declared_runtime_symbols_from_provenance(receipt), []
+        )
+
+        raw_poisons = {
+            "entry-abi": ("entry_abi", CENSUS.SPAN_SEARCH_ENTRY_ABI),
+            "prepared-bulk": (
+                "prepared_bulk_strategy", "Some(NativeOrderedNfaLoop)"
+            ),
+            "runtime-helper": (
+                "required_runtime_symbols", "fre_aot_regex_runtime_search_v1"
+            ),
+            "span-fill": (
+                "span_fill_symbol",
+                f"fre_aot_regex_fill_spans_exclusive_v1_{'e' * 64}",
+            ),
+            "entry-family": (
+                "entry_symbol", f"fre_aot_regex_search_v1_{'e' * 64}"
+            ),
+            "entry-identity": (
+                "entry_symbol",
+                f"fre_aot_regex_grep_count_exclusive_v1_{'d' * 64}",
+            ),
+            "program-identity": (
+                "program_symbol",
+                f"fre_aot_regex_runtime_program_v1_{'d' * 64}",
+            ),
+            "reducer-identity": (
+                "reducer_symbol",
+                f"fre_aot_regex_grep_count_exclusive_v1_{'d' * 64}",
+            ),
+        }
+        for poison, (key, value) in raw_poisons.items():
+            with self.subTest(layer="raw", poison=poison):
+                poisoned = dict(fields)
+                poisoned[key] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{name}={item}" for name, item in poisoned.items()
+                        ).encode()
+                    )
+
+        normalized_poisons = {
+            "entry-abi": ("entry_abi", CENSUS.SPAN_SEARCH_ENTRY_ABI),
+            "prepared-bulk": (
+                "prepared_bulk_strategy", "Some(NativeOrderedNfaLoop)"
+            ),
+            "runtime-helper": (
+                "required_runtime_symbols", ["fre_aot_regex_runtime_search_v1"]
+            ),
+            "span-fill": (
+                "span_fill_symbol",
+                f"fre_aot_regex_fill_spans_exclusive_v1_{'e' * 64}",
+            ),
+            "entry-identity": (
+                "entry_symbol",
+                f"fre_aot_regex_grep_count_exclusive_v1_{'d' * 64}",
+            ),
+            "program-identity": (
+                "program_symbol",
+                f"fre_aot_regex_runtime_program_v1_{'d' * 64}",
+            ),
+        }
+        for poison, (key, value) in normalized_poisons.items():
+            with self.subTest(layer="normalized", poison=poison):
+                poisoned = copy.deepcopy(receipt)
+                poisoned[key] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.validate_provenance_record(
+                        poisoned,
+                        f"poisoned operation-only prepared grep ({poison})",
+                    )
+        for poison, key in (
+            ("artifact-proof", "artifact_identity_sha256"),
+            ("reducer-proof", "reducer_identity_sha256"),
+        ):
+            with self.subTest(layer="normalized-proof", poison=poison):
+                poisoned = copy.deepcopy(receipt)
+                poisoned["prepared_grep_v15"][key] = "d" * 64
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.validate_provenance_record(
+                        poisoned,
+                        f"poisoned operation-only prepared grep ({poison})",
                     )
 
     def test_operation_only_shared_v15_fails_closed_on_topology_or_abi_tamper(self) -> None:

@@ -2017,7 +2017,7 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
     if fields["entry_abi"] == PREPARED_SCALAR_REDUCE_ENTRY_ABI and not (
         fields.get("aggregate_strategy") == "Some(NativeOrderedNfaFused)"
         and fields.get("model") in {
-            "count", "count-spans", "count-captures", "grep-captures",
+            "count", "count-spans", "count-captures", "grep", "grep-captures",
         }
         and (
             fields.get("shared_ordered_many") == "true"
@@ -2025,6 +2025,12 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
             or fields.get("model") in UNIFORM_CAPTURE_ADAPTER_MODELS
             or fields.get("span_iteration_strategy")
             == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+            or (
+                fields.get("model") == "grep"
+                and fields.get("shared_ordered_many") == "false"
+                and fields.get("required_prepare_capabilities")
+                == f"{PREPARED_V15_CAPABILITY:016x}"
+            )
         )
     ):
         raise CensusError("prepared scalar reducer ABI is attached to another route")
@@ -2520,13 +2526,11 @@ def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
     """Authenticate the exact scalar native V15 GrepCount route."""
     if (
         fields.get("model") != "grep"
-        or fields.get("entry_abi") != SPAN_SEARCH_ENTRY_ABI
         or fields.get("adapter")
         != "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
         or fields.get("engine") != "OrderedNfa"
         or fields.get("aggregate_strategy")
         != "Some(NativeOrderedNfaFused)"
-        or fields.get("prepared_bulk_strategy") != "Some(NativeOrderedNfaLoop)"
         or fields.get("span_iteration_strategy") != "not-applicable"
         or fields.get("grep_iteration_strategy")
         != "linked-native-grep-count-reducer-v1"
@@ -2544,14 +2548,6 @@ def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         != str(PREPARED_V15_MAX_SETUP_WORK)
     ):
         raise CensusError("scalar prepared V15 grep has a noncanonical route or cap")
-    entry_suffix = symbol_identity_suffix(
-        fields["entry_symbol"], NATIVE_SEARCH_ENTRY_SYMBOL,
-        "scalar prepared V15 ordinary entry",
-    )
-    span_fill_suffix = symbol_identity_suffix(
-        fields["span_fill_symbol"], NATIVE_SPAN_FILL_ENTRY_SYMBOL,
-        "scalar prepared V15 SpanFill entry",
-    )
     program_suffix = symbol_identity_suffix(
         fields["program_symbol"], NATIVE_RUNTIME_PROGRAM_SYMBOL,
         "scalar prepared V15 runtime program",
@@ -2560,16 +2556,43 @@ def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         fields["reducer_symbol"], NATIVE_GREP_COUNT_ENTRY_SYMBOL,
         "scalar prepared V15 native reducer",
     )
-    if (
-        len({entry_suffix, span_fill_suffix, program_suffix}) != 1
-        or reducer_suffix == entry_suffix
-    ):
-        raise CensusError("scalar prepared V15 symbol identities disagree")
     runtime_symbols = tuple(sorted(filter(
         None, fields["required_runtime_symbols"].split(",")
     )))
-    if runtime_symbols != PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS:
-        raise CensusError("scalar prepared V15 runtime dependency set differs")
+    if fields.get("entry_abi") == SPAN_SEARCH_ENTRY_ABI:
+        entry_suffix = symbol_identity_suffix(
+            fields["entry_symbol"], NATIVE_SEARCH_ENTRY_SYMBOL,
+            "scalar prepared V15 ordinary entry",
+        )
+        span_fill_suffix = symbol_identity_suffix(
+            fields["span_fill_symbol"], NATIVE_SPAN_FILL_ENTRY_SYMBOL,
+            "scalar prepared V15 SpanFill entry",
+        )
+        if (
+            fields.get("prepared_bulk_strategy")
+            != "Some(NativeOrderedNfaLoop)"
+            or runtime_symbols != PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS
+            or len({entry_suffix, span_fill_suffix, program_suffix}) != 1
+            or reducer_suffix == entry_suffix
+        ):
+            raise CensusError("scalar prepared V15 compatibility topology differs")
+        artifact_identity = entry_suffix
+    elif fields.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI:
+        entry_suffix = symbol_identity_suffix(
+            fields["entry_symbol"], NATIVE_GREP_COUNT_ENTRY_SYMBOL,
+            "scalar prepared V15 operation entry",
+        )
+        if (
+            fields.get("prepared_bulk_strategy") != "None"
+            or fields.get("span_fill_symbol") != ""
+            or runtime_symbols
+            or fields["entry_symbol"] != fields["reducer_symbol"]
+            or len({entry_suffix, program_suffix, reducer_suffix}) != 1
+        ):
+            raise CensusError("scalar prepared V15 operation-only topology differs")
+        artifact_identity = entry_suffix
+    else:
+        raise CensusError("scalar prepared V15 entry ABI differs")
     return {
         "required_prepare_capabilities": PREPARED_V15_CAPABILITY,
         "prepare_config_version": PREPARED_V15_CONFIG_VERSION,
@@ -2577,8 +2600,11 @@ def scalar_prepared_grep_v15_proof(fields: dict[str, str]) -> dict[str, object]:
         "max_handle_bytes": PREPARED_V15_MAX_HANDLE_BYTES,
         "max_scratch_bytes": PREPARED_V15_MAX_SCRATCH_BYTES,
         "max_setup_work": PREPARED_V15_MAX_SETUP_WORK,
-        "runtime_program_len": int(fields["program_len"], 10),
-        "artifact_identity_sha256": entry_suffix,
+        "runtime_program_len": parse_canonical_decimal(
+            fields.get("program_len"), "scalar prepared V15 runtime program length",
+            1, MAX_SERIALIZED_PROGRAM_BYTES,
+        ),
+        "artifact_identity_sha256": artifact_identity,
         "reducer_identity_sha256": reducer_suffix,
     }
 
@@ -6189,6 +6215,12 @@ def identity_defined_symbols_from_provenance(
             raise CensusError("shared ordered-many identity symbol set is malformed")
         return sorted(symbols)
     if provenance.get("kind") == "prepared-grep-v15-v2":
+        validate_normalized_prepared_grep_v15(
+            provenance.get("prepared_grep_v15"), provenance,
+            "normalized prepared V15 grep provenance",
+        )
+        if provenance.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI:
+            return [provenance["program_symbol"]]
         return sorted([
             provenance["entry_symbol"], provenance["span_fill_symbol"],
             provenance["program_symbol"],
@@ -7302,8 +7334,6 @@ def validate_normalized_prepared_grep_v15(
     reducer = provenance["reducer_symbol"]
     if not all(isinstance(value, str) for value in (entry, span_fill, program, reducer)):
         raise CensusError(f"{context} scalar prepared V15 symbols are malformed")
-    entry_suffix = symbol_identity_suffix(entry, NATIVE_SEARCH_ENTRY_SYMBOL, context)
-    span_fill_suffix = symbol_identity_suffix(span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, context)
     program_suffix = symbol_identity_suffix(program, NATIVE_RUNTIME_PROGRAM_SYMBOL, context)
     reducer_suffix = symbol_identity_suffix(reducer, NATIVE_GREP_COUNT_ENTRY_SYMBOL, context)
     if (
@@ -7316,12 +7346,41 @@ def validate_normalized_prepared_grep_v15(
         or not isinstance(proof["runtime_program_len"], int)
         or isinstance(proof["runtime_program_len"], bool)
         or not 1 <= proof["runtime_program_len"] <= MAX_SERIALIZED_PROGRAM_BYTES
-        or proof["artifact_identity_sha256"] != entry_suffix
         or proof["reducer_identity_sha256"] != reducer_suffix
-        or len({entry_suffix, span_fill_suffix, program_suffix}) != 1
-        or reducer_suffix == entry_suffix
     ):
         raise CensusError(f"{context} scalar prepared V15 proof differs")
+    if provenance.get("entry_abi") == SPAN_SEARCH_ENTRY_ABI:
+        entry_suffix = symbol_identity_suffix(
+            entry, NATIVE_SEARCH_ENTRY_SYMBOL, context
+        )
+        span_fill_suffix = symbol_identity_suffix(
+            span_fill, NATIVE_SPAN_FILL_ENTRY_SYMBOL, context
+        )
+        route_is_exact = (
+            provenance.get("prepared_bulk_strategy")
+            == "Some(NativeOrderedNfaLoop)"
+            and provenance.get("required_runtime_symbols")
+            == list(PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS)
+            and proof["artifact_identity_sha256"] == entry_suffix
+            and len({entry_suffix, span_fill_suffix, program_suffix}) == 1
+            and reducer_suffix != entry_suffix
+        )
+    elif provenance.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI:
+        entry_suffix = symbol_identity_suffix(
+            entry, NATIVE_GREP_COUNT_ENTRY_SYMBOL, context
+        )
+        route_is_exact = (
+            provenance.get("prepared_bulk_strategy") == "None"
+            and provenance.get("required_runtime_symbols") == []
+            and span_fill == ""
+            and entry == reducer
+            and proof["artifact_identity_sha256"] == entry_suffix
+            and len({entry_suffix, program_suffix, reducer_suffix}) == 1
+        )
+    else:
+        raise CensusError(f"{context} scalar prepared V15 entry ABI differs")
+    if not route_is_exact:
+        raise CensusError(f"{context} scalar prepared V15 topology differs")
 
 
 def validate_normalized_uniform_capture_reducer(
@@ -8415,7 +8474,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         if provenance.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI and not (
             provenance.get("aggregate_strategy") == "Some(NativeOrderedNfaFused)"
             and provenance.get("model") in {
-                "count", "count-spans", "count-captures", "grep-captures",
+                "count", "count-spans", "count-captures", "grep", "grep-captures",
             }
             and (
                 provenance.get("kind") == "shared-ordered-many-v2"
@@ -8423,6 +8482,10 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 or provenance.get("model") in UNIFORM_CAPTURE_ADAPTER_MODELS
                 or provenance.get("span_iteration_strategy")
                 == NATIVE_SPAN_SUM_ITERATION_STRATEGY
+                or (
+                    provenance.get("model") == "grep"
+                    and provenance.get("kind") == "prepared-grep-v15-v2"
+                )
             )
         ):
             raise CensusError(f"{context} reducer entry ABI is attached to another route")
@@ -8502,18 +8565,13 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 provenance["model"] != "grep"
                 or provenance["adapter"]
                 != "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15"
-                or provenance["entry_abi"] != SPAN_SEARCH_ENTRY_ABI
                 or provenance["boundary"] != "runtime-klv-warmup-schedule"
                 or provenance["engine"] != "OrderedNfa"
                 or provenance["aggregate_strategy"]
                 != "Some(NativeOrderedNfaFused)"
-                or provenance["prepared_bulk_strategy"]
-                != "Some(NativeOrderedNfaLoop)"
                 or provenance["span_iteration_strategy"] != "not-applicable"
                 or provenance["grep_iteration_strategy"]
                 != "linked-native-grep-count-reducer-v1"
-                or provenance["required_runtime_symbols"]
-                != list(PREPARED_V15_SCALAR_GREP_RUNTIME_SYMBOLS)
             ):
                 raise CensusError(f"{context} scalar prepared V15 route differs")
             validate_normalized_prepared_grep_v15(

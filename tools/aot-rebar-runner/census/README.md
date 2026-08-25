@@ -356,10 +356,14 @@ capability/config/operation flags, complete runtime-symbol set, prepared bulk
 strategy, serialized-program symbol and extent, Span-fill identity, and
 ordinary/prepared state. The top-level record seals the 8 MiB handle and
 scratch ceilings and two-million-unit setup-work ceiling. A scalar prepared
-`grep` seals the same V15 ABI, program extent, native entry/Span-fill/program
-identity, and distinct compatibility-reducer identity in normalized v2
-provenance. The final-binary inventory must find every named text or data
-identity; a provenance-only serialized program is not evidence.
+`grep` seals one of two exact V15 topologies in normalized v2 provenance. The
+legacy `SpanSearchV1` form binds one native entry/SpanFill/program identity, a
+distinct compatibility-reducer identity, and the complete prepared
+runtime-helper set. The operation-only `PreparedScalarReduceV1` form instead
+binds the GrepCount reducer as the public entry and to the program identity,
+with no bulk route, SpanFill symbol, or runtime helper. The final-binary
+inventory must find every named text or data identity not already selected as
+the operation entry; a provenance-only serialized program is not evidence.
 Uniform-capture rows must publish `true`, the exact
 `static-uniform-multiplier` resolution and native-search-core boundary, positive
 proof identity/work/stack/minimum-width/count fields, one value per source, and
