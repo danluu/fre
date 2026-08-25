@@ -589,7 +589,7 @@ int main(void){{
 
 #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
 #[test]
-#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links and executes sparse-prefix V15 Count+SpanSum"]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links and executes batched sparse-prefix V15 Count+SpanSum"]
 fn linked_aarch64_sparse_prefix_count_and_span_sum_match_stock() {
     use fre_aot_regex::{CpuFeature, FeatureSet};
     use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
@@ -631,6 +631,19 @@ fn linked_aarch64_sparse_prefix_count_and_span_sum_match_stock() {
         compiled.receipt().prepared_aggregate_strategy,
         Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
     );
+    let text = compiled
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.name == ".text")
+        .expect("exact-prefix object text section");
+    let batch_load = 0x4c40_2198_u32.to_le_bytes(); // ld1 {v24.16b-v27.16b}, [x12]
+    assert!(
+        text.bytes()
+            .chunks_exact(batch_load.len())
+            .any(|word| word == batch_load),
+        "final linked fixture retained the four-vector sparse-prefix load",
+    );
     let (program, program_len) = compiled
         .module()
         .required_runtime_program()
@@ -656,16 +669,32 @@ fn linked_aarch64_sparse_prefix_count_and_span_sum_match_stock() {
     lane15.push(b'Z');
     let mut earliest_lane = b"_".repeat(32);
     earliest_lane.extend_from_slice(b"QZ__Z");
+    let batch_hit = |position: usize| {
+        let mut haystack = b"_".repeat(80);
+        haystack[position] = b'Z';
+        haystack
+    };
     let cases = [
         Vec::new(),
         b"_".repeat(15),
         b"_".repeat(16),
+        b"_".repeat(63),
+        b"_".repeat(64),
+        b"_".repeat(65),
         lane15,
         b"_".repeat(16 * 1024),
         late,
         dense_decoy,
         dense_positive,
         earliest_lane,
+        batch_hit(6),
+        batch_hit(16),
+        batch_hit(22),
+        batch_hit(32),
+        batch_hit(38),
+        batch_hit(48),
+        batch_hit(54),
+        batch_hit(64),
     ];
     let stock = regex::bytes::Regex::new(PATTERN).expect("stock exact-prefix fixture");
     let expected = cases

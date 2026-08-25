@@ -8,12 +8,13 @@
 use super::{
     aarch64_add_w_reg, aarch64_add_x_imm, aarch64_add_x_lsl, aarch64_add_x_reg, aarch64_add_x_uxtw,
     aarch64_and_low_w, aarch64_and_w, aarch64_cmp_w, aarch64_cmp_w_imm, aarch64_cmp_x,
-    aarch64_cmp_x_imm,
+    aarch64_cmp_x_imm, aarch64_emit_candidate_any, aarch64_emit_candidate_batch_any,
     aarch64_emit_start_filter_constants, aarch64_emit_start_filter_vector_candidates,
-    aarch64_load_byte_reg, aarch64_load_pair_x, aarch64_load_q, aarch64_load_u32_constant,
-    aarch64_load_u64_constant, aarch64_load_w_imm, aarch64_load_w_uxtw, aarch64_load_x_imm,
-    aarch64_load_x_lsl3, aarch64_lsr_w_imm, aarch64_lsr_x_imm, aarch64_mov_x,
-    aarch64_orr_w, aarch64_store_pair_x, aarch64_umaxv_16b, aarch64_umov_b0,
+    aarch64_ld1_four_16b, aarch64_load_byte_reg, aarch64_load_pair_x, aarch64_load_q,
+    aarch64_load_u32_constant, aarch64_load_u64_constant, aarch64_load_w_imm,
+    aarch64_load_w_uxtw, aarch64_load_x_imm, aarch64_load_x_lsl3, aarch64_lsr_w_imm,
+    aarch64_lsr_x_imm, aarch64_mov_x, aarch64_orr_16b, aarch64_orr_w,
+    aarch64_store_pair_x, aarch64_umaxv_16b, aarch64_umov_b0,
     aarch64_store_w, aarch64_store_x, aarch64_sub_w_imm, aarch64_sub_x_imm,
     aarch64_sub_x_reg, Aarch64Assembler, ModuleRelocation, NativeByteRange, NativeStartFilter,
     ObjectError, RelocationKind, AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_LS,
@@ -2475,9 +2476,14 @@ fn emit_semantic_body(
             scan_hit = a.asm.label()?;
             a.add_x_imm(9, 9, 1)?;
             let scan_vector = a.asm.label()?;
+            let scan_single = a.asm.label()?;
             let scan_scalar = a.asm.label()?;
             let scan_scalar_next = a.asm.label()?;
             let constants_ready = a.asm.label()?;
+            let batch_hit = a.asm.label()?;
+            let batch_block0 = a.asm.label()?;
+            let batch_block1 = a.asm.label()?;
+            let batch_block2 = a.asm.label()?;
             let vector_hit = a.asm.label()?;
             let low_half_hit = a.asm.label()?;
             let lane_selected = a.asm.label()?;
@@ -2497,6 +2503,57 @@ fn emit_semantic_body(
             a.constant32(12, 1)?;
             a.store_w(12, 31, usize::from(L_START_PREFIX_VECTOR_READY))?;
             a.asm.bind(constants_ready)?;
+            a.i(aarch64_cmp_x_imm(10, 64))?;
+            a.branch_cond(AARCH64_LO, scan_single)?;
+            a.add_x(12, 20, 9)?;
+            a.i(aarch64_ld1_four_16b(24, 12))?;
+            for block in 0_u8..4 {
+                aarch64_emit_start_filter_vector_candidates(
+                    a.asm,
+                    filter,
+                    24_u8
+                        .checked_add(block)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 Ordered-NFA prefix batch source",
+                        ))?,
+                    block,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            }
+            // Preserve all four masks for exact first-block and first-lane
+            // recovery on the rare hit edge. The hot miss edge reduces only
+            // scratch copies before advancing one complete cache line.
+            aarch64_emit_candidate_batch_any(a.asm, 0)?;
+            a.branch_cond(AARCH64_NE, batch_hit)?;
+            a.add_x_imm(9, 9, 64)?;
+            a.branch(scan_vector)?;
+
+            a.asm.bind(batch_hit)?;
+            aarch64_emit_candidate_any(a.asm, 0)?;
+            a.branch_cond(AARCH64_NE, batch_block0)?;
+            aarch64_emit_candidate_any(a.asm, 1)?;
+            a.branch_cond(AARCH64_NE, batch_block1)?;
+            aarch64_emit_candidate_any(a.asm, 2)?;
+            a.branch_cond(AARCH64_NE, batch_block2)?;
+            // The aggregate mask proved a hit and the first three blocks are
+            // empty, so V3 is the exact selected block without another
+            // horizontal reduction.
+            a.i(aarch64_orr_16b(24, 3, 3))?;
+            a.add_x_imm(9, 9, 48)?;
+            a.branch(vector_hit)?;
+            a.asm.bind(batch_block2)?;
+            a.i(aarch64_orr_16b(24, 2, 2))?;
+            a.add_x_imm(9, 9, 32)?;
+            a.branch(vector_hit)?;
+            a.asm.bind(batch_block1)?;
+            a.i(aarch64_orr_16b(24, 1, 1))?;
+            a.add_x_imm(9, 9, 16)?;
+            a.branch(vector_hit)?;
+            a.asm.bind(batch_block0)?;
+            a.i(aarch64_orr_16b(24, 0, 0))?;
+            a.branch(vector_hit)?;
+
+            a.asm.bind(scan_single)?;
             a.add_x(12, 20, 9)?;
             a.i(aarch64_load_q(0, 12))?;
             aarch64_emit_start_filter_vector_candidates(
@@ -3387,7 +3444,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_nfa_aarch64_vectorizes_only_sparse_exact_start_prefix_covers() {
+    fn ordered_nfa_aarch64_batches_only_sparse_exact_start_prefix_covers() {
         let exact_program = optimizing_ordered_nfa(r"Q?Q?Q?Q?Q?Q?Q?Q?Zx");
         let exact = NativeOrderedNfaObjectImage::try_build(
             exact_program.native_ordered_nfa_view().unwrap(),
@@ -3425,7 +3482,15 @@ mod tests {
         .unwrap();
         assert!(exact_words.contains(&q_constant));
         assert!(exact_words.contains(&z_constant));
+        assert!(exact_words.contains(&aarch64_ld1_four_16b(24, 12).unwrap()));
         assert!(exact_words.contains(&aarch64_load_q(0, 12).unwrap()));
+        assert!(exact_words.contains(&aarch64_add_x_imm(9, 9, 64).unwrap()));
+        assert!(exact_words.contains(&aarch64_add_x_imm(9, 9, 32).unwrap()));
+        assert!(exact_words.contains(&aarch64_add_x_imm(9, 9, 48).unwrap()));
+        assert!(exact_words.contains(&aarch64_orr_16b(24, 0, 0).unwrap()));
+        assert!(exact_words.contains(&aarch64_orr_16b(24, 1, 1).unwrap()));
+        assert!(exact_words.contains(&aarch64_orr_16b(24, 2, 2).unwrap()));
+        assert!(exact_words.contains(&aarch64_orr_16b(24, 3, 3).unwrap()));
         let ready_clear = aarch64_store_w(31, 31, L_START_PREFIX_VECTOR_READY).unwrap();
         let clear_positions = exact_words
             .iter()
