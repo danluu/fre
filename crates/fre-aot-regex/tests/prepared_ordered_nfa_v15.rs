@@ -1,6 +1,6 @@
 use fre_aot_regex::{
-    CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource, EngineKind,
-    EntryAbi, ObjectError, OutputContract, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource, DeterminizeLimits,
+    EngineKind, EntryAbi, ObjectError, OutputContract, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy,
     PreparedOrderedNfaV15CompileDecline, PreparedOrderedNfaV15CompileDisposition, SymbolBinding,
     SymbolKind, Target, compile,
@@ -585,4 +585,241 @@ int main(void){{
         "operation-only GrepCount diverged from the repeated legacy NativeOrderedNfaLoop transcript",
     );
     fs::remove_dir_all(&directory).expect("remove linked GrepCount directory");
+}
+
+#[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
+#[test]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links and executes sparse-prefix V15 Count+SpanSum"]
+fn linked_aarch64_sparse_prefix_count_and_span_sum_match_stock() {
+    use fre_aot_regex::{CpuFeature, FeatureSet};
+    use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+    const PATTERN: &str = r"Q?Q?Q?Q?Q?Q?Q?Q?Z";
+    const REPEATS: usize = 8;
+
+    let target = match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("aarch64", "linux") => Target::aarch64_linux(),
+        ("aarch64", "macos") => Target::aarch64_macos(),
+        pair => panic!("unsupported linked-host pair {pair:?}"),
+    }
+    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+    .expect("linked host ASIMD target");
+    let disposition = compile_with_prepared_ordered_nfa_v15_reported(
+        CompileRequest::new(PATTERN, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(CompileLimitsV1 {
+                determinize: DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+                ..CompileLimitsV1::default()
+            }),
+        PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM),
+    )
+    .expect("exact-prefix Count compilation");
+    let decline = disposition.decline();
+    let compiled = disposition
+        .into_compiled()
+        .unwrap_or_else(|| panic!("exact-prefix fixture remains V15 eligible: {decline:?}"));
+    assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+    assert_eq!(
+        compiled.module().prepared_bulk_strategy(),
+        Some(PreparedBulkStrategy::NativeOrderedNfaLoop),
+    );
+    assert_eq!(
+        compiled.receipt().prepared_aggregate_strategy,
+        Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+    );
+    let (program, program_len) = compiled
+        .module()
+        .required_runtime_program()
+        .expect("exact-prefix preparation program");
+    let prepared_search = compiled
+        .module()
+        .prepared_entry_symbol()
+        .expect("exact-prefix prepared Span search");
+    let count_reducer = compiled
+        .module()
+        .prepared_count_symbol()
+        .expect("exact-prefix Count reducer");
+    let span_sum_reducer = compiled
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("exact-prefix SpanSum reducer");
+
+    let mut late = b"_".repeat(16 * 1024 + 15);
+    late.extend_from_slice(b"QQQQZ");
+    let dense_decoy = b"Qy".repeat(4096);
+    let dense_positive = b"Z_".repeat(1024);
+    let mut lane15 = b"_".repeat(16);
+    lane15.push(b'Z');
+    let mut earliest_lane = b"_".repeat(32);
+    earliest_lane.extend_from_slice(b"QZ__Z");
+    let cases = [
+        Vec::new(),
+        b"_".repeat(15),
+        b"_".repeat(16),
+        lane15,
+        b"_".repeat(16 * 1024),
+        late,
+        dense_decoy,
+        dense_positive,
+        earliest_lane,
+    ];
+    let stock = regex::bytes::Regex::new(PATTERN).expect("stock exact-prefix fixture");
+    let expected = cases
+        .iter()
+        .map(|haystack| {
+            let matches = stock.find_iter(haystack).collect::<Vec<_>>();
+            let count = u64::try_from(matches.len()).expect("stock count fits u64");
+            let span_sum = matches
+                .iter()
+                .try_fold(0_u64, |sum, matched| {
+                    sum.checked_add(
+                        u64::try_from(matched.end() - matched.start())
+                            .expect("span width fits u64"),
+                    )
+                })
+                .expect("stock span sum fits u64");
+            let first = matches
+                .first()
+                .map(|matched| (matched.start(), matched.end()));
+            (count, span_sum, first)
+        })
+        .collect::<Vec<_>>();
+    let mut arrays = String::new();
+    for (index, haystack) in cases.iter().enumerate() {
+        let initializer = if haystack.is_empty() {
+            "0".to_owned()
+        } else {
+            haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        writeln!(
+            arrays,
+            "static const unsigned char h{index}[]={{{initializer}}};"
+        )
+        .unwrap();
+    }
+    let mut checks = String::new();
+    for (index, (haystack, (expected_count, expected_span_sum, expected_first))) in
+        cases.iter().zip(&expected).enumerate()
+    {
+        let (expected_status, expected_start, expected_end) = expected_first
+            .map_or((0_u32, 0_usize, 0_usize), |(start, end)| {
+                (1_u32, start, end)
+            });
+        writeln!(
+            checks,
+            concat!(
+                "for(unsigned round=0;round<{repeats}U;round++){{",
+                "count=UINT64_C(0xaaaaaaaaaaaaaaaa)^round;",
+                "span_sum=UINT64_C(0x5555555555555555)^round;",
+                "if({count_reducer}(handle,h{index},{length}U,&count)!=0U||count!=UINT64_C({expected_count}))return {count_failure};",
+                "if({span_sum_reducer}(handle,h{index},{length}U,&span_sum)!=0U||span_sum!=UINT64_C({expected_span_sum}))return {span_sum_failure};",
+                "span_t one={{UINT64_C(0xaaaaaaaaaaaaaaaa),UINT64_C(0xbbbbbbbbbbbbbbbb)}};",
+                "uint32_t status={prepared_search}(handle,h{index},{length}U,0U,{length}U,&one);",
+                "if(status!={expected_status}U||one.start!={expected_start}U||one.end!={expected_end}U)return {span_failure};}}"
+            ),
+            repeats = REPEATS,
+            count_reducer = count_reducer,
+            span_sum_reducer = span_sum_reducer,
+            prepared_search = prepared_search,
+            index = index,
+            length = haystack.len(),
+            expected_count = expected_count,
+            expected_span_sum = expected_span_sum,
+            expected_status = expected_status,
+            expected_start = expected_start,
+            expected_end = expected_end,
+            count_failure = 20 + index,
+            span_sum_failure = 40 + index,
+            span_failure = 60 + index,
+        )
+        .unwrap();
+    }
+
+    let source = format!(
+        r"#include <stddef.h>
+#include <stdint.h>
+typedef void *handle_t;
+typedef struct {{size_t start;size_t end;}} span_t;
+typedef struct {{uint32_t struct_size;uint32_t config_version;uint64_t operation_flags;uint64_t max_start_filter_setup_work;uint64_t max_grep_count_workspace_bytes;uint64_t v2_reserved[4];uint64_t max_handle_bytes;uint64_t max_ordered_nfa_scratch_bytes;uint64_t max_ordered_nfa_setup_work;uint64_t required_capabilities;uint64_t reserved[2];}} prepare_v3_t;
+extern const unsigned char {program}[];
+extern uint32_t {prepared_search}(handle_t,const unsigned char*,size_t,size_t,size_t,span_t*);
+extern uint32_t {count_reducer}(handle_t,const unsigned char*,size_t,uint64_t*);
+extern uint32_t {span_sum_reducer}(handle_t,const unsigned char*,size_t,uint64_t*);
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v3(const unsigned char*,size_t,const prepare_v3_t*,handle_t*);
+extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);
+{arrays}
+int main(void){{
+  const prepare_v3_t config={{112U,3U,UINT64_C(2),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C(1),{{0,0}}}};
+  handle_t handle=0;
+  if(fre_aot_regex_runtime_prepare_exclusive_v3({program},{program_len}U,&config,&handle)!=0U)return 1;
+  uint64_t count=UINT64_C(0x1122334455667788),span_sum=UINT64_C(0x8877665544332211);
+  {checks}
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(handle)!=0U)return 2;
+  return 0;
+}}
+",
+    );
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-v15-exact-prefix-count-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create exact-prefix Count directory");
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+    let object_path = directory.join("exact-prefix-count.o");
+    let c_path = directory.join("exact-prefix-count.c");
+    let executable = directory.join("exact-prefix-count");
+    fs::write(&object_path, compiled.object()).expect("write exact-prefix Count object");
+    fs::write(&c_path, source).expect("write exact-prefix Count harness");
+    let compiler = if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    };
+    let linked = Command::new(compiler)
+        .arg("-O2")
+        .arg(&c_path)
+        .arg(&object_path)
+        .arg(&static_runtime)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .expect("link exact-prefix Count harness");
+    assert!(
+        linked.status.success(),
+        "exact-prefix Count link failed: {}",
+        String::from_utf8_lossy(&linked.stderr),
+    );
+    let executed = Command::new(&executable)
+        .output()
+        .expect("execute exact-prefix Count harness");
+    assert!(
+        executed.status.success(),
+        "exact-prefix Count status={:?}, stderr={}",
+        executed.status.code(),
+        String::from_utf8_lossy(&executed.stderr),
+    );
+    fs::remove_dir_all(&directory).expect("remove exact-prefix Count directory");
 }

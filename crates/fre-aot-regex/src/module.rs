@@ -1811,6 +1811,11 @@ pub struct CompiledModule {
     /// Whether this exact Ordered-NFA text uses the anchored-prefix first-byte
     /// proof. This compiler-only bit drives its monotone final-object retry.
     ordered_nfa_start_prefix_lowered: bool,
+    /// Whether the emitted Ordered-NFA text actually selected its optional
+    /// ASIMD start-prefix scanner. This lowering-produced compiler-only fact
+    /// gates the exact scalar-prefix final-object ablation; a target policy
+    /// permission or an ordinary scalar prefix alone is insufficient.
+    ordered_nfa_start_prefix_vector_lowered: bool,
     /// Exact graph-proved fragmented final-byte membership retained for
     /// exhaustive Count/SpanSum wrappers. The ordinary Ordered-NFA entry is
     /// byte-inert to these compiler-only words; they drive the first monotone
@@ -2843,6 +2848,7 @@ struct PreparedOrderedNfaEntryLayout {
     whole_window_width_gate_lowered: bool,
     start_closure_dispatch_lowered: bool,
     start_prefix_lowered: bool,
+    start_prefix_vector_lowered: bool,
     object_offset: usize,
     object_size: usize,
     object_alignment: usize,
@@ -3302,6 +3308,36 @@ impl CompiledModule {
             allow_ordered_nfa_start_prefix,
             allow_ordered_nfa_whole_window_width_gate,
             allow_ordered_nfa_terminal_exact_set,
+            true,
+            max_native_data_bytes,
+        )
+    }
+
+    /// Rebuild the exact post-width-retry Ordered-NFA candidate while
+    /// retaining the scalar anchored-prefix proof and disabling only its
+    /// AArch64 ASIMD idle scanner. This is the final-object-cap incumbent for
+    /// the additive SIMD text; frozen native data and every older retained
+    /// route remain unchanged.
+    pub(crate) fn lower_ordered_nfa_scalar_prefix_after_width_retry(
+        program: &CompiledProgram,
+        target: Target,
+        allow_endpoint_oracle: bool,
+        allow_ordered_nfa: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        Self::lower_without_slow_optimization(
+            program,
+            target,
+            false,
+            allow_endpoint_oracle,
+            allow_ordered_nfa,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
             max_native_data_bytes,
         )
     }
@@ -3528,7 +3564,7 @@ impl CompiledModule {
                     allow_ordered_nfa
                         .then(|| program.native_ordered_nfa_view())
                         .flatten()
-                        .map(|view| (view, effective_native_data_limit_bytes)),
+                        .map(|view| (view, effective_native_data_limit_bytes, true)),
                     target,
                 )
                 .map_err(CompileError::from);
@@ -3793,7 +3829,7 @@ impl CompiledModule {
                 allow_ordered_nfa
                     .then(|| program.native_ordered_nfa_view())
                     .flatten()
-                    .map(|view| (view, effective_native_data_limit_bytes)),
+                    .map(|view| (view, effective_native_data_limit_bytes, true)),
                 target,
             )
             .map_err(CompileError::from);
@@ -4502,7 +4538,7 @@ impl CompiledModule {
             allow_ordered_nfa
                 .then(|| program.native_ordered_nfa_view())
                 .flatten()
-                .map(|view| (view, effective_native_data_limit_bytes)),
+                .map(|view| (view, effective_native_data_limit_bytes, true)),
             target,
         )
         .map_err(CompileError::from)?;
@@ -4539,6 +4575,7 @@ impl CompiledModule {
             true,
             true,
             allow_ordered_nfa,
+            true,
             true,
             true,
             true,
@@ -4642,6 +4679,7 @@ impl CompiledModule {
             allow_ordered_nfa_terminal_exact_set,
             max_native_data_bytes,
             surface,
+            true,
         )? {
             PreparedOrderedNfaV15LoweringDisposition::Lowered(module) => Ok(module),
             PreparedOrderedNfaV15LoweringDisposition::Unsupported => Err(
@@ -4688,6 +4726,7 @@ impl CompiledModule {
             allow_ordered_nfa_terminal_exact_set,
             max_native_data_bytes,
             PreparedOrderedNfaV15Surface::Compatibility,
+            true,
         )
     }
 
@@ -4718,7 +4757,48 @@ impl CompiledModule {
             allow_ordered_nfa_terminal_exact_set,
             max_native_data_bytes,
             PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+            true,
         )
+    }
+
+    /// Rebuild the exact prepared candidate after terminal-set and width-gate
+    /// retries while retaining scalar prefix acceleration and disabling only
+    /// the additive AArch64 ASIMD idle scanner.
+    pub(crate) fn lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+        surface: PreparedOrderedNfaV15Surface,
+    ) -> Result<Self, CompileError> {
+        match Self::lower_prepared_ordered_nfa_v15_reported_with_surface(
+            program,
+            target,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            max_native_data_bytes,
+            surface,
+            false,
+        )? {
+            PreparedOrderedNfaV15LoweringDisposition::Lowered(module) => Ok(module),
+            PreparedOrderedNfaV15LoweringDisposition::Unsupported => {
+                Err(ObjectError::InvalidModule(
+                    "prepared Ordered-NFA scalar-prefix retry is unsupported",
+                )
+                .into())
+            }
+            PreparedOrderedNfaV15LoweringDisposition::DataLimit { required } => {
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit: max_native_data_bytes,
+                    required,
+                }
+                .into())
+            }
+        }
     }
 
     #[allow(
@@ -4737,6 +4817,7 @@ impl CompiledModule {
         allow_ordered_nfa_terminal_exact_set: bool,
         max_native_data_bytes: usize,
         surface: PreparedOrderedNfaV15Surface,
+        allow_start_prefix_vector: bool,
     ) -> Result<PreparedOrderedNfaV15LoweringDisposition, CompileError> {
         target.validate()?;
         let program_bytes = program.serialize()?;
@@ -4769,6 +4850,7 @@ impl CompiledModule {
                 max_native_data_bytes,
                 FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
                 surface,
+            allow_start_prefix_vector,
             )? {
                 NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => {
                     (lowering, layout)
@@ -4839,6 +4921,7 @@ impl CompiledModule {
         allow_ordered_nfa_start_prefix: bool,
         allow_ordered_nfa_whole_window_width_gate: bool,
         allow_ordered_nfa_terminal_exact_set: bool,
+        allow_ordered_nfa_start_prefix_vector: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
         target.validate()?;
@@ -4901,7 +4984,13 @@ impl CompiledModule {
                     }
                     view
                 })
-                .map(|view| (view, max_native_data_bytes)),
+                .map(|view| {
+                    (
+                        view,
+                        max_native_data_bytes,
+                        allow_ordered_nfa_start_prefix_vector,
+                    )
+                }),
             target,
         )
         .map_err(CompileError::from)
@@ -4920,7 +5009,7 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
-        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize, bool)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         let prelowered = if native_materialized_fallback {
@@ -4972,7 +5061,7 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
-        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize, bool)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         Self::lower_serialized_with_prelowered_and_exact_finite_exists(
@@ -5018,7 +5107,7 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
-        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize, bool)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         if slow_retained_forward_minimized && slow_aot_report.is_none() {
@@ -6356,6 +6445,13 @@ impl CompiledModule {
                     ..
                 }))
             ),
+            ordered_nfa_start_prefix_vector_lowered: matches!(
+                prepared_layout.map(|layout| layout.kind),
+                Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
+                    start_prefix_vector_lowered: true,
+                    ..
+                }))
+            ),
             ordered_nfa_terminal_exact_set_lowered: match prepared_layout.map(|layout| layout.kind)
             {
                 Some(PreparedEntryKind::OrderedNfa(ordered)) => ordered.terminal_exact_set_lowered,
@@ -6921,6 +7017,15 @@ impl CompiledModule {
     #[must_use]
     pub(crate) const fn has_ordered_nfa_start_prefix(&self) -> bool {
         self.ordered_nfa_start_prefix_lowered
+    }
+
+    /// Whether the exact emitted Ordered-NFA entry contains its optional
+    /// ASIMD start-prefix scanner. This fact comes directly from the target
+    /// lowering and is used only to decide whether scalar-prefix object-cap
+    /// ablation is applicable.
+    #[must_use]
+    pub(crate) const fn has_ordered_nfa_start_prefix_vector(&self) -> bool {
+        self.ordered_nfa_start_prefix_vector_lowered
     }
 
     /// Whether the module retains the compiler-only fragmented terminal proof
@@ -13033,6 +13138,7 @@ fn lower_native_ordered_nfa_prepared(
     view: NativeOrderedNfaProgramView<'_>,
     target: Target,
     max_native_data_bytes: usize,
+    allow_start_prefix_vector: bool,
 ) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
     Ok(match lower_native_ordered_nfa_prepared_reported(
         program_bytes,
@@ -13041,6 +13147,7 @@ fn lower_native_ordered_nfa_prepared(
         max_native_data_bytes,
         FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
         PreparedOrderedNfaV15Surface::Compatibility,
+        allow_start_prefix_vector,
     )? {
         NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => Some((lowering, layout)),
         NativeOrderedNfaPreparedOutcome::Unsupported
@@ -13061,6 +13168,7 @@ fn lower_native_ordered_nfa_prepared_reported(
     max_native_data_bytes: usize,
     max_descriptor_bytes: usize,
     surface: PreparedOrderedNfaV15Surface,
+    allow_start_prefix_vector: bool,
 ) -> Result<NativeOrderedNfaPreparedOutcome, ObjectError> {
     let serialized_identity: [u8; 32] = Sha256::digest(&program_bytes).into();
     if serialized_identity != view.artifact_identity {
@@ -13142,7 +13250,13 @@ fn lower_native_ordered_nfa_prepared_reported(
             }
         }
     }
-    let (entry_code, entry_relocations, private_relative, gate_relative) =
+    let (
+        entry_code,
+        entry_relocations,
+        private_relative,
+        gate_relative,
+        start_prefix_vector_lowered,
+    ) =
         match target.architecture {
             Architecture::X86_64 => {
                 let entry = match surface {
@@ -13158,15 +13272,24 @@ fn lower_native_ordered_nfa_prepared_reported(
                     entry.relocations,
                     entry.private_entry_offset,
                     entry.bulk_gate_entry_offset,
+                    false,
                 )
             }
             Architecture::Aarch64 => {
                 let entry = match surface {
                     PreparedOrderedNfaV15Surface::Compatibility => {
-                        ordered_nfa_aarch64_codegen::lower_aarch64(&image)?
+                        ordered_nfa_aarch64_codegen::lower_aarch64_with_start_prefix_vector_policy(
+                            &image,
+                            allow_start_prefix_vector
+                                && target.features.has(CpuFeature::Aarch64Asimd),
+                        )?
                     }
                     PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
-                        ordered_nfa_aarch64_codegen::lower_aarch64_operation_only(&image)?
+                        ordered_nfa_aarch64_codegen::lower_aarch64_operation_only_with_start_prefix_vector_policy(
+                            &image,
+                            allow_start_prefix_vector
+                                && target.features.has(CpuFeature::Aarch64Asimd),
+                        )?
                     }
                 };
                 (
@@ -13174,6 +13297,7 @@ fn lower_native_ordered_nfa_prepared_reported(
                     entry.relocations,
                     entry.private_entry_offset,
                     entry.bulk_gate_entry_offset,
+                    entry.start_prefix_vector_lowered,
                 )
             }
         };
@@ -13251,6 +13375,7 @@ fn lower_native_ordered_nfa_prepared_reported(
                     .is_some(),
                 start_closure_dispatch_lowered: image.layout.start_closure_dispatch.is_some(),
                 start_prefix_lowered: image.layout.start_prefix.is_some(),
+                start_prefix_vector_lowered,
                 object_offset,
                 object_size: image.bytes.len(),
                 object_alignment: ORDERED_NFA_OBJECT_V1_ALIGNMENT,
@@ -13267,15 +13392,16 @@ fn lower_native_ordered_nfa_prepared_reported(
 
 fn lower_ordered_nfa_or_runtime_adapter(
     program_bytes: Vec<u8>,
-    native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+    native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize, bool)>,
     target: Target,
 ) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
-    if let Some((view, max_native_data_bytes)) = native_ordered_nfa
+    if let Some((view, max_native_data_bytes, allow_start_prefix_vector)) = native_ordered_nfa
         && let Some(selected) = lower_native_ordered_nfa_prepared(
             program_bytes.clone(),
             view,
             target,
             max_native_data_bytes,
+            allow_start_prefix_vector,
         )?
     {
         return Ok(selected);
@@ -16423,6 +16549,10 @@ fn native_module_digest_with_runtime_symbol(
             || ordered.private_entry_size == 0
             || ordered.bulk_gate_entry_size == 0
             || ordered.private_entry_offset == ordered.bulk_gate_entry_offset
+            || (ordered.start_prefix_vector_lowered
+                && (!ordered.start_prefix_lowered
+                    || target.architecture != Architecture::Aarch64
+                    || !target.features.has(CpuFeature::Aarch64Asimd)))
             || !ordered.private_entry_offset.is_multiple_of(match target.architecture {
                 Architecture::X86_64 => 1,
                 Architecture::Aarch64 => 4,
@@ -30817,6 +30947,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         exact_pair_suffix_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
         ordered_nfa_whole_window_width_gate_lowered: false,
     })
@@ -31338,6 +31469,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         exact_pair_suffix_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
         ordered_nfa_whole_window_width_gate_lowered: false,
     })
@@ -31491,6 +31623,7 @@ fn native_regex_redux_module(
         exact_pair_suffix_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
         ordered_nfa_whole_window_width_gate_lowered: false,
     })
@@ -31639,6 +31772,7 @@ fn native_weighted_capture_module(
         exact_pair_suffix_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
         ordered_nfa_whole_window_width_gate_lowered: false,
     })
@@ -32081,6 +32215,7 @@ fn native_rebar_multi_grep_module_v1(
         exact_pair_suffix_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
         ordered_nfa_whole_window_width_gate_lowered: false,
     })
@@ -32236,6 +32371,7 @@ fn native_rebar_row_scalar_module_v1(
         exact_pair_suffix_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
         ordered_nfa_whole_window_width_gate_lowered: false,
     })
@@ -77975,6 +78111,7 @@ mod tests {
             view,
             target,
             usize::MAX,
+            true,
         )
         .expect("digest lowering")
         .expect("digest Ordered-NFA admission");
@@ -77983,6 +78120,18 @@ mod tests {
         let no_kind = native_module_digest(&program_bytes, target, &lowering, None)
             .expect("incumbent digest stream");
         assert_ne!(digest, no_kind);
+        let mut forged_vector = layout;
+        let PreparedEntryKind::OrderedNfa(mut ordered) = forged_vector.kind else {
+            panic!("digest fixture lost Ordered-NFA layout");
+        };
+        ordered.start_prefix_vector_lowered = true;
+        forged_vector.kind = PreparedEntryKind::OrderedNfa(ordered);
+        assert!(matches!(
+            native_module_digest(&program_bytes, target, &lowering, Some(forged_vector)),
+            Err(ObjectError::InvalidModule(
+                "Ordered-NFA digest layout is inconsistent"
+            ))
+        ));
         let mut shifted = layout;
         let PreparedEntryKind::OrderedNfa(mut ordered) = shifted.kind else {
             panic!("digest fixture lost Ordered-NFA layout");
@@ -120452,6 +120601,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 exact_pair_suffix_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
                 ordered_nfa_start_prefix_lowered: false,
+                ordered_nfa_start_prefix_vector_lowered: false,
                 ordered_nfa_terminal_exact_set_lowered: None,
                 ordered_nfa_whole_window_width_gate_lowered: false,
             };
@@ -120787,6 +120937,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             exact_pair_suffix_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
             ordered_nfa_start_prefix_lowered: false,
+            ordered_nfa_start_prefix_vector_lowered: false,
             ordered_nfa_terminal_exact_set_lowered: None,
             ordered_nfa_whole_window_width_gate_lowered: false,
         };
@@ -130438,7 +130589,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
             || Err(CompileError::InternalInvariant("unexpected width retry")),
-            || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+            |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
             || Err(CompileError::InternalInvariant("unexpected start retry")),
             || Err(CompileError::InternalInvariant("unexpected terminal retry")),
             || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -130482,7 +130633,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
             || Err(CompileError::InternalInvariant("unexpected width retry")),
-            || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+            |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
             || Err(CompileError::InternalInvariant("unexpected start retry")),
             || Err(CompileError::InternalInvariant("unexpected terminal retry")),
             || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -130583,7 +130734,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
                 || Err(CompileError::InternalInvariant("unexpected width retry")),
-                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
                 || Err(CompileError::InternalInvariant("unexpected start retry")),
                 || Err(CompileError::InternalInvariant("unexpected terminal retry")),
                 || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -130680,7 +130831,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
                 || Err(CompileError::InternalInvariant("unexpected width retry")),
-                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
                 || Err(CompileError::InternalInvariant("unexpected start retry")),
                 || Err(CompileError::InternalInvariant("unexpected terminal retry")),
                 || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -130708,6 +130859,261 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             emit_object(&module, object_format, usize::MAX).unwrap(),
             incumbent_object
         );
+    }
+
+    #[test]
+    fn aarch64_ordered_nfa_prefix_simd_object_limit_restores_scalar_prefix() {
+        let scalar_target = Target::aarch64_linux();
+        let target = scalar_target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let pattern = r"Q?Q?Q?Q?Q?Q?Q?Q?Zx";
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+        )
+        .expect("sparse-prefix Ordered-NFA fixture");
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+
+        let feature_empty =
+            CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                compiled.program(),
+                scalar_target,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                usize::MAX,
+            )
+            .expect("feature-empty prefix module");
+        let feature_empty_scalar =
+            CompiledModule::lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+                compiled.program(),
+                scalar_target,
+                usize::MAX,
+                PreparedOrderedNfaV15Surface::Compatibility,
+            )
+            .expect("feature-empty scalar-prefix module");
+        assert!(feature_empty.has_ordered_nfa_start_prefix());
+        assert!(!feature_empty.has_ordered_nfa_start_prefix_vector());
+        assert!(!feature_empty_scalar.has_ordered_nfa_start_prefix_vector());
+        let feature_empty_object = emit_object(
+            &feature_empty,
+            ObjectFormat::for_target(scalar_target),
+            usize::MAX,
+        )
+        .unwrap();
+        let feature_empty_scalar_object = emit_object(
+            &feature_empty_scalar,
+            ObjectFormat::for_target(scalar_target),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            feature_empty_object,
+            feature_empty_scalar_object,
+            "feature-empty AArch64 must be byte-identical to the scalar-prefix incumbent",
+        );
+
+        let feature_empty_without_prefix =
+            CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                compiled.program(),
+                scalar_target,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                usize::MAX,
+            )
+            .expect("feature-empty no-prefix module");
+        let feature_empty_without_prefix_object = emit_object(
+            &feature_empty_without_prefix,
+            ObjectFormat::for_target(scalar_target),
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(feature_empty_without_prefix_object.len() < feature_empty_object.len());
+        let scalar_rebuild_calls = std::cell::Cell::new(0_u8);
+        let decline_retry = crate::emit_with_ordered_nfa_accelerator_retries(
+            feature_empty.clone(),
+            ObjectFormat::for_target(scalar_target),
+            feature_empty_without_prefix_object.len(),
+            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            |retain_scalar_prefix| {
+                if retain_scalar_prefix {
+                    scalar_rebuild_calls.set(scalar_rebuild_calls.get() + 1);
+                    return Err(CompileError::InternalInvariant(
+                        "feature-empty target attempted a redundant scalar-prefix rebuild",
+                    ));
+                }
+                Ok(feature_empty_without_prefix.clone())
+            },
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected edge retry")),
+        )
+        .expect("feature-empty prefix decline retry");
+        let crate::FinalObjectAttempt::Fit { module, object } = decline_retry else {
+            panic!("feature-empty no-prefix object did not fit its exact ceiling");
+        };
+        assert_eq!(scalar_rebuild_calls.get(), 0);
+        assert!(!module.has_ordered_nfa_start_prefix());
+        assert_eq!(object, feature_empty_without_prefix_object);
+
+        let common_compiled = compile(
+            CompileRequest::new(r"a?a?a?a?a?a?a?a?Zx", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+        )
+        .expect("common-byte prefix Ordered-NFA fixture");
+        assert_eq!(common_compiled.receipt().engine, EngineKind::OrderedNfa);
+        let common = CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+            common_compiled.program(),
+            target,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            usize::MAX,
+        )
+        .expect("common-byte prefix module");
+        let common_scalar =
+            CompiledModule::lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+                common_compiled.program(),
+                target,
+                usize::MAX,
+                PreparedOrderedNfaV15Surface::Compatibility,
+            )
+            .expect("common-byte scalar-prefix module");
+        assert!(common.has_ordered_nfa_start_prefix());
+        assert!(!common.has_ordered_nfa_start_prefix_vector());
+        assert_eq!(
+            emit_object(&common, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+            emit_object(
+                &common_scalar,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap(),
+            "ASIMD common-byte admission decline must be the exact scalar-prefix object",
+        );
+
+        let vector = CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+            compiled.program(),
+            target,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            usize::MAX,
+        )
+        .expect("vector-prefix module");
+        let scalar =
+            CompiledModule::lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+                compiled.program(),
+                target,
+                usize::MAX,
+                PreparedOrderedNfaV15Surface::Compatibility,
+            )
+            .expect("scalar-prefix module");
+        assert!(vector.has_ordered_nfa_start_prefix());
+        assert!(scalar.has_ordered_nfa_start_prefix());
+        assert!(vector.has_ordered_nfa_start_prefix_vector());
+        assert!(!scalar.has_ordered_nfa_start_prefix_vector());
+        assert_eq!(
+            vector.sections()[PROGRAM_SECTION].data,
+            scalar.sections()[PROGRAM_SECTION].data,
+            "SIMD ablation must not alter retained graph bytes",
+        );
+        assert!(
+            vector.sections()[TEXT_SECTION].data.len() > scalar.sections()[TEXT_SECTION].data.len(),
+            "sparse exact prefix must select additive ASIMD text",
+        );
+
+        let format = ObjectFormat::for_target(target);
+        let vector_object = emit_object(&vector, format, usize::MAX).unwrap();
+        let scalar_object = emit_object(&scalar, format, usize::MAX).unwrap();
+        assert!(scalar_object.len() < vector_object.len());
+        let retry = crate::emit_with_ordered_nfa_accelerator_retries(
+            vector.clone(),
+            format,
+            scalar_object.len(),
+            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            || {
+                Err(CompileError::InternalInvariant(
+                    "unexpected terminal-set retry",
+                ))
+            },
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            |retain_scalar_prefix| {
+                if retain_scalar_prefix {
+                    Ok(scalar.clone())
+                } else {
+                    Err(CompileError::InternalInvariant(
+                        "scalar prefix should fit before prefix removal",
+                    ))
+                }
+            },
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected edge retry")),
+        )
+        .expect("exact scalar-prefix object retry");
+        let crate::FinalObjectAttempt::Fit { module, object } = retry else {
+            panic!("scalar prefix did not fit its exact object ceiling");
+        };
+        assert!(module.has_ordered_nfa_start_prefix());
+        assert!(!module.has_ordered_nfa_start_prefix_vector());
+        assert_eq!(object, scalar_object);
+
+        let allocation = crate::emit_with_ordered_nfa_accelerator_retries(
+            vector,
+            format,
+            scalar_object.len(),
+            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            || {
+                Err(CompileError::InternalInvariant(
+                    "unexpected terminal-set retry",
+                ))
+            },
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            |_| Err(ObjectError::Allocation("prefix-SIMD scalar rebuild seam").into()),
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected edge retry")),
+        );
+        let Err(allocation) = allocation else {
+            panic!("allocator failure was not terminal");
+        };
+        assert!(matches!(
+            allocation,
+            CompileError::Object(ObjectError::Allocation("prefix-SIMD scalar rebuild seam"))
+        ));
     }
 
     #[test]
@@ -130774,7 +131180,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
                 || Err(CompileError::InternalInvariant("unexpected width retry")),
-                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
                 || Err(CompileError::InternalInvariant("unexpected start retry")),
                 || Err(CompileError::InternalInvariant("unexpected terminal retry")),
                 || Err(CompileError::InternalInvariant("unexpected scalar retry")),
