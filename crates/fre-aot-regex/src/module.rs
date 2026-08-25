@@ -31,6 +31,7 @@ use crate::{
     context_native::MAX_CONTEXT_NATIVE_DATA_BYTES,
     direct_count_v3::{
         DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
+        DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
         DirectExactSingletonCountAotReport, DirectExactSingletonCountCostShape,
         DirectExactSingletonCountSelectionBasis, DirectExactSingletonCountSuccessorMode,
         PreparedDirectExactSingletonCount,
@@ -9225,6 +9226,14 @@ impl CompiledModule {
                 "direct Count-v3 incumbent text is not instruction aligned",
             ));
         }
+        let text_alignment = usize::try_from(self.sections[TEXT_SECTION].alignment).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 text section alignment")
+        })?;
+        if !text_alignment.is_multiple_of(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES) {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 text section cannot honor producer alignment",
+            ));
+        }
         let short_fallback_max_bytes =
             direct_exact_singleton_count_short_fallback_max_bytes(
                 candidate_recipe.strategy(),
@@ -9276,28 +9285,51 @@ impl CompiledModule {
             .map(|_| lower_aarch64_direct_count_cold_long())
             .transpose()?;
         let cold_long_offset = cold_long.as_ref().map(|_| original_text_bytes);
-        let cold_long_bytes = cold_long.as_ref().map(|cold| cold.code.len());
-        let core_offset = original_text_bytes
-            .checked_add(cold_long_bytes.unwrap_or(0))
-            .and_then(|end| end.checked_add(3))
+        if DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES < 4
+            || !DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES.is_power_of_two()
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 producer code alignment is invalid",
+            ));
+        }
+        let unaligned_core_offset = original_text_bytes
+            .checked_add(cold_long.as_ref().map_or(0, |cold| cold.code.len()))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 unaligned core extent",
+            ))?;
+        let core_offset = unaligned_core_offset
+            .checked_add(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES - 1)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "direct Count-v3 core alignment",
             ))?
-            & !3;
-        let final_text_bytes = core_offset.checked_add(candidate.code.len()).ok_or(
-            ObjectError::ArithmeticOverflow("direct Count-v3 core extent"),
-        )?;
-        let selected_count_size = core_offset.checked_sub(count_start).ok_or(
-            ObjectError::InvalidModule("direct Count-v3 selected Count extent is invalid"),
-        )?;
+            & !(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES - 1);
+        let cold_long_bytes = cold_long_offset
+            .map(|offset| {
+                core_offset.checked_sub(offset).ok_or(ObjectError::InvalidModule(
+                    "direct Count-v3 cold-long extent precedes its start",
+                ))
+            })
+            .transpose()?;
+        if !core_offset.is_multiple_of(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES) {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 core start violates producer alignment",
+            ));
+        }
+        let final_text_bytes = core_offset
+            .checked_add(candidate.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 core extent",
+            ))?;
+        let selected_count_size = if short_fallback_max_bytes.is_some() {
+            core_offset.checked_sub(count_start).ok_or(
+                ObjectError::InvalidModule("direct Count-v3 selected Count extent is invalid"),
+            )?
+        } else {
+            count_size
+        };
         let selected_count_symbol_size = u64::try_from(selected_count_size).map_err(|_| {
             ObjectError::ArithmeticOverflow("direct Count-v3 selected Count symbol size")
         })?;
-        if short_fallback_max_bytes.is_none() && selected_count_size != count_size {
-            return Err(ObjectError::InvalidModule(
-                "direct Count-v3 ungated Count symbol extent changed",
-            ));
-        }
         let incumbent_code_bytes = u32::try_from(count_size).map_err(|_| {
             ObjectError::ArithmeticOverflow("direct Count-v3 incumbent code bytes")
         })?;
@@ -9489,6 +9521,7 @@ impl CompiledModule {
         }
         candidate.authenticate_embedded(
             literal,
+            core_offset,
             &text[core_offset..final_text_bytes],
         )?;
         let selected_relocations = if let (Some(cold_offset), Some(cold)) =
@@ -9538,7 +9571,7 @@ impl CompiledModule {
             DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance
         };
         let mut selected_identity = Sha256::new();
-        selected_identity.update(b"fre-aot-regex/direct-exact-singleton-count-module/v4\0");
+        selected_identity.update(b"fre-aot-regex/direct-exact-singleton-count-module/v5\0");
         selected_identity.update(incumbent_module_identity);
         selected_identity.update(artifact_identity);
         selected_identity.update(candidate.recipe_identity);
@@ -9578,6 +9611,15 @@ impl CompiledModule {
             u64::try_from(core_offset)
                 .map_err(|_| {
                     ObjectError::ArithmeticOverflow("direct Count-v3 core identity offset")
+                })?
+                .to_le_bytes(),
+        );
+        selected_identity.update(
+            u64::try_from(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 core identity alignment",
+                    )
                 })?
                 .to_le_bytes(),
         );
@@ -9668,6 +9710,7 @@ impl CompiledModule {
                 copied_incumbent_body_bytes,
                 cold_long_offset,
                 cold_long_bytes,
+                core_alignment_bytes: DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
                 core_offset,
                 core_bytes: candidate.code.len(),
                 core_sha256: candidate.core_sha256,
@@ -9705,6 +9748,16 @@ impl CompiledModule {
             ))?;
         let original_text_bytes = original_text.len();
         let gated = report.short_fallback_max_bytes.is_some();
+        if report.core_alignment_bytes != DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES
+            || !report.core_offset.is_multiple_of(report.core_alignment_bytes)
+            || !usize::try_from(self.sections[TEXT_SECTION].alignment)
+                .ok()
+                .is_some_and(|alignment| alignment.is_multiple_of(report.core_alignment_bytes))
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 rollback core alignment disagrees",
+            ));
+        }
         if gated {
             let (Some(cold_offset), Some(cold_bytes), Some(original_relocations_ref)) = (
                 report.cold_long_offset,
@@ -9731,7 +9784,16 @@ impl CompiledModule {
             || report.cold_long_offset.is_some()
             || report.cold_long_bytes.is_some()
             || original_relocations.is_some()
-            || report.core_offset != original_text_bytes
+            || report.core_offset < original_text_bytes
+            || report.core_offset - original_text_bytes >= report.core_alignment_bytes
+            || self.sections[TEXT_SECTION]
+                .data
+                .get(original_text_bytes..report.core_offset)
+                .is_none_or(|padding| {
+                    !padding
+                        .chunks_exact(4)
+                        .all(|word| word == 0xd503_201f_u32.to_le_bytes())
+                })
         {
             return Err(ObjectError::InvalidModule(
                 "direct Count-v3 rollback ungated layout disagrees",

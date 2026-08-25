@@ -54,7 +54,7 @@ pub use image_v2::{
 };
 pub use image_v3::{
     AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V3,
-    AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, AOT_COUNT_KIR_ABI_VERSION_V3,
+    AOT_COUNT_CODE_ALIGNMENT_V3, AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, AOT_COUNT_KIR_ABI_VERSION_V3,
     AOT_COUNT_KIR_SEMANTICS_VERSION_V3, AotCountArtifactIdentityV3, AotCountBackendSupportV3,
     AotCountImageBuildReceiptV3, AotCountImageLayoutV3, AotCountImageStatsV3, AotCountImageV3,
     AotCountImageViewV3, AotCountLiteralManifestV3, AotCountMappedMetadataV3,

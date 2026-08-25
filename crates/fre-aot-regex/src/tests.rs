@@ -267,6 +267,15 @@ fn direct_exact_singleton_count_selects_for_every_supported_width_and_format() {
             );
             assert_eq!(report.cold_long_offset.is_some(), has_short_fallback);
             assert_eq!(report.cold_long_bytes.is_some(), has_short_fallback);
+            assert_eq!(
+                report.core_alignment_bytes,
+                crate::direct_count_v3::DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
+            );
+            assert!(
+                report
+                    .core_offset
+                    .is_multiple_of(report.core_alignment_bytes),
+            );
             assert_eq!(report.incumbent_cost.scan_passes, 1);
             assert_eq!(report.selected_cost.scan_passes, 1);
             assert_eq!(report.incumbent_cost.native_calls_per_match, 1);
@@ -627,13 +636,19 @@ fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface(
         }
     };
     candidate
-        .authenticate_embedded(literal, &candidate.code)
+        .authenticate_embedded(literal, 0, &candidate.code)
         .expect("authenticate untouched direct Count-v3 core");
+    assert!(
+        candidate
+            .authenticate_embedded(literal, 4, &candidate.code)
+            .is_err(),
+        "a byte-identical core at a merely instruction-aligned offset must fail",
+    );
     let mut tampered_core = candidate.code.to_vec();
     tampered_core[0] ^= 1;
     assert!(
         candidate
-            .authenticate_embedded(literal, &tampered_core)
+            .authenticate_embedded(literal, 0, &tampered_core)
             .is_err(),
     );
 
@@ -708,6 +723,11 @@ fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface(
         .expect("selected text section index");
     let text = &selected.sections()[text_index];
     let core_end = report.core_offset + report.core_bytes;
+    assert_eq!(
+        report.core_alignment_bytes,
+        crate::direct_count_v3::DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
+    );
+    assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
     assert_eq!(
         <[u8; 32]>::from(Sha256::digest(&text.bytes()[report.core_offset..core_end])),
         report.core_sha256,
@@ -786,6 +806,11 @@ fn direct_exact_singleton_count_short_gate_preserves_the_hot_incumbent_layout() 
         .bytes();
     assert_eq!(cold_offset, incumbent_text.len());
     assert_eq!(cold_offset + cold_bytes, report.core_offset);
+    assert_eq!(
+        report.core_alignment_bytes,
+        crate::direct_count_v3::DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
+    );
+    assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
     assert_eq!(
         &selected_text[report.authenticated_wrapper_body_offset..cold_offset],
         &incumbent_text[report.authenticated_wrapper_body_offset..],

@@ -20,11 +20,11 @@ use crate::audit_cfg_v3::{
     decoded_cfg_safety_work_upper_bound_v3,
 };
 use crate::{
-    AOT_COUNT_BACKEND_VERSION_V3, AotCountArtifactIdentityV3, AotCountCpuFeatures, AotCountImageV3,
-    AotCountImageViewV3, AotCountLiteralManifestV3, AotCountMappedMetadataV3,
-    AotCountRecipeManifestV3, CodeLabelV3, CountAotArithmeticSite, CountAotError, CountAotResource,
-    CountEmitLimitsV3, LabelKindV3, RelocationKindV3, RelocationTargetV3, RelocationV3,
-    SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3, emit_count_v3,
+    AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_CODE_ALIGNMENT_V3, AotCountArtifactIdentityV3,
+    AotCountCpuFeatures, AotCountImageV3, AotCountImageViewV3, AotCountLiteralManifestV3,
+    AotCountMappedMetadataV3, AotCountRecipeManifestV3, CodeLabelV3, CountAotArithmeticSite,
+    CountAotError, CountAotResource, CountEmitLimitsV3, LabelKindV3, RelocationKindV3,
+    RelocationTargetV3, RelocationV3, SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3, emit_count_v3,
     emit_v3::{
         ProspectiveV3, artifact_identity_encoded_len_v3,
         assembler_scratch_derivation_work_upper_bound_v3, assembler_scratch_for_capacities_v3,
@@ -1170,7 +1170,8 @@ fn audit_impl_v3(
     {
         return Err(invalid_v3("v3 semantic manifest"));
     }
-    let expected_code_alignment = 16_u32;
+    let expected_code_alignment =
+        u32::try_from(AOT_COUNT_CODE_ALIGNMENT_V3).map_err(|_| invalid_v3("v3 code alignment"))?;
     let expected_rodata_offset = align_up_audit_v3(
         image.code.len(),
         usize::try_from(expected_code_alignment).unwrap(),

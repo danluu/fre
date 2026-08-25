@@ -5,8 +5,8 @@
 //! corpus name, or source-pattern identity outside the bound artifact hash.
 
 use fre_aot_aarch64::{
-    AotCountMappedMetadataV3, CountAotError, CountAotUnsupported, CountEmitLimitsV3,
-    audit_count_mapped_code_v3,
+    AOT_COUNT_CODE_ALIGNMENT_V3, AotCountMappedMetadataV3, CountAotError, CountAotUnsupported,
+    CountEmitLimitsV3, audit_count_mapped_code_v3,
 };
 use fre_aot_count_compiler::{
     CountCompileErrorV3, CountCompileLimitsV3, CountCompileRequestV3, CountCompileTargetV3,
@@ -27,7 +27,10 @@ use crate::{
     PreparedAggregateStrategy, Target,
 };
 
-pub const DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION: u16 = 4;
+pub const DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION: u16 = 5;
+
+pub(crate) const DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES: usize =
+    AOT_COUNT_CODE_ALIGNMENT_V3;
 
 /// Largest source length routed to the authenticated incumbent body for the
 /// short-input periodic schedule. The focused core starts at one complete
@@ -63,7 +66,8 @@ pub enum DirectExactSingletonCountSelectionBasis {
     /// per-match search call and internal span publication.
     StructuralSingleScanDominance,
     /// The direct arm has the same structural dominance, while a source-only
-    /// cold-long gate leaves the incumbent short path byte-for-byte in place.
+    /// cold-long gate preserves the incumbent short-path instruction count and
+    /// layout, replacing only its signed-length check and branch in place.
     StructuralSingleScanDominanceWithShortIncumbent,
 }
 
@@ -105,19 +109,25 @@ pub struct DirectExactSingletonCountAotReport {
     /// present, shorter sources use the exact `incumbent_cost` arm instead.
     pub selected_cost: DirectExactSingletonCountCostShape,
     pub authenticated_wrapper_body_offset: usize,
-    /// Inclusive source-length ceiling for the byte-identical incumbent arm.
-    /// `None` means the selected core owns every authenticated source length.
+    /// Inclusive source-length ceiling for the incumbent short arm after its
+    /// signed-length pair is replaced by the in-place cold-long gate. `None`
+    /// means the selected core owns every authenticated source length.
     pub short_fallback_max_bytes: Option<u32>,
     /// Text extent of a relocated incumbent body used by an older gate layout.
-    /// Schema V4's cold-long gate leaves both fields absent because the short
-    /// arm and its body remain byte-for-byte in place.
+    /// Schema V5's cold-long gate leaves both fields absent because the
+    /// incumbent body remains at its original offsets; only the signed-length
+    /// pair is rewritten in place.
     pub copied_incumbent_body_offset: Option<usize>,
     pub copied_incumbent_body_bytes: Option<usize>,
     /// Appended cold path that rechecks invalid-length precedence, validates
     /// the result pointer, reauthenticates the handle, and enters the core.
-    /// The established short path never executes this extent.
+    /// The established short path never executes this extent. Its byte count
+    /// includes any trailing NOPs needed to align the Count-v3 core.
     pub cold_long_offset: Option<usize>,
     pub cold_long_bytes: Option<usize>,
+    /// Required start alignment inherited from the independently audited
+    /// Count-v3 producer layout.
+    pub core_alignment_bytes: usize,
     pub core_offset: usize,
     pub core_bytes: usize,
     pub core_sha256: [u8; 32],
@@ -148,19 +158,22 @@ pub(crate) struct PreparedDirectExactSingletonCount {
 
 impl PreparedDirectExactSingletonCount {
     /// Rebuild the exact KIR and independently audit the core after it has
-    /// been placed at its final module offset. Count-v3 is PIC, so the exact
-    /// bounded slice is the complete offset-independent audit surface.
+    /// been placed at its final module offset. Count-v3 is PIC, but its
+    /// producer layout still requires an aligned code start; the exact bounded
+    /// slice is otherwise the complete offset-independent audit surface.
     pub(crate) fn authenticate_embedded(
         &self,
         literal: &[u8],
+        embedded_offset: usize,
         embedded: &[u8],
     ) -> Result<(), ObjectError> {
-        if <[u8; 32]>::from(Sha256::digest(literal)) != self.literal_sha256
+        if !embedded_offset.is_multiple_of(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES)
+            || <[u8; 32]>::from(Sha256::digest(literal)) != self.literal_sha256
             || embedded != self.code.as_ref()
             || <[u8; 32]>::from(Sha256::digest(embedded)) != self.core_sha256
         {
             return Err(ObjectError::InvalidModule(
-                "embedded direct Count-v3 core identity disagrees",
+                "embedded direct Count-v3 core identity or alignment disagrees",
             ));
         }
         let program = build_exact_aggregate::<Count>(literal, self.kernel_limits)

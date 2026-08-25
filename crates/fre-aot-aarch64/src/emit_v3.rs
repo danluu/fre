@@ -17,12 +17,12 @@ use fre_kernel_ir::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, AotCountArtifactIdentityV3, AotCountCpuFeatures,
-    AotCountImageBuildReceiptV3, AotCountImageLayoutV3, AotCountImageStatsV3, AotCountImageV3,
-    AotCountLiteralManifestV3, AotCountRecipeManifestV3, AotCountTargetSpec, CodeLabelV3,
-    ConditionV3, CountAotArithmeticSite, CountAotError, CountAotResource, CountAotUnsupported,
-    CountAuditReportV3, LabelKindV3, RelocationKindV3, RelocationTargetV3, RelocationV3,
-    SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3,
+    AOT_COUNT_CODE_ALIGNMENT_V3, AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, AotCountArtifactIdentityV3,
+    AotCountCpuFeatures, AotCountImageBuildReceiptV3, AotCountImageLayoutV3, AotCountImageStatsV3,
+    AotCountImageV3, AotCountLiteralManifestV3, AotCountRecipeManifestV3, AotCountTargetSpec,
+    CodeLabelV3, ConditionV3, CountAotArithmeticSite, CountAotError, CountAotResource,
+    CountAotUnsupported, CountAuditReportV3, LabelKindV3, RelocationKindV3, RelocationTargetV3,
+    RelocationV3, SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3,
     audit_v3::{
         audit_candidate_wrapper_inline_bytes_v3, audit_count_image_candidate_v3,
         audit_count_image_v3, audit_public_wrapper_inline_bytes_v3, audit_scratch_upper_bound_v3,
@@ -30,7 +30,6 @@ use crate::{
     },
 };
 
-const CODE_ALIGNMENT_V3: usize = 16;
 const MAX_CODE_BYTES_V3: u64 = 16 << 10;
 const MAX_LABELS_V3: u64 = 48;
 const MAX_RELOCATIONS_V3: u64 = 256;
@@ -385,10 +384,10 @@ pub fn emit_count_v3(
         });
     }
     let code_bytes = to_u32(code.len(), CountAotArithmeticSite::ImageLayout)?;
-    let rodata_offset = align_up_v3(code.len(), CODE_ALIGNMENT_V3)?;
+    let rodata_offset = align_up_v3(code.len(), AOT_COUNT_CODE_ALIGNMENT_V3)?;
     let layout = AotCountImageLayoutV3 {
-        code_alignment: u32::try_from(CODE_ALIGNMENT_V3).expect("small alignment"),
-        rodata_alignment: u32::try_from(CODE_ALIGNMENT_V3).expect("small alignment"),
+        code_alignment: u32::try_from(AOT_COUNT_CODE_ALIGNMENT_V3).expect("small alignment"),
+        rodata_alignment: u32::try_from(AOT_COUNT_CODE_ALIGNMENT_V3).expect("small alignment"),
         rodata_from_code_start: to_u32(rodata_offset, CountAotArithmeticSite::ImageLayout)?,
         total_mapped_bytes: to_u32(rodata_offset, CountAotArithmeticSite::ImageLayout)?,
     };

@@ -18,11 +18,15 @@ pub const AOT_COUNT_BACKEND_VERSION_V3: AotCountBackendVersion = AotCountBackend
 pub const AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3: u16 = 11;
 pub const AOT_COUNT_KIR_SEMANTICS_VERSION_V3: u16 = 1;
 pub const AOT_COUNT_KIR_ABI_VERSION_V3: u16 = 1;
+/// Required start alignment of a mapped Count-v3 code image.
+pub const AOT_COUNT_CODE_ALIGNMENT_V3: usize = 16;
 const AOT_COUNT_LITERAL_MANIFEST_BYTES_V3: usize = 32;
 const AOT_COUNT_NO_FILTER_OFFSET_V3: u8 = u8::MAX;
 const _: () = assert!(SemanticsVersion::CURRENT.0 == AOT_COUNT_KIR_SEMANTICS_VERSION_V3);
 const _: () = assert!(AbiVersion::CURRENT.0 == AOT_COUNT_KIR_ABI_VERSION_V3);
 const _: () = assert!(COUNT_V3_RECIPE_CANONICAL_BYTES == 256);
+const _: () =
+    assert!(AOT_COUNT_CODE_ALIGNMENT_V3 >= 4 && AOT_COUNT_CODE_ALIGNMENT_V3.is_power_of_two());
 
 /// Exact backend/KIR/output/target support row admitted by optimizing v3.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
