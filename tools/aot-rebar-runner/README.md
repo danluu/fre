@@ -18,11 +18,13 @@ native objects. Each row is either an ordinary helper-free native entry or,
 only when that exact ordinary incumbent reports the typed Ordered-NFA need, an
 independently authenticated V15 prepared native search entry. A build with
 no KLV remains a harmless unconfigured workspace binary.
-For multi-pattern `grep`, an all-ordinary row table additionally selects a
-helper-free native wrapper that owns the complete LF/CRLF line traversal,
-calls and validates every distinct row on every line, and publishes the
-checked line count transactionally. A prepared V15 row or the wrapper's typed
-object-byte cap decline retains the exact pre-existing Rust line/row adapter.
+For multi-pattern `grep`, the row table additionally selects a native wrapper
+that owns the complete LF/CRLF line traversal, calls and validates every
+distinct row on every line, and publishes the checked line count
+transactionally. An all-ordinary table retains the legacy helper-free ABI; a
+mixed table uses a distinct one-slot-per-row handle ABI. Only the wrapper's
+typed object-byte cap decline retains the exact pre-existing Rust line/row
+adapter.
 
 A configured build has two validation modes. With both
 `FRE_AOT_REBAR_EXPECTED_VALUE` and `FRE_AOT_REBAR_EXPECTED_COMPARATOR` absent,
@@ -146,9 +148,13 @@ timing belongs to a separately named compiler-stage benchmark.
   source map, row identities, relocations, code/object identities, and total
   object envelope are sealed at build time; runtime reauthenticates the source
   and artifact identities, and formal qualification rehashes every object. A
-  prepared V15 row or typed reducer object-cap decline retains the older
-  per-line/per-row adapter;
-  prepared handles are constructed before warmup and timed loops.
+  A mixed ordinary/prepared table instead links a distinct five-argument
+  reducer. Its authenticated one-slot-per-row handle table is passed once per
+  operation, and the native wrapper invokes ordinary rows with the ordinary
+  ABI and prepared rows with the exclusive-handle ABI. Prepared handles are
+  constructed before warmup and timed loops. Only the final numeric reducer
+  object-cap decline retains the older per-line/per-row adapter; allocator,
+  lowering, emission, and authentication failures remain terminal.
 - An exact one-pattern `count-captures` or `grep-captures` job first attempts
   one identity-suffixed uniform-capture reducer. The reducer owns the complete
   operation and returns a checked `u64` through the same exclusive-session
@@ -253,10 +259,12 @@ each byte line is relevant. When every row is ordinary, its native reducer
 owns that complete line/row loop in one call while still invoking every row so
 a losing row's malformed status or span remains terminal. Its child relocation
 closure is exactly the distinct row entries. Prepared V15 rows retain the old
-adapter because handle lifecycle is not part of this reducer ABI; the only
-other safe decline is the exact remaining `ObjectBytes` ceiling after charging
-all row objects. Allocation, arithmetic, lowering, emission, and
-authentication failures are terminal.
+semantics through a distinct five-argument reducer ABI: one authenticated table
+slot per row is passed once, ordinary slots are null, and prepared slots hold
+already-prepared exclusive handles. Handle lifecycle remains outside warmup
+and samples. The only safe decline is the exact remaining `ObjectBytes`
+ceiling after charging all row objects. Allocation, arithmetic, lowering,
+emission, and authentication failures are terminal.
 
 Count, SpanSum, and GrepCount first attempt an additive shared ordered-many
 route for 2..=4,096 rows. That route independently parses every source,
@@ -445,7 +453,11 @@ Multi-pattern `grep` uses the same authenticated direct/prepared native rows,
 restarts every selector for each Rebar byte-line, and reduces only whether any
 row matched that line. An all-ordinary table selects
 `native-independent-span-row-whole-grep-reducer-v1`, with one native wrapper
-owning both loops. A prepared V15 row or typed wrapper object-cap decline is
+owning both loops. A table containing a prepared V15 row selects the distinct
+`native-independent-mixed-prepared-span-row-whole-grep-reducer-v1` wrapper and
+passes its authenticated handle table once. Every row is still called and
+validated after a match, each matching line is counted once, and publication
+remains transactional. Only the final numeric wrapper object-cap decline is
 reported as the corresponding `per-line-native-independent-*` Rust adapter.
 Neither route scans across a line boundary or substitutes one whole-haystack
 match stream for Rebar's per-line model.
@@ -475,6 +487,11 @@ operation entry; child row entries remain identity-defined link targets. A
 mixed wrapper is still classified as semantic-helper-backed because each V15
 child retains its authenticated runtime-symbol surface, rather than being
 misreported in the helper-free whole-operation numerator.
+`native-multi-grep-reducer-v1` uses the same mixed route vector and handle-table
+closure under its own Grep-specific operation, artifact, symbol, and ABI
+domains. Its final reducer is one native operation call, but the census labels
+the mixed form semantic-helper-backed because prepared children retain their
+closed V15 runtime-helper surface.
 Uniform-capture v3 row-adapter routes additionally publish `capture_resolution` as
 `static-uniform-multiplier`, both proof-identity versions, every source's
 multiplier/minimum/census/accounting, and the selector digests that bind it to

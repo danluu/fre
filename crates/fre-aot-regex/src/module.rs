@@ -32132,8 +32132,16 @@ fn native_rebar_multi_grep_module_v1(
     code: Vec<u8>,
     row_entries: &[String],
     relocations: Vec<ModuleRelocation>,
+    mixed_handle_table: bool,
 ) -> Result<CompiledModule, ObjectError> {
-    let entry_name = identity_symbol("fre_aot_regex_rebar_multi_grep_v1_", &identity)?;
+    let entry_name = identity_symbol(
+        if mixed_handle_table {
+            "fre_aot_regex_rebar_mixed_multi_grep_v1_"
+        } else {
+            "fre_aot_regex_rebar_multi_grep_v1_"
+        },
+        &identity,
+    )?;
     let mut symbols = Vec::new();
     symbols
         .try_reserve_exact(REBAR_MULTI_GREP_ROW_SYMBOL_BASE + row_entries.len())
@@ -32167,7 +32175,11 @@ fn native_rebar_multi_grep_module_v1(
                 data: code.into_boxed_slice(),
             },
             ModuleSection {
-                name: ".rodata.fre.rebar-multi-grep",
+                name: if mixed_handle_table {
+                    ".rodata.fre.rebar-mixed-multi-grep"
+                } else {
+                    ".rodata.fre.rebar-multi-grep"
+                },
                 kind: SectionKind::ReadOnlyData,
                 alignment: 1,
                 data: Box::default(),
@@ -32243,8 +32255,12 @@ pub(crate) fn lower_native_rebar_multi_grep_reducer_v1(
         ));
     }
     let (code, call_offsets) = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_native_rebar_multi_grep_v1(row_entries.len())?,
-        Architecture::Aarch64 => lower_aarch64_native_rebar_multi_grep_v1(row_entries.len())?,
+        Architecture::X86_64 => {
+            lower_x86_64_native_rebar_multi_grep_v1(row_entries.len(), None)?
+        }
+        Architecture::Aarch64 => {
+            lower_aarch64_native_rebar_multi_grep_v1(row_entries.len(), None)?
+        }
     };
     if call_offsets.len() != row_entries.len() {
         return Err(ObjectError::InvalidModule(
@@ -32275,7 +32291,80 @@ pub(crate) fn lower_native_rebar_multi_grep_reducer_v1(
             })
         })
         .collect::<Result<Vec<_>, ObjectError>>()?;
-    native_rebar_multi_grep_module_v1(target, identity, code, row_entries, relocations)
+    native_rebar_multi_grep_module_v1(target, identity, code, row_entries, relocations, false)
+}
+
+pub(crate) fn lower_native_rebar_mixed_multi_grep_reducer_v1(
+    target: Target,
+    identity: [u8; 32],
+    row_entries: &[String],
+    prepared_rows: &[bool],
+) -> Result<CompiledModule, ObjectError> {
+    if row_entries.is_empty()
+        || row_entries.len() > crate::ORDERED_MANY_AOT_MAX_ROWS
+        || row_entries.len() != prepared_rows.len()
+        || !prepared_rows.iter().copied().any(core::convert::identity)
+        || row_entries.iter().any(String::is_empty)
+        || row_entries.iter().enumerate().any(|(row, entry)| {
+            row_entries[..row].iter().any(|prior| prior == entry)
+        })
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "Rebar mixed multi-grep target or row closure",
+        ));
+    }
+    let (code, call_offsets) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_rebar_multi_grep_v1(
+            row_entries.len(),
+            Some(prepared_rows),
+        )?,
+        Architecture::Aarch64 => lower_aarch64_native_rebar_multi_grep_v1(
+            row_entries.len(),
+            Some(prepared_rows),
+        )?,
+    };
+    if call_offsets.len() != row_entries.len() {
+        return Err(ObjectError::InvalidModule(
+            "Rebar mixed multi-grep row-call cardinality",
+        ));
+    }
+    let relocations = call_offsets
+        .iter()
+        .enumerate()
+        .map(|(row, &offset)| {
+            Ok(ModuleRelocation {
+                section: REBAR_MULTI_GREP_TEXT_SECTION,
+                offset: offset_u64(offset, "Rebar mixed multi-grep call relocation")?,
+                kind: match target.architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                symbol: REBAR_MULTI_GREP_ROW_SYMBOL_BASE
+                    .checked_add(row)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "Rebar mixed multi-grep row symbol",
+                    ))?,
+                addend: if target.architecture == Architecture::X86_64 {
+                    -4
+                } else {
+                    0
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ObjectError>>()?;
+    native_rebar_multi_grep_module_v1(
+        target,
+        identity,
+        code,
+        row_entries,
+        relocations,
+        true,
+    )
 }
 
 const REBAR_ROW_SCALAR_TEXT_SECTION: usize = 0;
@@ -46924,12 +47013,15 @@ fn lower_x86_64_prepared_grep_count(
 )]
 fn lower_x86_64_native_rebar_multi_grep_v1(
     row_count: usize,
+    prepared_rows: Option<&[bool]>,
 ) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
-    const FRAME_BYTES: u8 = 40;
+    const ORDINARY_FRAME_BYTES: u8 = 40;
+    const MIXED_FRAME_BYTES: u8 = 56;
     const RESULT_END_OFFSET: u8 = 8;
     const LINE_LENGTH_OFFSET: u8 = 24;
     const MATCHED_OFFSET: u8 = 32;
-    if row_count == 0 {
+    const HANDLE_TABLE_OFFSET: u8 = 40;
+    if row_count == 0 || prepared_rows.is_some_and(|routes| routes.len() != row_count) {
         return Err(ObjectError::InvalidModule(
             "x86 Rebar multi-grep row cardinality",
         ));
@@ -46946,17 +47038,33 @@ fn lower_x86_64_native_rebar_multi_grep_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    let frame_bytes = if prepared_rows.is_some() {
+        MIXED_FRAME_BYTES
+    } else {
+        ORDINARY_FRAME_BYTES
+    };
+    if let Some(routes) = prepared_rows {
+        x86_mixed_row_scalar_boundary(&mut assembler, routes, invalid)?;
+    } else {
+        x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    }
     assembler.instruction(&[0x55])?; // rbp
     assembler.instruction(&[0x53])?; // rbx
     assembler.instruction(&[0x41, 0x54])?; // r12
     assembler.instruction(&[0x41, 0x55])?; // r13
     assembler.instruction(&[0x41, 0x56])?; // r14
     assembler.instruction(&[0x41, 0x57])?; // r15
-    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
-    assembler.instruction(&[0x49, 0x89, 0xfc])?; // base
-    assembler.instruction(&[0x49, 0x89, 0xf5])?; // complete length
-    assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+    if prepared_rows.is_some() {
+        assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, HANDLE_TABLE_OFFSET])?;
+        assembler.instruction(&[0x49, 0x89, 0xd4])?; // base
+        assembler.instruction(&[0x49, 0x89, 0xcd])?; // complete length
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?; // output
+    } else {
+        assembler.instruction(&[0x49, 0x89, 0xfc])?; // base
+        assembler.instruction(&[0x49, 0x89, 0xf5])?; // complete length
+        assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    }
     assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
     assembler.instruction(&[0x48, 0x31, 0xdb])?; // cursor
     assembler.instruction(&[0x4d, 0x85, 0xed])?;
@@ -47001,7 +47109,7 @@ fn lower_x86_64_native_rebar_multi_grep_v1(
     call_labels
         .try_reserve_exact(row_count)
         .map_err(|_| ObjectError::Allocation("x86 Rebar multi-grep calls"))?;
-    for _ in 0..row_count {
+    for row in 0..row_count {
         let next_row = assembler.label()?;
         assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0xff, 0xff, 0xff, 0xff])?;
         assembler.instruction(&[
@@ -47015,17 +47123,41 @@ fn lower_x86_64_native_rebar_multi_grep_v1(
             0xff,
             0xff,
         ])?;
-        assembler.instruction(&[0x49, 0x8d, 0x3c, 0x2c])?; // base + line start
-        assembler.instruction(&[
-            0x48,
-            0x8b,
-            0x74,
-            0x24,
-            LINE_LENGTH_OFFSET,
-        ])?;
-        assembler.instruction(&[0x31, 0xd2])?;
-        assembler.instruction(&[0x48, 0x89, 0xf1])?;
-        assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+        if prepared_rows.is_some_and(|routes| routes[row]) {
+            assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, HANDLE_TABLE_OFFSET])?;
+            let displacement = row
+                .checked_mul(core::mem::size_of::<usize>())
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 mixed multi-grep handle load",
+                ))?;
+            let mut load_handle = vec![0x48, 0x8b, 0xb8]; // rdi = table[row]
+            load_handle.extend_from_slice(&displacement.to_le_bytes());
+            assembler.instruction(&load_handle)?;
+            assembler.instruction(&[0x49, 0x8d, 0x34, 0x2c])?; // line base
+            assembler.instruction(&[
+                0x48,
+                0x8b,
+                0x54,
+                0x24,
+                LINE_LENGTH_OFFSET,
+            ])?;
+            assembler.instruction(&[0x31, 0xc9])?; // window start
+            assembler.instruction(&[0x49, 0x89, 0xd0])?; // window end
+            assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // result
+        } else {
+            assembler.instruction(&[0x49, 0x8d, 0x3c, 0x2c])?; // base + line start
+            assembler.instruction(&[
+                0x48,
+                0x8b,
+                0x74,
+                0x24,
+                LINE_LENGTH_OFFSET,
+            ])?;
+            assembler.instruction(&[0x31, 0xd2])?;
+            assembler.instruction(&[0x48, 0x89, 0xf1])?;
+            assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+        }
         assembler.instruction(&[0xe8])?;
         let call = assembler.label()?;
         assembler.bind(call)?;
@@ -47066,7 +47198,7 @@ fn lower_x86_64_native_rebar_multi_grep_v1(
     assembler.bind(runtime_failure)?;
     assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
     assembler.bind(returned)?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0x41, 0x5f])?;
     assembler.instruction(&[0x41, 0x5e])?;
     assembler.instruction(&[0x41, 0x5d])?;
@@ -49925,10 +50057,14 @@ fn lower_aarch64_prepared_grep_count(
 )]
 fn lower_aarch64_native_rebar_multi_grep_v1(
     row_count: usize,
+    prepared_rows: Option<&[bool]>,
 ) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
-    const FRAME_BYTES: u16 = 112;
-    const RESULT_OFFSET: u16 = 96;
-    if row_count == 0 {
+    const ORDINARY_FRAME_BYTES: u16 = 112;
+    const MIXED_FRAME_BYTES: u16 = 128;
+    const ORDINARY_RESULT_OFFSET: u16 = 96;
+    const MIXED_HANDLE_TABLE_OFFSET: u16 = 96;
+    const MIXED_RESULT_OFFSET: u16 = 112;
+    if row_count == 0 || prepared_rows.is_some_and(|routes| routes.len() != row_count) {
         return Err(ObjectError::InvalidModule(
             "AArch64 Rebar multi-grep row cardinality",
         ));
@@ -49945,11 +50081,32 @@ fn lower_aarch64_native_rebar_multi_grep_v1(
     let returned = assembler.label()?;
     let invalid = assembler.label()?;
 
-    aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
-    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
-    assembler.instruction(aarch64_mov_x(19, 0)?)?;
-    assembler.instruction(aarch64_mov_x(20, 1)?)?;
-    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    let frame_bytes = if prepared_rows.is_some() {
+        MIXED_FRAME_BYTES
+    } else {
+        ORDINARY_FRAME_BYTES
+    };
+    let result_offset = if prepared_rows.is_some() {
+        MIXED_RESULT_OFFSET
+    } else {
+        ORDINARY_RESULT_OFFSET
+    };
+    if let Some(routes) = prepared_rows {
+        aarch64_mixed_row_scalar_boundary(&mut assembler, routes, invalid)?;
+    } else {
+        aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    }
+    aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
+    if prepared_rows.is_some() {
+        assembler.instruction(aarch64_store_x(0, 31, MIXED_HANDLE_TABLE_OFFSET)?)?;
+        assembler.instruction(aarch64_mov_x(19, 2)?)?;
+        assembler.instruction(aarch64_mov_x(20, 3)?)?;
+        assembler.instruction(aarch64_mov_x(21, 4)?)?;
+    } else {
+        assembler.instruction(aarch64_mov_x(19, 0)?)?;
+        assembler.instruction(aarch64_mov_x(20, 1)?)?;
+        assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    }
     assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
     assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
     assembler.branch_zero_x(20, finished)?;
@@ -49989,21 +50146,41 @@ fn lower_aarch64_native_rebar_multi_grep_v1(
     call_offsets
         .try_reserve_exact(row_count)
         .map_err(|_| ObjectError::Allocation("AArch64 Rebar multi-grep calls"))?;
-    for _ in 0..row_count {
+    for row in 0..row_count {
         let next_row = assembler.label()?;
         assembler.instruction(0x9280_0005)?; // movn x5, #0
         assembler.instruction(aarch64_store_pair_x(
             5,
             5,
             31,
-            i16::try_from(RESULT_OFFSET)
+            i16::try_from(result_offset)
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 grep result offset"))?,
         )?)?;
-        assembler.instruction(aarch64_add_x_reg(0, 19, 24)?)?;
-        assembler.instruction(aarch64_mov_x(1, 26)?)?;
-        assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
-        assembler.instruction(aarch64_mov_x(3, 26)?)?;
-        assembler.instruction(aarch64_add_x_imm(4, 31, RESULT_OFFSET)?)?;
+        if prepared_rows.is_some_and(|routes| routes[row]) {
+            let handle_offset = row
+                .checked_mul(core::mem::size_of::<usize>())
+                .and_then(|offset| u16::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 mixed multi-grep handle load",
+                ))?;
+            assembler.instruction(aarch64_load_x_imm(
+                0,
+                31,
+                MIXED_HANDLE_TABLE_OFFSET,
+            )?)?;
+            assembler.instruction(aarch64_load_x_imm(0, 0, handle_offset)?)?;
+            assembler.instruction(aarch64_add_x_reg(1, 19, 24)?)?;
+            assembler.instruction(aarch64_mov_x(2, 26)?)?;
+            assembler.instruction(aarch64_movz_x(3, 0, 0)?)?;
+            assembler.instruction(aarch64_mov_x(4, 26)?)?;
+            assembler.instruction(aarch64_add_x_imm(5, 31, result_offset)?)?;
+        } else {
+            assembler.instruction(aarch64_add_x_reg(0, 19, 24)?)?;
+            assembler.instruction(aarch64_mov_x(1, 26)?)?;
+            assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+            assembler.instruction(aarch64_mov_x(3, 26)?)?;
+            assembler.instruction(aarch64_add_x_imm(4, 31, result_offset)?)?;
+        }
         call_offsets.push(assembler.instruction(0x9400_0000)?);
         assembler.branch_zero_w(0, next_row)?;
         assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
@@ -50012,7 +50189,7 @@ fn lower_aarch64_native_rebar_multi_grep_v1(
             5,
             6,
             31,
-            i16::try_from(RESULT_OFFSET)
+            i16::try_from(result_offset)
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 grep result offset"))?,
         )?)?;
         assembler.instruction(aarch64_cmp_x(5, 6)?)?;
@@ -50037,7 +50214,7 @@ fn lower_aarch64_native_rebar_multi_grep_v1(
     assembler.bind(runtime_failure)?;
     assembler.instruction(aarch64_movz_w(0, 3)?)?;
     assembler.bind(returned)?;
-    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(0xd65f_03c0)?;

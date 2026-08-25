@@ -729,13 +729,29 @@ fn strict_native_row_reduce(
     unsafe_code,
     reason = "route authentication binds the statically linked whole-operation reducer ABI"
 )]
-fn strict_linked_native_multi_grep_reduce(haystack: &[u8]) -> Result<u64, String> {
+fn strict_linked_native_multi_grep_reduce(
+    haystack: &[u8],
+    sessions: Option<&PreparedRowSessions>,
+) -> Result<u64, String> {
     let mut value = u64::MAX;
-    // SAFETY: route authentication binds the symbol and complete ordinary-row
-    // closure to this ABI. The haystack and aligned output remain live and
-    // disjoint for the complete call.
+    let (handles, handle_count) = if linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE {
+        sessions
+            .ok_or_else(|| "mixed native multi-grep reducer omitted its prepared handle table".to_owned())?
+            .handle_table()
+    } else {
+        (core::ptr::null(), 0)
+    };
+    // SAFETY: route authentication binds the symbol, exact row routes, and
+    // complete row closure to this ABI. Handles, haystack, and aligned output
+    // remain live and disjoint for the complete call.
     let status = unsafe {
-        linked::reduce_multi_grep(haystack.as_ptr(), haystack.len(), &mut value)
+        linked::reduce_multi_grep(
+            handles,
+            handle_count,
+            haystack.as_ptr(),
+            haystack.len(),
+            &mut value,
+        )
     };
     match status {
         fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_SUCCESS if value != u64::MAX => {
@@ -2106,10 +2122,18 @@ fn print_provenance() {
             .expect("format native row-scalar reducer provenance");
         }
         if linked::NATIVE_MULTI_GREP_REDUCER {
+            let row_routes = linked::MULTI_GREP_REDUCER_ROW_ROUTES
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
             write!(
                 &mut provenance,
-                " native_multi_grep_reducer=true multi_grep_reducer_abi_version={} multi_grep_reducer_source_cardinality={} multi_grep_reducer_source_bytes={} multi_grep_reducer_ordered_sources_sha256={} multi_grep_reducer_symbol={} multi_grep_reducer_operation_identity_sha256={} multi_grep_reducer_code_sha256={} multi_grep_reducer_object_sha256={} multi_grep_reducer_relocation_count={} multi_grep_reducer_semantic_runtime_calls={} multi_grep_reducer_object_bytes={} multi_grep_reducer_max_object_bytes={} multi_grep_reducer_artifact_identity_sha256={}",
+                " native_multi_grep_reducer=true multi_grep_reducer_abi_version={} multi_grep_reducer_mixed_handle_table={} multi_grep_reducer_required_handle_count={} multi_grep_reducer_row_routes={} multi_grep_reducer_source_cardinality={} multi_grep_reducer_source_bytes={} multi_grep_reducer_ordered_sources_sha256={} multi_grep_reducer_symbol={} multi_grep_reducer_operation_identity_sha256={} multi_grep_reducer_code_sha256={} multi_grep_reducer_object_sha256={} multi_grep_reducer_relocation_count={} multi_grep_reducer_semantic_runtime_calls={} multi_grep_reducer_object_bytes={} multi_grep_reducer_max_object_bytes={} multi_grep_reducer_artifact_identity_sha256={}",
                 linked::MULTI_GREP_REDUCER_ABI_VERSION,
+                linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE,
+                linked::MULTI_GREP_REDUCER_REQUIRED_HANDLE_COUNT,
+                row_routes,
                 linked::MULTI_GREP_REDUCER_SOURCE_CARDINALITY,
                 linked::MULTI_GREP_REDUCER_SOURCE_BYTES,
                 hex(&linked::MULTI_GREP_REDUCER_ORDERED_SOURCES_SHA256),
@@ -2188,6 +2212,10 @@ fn print_provenance() {
             "single-call-native-mixed-row-scalar-reducer"
         } else if linked::NATIVE_ROW_SCALAR_REDUCER {
             "single-call-helper-free-native-row-scalar-reducer"
+        } else if linked::NATIVE_MULTI_GREP_REDUCER
+            && linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE
+        {
+            "single-call-native-mixed-multi-grep-reducer"
         } else if linked::NATIVE_MULTI_GREP_REDUCER {
             "single-call-helper-free-native-multi-grep-reducer"
         } else if linked::UNIFORM_CAPTURE_BRIDGE {
@@ -2388,8 +2416,15 @@ fn expected_multi_grep_operation_identity(
         .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
         .ok_or_else(|| "multi-grep runtime source byte sum overflowed".to_owned())?;
     let mut digest = Sha256::new();
-    digest.update(fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN);
-    digest.update(fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes());
+    if linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE {
+        digest.update(fre_aot_regex::REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN);
+        digest.update(
+            fre_aot_regex::REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes(),
+        );
+    } else {
+        digest.update(fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN);
+        digest.update(fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes());
+    }
     digest.update([
         target.architecture as u8,
         target.operating_system as u8,
@@ -2409,6 +2444,12 @@ fn expected_multi_grep_operation_identity(
             &mut digest,
             linked::ROW_FIRST_SOURCE_ORDINALS[row],
         )?;
+        if linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE {
+            let route = linked::MULTI_GREP_REDUCER_ROW_ROUTES
+                .get(row)
+                .ok_or_else(|| "mixed multi-grep route cardinality disagrees with rows".to_owned())?;
+            digest.update([*route]);
+        }
         update_multi_grep_identity_field(
             &mut digest,
             linked::ROW_ENTRY_SYMBOLS[row].as_bytes(),
@@ -2424,7 +2465,11 @@ fn expected_multi_grep_artifact_identity(
     operation_identity: [u8; 32],
 ) -> Result<[u8; 32], String> {
     let mut digest = Sha256::new();
-    digest.update(b"fre-aot-regex/rebar-multi-grep-reducer-artifact/v1\0");
+    if linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE {
+        digest.update(b"fre-aot-regex/rebar-mixed-multi-grep-reducer-artifact/v1\0");
+    } else {
+        digest.update(b"fre-aot-regex/rebar-multi-grep-reducer-artifact/v1\0");
+    }
     digest.update(operation_identity);
     update_multi_grep_identity_field(&mut digest, linked::MULTI_GREP_REDUCER_SYMBOL.as_bytes())?;
     digest.update(linked::MULTI_GREP_REDUCER_CODE_SHA256);
@@ -2438,6 +2483,13 @@ fn expected_multi_grep_artifact_identity(
         &mut digest,
         linked::MULTI_GREP_REDUCER_MAX_OBJECT_BYTES,
     )?;
+    if linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE {
+        update_multi_grep_identity_usize(
+            &mut digest,
+            linked::MULTI_GREP_REDUCER_ROW_ROUTES.len(),
+        )?;
+        digest.update(linked::MULTI_GREP_REDUCER_ROW_ROUTES);
+    }
     Ok(digest.finalize().into())
 }
 
@@ -2587,6 +2639,9 @@ fn native_row_scalar_reducer_receipt_is_empty() -> bool {
 
 fn multi_grep_reducer_receipt_is_empty() -> bool {
     linked::MULTI_GREP_REDUCER_ABI_VERSION == 0
+        && !linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE
+        && linked::MULTI_GREP_REDUCER_REQUIRED_HANDLE_COUNT == 0
+        && linked::MULTI_GREP_REDUCER_ROW_ROUTES.is_empty()
         && linked::MULTI_GREP_REDUCER_SOURCE_CARDINALITY == 0
         && linked::MULTI_GREP_REDUCER_SOURCE_BYTES == 0
         && linked::MULTI_GREP_REDUCER_RELOCATION_COUNT == 0
@@ -4389,9 +4444,14 @@ fn authenticate_native_multi_grep_reducer(
     let operation_identity = expected_multi_grep_operation_identity(benchmark)?;
     let artifact_identity = expected_multi_grep_artifact_identity(operation_identity)?;
     let operation_identity_hex = hex(&operation_identity);
+    let mixed_handle_table = linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE;
     let symbol_identity = native_symbol_identity(
         linked::MULTI_GREP_REDUCER_SYMBOL,
-        "fre_aot_regex_rebar_multi_grep_v1_",
+        if mixed_handle_table {
+            "fre_aot_regex_rebar_mixed_multi_grep_v1_"
+        } else {
+            "fre_aot_regex_rebar_multi_grep_v1_"
+        },
     );
     let reducer_limit = shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
         .checked_sub(linked::ROW_TOTAL_OBJECT_BYTES)
@@ -4406,15 +4466,38 @@ fn authenticate_native_multi_grep_reducer(
         linked::MULTI_GREP_REDUCER_OBJECT_SHA256,
         linked::MULTI_GREP_REDUCER_ARTIFACT_IDENTITY_SHA256,
     ];
+    let routes_match = linked::MULTI_GREP_REDUCER_ROW_ROUTES.len()
+        == linked::ROW_ARTIFACT_COUNT
+        && linked::MULTI_GREP_REDUCER_ROW_ROUTES
+            .iter()
+            .copied()
+            .zip(linked::ROW_REQUIRED_PREPARE_CAPABILITIES.iter().copied())
+            .all(|(route, capabilities)| {
+                (route == 0 && capabilities == 0)
+                    || (route == 1
+                        && capabilities == PREPARE_CAPABILITY_ORDERED_NFA_V15)
+            });
+    let expected_abi_version = if mixed_handle_table {
+        fre_aot_regex::REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION
+    } else {
+        fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION
+    };
     if benchmark.model != shared::Model::GrepCount
         || benchmark.patterns.len() < 2
-        || has_prepared_v15
+        || mixed_handle_table != has_prepared_v15
+        || linked::MULTI_GREP_REDUCER_REQUIRED_HANDLE_COUNT
+            != if mixed_handle_table {
+                linked::ROW_ARTIFACT_COUNT
+            } else {
+                0
+            }
+        || !routes_match
+        || linked::NATIVE_ROW_SCALAR_REDUCER
         || linked::UNIFORM_CAPTURE_BRIDGE
         || linked::STRICT_CAPTURE_BRIDGE
         || linked::PARTICIPATION_CAPTURE_BRIDGE
         || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
-        || linked::MULTI_GREP_REDUCER_ABI_VERSION
-            != fre_aot_regex::REBAR_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION
+        || linked::MULTI_GREP_REDUCER_ABI_VERSION != expected_abi_version
         || linked::MULTI_GREP_REDUCER_SOURCE_CARDINALITY != benchmark.patterns.len()
         || linked::MULTI_GREP_REDUCER_SOURCE_BYTES != source_bytes
         || linked::MULTI_GREP_REDUCER_ORDERED_SOURCES_SHA256 != ordered_sources_sha256
@@ -4453,8 +4536,12 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         "native-independent-mixed-span-row-whole-scalar-reducer-v1";
     const NATIVE_MULTI_GREP_STRATEGY: &str =
         "native-independent-span-row-whole-grep-reducer-v1";
+    const MIXED_NATIVE_MULTI_GREP_STRATEGY: &str =
+        "native-independent-mixed-prepared-span-row-whole-grep-reducer-v1";
     const LINKED_NATIVE_MULTI_GREP_STRATEGY: &str =
         "linked-native-multi-grep-whole-operation-reducer-v1";
+    const LINKED_MIXED_NATIVE_MULTI_GREP_STRATEGY: &str =
+        "linked-native-mixed-prepared-multi-grep-whole-operation-reducer-v1";
     const SELECTOR_FALLBACK_STRATEGY: &str =
         "native-selector-negative-certificate-with-stock-positive-capture-fallback-v1";
     const GREP_SELECTOR_FALLBACK_STRATEGY: &str =
@@ -4565,6 +4652,8 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         MIXED_NATIVE_ROW_SCALAR_STRATEGY
     } else if linked::NATIVE_ROW_SCALAR_REDUCER {
         NATIVE_ROW_SCALAR_STRATEGY
+    } else if linked::NATIVE_MULTI_GREP_REDUCER && has_prepared_v15 {
+        MIXED_NATIVE_MULTI_GREP_STRATEGY
     } else if linked::NATIVE_MULTI_GREP_REDUCER {
         NATIVE_MULTI_GREP_STRATEGY
     } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
@@ -4603,7 +4692,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     } else {
         "not-applicable"
     };
-    let expected_grep_strategy = if linked::NATIVE_MULTI_GREP_REDUCER {
+    let expected_grep_strategy = if linked::NATIVE_MULTI_GREP_REDUCER && has_prepared_v15 {
+        LINKED_MIXED_NATIVE_MULTI_GREP_STRATEGY
+    } else if linked::NATIVE_MULTI_GREP_REDUCER {
         LINKED_NATIVE_MULTI_GREP_STRATEGY
     } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE
         && benchmark.model == shared::Model::GrepCaptures
@@ -4649,6 +4740,8 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
             }
             _ => return Err("row-scalar bridge has a non-scalar adapter".to_owned()),
         }
+    } else if linked::NATIVE_MULTI_GREP_REDUCER && has_prepared_v15 {
+        "general-aot-native-mixed-prepared-ordered-nfa-v15-multi-grep-whole-operation-reducer-v1"
     } else if linked::NATIVE_MULTI_GREP_REDUCER {
         "general-aot-native-multi-grep-whole-operation-reducer-v1"
     } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
@@ -5519,7 +5612,8 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         || linked::UNIFORM_CAPTURE_BRIDGE
         || (linked::NATIVE_ROW_SCALAR_REDUCER
             && !linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE)
-        || linked::NATIVE_MULTI_GREP_REDUCER
+        || (linked::NATIVE_MULTI_GREP_REDUCER
+            && !linked::MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE)
     {
         None
     } else {
@@ -5542,7 +5636,7 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         } else if linked::NATIVE_ROW_SCALAR_REDUCER {
             strict_linked_native_row_scalar_reduce(haystack, prepared_rows.as_ref())
         } else if linked::NATIVE_MULTI_GREP_REDUCER {
-            strict_linked_native_multi_grep_reduce(haystack)
+            strict_linked_native_multi_grep_reduce(haystack, prepared_rows.as_ref())
         } else {
             strict_native_row_reduce(
                 benchmark.model,

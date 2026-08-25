@@ -43,8 +43,8 @@ schedule's selected comparator remains authoritative even when another pinned
 comparator has a known semantic defect; the candidate never supplies its own
 expected value.
 
-Fallback `count-spans` direct-entry or Span-fill iteration, prepared/cap-
-declined multi-pattern per-line `grep`, the static uniform capture multiplier
+Fallback `count-spans` direct-entry or Span-fill iteration, object-cap-declined
+multi-pattern per-line `grep`, the static uniform capture multiplier
 route, the helper-free
 legacy v4 exact-span participation route, the selector-negative/stock-positive
 capture route, and the legacy v4 strict native `capture_next` route can
@@ -55,7 +55,11 @@ whole-operation reducer once, so its LF/CRLF split and checked scalar reduction
 do not retain that Rust outer loop. An all-ordinary multi-pattern `grep` table
 now does the same through `linked-native-multi-grep-reducer`; its child rows
 remain authenticated identities, while the single wrapper owns both line and
-row loops. After a typed shared ordered-many decline, an all-ordinary
+row loops. A mixed table instead uses
+`linked-native-mixed-multi-grep-reducer`: the same single-call boundary owns
+both loops, while formal classification remains semantic-helper-backed because
+prepared children retain their sealed runtime-helper closure. After a typed
+shared ordered-many decline, an all-ordinary
 multi-pattern `count` or `count-spans` table may likewise use
 `linked-native-row-scalar-reducer`; one helper-free wrapper owns source-priority
 selection, byte-wise empty progress, and the checked scalar transaction. Its
@@ -344,12 +348,18 @@ in component order followed by its final reducer object. The reducer remains
 the sole operation entry; component entries are authenticated linked
 identities. Both reproducible builds must preserve that exact object order and
 the separately sealed component-byte and reducer-byte extents.
-For `native-multi-grep-reducer-v1`, supply the ordinary row objects in
-component order followed by `aot-rebar-artifact.o`. The latter is the sole
+For `native-multi-grep-reducer-v1`, supply the ordinary or mixed
+ordinary/prepared row objects in component order followed by
+`aot-rebar-artifact.o`. The latter is the sole
 claimed operation entry. Its receipt authenticates the ordered raw-source
 digest, source map, first ordinals, every row automaton/program/object identity,
 exact relocation closure, wrapper code/object identities, empty semantic
-runtime-call surface, and the row-plus-wrapper object envelope.
+runtime-call surface, and the row-plus-wrapper object envelope. A mixed receipt
+also authenticates the exact handle cardinality and row route vector under
+distinct Grep operation/artifact/symbol domains. Route-aware identity inventory
+requires ordinary search symbols on ordinary rows and the exclusive search,
+Span-fill, and serialized-program identities on prepared rows; no prepared
+child is credited as helper-free.
 `native-row-scalar-reducer-v1` uses the same object order and final-wrapper
 operation boundary for Count and SpanSum. Its receipt additionally binds the
 operation tag and every relocation section, offset, kind, child-symbol index,
@@ -471,11 +481,13 @@ Three fresh processes authenticate each job:
    controller runs 15 independent negative controls so a trap in the first
    stage cannot stand in for proof that the other 14 entries execute.
    `native-multi-grep-reducer-v1` instead traps exactly its final wrapper; its
-   ordinary row entries are inventoried as required defined identities and are
-   not substituted as Rust-loop operation entries.
+   child rows are inventoried as required defined identities and are not
+   substituted as Rust-loop operation entries. Ordinary routes require the
+   ordinary search symbol; mixed prepared routes require the exclusive search,
+   Span-fill, and serialized-program identities for every prepared child.
    `native-row-scalar-reducer-v1` follows the same rule: trap its final Count or
-   SpanSum wrapper, and inventory each ordinary row entry as an authenticated
-   child identity rather than treating the rows as separate operation entries.
+   SpanSum wrapper, and inventory each route-specific child identity rather
+   than treating the rows as separate operation entries.
    The variable-width native-row bridge and uniform-capture row bridge receive
    the same independent negative control for every retained row artifact. The
    exact-span participation v4 runs two independent negative controls: one for

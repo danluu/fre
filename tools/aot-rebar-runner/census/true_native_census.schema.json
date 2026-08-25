@@ -1215,7 +1215,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "abi_version", "source_cardinality", "source_bytes",
+        "abi_version", "mixed_handle_table", "required_handle_count",
+        "row_routes", "source_cardinality", "source_bytes",
         "ordered_sources_sha256", "operation_identity_sha256",
         "reducer_symbol", "code_sha256", "object_sha256",
         "relocation_count", "semantic_runtime_calls", "object_bytes",
@@ -1223,13 +1224,21 @@
       ],
       "properties": {
         "abi_version": { "const": 1 },
+        "mixed_handle_table": { "type": "boolean" },
+        "required_handle_count": {
+          "type": "integer", "minimum": 0, "maximum": 4096
+        },
+        "row_routes": {
+          "type": "array", "minItems": 1, "maxItems": 4096,
+          "items": { "enum": [0, 1] }
+        },
         "source_cardinality": { "type": "integer", "minimum": 2 },
         "source_bytes": { "type": "integer", "minimum": 0 },
         "ordered_sources_sha256": { "$ref": "#/$defs/nonzeroSha256" },
         "operation_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
         "reducer_symbol": {
           "type": "string",
-          "pattern": "^fre_aot_regex_rebar_multi_grep_v1_[0-9a-f]{64}$"
+          "pattern": "^fre_aot_regex_rebar_(mixed_)?multi_grep_v1_[0-9a-f]{64}$"
         },
         "code_sha256": { "$ref": "#/$defs/nonzeroSha256" },
         "object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
@@ -1244,7 +1253,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "abi_version", "operation", "source_cardinality", "source_bytes",
+        "abi_version", "operation", "mixed_handle_table",
+        "required_handle_count", "row_routes", "source_cardinality", "source_bytes",
         "ordered_sources_sha256", "operation_identity_sha256",
         "reducer_symbol", "code_sha256", "object_sha256",
         "relocation_count", "relocation_sections", "relocation_offsets",
@@ -1255,13 +1265,21 @@
       "properties": {
         "abi_version": { "const": 1 },
         "operation": { "enum": ["count", "span-sum"] },
+        "mixed_handle_table": { "type": "boolean" },
+        "required_handle_count": {
+          "type": "integer", "minimum": 0, "maximum": 4096
+        },
+        "row_routes": {
+          "type": "array", "minItems": 1, "maxItems": 4096,
+          "items": { "enum": [0, 1] }
+        },
         "source_cardinality": { "type": "integer", "minimum": 2 },
         "source_bytes": { "type": "integer", "minimum": 0 },
         "ordered_sources_sha256": { "$ref": "#/$defs/nonzeroSha256" },
         "operation_identity_sha256": { "$ref": "#/$defs/nonzeroSha256" },
         "reducer_symbol": {
           "type": "string",
-          "pattern": "^fre_aot_regex_rebar_row_scalar_v1_[0-9a-f]{64}$"
+          "pattern": "^fre_aot_regex_rebar_(mixed_)?row_scalar_v1_[0-9a-f]{64}$"
         },
         "code_sha256": { "$ref": "#/$defs/nonzeroSha256" },
         "object_sha256": { "$ref": "#/$defs/nonzeroSha256" },
@@ -1645,12 +1663,46 @@
         },
         {
           "if": {
-            "properties": {
-              "composite_kind": {
-                "const": "mixed-prepared-native-row-bridge-v15"
+            "anyOf": [
+              {
+                "properties": {
+                  "composite_kind": {
+                    "const": "mixed-prepared-native-row-bridge-v15"
+                  }
+                },
+                "required": ["composite_kind"]
+              },
+              {
+                "properties": {
+                  "composite_kind": {
+                    "const": "native-multi-grep-reducer-v1"
+                  },
+                  "multi_grep_reducer": {
+                    "type": "object",
+                    "properties": {
+                      "mixed_handle_table": { "const": true }
+                    },
+                    "required": ["mixed_handle_table"]
+                  }
+                },
+                "required": ["composite_kind", "multi_grep_reducer"]
+              },
+              {
+                "properties": {
+                  "composite_kind": {
+                    "const": "native-row-scalar-reducer-v1"
+                  },
+                  "row_scalar_reducer": {
+                    "type": "object",
+                    "properties": {
+                      "mixed_handle_table": { "const": true }
+                    },
+                    "required": ["mixed_handle_table"]
+                  }
+                },
+                "required": ["composite_kind", "row_scalar_reducer"]
               }
-            },
-            "required": ["composite_kind"]
+            ]
           },
           "then": {
             "required": ["prepared_v15_limits"],

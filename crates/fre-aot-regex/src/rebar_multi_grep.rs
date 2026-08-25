@@ -1,11 +1,12 @@
 //! Whole-operation lowering for Rebar's independent native row closures.
 //!
 //! These reducers consume independently authenticated ordinary `SpanSearchV1`
-//! artifacts and, for scalar operations, prepared Ordered-NFA V15 artifacts.
-//! They own the operation traversal, validate every returned status and span,
-//! and publish the final `u64` only after the complete operation succeeds.
-//! Prepared rows retain their authenticated semantic-runtime route, while the
-//! caller prepares and owns their opaque handles.
+//! artifacts and, for scalar operations and multi-pattern Grep, prepared
+//! Ordered-NFA V15 artifacts. Distinct mixed ABIs consume one sealed handle
+//! table slot per row. The reducers own the operation traversal, validate every
+//! returned status and span, and publish the final `u64` only after the complete
+//! operation succeeds. Prepared rows retain their authenticated semantic-runtime
+//! route; handle preparation, ownership, and destruction stay outside the call.
 
 use core::fmt;
 
@@ -28,6 +29,14 @@ pub const REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_SUCCESS: u32 = 0;
 pub const REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_INVALID_ARGUMENT: u32 = 2;
 /// A child status/span invariant or checked reducer operation failed.
 pub const REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_RUNTIME_FAILURE: u32 = 3;
+
+/// Domain separator for a GrepCount reducer whose immutable row closure mixes
+/// ordinary and prepared Ordered-NFA V15 search ABIs.
+pub const REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/rebar-mixed-multi-grep-reducer/v1\0";
+/// Native ABI version:
+/// `u32 entry(const handle *, usize, const u8 *, usize, u64 *)`.
+pub const REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION: u32 = 1;
 
 /// One independently compiled distinct row, retained in source-priority order.
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +79,8 @@ pub struct RebarMultiGrepReducerAotReceiptV1 {
     row_automaton_sha256: Box<[[u8; 32]]>,
     row_program_sha256: Box<[[u8; 32]]>,
     row_object_sha256: Box<[[u8; 32]]>,
+    mixed_handle_table: bool,
+    row_routes: Box<[RebarMixedNativeRowScalarRouteV1]>,
     operation_identity_sha256: [u8; 32],
     reducer_symbol: String,
     reducer_code_sha256: [u8; 32],
@@ -135,6 +146,29 @@ impl RebarMultiGrepReducerAotReceiptV1 {
     #[must_use]
     pub fn row_object_sha256(&self) -> &[[u8; 32]] {
         &self.row_object_sha256
+    }
+
+    /// Whether this reducer consumes an exact one-slot-per-row handle table.
+    #[must_use]
+    pub const fn uses_mixed_handle_table(&self) -> bool {
+        self.mixed_handle_table
+    }
+
+    /// The immutable call ABI selected for every distinct row.
+    #[must_use]
+    pub fn row_routes(&self) -> &[RebarMixedNativeRowScalarRouteV1] {
+        &self.row_routes
+    }
+
+    /// Exact handle-table cardinality for the mixed ABI, or zero for the
+    /// legacy ordinary-only ABI.
+    #[must_use]
+    pub const fn required_handle_count(&self) -> usize {
+        if self.mixed_handle_table {
+            self.row_routes.len()
+        } else {
+            0
+        }
     }
 
     #[must_use]
@@ -228,6 +262,27 @@ impl RebarMultiGrepReducerAotArtifactV1 {
         )
         .is_ok()
     }
+
+    /// Rebuild and authenticate a mixed ordinary/prepared GrepCount closure.
+    #[must_use]
+    pub fn authenticates_mixed_rows(
+        &self,
+        ordered_sources_sha256: [u8; 32],
+        source_cardinality: usize,
+        source_bytes: usize,
+        source_to_row: &[usize],
+        rows: &[RebarMixedMultiGrepReducerRowV1<'_>],
+    ) -> bool {
+        authenticate_mixed_grep_artifact(
+            self,
+            ordered_sources_sha256,
+            source_cardinality,
+            source_bytes,
+            source_to_row,
+            rows,
+        )
+        .is_ok()
+    }
 }
 
 /// The sole safe decline after all row artifacts already exist.
@@ -251,6 +306,27 @@ pub enum RebarMultiGrepReducerAotErrorV1 {
     SourceAuthentication(&'static str),
     Object(ObjectError),
     Authentication(&'static str),
+}
+
+enum MultiGrepReducerObjectOutcome {
+    Selected(Vec<u8>),
+    Declined(RebarMultiGrepReducerAotCompileDeclineV1),
+}
+
+fn classify_multi_grep_reducer_object_outcome(
+    outcome: Result<Vec<u8>, ObjectError>,
+) -> Result<MultiGrepReducerObjectOutcome, RebarMultiGrepReducerAotErrorV1> {
+    match outcome {
+        Ok(object) => Ok(MultiGrepReducerObjectOutcome::Selected(object)),
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        }) => Ok(MultiGrepReducerObjectOutcome::Declined(
+            RebarMultiGrepReducerAotCompileDeclineV1::ObjectBytes { limit, required },
+        )),
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl fmt::Display for RebarMultiGrepReducerAotErrorV1 {
@@ -412,7 +488,11 @@ fn operation_identity(
 
 fn artifact_identity(receipt: &RebarMultiGrepReducerAotReceiptV1) -> Result<[u8; 32], ObjectError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"fre-aot-regex/rebar-multi-grep-reducer-artifact/v1\0");
+    if receipt.mixed_handle_table {
+        hasher.update(b"fre-aot-regex/rebar-mixed-multi-grep-reducer-artifact/v1\0");
+    } else {
+        hasher.update(b"fre-aot-regex/rebar-multi-grep-reducer-artifact/v1\0");
+    }
     hasher.update(receipt.operation_identity_sha256);
     update_len_prefixed(&mut hasher, receipt.reducer_symbol.as_bytes())?;
     hasher.update(receipt.reducer_code_sha256);
@@ -420,6 +500,12 @@ fn artifact_identity(receipt: &RebarMultiGrepReducerAotReceiptV1) -> Result<[u8;
     update_usize(&mut hasher, receipt.reducer_relocation_count)?;
     update_usize(&mut hasher, receipt.object_bytes)?;
     update_usize(&mut hasher, receipt.max_object_bytes)?;
+    if receipt.mixed_handle_table {
+        update_usize(&mut hasher, receipt.row_routes.len())?;
+        for route in &receipt.row_routes {
+            hasher.update([route.identity_tag()]);
+        }
+    }
     Ok(hasher.finalize().into())
 }
 
@@ -494,6 +580,12 @@ fn authenticate_artifact(
                 .iter()
                 .map(|row| row.compiled.receipt().object_sha256)
                 .collect::<Vec<_>>()
+        || receipt.mixed_handle_table
+        || receipt
+            .row_routes
+            .iter()
+            .any(|route| *route != RebarMixedNativeRowScalarRouteV1::Ordinary)
+        || receipt.row_routes.len() != rows.len()
         || receipt.operation_identity_sha256 != identity
         || receipt.reducer_symbol != rebuilt.entry_symbol()
         || receipt.reducer_code_sha256 != rebuilt_code_sha256
@@ -546,18 +638,15 @@ pub fn compile_rebar_multi_grep_reducer_aot_v1(
         .collect::<Vec<_>>();
     let module =
         crate::module::lower_native_rebar_multi_grep_reducer_v1(target, identity, &entries)?;
-    let object = match emit_object(&module, ObjectFormat::for_target(target), max_object_bytes) {
-        Ok(object) => object,
-        Err(ObjectError::Resource {
-            resource: CompileResource::ObjectBytes,
-            limit,
-            required,
-        }) => {
-            return Ok(RebarMultiGrepReducerAotCompileDispositionV1::Declined(
-                RebarMultiGrepReducerAotCompileDeclineV1::ObjectBytes { limit, required },
-            ));
+    let object = match classify_multi_grep_reducer_object_outcome(emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ))? {
+        MultiGrepReducerObjectOutcome::Selected(object) => object,
+        MultiGrepReducerObjectOutcome::Declined(decline) => {
+            return Ok(RebarMultiGrepReducerAotCompileDispositionV1::Declined(decline));
         }
-        Err(error) => return Err(error.into()),
     };
     let text = module
         .sections()
@@ -593,6 +682,9 @@ pub fn compile_rebar_multi_grep_reducer_aot_v1(
             .iter()
             .map(|row| row.compiled.receipt().object_sha256)
             .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        mixed_handle_table: false,
+        row_routes: vec![RebarMixedNativeRowScalarRouteV1::Ordinary; rows.len()]
             .into_boxed_slice(),
         operation_identity_sha256: identity,
         reducer_symbol: module.entry_symbol().to_owned(),
@@ -715,6 +807,14 @@ impl<'a> RebarMixedNativeRowScalarReducerRowV1<'a> {
         }
     }
 }
+
+/// One independently authenticated row in a mixed GrepCount reducer.
+///
+/// GrepCount and scalar reducers intentionally share the exact sealed route
+/// descriptor: only their whole-operation ABI, identity, symbol, and native
+/// traversal differ.
+pub type RebarMixedMultiGrepReducerRowV1<'a> =
+    RebarMixedNativeRowScalarReducerRowV1<'a>;
 
 /// Scalar operation owned by a native independent-row wrapper.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1835,9 +1935,345 @@ pub fn compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
     ))
 }
 
+fn mixed_grep_source_shape(
+    ordered_sources_sha256: [u8; 32],
+    source_cardinality: usize,
+    source_bytes: usize,
+    source_to_row: &[usize],
+    rows: &[RebarMixedMultiGrepReducerRowV1<'_>],
+) -> Result<Target, RebarMultiGrepReducerAotErrorV1> {
+    mixed_scalar_source_shape(
+        ordered_sources_sha256,
+        source_cardinality,
+        source_bytes,
+        source_to_row,
+        rows,
+    )
+    .map_err(|error| match error {
+        RebarNativeRowScalarReducerAotErrorV1::SourceAuthentication(detail) => {
+            RebarMultiGrepReducerAotErrorV1::SourceAuthentication(detail)
+        }
+        RebarNativeRowScalarReducerAotErrorV1::Object(error) => error.into(),
+        RebarNativeRowScalarReducerAotErrorV1::Authentication(detail) => {
+            RebarMultiGrepReducerAotErrorV1::Authentication(detail)
+        }
+    })
+}
+
+fn mixed_grep_operation_identity(
+    target: Target,
+    ordered_sources_sha256: [u8; 32],
+    source_cardinality: usize,
+    source_bytes: usize,
+    source_to_row: &[usize],
+    rows: &[RebarMixedMultiGrepReducerRowV1<'_>],
+) -> Result<[u8; 32], ObjectError> {
+    let mut hasher = Sha256::new();
+    hasher.update(REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN);
+    hasher.update(REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes());
+    hasher.update([
+        target.architecture as u8,
+        target.operating_system as u8,
+        target.abi as u8,
+    ]);
+    hasher.update(target.features.bits().to_le_bytes());
+    update_usize(&mut hasher, source_cardinality)?;
+    update_usize(&mut hasher, source_bytes)?;
+    hasher.update(ordered_sources_sha256);
+    update_usize(&mut hasher, source_to_row.len())?;
+    for &row in source_to_row {
+        update_usize(&mut hasher, row)?;
+    }
+    update_usize(&mut hasher, rows.len())?;
+    for descriptor in rows.iter().copied() {
+        update_usize(&mut hasher, descriptor.first_source_ordinal)?;
+        hasher.update([descriptor.route.identity_tag()]);
+        update_len_prefixed(
+            &mut hasher,
+            descriptor
+                .entry_symbol()
+                .ok_or(ObjectError::InvalidModule("mixed grep row entry"))?
+                .as_bytes(),
+        )?;
+        hasher.update(descriptor.compiled.receipt().automaton_sha256);
+        hasher.update(descriptor.compiled.receipt().program_sha256);
+        hasher.update(descriptor.compiled.receipt().object_sha256);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn authenticate_mixed_grep_artifact(
+    artifact: &RebarMultiGrepReducerAotArtifactV1,
+    ordered_sources_sha256: [u8; 32],
+    source_cardinality: usize,
+    source_bytes: usize,
+    source_to_row: &[usize],
+    rows: &[RebarMixedMultiGrepReducerRowV1<'_>],
+) -> Result<(), RebarMultiGrepReducerAotErrorV1> {
+    let target = mixed_grep_source_shape(
+        ordered_sources_sha256,
+        source_cardinality,
+        source_bytes,
+        source_to_row,
+        rows,
+    )?;
+    let receipt = artifact.receipt();
+    let identity = mixed_grep_operation_identity(
+        target,
+        ordered_sources_sha256,
+        source_cardinality,
+        source_bytes,
+        source_to_row,
+        rows,
+    )?;
+    let entries = rows
+        .iter()
+        .map(|row| {
+            row.entry_symbol()
+                .map(str::to_owned)
+                .ok_or(RebarMultiGrepReducerAotErrorV1::SourceAuthentication(
+                    "mixed grep row entry",
+                ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let routes = rows
+        .iter()
+        .map(|row| row.route.is_prepared())
+        .collect::<Vec<_>>();
+    let rebuilt = crate::module::lower_native_rebar_mixed_multi_grep_reducer_v1(
+        target, identity, &entries, &routes,
+    )?;
+    let object = emit_object(
+        &rebuilt,
+        ObjectFormat::for_target(target),
+        receipt.max_object_bytes,
+    )?;
+    let text = rebuilt
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .ok_or(RebarMultiGrepReducerAotErrorV1::Authentication(
+            "rebuilt mixed grep reducer text",
+        ))?;
+    let rebuilt_code_sha256: [u8; 32] = Sha256::digest(text.bytes()).into();
+    let rebuilt_object_sha256: [u8; 32] = Sha256::digest(&object).into();
+    if receipt.abi_version != REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION
+        || receipt.target != target
+        || receipt.source_cardinality != source_cardinality
+        || receipt.source_bytes != source_bytes
+        || receipt.ordered_sources_sha256 != ordered_sources_sha256
+        || receipt.source_to_row.as_ref() != source_to_row
+        || receipt.row_first_source_ordinals.as_ref()
+            != rows
+                .iter()
+                .map(|row| row.first_source_ordinal)
+                .collect::<Vec<_>>()
+        || receipt.row_entry_symbols.as_ref() != entries
+        || receipt.row_automaton_sha256.as_ref()
+            != rows
+                .iter()
+                .map(|row| row.compiled.receipt().automaton_sha256)
+                .collect::<Vec<_>>()
+        || receipt.row_program_sha256.as_ref()
+            != rows
+                .iter()
+                .map(|row| row.compiled.receipt().program_sha256)
+                .collect::<Vec<_>>()
+        || receipt.row_object_sha256.as_ref()
+            != rows
+                .iter()
+                .map(|row| row.compiled.receipt().object_sha256)
+                .collect::<Vec<_>>()
+        || !receipt.mixed_handle_table
+        || receipt.row_routes.as_ref()
+            != rows.iter().map(|row| row.route).collect::<Vec<_>>()
+        || receipt.operation_identity_sha256 != identity
+        || receipt.reducer_symbol != rebuilt.entry_symbol()
+        || receipt.reducer_code_sha256 != rebuilt_code_sha256
+        || receipt.reducer_object_sha256 != rebuilt_object_sha256
+        || receipt.reducer_relocation_count != rows.len()
+        || receipt.reducer_relocation_count != rebuilt.relocations().len()
+        || receipt.semantic_runtime_calls != 0
+        || receipt.object_bytes != object.len()
+        || receipt.artifact_identity_sha256 != artifact_identity(receipt)?
+        || artifact.module != rebuilt
+        || artifact.object.as_ref() != object
+    {
+        return Err(RebarMultiGrepReducerAotErrorV1::Authentication(
+            "deterministic mixed grep reducer closure",
+        ));
+    }
+    Ok(())
+}
+
+/// Compile one mixed ordinary/prepared LF/CRLF GrepCount transaction.
+///
+/// The opaque handle table is prepared independently and contains exactly one
+/// slot for every retained row: null for ordinary rows and a non-null handle
+/// for prepared rows. Only the final numeric object representation cap can
+/// decline; every allocation, arithmetic, row/helper mismatch, lowering, and
+/// authentication failure remains terminal.
+pub fn compile_rebar_mixed_multi_grep_reducer_aot_v1(
+    ordered_sources_sha256: [u8; 32],
+    source_cardinality: usize,
+    source_bytes: usize,
+    source_to_row: &[usize],
+    rows: &[RebarMixedMultiGrepReducerRowV1<'_>],
+    max_object_bytes: usize,
+) -> Result<RebarMultiGrepReducerAotCompileDispositionV1, RebarMultiGrepReducerAotErrorV1> {
+    let target = mixed_grep_source_shape(
+        ordered_sources_sha256,
+        source_cardinality,
+        source_bytes,
+        source_to_row,
+        rows,
+    )?;
+    let identity = mixed_grep_operation_identity(
+        target,
+        ordered_sources_sha256,
+        source_cardinality,
+        source_bytes,
+        source_to_row,
+        rows,
+    )?;
+    let entries = rows
+        .iter()
+        .map(|row| {
+            row.entry_symbol()
+                .map(str::to_owned)
+                .ok_or(RebarMultiGrepReducerAotErrorV1::SourceAuthentication(
+                    "mixed grep row entry",
+                ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared_routes = rows
+        .iter()
+        .map(|row| row.route.is_prepared())
+        .collect::<Vec<_>>();
+    let module = crate::module::lower_native_rebar_mixed_multi_grep_reducer_v1(
+        target,
+        identity,
+        &entries,
+        &prepared_routes,
+    )?;
+    let object = match classify_multi_grep_reducer_object_outcome(emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ))? {
+        MultiGrepReducerObjectOutcome::Selected(object) => object,
+        MultiGrepReducerObjectOutcome::Declined(decline) => {
+            return Ok(RebarMultiGrepReducerAotCompileDispositionV1::Declined(decline));
+        }
+    };
+    let text = module
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .ok_or(RebarMultiGrepReducerAotErrorV1::Authentication(
+            "fresh mixed grep reducer text",
+        ))?;
+    let mut receipt = RebarMultiGrepReducerAotReceiptV1 {
+        abi_version: REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION,
+        target,
+        source_cardinality,
+        source_bytes,
+        ordered_sources_sha256,
+        source_to_row: source_to_row.to_vec().into_boxed_slice(),
+        row_first_source_ordinals: rows
+            .iter()
+            .map(|row| row.first_source_ordinal)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        row_entry_symbols: entries.into_boxed_slice(),
+        row_automaton_sha256: rows
+            .iter()
+            .map(|row| row.compiled.receipt().automaton_sha256)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        row_program_sha256: rows
+            .iter()
+            .map(|row| row.compiled.receipt().program_sha256)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        row_object_sha256: rows
+            .iter()
+            .map(|row| row.compiled.receipt().object_sha256)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        mixed_handle_table: true,
+        row_routes: rows
+            .iter()
+            .map(|row| row.route)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        operation_identity_sha256: identity,
+        reducer_symbol: module.entry_symbol().to_owned(),
+        reducer_code_sha256: Sha256::digest(text.bytes()).into(),
+        reducer_object_sha256: Sha256::digest(&object).into(),
+        reducer_relocation_count: module.relocations().len(),
+        semantic_runtime_calls: 0,
+        object_bytes: object.len(),
+        max_object_bytes,
+        artifact_identity_sha256: [0; 32],
+    };
+    receipt.artifact_identity_sha256 = artifact_identity(&receipt)?;
+    let artifact = RebarMultiGrepReducerAotArtifactV1 {
+        module,
+        object: object.into_boxed_slice(),
+        receipt,
+    };
+    authenticate_mixed_grep_artifact(
+        &artifact,
+        ordered_sources_sha256,
+        source_cardinality,
+        source_bytes,
+        source_to_row,
+        rows,
+    )?;
+    Ok(RebarMultiGrepReducerAotCompileDispositionV1::Selected(
+        artifact,
+    ))
+}
+
 #[cfg(test)]
 mod scalar_reducer_failure_tests {
     use super::*;
+
+    #[test]
+    fn only_object_bytes_authorizes_multi_grep_adapter_fallback() {
+        assert!(matches!(
+            classify_multi_grep_reducer_object_outcome(Err(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit: 7,
+                required: 8,
+            })),
+            Ok(MultiGrepReducerObjectOutcome::Declined(
+                RebarMultiGrepReducerAotCompileDeclineV1::ObjectBytes {
+                    limit: 7,
+                    required: 8,
+                }
+            ))
+        ));
+        assert!(matches!(
+            classify_multi_grep_reducer_object_outcome(Err(ObjectError::Allocation(
+                "injected multi-grep object allocation"
+            ))),
+            Err(RebarMultiGrepReducerAotErrorV1::Object(
+                ObjectError::Allocation("injected multi-grep object allocation")
+            ))
+        ));
+        assert!(matches!(
+            classify_multi_grep_reducer_object_outcome(Err(ObjectError::InvalidModule(
+                "injected multi-grep lowering/authentication failure"
+            ))),
+            Err(RebarMultiGrepReducerAotErrorV1::Object(
+                ObjectError::InvalidModule(
+                    "injected multi-grep lowering/authentication failure"
+                )
+            ))
+        ));
+    }
 
     #[test]
     fn only_object_bytes_authorizes_scalar_adapter_fallback() {

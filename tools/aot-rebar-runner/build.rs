@@ -541,11 +541,10 @@ fn main() {
         };
         let multi_grep_reducer = if benchmark.model == shared::Model::GrepCount {
             match shared::try_compile_native_multi_grep_reducer(&benchmark, &bridge)
-                .expect("compile helper-free native multi-pattern Grep reducer")
+                .expect("compile native multi-pattern Grep reducer")
             {
                 shared::NativeMultiGrepReducerDisposition::Selected(artifact) => Some(artifact),
-                shared::NativeMultiGrepReducerDisposition::DeclinedPreparedRow { .. }
-                | shared::NativeMultiGrepReducerDisposition::DeclinedObjectBytes { .. } => None,
+                shared::NativeMultiGrepReducerDisposition::DeclinedObjectBytes { .. } => None,
             }
         } else {
             None
@@ -2757,6 +2756,8 @@ fn configured_native_row_source(
             }
             _ => unreachable!("row-scalar reducer admits only Count or SpanSum"),
         }
+    } else if native_multi_grep && has_prepared_v15 {
+        "general-aot-native-mixed-prepared-ordered-nfa-v15-multi-grep-whole-operation-reducer-v1"
     } else if native_multi_grep {
         "general-aot-native-multi-grep-whole-operation-reducer-v1"
     } else if selector_fallback {
@@ -2810,6 +2811,8 @@ fn configured_native_row_source(
         "native-independent-mixed-span-row-whole-scalar-reducer-v1"
     } else if native_row_scalar {
         "native-independent-span-row-whole-scalar-reducer-v1"
+    } else if native_multi_grep && has_prepared_v15 {
+        "native-independent-mixed-prepared-span-row-whole-grep-reducer-v1"
     } else if native_multi_grep {
         "native-independent-span-row-whole-grep-reducer-v1"
     } else if selector_fallback {
@@ -2828,7 +2831,9 @@ fn configured_native_row_source(
     } else {
         "not-applicable"
     };
-    let grep_iteration_strategy = if native_multi_grep {
+    let grep_iteration_strategy = if native_multi_grep && has_prepared_v15 {
+        "linked-native-mixed-prepared-multi-grep-whole-operation-reducer-v1"
+    } else if native_multi_grep {
         "linked-native-multi-grep-whole-operation-reducer-v1"
     } else if selector_fallback {
         "per-line-native-selector-negative-certificate-stock-positive-capture-fallback-v1"
@@ -3366,7 +3371,11 @@ fn configured_native_row_source(
     }
     if let Some(receipt) = multi_grep_reducer {
         writeln!(source, "    #[link_name = {:?}]", receipt.reducer_symbol()).unwrap();
-        source.push_str("    fn LINKED_MULTI_GREP_REDUCER(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n");
+        if receipt.uses_mixed_handle_table() {
+            source.push_str("    fn LINKED_MULTI_GREP_REDUCER(handles: *const fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, handle_count: usize, haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n");
+        } else {
+            source.push_str("    fn LINKED_MULTI_GREP_REDUCER(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32;\n");
+        }
     }
     if let Some(receipt) = row_scalar_reducer {
         writeln!(source, "    #[link_name = {:?}]", receipt.reducer_symbol()).unwrap();
@@ -3401,10 +3410,12 @@ fn configured_native_row_source(
     } else {
         source.push_str("pub unsafe fn weighted_capture_reduce(_haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     }
-    if multi_grep_reducer.is_some() {
-        source.push_str("pub unsafe fn reduce_multi_grep(haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_MULTI_GREP_REDUCER(haystack, haystack_len, value_out) } }\n");
+    if multi_grep_reducer.is_some_and(|receipt| receipt.uses_mixed_handle_table()) {
+        source.push_str("pub unsafe fn reduce_multi_grep(handles: *const fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, handle_count: usize, haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_MULTI_GREP_REDUCER(handles, handle_count, haystack, haystack_len, value_out) } }\n");
+    } else if multi_grep_reducer.is_some() {
+        source.push_str("pub unsafe fn reduce_multi_grep(_handles: *const fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _handle_count: usize, haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_MULTI_GREP_REDUCER(haystack, haystack_len, value_out) } }\n");
     } else {
-        source.push_str("pub unsafe fn reduce_multi_grep(_haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+        source.push_str("pub unsafe fn reduce_multi_grep(_handles: *const fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _handle_count: usize, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
     }
     if row_scalar_reducer.is_some_and(|receipt| receipt.uses_mixed_handle_table()) {
         source.push_str("pub unsafe fn reduce_native_rows(handles: *const fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, handle_count: usize, haystack: *const u8, haystack_len: usize, value_out: *mut u64) -> u32 { unsafe { LINKED_ROW_SCALAR_REDUCER(handles, handle_count, haystack, haystack_len, value_out) } }\n");
@@ -3940,6 +3951,31 @@ fn push_multi_grep_reducer_receipt(
     .unwrap();
     writeln!(
         source,
+        "pub const MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE: bool = {};",
+        receipt.uses_mixed_handle_table(),
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const MULTI_GREP_REDUCER_REQUIRED_HANDLE_COUNT: usize = {};",
+        receipt.required_handle_count(),
+    )
+    .unwrap();
+    let row_routes = receipt
+        .row_routes()
+        .iter()
+        .map(|route| match route {
+            fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary => 0_u8,
+            fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15 => 1_u8,
+        })
+        .collect::<Vec<_>>();
+    writeln!(
+        source,
+        "pub const MULTI_GREP_REDUCER_ROW_ROUTES: &[u8] = &{row_routes:?};"
+    )
+    .unwrap();
+    writeln!(
+        source,
         "pub const MULTI_GREP_REDUCER_SYMBOL: &str = {:?};",
         receipt.reducer_symbol(),
     )
@@ -4111,6 +4147,9 @@ fn push_empty_row_scalar_reducer_bindings(source: &mut String) {
 
 fn push_empty_multi_grep_reducer_receipt(source: &mut String) {
     source.push_str("pub const MULTI_GREP_REDUCER_ABI_VERSION: u32 = 0;\n");
+    source.push_str("pub const MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE: bool = false;\n");
+    source.push_str("pub const MULTI_GREP_REDUCER_REQUIRED_HANDLE_COUNT: usize = 0;\n");
+    source.push_str("pub const MULTI_GREP_REDUCER_ROW_ROUTES: &[u8] = &[];\n");
     source.push_str("pub const MULTI_GREP_REDUCER_SOURCE_CARDINALITY: usize = 0;\n");
     source.push_str("pub const MULTI_GREP_REDUCER_SOURCE_BYTES: usize = 0;\n");
     source.push_str("pub const MULTI_GREP_REDUCER_RELOCATION_COUNT: usize = 0;\n");
@@ -4128,7 +4167,7 @@ fn push_empty_multi_grep_reducer_receipt(source: &mut String) {
 fn push_empty_multi_grep_reducer_bindings(source: &mut String) {
     source.push_str("pub const NATIVE_MULTI_GREP_REDUCER: bool = false;\n");
     push_empty_multi_grep_reducer_receipt(source);
-    source.push_str("pub unsafe fn reduce_multi_grep(_haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
+    source.push_str("pub unsafe fn reduce_multi_grep(_handles: *const fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1, _handle_count: usize, _haystack: *const u8, _haystack_len: usize, _value_out: *mut u64) -> u32 { fre_aot_regex_runtime::STATUS_INVALID_ARGUMENT }\n");
 }
 
 fn push_empty_prepared_row_bindings(source: &mut String, row_count: usize) {
@@ -4217,6 +4256,9 @@ pub const ROW_SCALAR_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];
 pub const ROW_SCALAR_REDUCER_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
 pub const NATIVE_MULTI_GREP_REDUCER: bool = false;
 pub const MULTI_GREP_REDUCER_ABI_VERSION: u32 = 0;
+pub const MULTI_GREP_REDUCER_MIXED_HANDLE_TABLE: bool = false;
+pub const MULTI_GREP_REDUCER_REQUIRED_HANDLE_COUNT: usize = 0;
+pub const MULTI_GREP_REDUCER_ROW_ROUTES: &[u8] = &[];
 pub const MULTI_GREP_REDUCER_SOURCE_CARDINALITY: usize = 0;
 pub const MULTI_GREP_REDUCER_SOURCE_BYTES: usize = 0;
 pub const MULTI_GREP_REDUCER_RELOCATION_COUNT: usize = 0;
@@ -4448,6 +4490,8 @@ pub unsafe fn reduce(
     _value_out: *mut u64,
 ) -> u32 { 2 }
 pub unsafe fn reduce_multi_grep(
+    _handles: *const fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1,
+    _handle_count: usize,
     _haystack: *const u8,
     _haystack_len: usize,
     _value_out: *mut u64,
