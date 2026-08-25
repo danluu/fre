@@ -7774,6 +7774,9 @@ impl PortableBuilder {
             captures_len,
             storage_bytes: capture_name_storage_bytes,
         } = match provenance {
+            ParsedBuildProvenance::Canonical if explicit_captures == 0 => {
+                capture_free_name_metadata()?
+            }
             ParsedBuildProvenance::Canonical => {
                 capture_name_metadata(&rust.hir, explicit_captures, syntax.hir_nodes)?
             }
