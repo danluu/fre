@@ -47613,9 +47613,10 @@ fn lower_aarch64_direct_exact_singleton_span_sum_cold_long(
 /// four-argument prepared `SpanSum` ABI to the three-argument Count-v3 core.
 ///
 /// The exact-singleton proof makes every accepted non-overlapping span have
-/// `literal_bytes` bytes, so the result is `count * literal_bytes`. The
-/// multiplication is checked independently and the result is not published
-/// until the Count core and both bounds checks succeed.
+/// `literal_bytes` bytes, so the result is `count * literal_bytes`. Every
+/// nontrivial product is checked independently; multiplication by one
+/// discharges that overflow proof without arithmetic. The result is not
+/// published until the Count core and every applicable bound check succeed.
 fn lower_aarch64_direct_exact_singleton_span_sum_wrapper(
     literal_bytes: u8,
 ) -> Result<DirectExactSingletonSpanSumWrapper, ObjectError> {
@@ -47650,10 +47651,15 @@ fn lower_aarch64_direct_exact_singleton_span_sum_wrapper(
     assembler.branch_nonzero_w(0, returned)?;
 
     assembler.instruction(aarch64_load_x_imm(8, 31, COUNT_OFFSET)?)?;
-    assembler.instruction(aarch64_movz_x(9, u16::from(literal_bytes), 0)?)?;
-    assembler.instruction(aarch64_umulh_x(10, 8, 9)?)?;
-    assembler.branch_nonzero_x(10, overflow)?;
-    assembler.instruction(aarch64_mul_x(8, 8, 9)?)?;
+    // Width one is already expressed in bytes, so its checked product is the
+    // Count result itself. The common bound below still independently rejects
+    // a corrupt core result larger than the authenticated source extent.
+    if literal_bytes != 1 {
+        assembler.instruction(aarch64_movz_x(9, u16::from(literal_bytes), 0)?)?;
+        assembler.instruction(aarch64_umulh_x(10, 8, 9)?)?;
+        assembler.branch_nonzero_x(10, overflow)?;
+        assembler.instruction(aarch64_mul_x(8, 8, 9)?)?;
+    }
     // Redundant for a correct Count-v3 core, but independently authenticate
     // the semantic invariant SpanSum <= haystack length at the seam.
     assembler.instruction(aarch64_cmp_x(8, 20)?)?;

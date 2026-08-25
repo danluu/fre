@@ -2,8 +2,9 @@
 //!
 //! The selected implementation keeps the public `SpanSum` entry and its
 //! artifact-authentication prefix. Its private leaf calls one independently
-//! audited Count-v3 core, checks `count * literal_width`, and publishes the
-//! completed byte sum transactionally. No source bytes are retained here.
+//! audited Count-v3 core, checks `count * literal_width` (with multiplication
+//! by one discharged arithmetically), and publishes the completed byte sum
+//! transactionally. No source bytes are retained here.
 
 use crate::PreparedAggregateStrategy;
 use fre_aot_optimizer::CountV3Strategy;

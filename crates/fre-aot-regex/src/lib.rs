@@ -1236,7 +1236,7 @@ pub fn compile_with_independent_exists_batch(
 /// export with the audited `Count-v3` core when source-independent
 /// finite-language facts prove one exact non-empty 1..=32-byte literal and
 /// that core beats the complete incumbent portfolio. `SpanSum` composes the
-/// count with a separately checked exact-width multiply and publishes only
+/// count with a separately proved exact-width product and publishes only
 /// after both operations succeed. Periodic two- and four-byte recipes retain
 /// the established short-input instruction path and enter the focused core
 /// through a cold long-input arm. The public wrappers still validate every

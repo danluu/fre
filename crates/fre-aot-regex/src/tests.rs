@@ -459,6 +459,7 @@ fn direct_exact_singleton_span_sum_selects_with_the_count_gate_policy() {
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
             .expect("valid AArch64 ASIMD target")
     }) {
+        let mut width_two_wrapper_bytes = None;
         for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
             let compiled = compile_with_prepared_aggregate_exports(
                 direct_count_request(
@@ -541,6 +542,72 @@ fn direct_exact_singleton_span_sum_selects_with_the_count_gate_policy() {
                     .chunks_exact(4)
                     .all(|word| word == 0xd503_201f_u32.to_le_bytes()),
             );
+            let wrapper = &text.bytes()[report.wrapper_offset..wrapper_end];
+            assert!(wrapper.len().is_multiple_of(4));
+            let wrapper_words = wrapper
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("AArch64 word")))
+                .collect::<Vec<_>>();
+            const UMULH_COUNT_WIDTH: u32 = 0x9bc9_7d0a; // UMULH X10,X8,X9
+            const MUL_COUNT_WIDTH: u32 = 0x9b09_7d08; // MUL X8,X8,X9
+            for product_word in [UMULH_COUNT_WIDTH, MUL_COUNT_WIDTH] {
+                assert_eq!(
+                    wrapper_words
+                        .iter()
+                        .filter(|&&word| word == product_word)
+                        .count(),
+                    if width == 1 { 0 } else { 1 },
+                );
+            }
+            if width == 1 {
+                assert!(
+                    crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+                        1,
+                        report.wrapper_offset,
+                        report.core_offset,
+                        wrapper,
+                    )
+                    .is_ok(),
+                );
+                assert!(
+                    crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+                        2,
+                        report.wrapper_offset,
+                        report.core_offset,
+                        wrapper,
+                    )
+                    .is_err(),
+                );
+            }
+            if width == 2 {
+                width_two_wrapper_bytes = Some(wrapper.len());
+                assert!(
+                    crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+                        2,
+                        report.wrapper_offset,
+                        report.core_offset,
+                        wrapper,
+                    )
+                    .is_ok(),
+                );
+                assert!(
+                    crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+                        3,
+                        report.wrapper_offset,
+                        report.core_offset,
+                        wrapper,
+                    )
+                    .is_err(),
+                    "equal-length wrappers must still bind the literal-width immediate",
+                );
+            }
+            if width == 3 {
+                assert_eq!(
+                    width_two_wrapper_bytes,
+                    Some(wrapper.len()),
+                    "the width-2/width-3 rejection must exercise equal-length topology",
+                );
+            }
             assert_eq!(report.incumbent_strategy, PreparedAggregateStrategy::NativeFused);
             assert_eq!(report.incumbent_cost.scan_passes, 1);
             assert_eq!(report.selected_cost.scan_passes, 1);
