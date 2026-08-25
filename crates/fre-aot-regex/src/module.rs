@@ -82787,20 +82787,30 @@ mod tests {
             .ordered_finite_language_aot
             .expect("early finite receipt")
             .native_data_bytes;
+        let bounded_limit = finite_bytes
+            .checked_sub(1)
+            .expect("finite image is nonempty");
+        // The cap excludes the initially preferred layout, but the portfolio
+        // now retains a smaller authenticated layout for the same finite
+        // language. Resource fallback must compare that alternative before
+        // returning to the complete semantic DFA.
         let bounded = crate::compile_with_slow_aot_limits(
             CompileRequest::new(variable_pattern, Target::x86_64_linux())
                 .mode(CompileMode::Optimizing)
                 .output(OutputContract::Span),
             SlowAotLimits {
-                max_native_data_bytes: finite_bytes
-                    .checked_sub(1)
-                    .expect("finite image is nonempty"),
+                max_native_data_bytes: bounded_limit,
                 ..SlowAotLimits::default()
             },
         )
-        .expect("finite data decline preserves complete semantic DFA");
+        .expect("bounded finite portfolio preserves the complete semantic DFA");
         assert_eq!(bounded.receipt().engine, EngineKind::OrderedDfa);
-        assert!(bounded.receipt().ordered_finite_language_aot.is_none());
+        let bounded_finite = bounded
+            .receipt()
+            .ordered_finite_language_aot
+            .expect("the smaller finite layout fits after the incumbent layout is capped");
+        assert!(bounded_finite.native_data_bytes < finite_bytes);
+        assert!(bounded_finite.native_data_bytes <= bounded_limit);
         assert!(bounded.module().required_runtime_symbol().is_none());
     }
 
@@ -83805,6 +83815,16 @@ mod tests {
                     // while no-row products use it only through the faster
                     // portable exact-product route.
                     let direct = compiled.module().start_accelerator() != StartAccelerator::None;
+                    // A scanner-free Span keeps the ordinary runtime adapter
+                    // authoritative while publishing the native Ordered-NFA
+                    // V15 prepared surface. The exact-product route has
+                    // priority over the endpoint-oracle portfolio, so these
+                    // fixtures must never compose an endpoint oracle too.
+                    let ordered_nfa_v15 = compiled.module().required_prepare_capabilities()
+                        == PREPARED_CAPABILITY_ORDERED_NFA_V15;
+                    assert_eq!(ordered_nfa_v15, !direct && output == OutputContract::Span);
+                    assert!(!compiled.module().has_bit_parallel_endpoint_oracle());
+                    let native_instruction_selection = direct || ordered_nfa_v15;
                     assert_eq!(compiled.receipt().runtime_helper_required, !direct);
                     assert_eq!(compiled.module().required_runtime_symbol().is_some(), !direct);
                     assert_eq!(compiled.module().required_runtime_program().is_some(), !direct);
@@ -83813,7 +83833,8 @@ mod tests {
                             .receipt()
                             .passes
                             .contains(&crate::OptimizationPass::TargetInstructionSelection),
-                        direct
+                        native_instruction_selection,
+                        "a runtime-backed Span may still own the native Ordered-NFA V15 surface"
                     );
                     assert_eq!(
                         compiled
@@ -90519,7 +90540,7 @@ mod tests {
                 FeatureSet::of(CpuFeature::X86Avx2),
                 StartAccelerator::X86Avx2,
                 4,
-                8,
+                9,
             ),
             (avx512, StartAccelerator::X86Avx512Bw, 4, 0),
         ] {
@@ -91326,7 +91347,7 @@ mod tests {
                 assert_eq!(
                     x86_avx2_identity_guard_cleanup_count(&emission.code),
                     if features.has(CpuFeature::X86Avx2) {
-                        8 - usize::from(output != OutputContract::Exists)
+                        9 - usize::from(output != OutputContract::Exists)
                     } else {
                         0
                     },
@@ -91348,7 +91369,8 @@ mod tests {
                         .iter()
                         .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
                         .count(),
-                    1
+                    2,
+                    "the public search and private frozen-session entry each authenticate the exact root"
                 );
                 assert_eq!(
                     emission
@@ -91909,7 +91931,8 @@ mod tests {
                         .iter()
                         .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
                         .count(),
-                    2
+                    4,
+                    "the public search and private frozen-session entry each use one ADRP/ADD identity pair"
                 );
                 assert_eq!(
                     emission
@@ -92188,18 +92211,26 @@ mod tests {
             output: OutputContract,
         ) {
             let context = format!("{target:?}/{output:?}");
-            let frame_open = aarch64_sub_x_imm(31, 31, 112).unwrap();
-            let frame_close = aarch64_add_x_imm(31, 31, 112).unwrap();
+            let frame_open_instruction = aarch64_sub_x_imm(31, 31, 112).unwrap();
+            let frame_close_instruction = aarch64_add_x_imm(31, 31, 112).unwrap();
             let restore_link = aarch64_load_x_imm(30, 31, 104).unwrap();
             let return_instruction = 0xd65f_03c0;
-            let opens = words
+            let bulk_entry_bytes = emission
+                .bulk_frozen_session_entry_offset
+                .expect("rooted immutable entry has a private frozen session");
+            assert_eq!(bulk_entry_bytes % 4, 0, "{context}: aligned bulk entry");
+            let bulk_entry = bulk_entry_bytes / 4;
+            let (public_words, private_words) = words.split_at(bulk_entry);
+            let opens = public_words
                 .iter()
                 .enumerate()
-                .filter_map(|(index, &word)| (word == frame_open).then_some(index))
+                .filter_map(|(index, &word)| {
+                    (word == frame_open_instruction).then_some(index)
+                })
                 .collect::<Vec<_>>();
-            assert_eq!(opens.len(), 1, "{context}: one frame allocation");
-            let frame_open = opens[0];
-            let frozen_guard = words
+            assert_eq!(opens.len(), 1, "{context}: one public frame allocation");
+            let public_frame_open = opens[0];
+            let frozen_guard = public_words
                 .iter()
                 .enumerate()
                 .filter_map(|(index, &word)| {
@@ -92222,25 +92253,36 @@ mod tests {
                 PREPARED_FALLBACK_RUNTIME_SYMBOL,
                 &context,
             );
-            assert_eq!(words[deopt] & 0xfc00_0000, 0x1400_0000, "{context}");
-            assert_eq!(words[fallback] & 0xfc00_0000, 0x1400_0000, "{context}");
+            assert_eq!(
+                public_words[deopt] & 0xfc00_0000,
+                0x1400_0000,
+                "{context}"
+            );
+            assert_eq!(
+                public_words[fallback] & 0xfc00_0000,
+                0x1400_0000,
+                "{context}"
+            );
 
             let mut ordinary_returns = 0;
             let mut frozen_fallbacks = 0;
             let mut adaptive_deopts = 0;
-            for (close, _) in words
+            for (close, _) in public_words
                 .iter()
                 .enumerate()
-                .filter(|&(_, &word)| word == frame_close)
+                .filter(|&(_, &word)| word == frame_close_instruction)
             {
-                assert!(frame_open < close, "{context}: close before frame allocation");
+                assert!(
+                    public_frame_open < close,
+                    "{context}: close before frame allocation"
+                );
                 assert_eq!(
-                    words.get(close.wrapping_sub(1)),
+                    public_words.get(close.wrapping_sub(1)),
                     Some(&restore_link),
                     "{context}: frame close without link-register restore"
                 );
                 let terminal = close + 1;
-                if words.get(terminal) == Some(&return_instruction) {
+                if public_words.get(terminal) == Some(&return_instruction) {
                     assert!(
                         close < frozen_guard,
                         "{context}: ordinary return follows the frozen fallback"
@@ -92252,7 +92294,7 @@ mod tests {
                         "{context}: adaptive deopt precedes frozen authentication"
                     );
                     adaptive_deopts += 1;
-                } else if aarch64_unconditional_target(words, terminal) == Some(fallback) {
+                } else if aarch64_unconditional_target(public_words, terminal) == Some(fallback) {
                     assert!(
                         frozen_guard < close,
                         "{context}: frozen fallback precedes its authentication"
@@ -92268,17 +92310,54 @@ mod tests {
                 "{context}: authenticated frozen fallback exit"
             );
             assert_eq!(adaptive_deopts, 1, "{context}: adaptive deopt exit");
-            for (return_index, _) in words
+            for (return_index, _) in public_words
                 .iter()
                 .enumerate()
                 .filter(|&(_, &word)| word == return_instruction)
             {
                 assert_eq!(
-                    words.get(return_index.wrapping_sub(1)),
-                    Some(&frame_close),
+                    public_words.get(return_index.wrapping_sub(1)),
+                    Some(&frame_close_instruction),
                     "{context}: framed return without frame close"
                 );
             }
+
+            // The frozen-session entry is a second caller with the same frame
+            // ABI. Its selected path jumps back into the fully audited public
+            // compact bodies above; its local decline must close exactly one
+            // private frame before re-entering the public entry.
+            assert_eq!(
+                private_words
+                    .iter()
+                    .filter(|&&word| word == frame_open_instruction)
+                    .count(),
+                1,
+                "{context}: one private frozen-session frame allocation"
+            );
+            let private_closes = private_words
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &word)| {
+                    (word == frame_close_instruction).then_some(bulk_entry + index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                private_closes.len(),
+                1,
+                "{context}: one private frozen-session frame close"
+            );
+            let private_close = private_closes[0];
+            assert_eq!(
+                words.get(private_close.wrapping_sub(1)),
+                Some(&restore_link),
+                "{context}: private frame close without link-register restore"
+            );
+            let public_reentry = aarch64_unconditional_target(words, private_close + 1)
+                .expect("private frozen-session fallback branch");
+            assert!(
+                public_reentry < bulk_entry,
+                "{context}: private fallback must re-enter the public entry"
+            );
         }
 
         let filter = dynamic_root_test_filter(b"a", 1);
@@ -92316,7 +92395,7 @@ mod tests {
                 assert_eq!(
                     x86_avx2_identity_guard_cleanup_count(&code),
                     if features.has(CpuFeature::X86Avx2) {
-                        7
+                        8
                     } else {
                         0
                     },
@@ -92893,7 +92972,7 @@ mod tests {
                 assert_eq!(
                     x86_avx2_identity_guard_cleanup_count(&root.code),
                     if features.has(CpuFeature::X86Avx2) {
-                        8 - usize::from(output != OutputContract::Exists)
+                        9 - usize::from(output != OutputContract::Exists)
                     } else {
                         0
                     },
@@ -102409,17 +102488,21 @@ int main(void){{
                 module.required_prepared_fallback_runtime_symbol(),
                 Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
             );
+            // The static prefix now owns the eager authenticated V1
+            // preflight/recovery pair. Its ordinary holes still enter the
+            // persistent prepared fallback asserted above, while the older
+            // lazy V3 recovery must not coexist with this selected route.
             assert_eq!(
                 module.required_prepared_preflight_runtime_symbol(),
-                None
+                Some(SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME)
             );
             assert_eq!(
                 module.required_prepared_span_recovery_runtime_symbol(),
-                None
+                Some(SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME)
             );
             assert_eq!(
                 module.required_prepared_lazy_static_prefix_span_recovery_runtime_symbol(),
-                Some(SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+                None
             );
             assert!(module.sections()[PROGRAM_SECTION]
                 .bytes()
@@ -103180,7 +103263,17 @@ int main(void){{
                 assert_eq!(fallback_module.anchored_prefix_filter_bytes(), 0);
                 assert_eq!(
                     fallback_module.symbols().len(),
-                    if retains_continuation_tail { 15 } else { 11 }
+                    (if retains_continuation_tail { 15 } else { 11 })
+                        + usize::from(output != OutputContract::SelectedEnd),
+                    "the stable prepared layout plus its contract-specific frozen bulk export"
+                );
+                assert_eq!(
+                    fallback_module.prepared_exists_batch_symbol().is_some(),
+                    output == OutputContract::Exists
+                );
+                assert_eq!(
+                    fallback_module.prepared_span_fill_symbol().is_some(),
+                    output == OutputContract::Span
                 );
                 assert_eq!(
                     fallback_module.symbols()[PARTIAL_NATIVE_CORE_SYMBOL].section,
@@ -121669,7 +121762,23 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .unwrap();
         assert!(frame_position < flag_position);
         assert!(flag_position < minimum_position);
-        assert_eq!(words.iter().filter(|&&word| word == arm_minimum).count(), 1);
+        assert_eq!(
+            words[..=minimum_position]
+                .iter()
+                .filter(|&&word| word == arm_minimum)
+                .count(),
+            1,
+            "the V12 crossover owns the first minimum-width comparison; later compact bodies may encode the same instruction"
+        );
+        assert_eq!(
+            words
+                .get(minimum_position + 1)
+                .copied()
+                .expect("V12 minimum-width conditional crossover edge")
+                & 0xff00_001f,
+            0x5400_0000 | u32::from(AARCH64_LO),
+            "the V12 minimum-width comparison must retain its conditional crossover edge"
+        );
     }
 
     #[test]
@@ -121868,7 +121977,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 );
                 assert_eq!(
                     byte_occurrences(&emission.code, &x86_v12_flag),
-                    1,
+                    1 + usize::from(root.is_some()),
                     "x86 {context}: exact V12 flag selector"
                 );
                 assert_eq!(
@@ -122046,7 +122155,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 );
                 assert_eq!(
                     word_occurrences(&words, &arm_v12_flag),
-                    1,
+                    1 + usize::from(root.is_some()),
                     "AArch64 {context}: exact V12 flag selector"
                 );
                 assert_eq!(

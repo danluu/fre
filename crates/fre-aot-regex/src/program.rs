@@ -30513,16 +30513,20 @@ mod tests {
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 PROGRAM_FORMAT_VERSION_V7
             );
-            assert!(compiled.automaton.has_epsilon_closure_dispatch());
+            // The small graph retains the selective suffix without paying for
+            // a separate epsilon-dispatch owner.
+            assert!(!compiled.automaton.has_epsilon_closure_dispatch());
             assert_eq!(
                 bytes[15],
-                PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
-                    | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
-                    | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
+                PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
             );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
             assert!(restored.nfa_mandatory_suffix.is_some());
+            assert_eq!(
+                restored.automaton.has_epsilon_closure_dispatch(),
+                compiled.automaton.has_epsilon_closure_dispatch()
+            );
             assert_eq!(
                 restored.bit_parallel_exists_stats(),
                 compiled.bit_parallel_exists_stats()
@@ -48027,11 +48031,10 @@ mod tests {
             },
         );
         let bytes = fallback.serialize().unwrap();
+        assert!(!fallback.automaton.has_epsilon_closure_dispatch());
         assert_eq!(
             bytes[15],
-            PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
-                | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
-                | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
+            PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
         );
 
         let mut missing_optimizing_marker = bytes.clone();
