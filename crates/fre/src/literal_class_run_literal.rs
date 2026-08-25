@@ -149,6 +149,7 @@ pub(super) enum InspectionOutcome<'a> {
     Ineligible {
         work: usize,
         finite: Option<FiniteInspection<'a>>,
+        unbounded_corridor: bool,
     },
 }
 
@@ -191,6 +192,18 @@ impl Accounting {
         InspectionOutcome::Ineligible {
             work: self.work,
             finite: None,
+            unbounded_corridor: false,
+        }
+    }
+
+    const fn ineligible_with_unbounded_corridor(
+        &self,
+        unbounded_corridor: bool,
+    ) -> InspectionOutcome<'static> {
+        InspectionOutcome::Ineligible {
+            work: self.work,
+            finite: None,
+            unbounded_corridor,
         }
     }
 }
@@ -321,9 +334,22 @@ fn inspect_with_accounting<'a>(
         return Ok(accounting.ineligible());
     };
 
-    let inspection =
-        finish_unbounded_inspection(prefix, class, suffix, minimum, lazy, accounting, limit)?;
-    Ok(inspection.map_or_else(|| accounting.ineligible(), InspectionOutcome::Eligible))
+    let mut unbounded_corridor = false;
+    let inspection = finish_unbounded_inspection(
+        prefix,
+        class,
+        suffix,
+        minimum,
+        lazy,
+        defer_finite,
+        &mut unbounded_corridor,
+        accounting,
+        limit,
+    )?;
+    Ok(inspection.map_or_else(
+        || accounting.ineligible_with_unbounded_corridor(unbounded_corridor),
+        InspectionOutcome::Eligible,
+    ))
 }
 
 fn inspect_four_part_run<'a>(
@@ -405,12 +431,15 @@ fn inspect_adjacent_same_class_run<'a>(
         return Ok(None);
     }
     let lazy = !repetition.greedy;
+    let mut ignored_corridor = false;
     finish_unbounded_inspection(
         prefix,
         mandatory_class,
         &suffix.0,
         SearchRunMinimum::One,
         lazy,
+        false,
+        &mut ignored_corridor,
         accounting,
         limit,
     )
@@ -443,6 +472,8 @@ fn finish_unbounded_inspection<'a>(
     suffix: &'a [u8],
     minimum: SearchRunMinimum,
     lazy: bool,
+    defer_unbounded_corridor: bool,
+    unbounded_corridor: &mut bool,
     accounting: &mut Accounting,
     limit: usize,
 ) -> Result<Option<Inspection<'a>>, InspectionError> {
@@ -469,6 +500,10 @@ fn finish_unbounded_inspection<'a>(
         && class_contains(class, suffix_first, limit, accounting)?
     {
         if !prefix.is_empty() {
+            if defer_unbounded_corridor {
+                *unbounded_corridor =
+                    exact_unbounded_corridor_hint(prefix, class, suffix, lazy, limit, accounting)?;
+            }
             return Ok(None);
         }
         for &byte in suffix.iter().skip(1) {
@@ -489,6 +524,52 @@ fn finish_unbounded_inspection<'a>(
         hir_nodes: accounting.hir_nodes,
         captures: accounting.captures,
     }))
+}
+
+/// Retain the deferred corridor bit only for the final inspector's exact
+/// geometry. This prevents common losing class-run shapes from paying for a
+/// second HIR traversal merely because their suffix begins inside the class.
+fn exact_unbounded_corridor_hint(
+    prefix: &[u8],
+    class: InspectedClass<'_>,
+    suffix: &[u8],
+    lazy: bool,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<bool, InspectionError> {
+    if lazy
+        || prefix.is_empty()
+        || suffix.is_empty()
+        || prefix.len() > crate::k0_literal_class_corridor::MAX_LITERAL_BYTES
+        || suffix.len() > crate::k0_literal_class_corridor::MAX_LITERAL_BYTES
+    {
+        return Ok(false);
+    }
+    let InspectedClass::Bytes(class) = class else {
+        return Ok(false);
+    };
+
+    let mut members = 0_usize;
+    for range in class.ranges() {
+        accounting.charge(1, limit)?;
+        let width = usize::from(range.end())
+            .checked_sub(usize::from(range.start()))
+            .and_then(|width| width.checked_add(1))
+            .ok_or(InspectionError::Overflow)?;
+        members = members
+            .checked_add(width)
+            .ok_or(InspectionError::Overflow)?;
+    }
+    if members != 255 {
+        return Ok(false);
+    }
+
+    for &byte in prefix.iter().chain(suffix.iter()) {
+        if !class_contains(InspectedClass::Bytes(class), byte, limit, accounting)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[allow(
@@ -547,6 +628,7 @@ fn inspect_finite_two_barrier_run<'a>(
             minimum,
             maximum,
         }),
+        unbounded_corridor: false,
     })
 }
 
@@ -942,6 +1024,63 @@ mod tests {
     }
 
     #[test]
+    fn defers_only_exact_unbounded_literal_class_corridor_geometry() {
+        for pattern in [r"BEGIN.*END", r"BEGIN.+END"] {
+            let parsed = hir(pattern);
+            let InspectionOutcome::Ineligible {
+                work,
+                finite: None,
+                unbounded_corridor: true,
+            } = inspect(&parsed, usize::MAX).unwrap()
+            else {
+                panic!("expected exact deferred corridor for {pattern:?}");
+            };
+            assert!(matches!(
+                inspect(&parsed, work),
+                Ok(InspectionOutcome::Ineligible {
+                    unbounded_corridor: true,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                inspect(&parsed, work - 1),
+                Err(InspectionError::WorkLimit { needed, limit })
+                    if needed == work && limit == work - 1
+            ));
+
+            let InspectionOutcome::Ineligible {
+                work: aggregate_work,
+                finite: None,
+                unbounded_corridor: false,
+            } = inspect_attempt(&parsed, usize::MAX).unwrap()
+            else {
+                panic!("aggregate attempt must not retain corridor work for {pattern:?}");
+            };
+            assert!(aggregate_work < work, "pattern={pattern:?}");
+        }
+
+        for pattern in [
+            r"(?s:BEGIN.*END)",
+            r"a[ab]*b",
+            r"ABCDEFGHI.*END",
+            r"BEGIN.*E\nD",
+            r"\n.*END",
+            r"BEGIN.*?END",
+        ] {
+            assert!(
+                matches!(
+                    inspect(&hir(pattern), usize::MAX).unwrap(),
+                    InspectionOutcome::Ineligible {
+                        unbounded_corridor: false,
+                        ..
+                    }
+                ),
+                "pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
     fn admits_owned_unicode_class_with_complete_non_ascii_coverage() {
         let parsed = unicode_hir(r"a[^z\r\n]*z");
         let InspectionOutcome::Eligible(inspection) = inspect(&parsed, usize::MAX).unwrap() else {
@@ -1029,6 +1168,7 @@ mod tests {
             let InspectionOutcome::Ineligible {
                 work,
                 finite: Some(finite),
+                ..
             } = inspect(&hir, usize::MAX).unwrap()
             else {
                 panic!("expected deferred finite eligibility for {pattern:?}");
@@ -1072,6 +1212,7 @@ mod tests {
         let InspectionOutcome::Ineligible {
             work: portable_work,
             finite: Some(_),
+            ..
         } = inspect(&hir, usize::MAX).unwrap()
         else {
             panic!("portable inspection should retain the deferred proof");
@@ -1079,6 +1220,7 @@ mod tests {
         let InspectionOutcome::Ineligible {
             work: aggregate_work,
             finite: None,
+            ..
         } = inspect_attempt(&hir, usize::MAX).unwrap()
         else {
             panic!("aggregate inspection should preserve its immediate refusal");
@@ -1088,7 +1230,8 @@ mod tests {
             inspect_attempt(&hir, aggregate_work).unwrap(),
             InspectionOutcome::Ineligible {
                 work,
-                finite: None
+                finite: None,
+                ..
             } if work == aggregate_work
         ));
         let error = inspect_attempt(&hir, aggregate_work - 1).unwrap_err();
