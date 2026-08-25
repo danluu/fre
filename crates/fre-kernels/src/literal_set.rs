@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aho_corasick::automaton::{Automaton, StateID};
 use aho_corasick::dfa::DFA;
-use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind, Span};
+use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind, PatternID, Span};
 use fre_exact_alloc::try_box_preserve;
 use fre_simd_kernels::BYTE_BUCKET_BLOCK_BYTES;
 
@@ -259,17 +259,30 @@ pub struct LiteralSetOrdinaryExecutor<'a> {
     plan: &'a LiteralSetPlan,
 }
 
-/// Stateful selected-end scan used only by ordinary literal-set counting.
+/// Stateful selected-match scan shared by ordinary literal-set operations.
 ///
 /// Binding the immutable automaton, haystack, terminal boundary and start
-/// state once lets count restart at each selected endpoint without crossing
-/// the ordinary one-shot scanner's non-inlined call boundary per match.
-struct LiteralSetCountScanner<'a, 'h> {
+/// state once lets count and span iteration restart at each selected endpoint
+/// without crossing the ordinary one-shot scanner's non-inlined call boundary
+/// per match.
+struct LiteralSetDfaScanner<'a, 'h> {
     automaton: &'a DFA,
     haystack: &'h [u8],
     start_state: StateID,
     restart: usize,
     end: usize,
+}
+
+/// One selected DFA match before an operation-specific projection.
+///
+/// `LiteralSetDfaScanner::next::<false>` never reads an output pattern, so
+/// its count-only instantiation retains the incumbent endpoint loop without
+/// pattern bookkeeping. The span instantiation records output slot zero from
+/// the final delayed LeftmostFirst acceptance and resolves its width once.
+#[derive(Clone, Copy)]
+struct LiteralSetDfaSelection {
+    end: usize,
+    pattern: Option<PatternID>,
 }
 
 /// Construction-bound capability for deliberately bypassing the optional
@@ -781,13 +794,34 @@ impl LiteralSetPlan {
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<(usize, usize)>, LiteralSetError> {
+        Ok(self.find_window_value_validated_total(haystack, window))
+    }
+
+    /// Find one span after the caller has validated `window`.
+    ///
+    /// Aho offsets are bounded by the sliced input, so translating them by
+    /// the validated base cannot overflow: both resulting offsets are at most
+    /// `window.end()`, which is at most `haystack.len()`.
+    #[inline]
+    fn find_window_value_validated_total(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Option<(usize, usize)> {
+        debug_assert!(window.start() <= window.end());
+        debug_assert!(window.end() <= haystack.len());
         let input = Input::new(&haystack[window.start()..window.end()]);
         self.automaton
             .as_ref()
             .try_find(&input)
             .expect("the literal-set DFA supports its construction-selected unanchored input")
-            .map(|matched| absolute_match(window.start(), matched))
-            .transpose()
+            .map(|matched| {
+                let start = window.start() + matched.start();
+                let end = window.start() + matched.end();
+                debug_assert!(start <= end);
+                debug_assert!(end <= window.end());
+                (start, end)
+            })
     }
 
     #[inline(never)]
@@ -1410,9 +1444,14 @@ impl LiteralSetPlan {
     }
 }
 
-impl<'a, 'h> LiteralSetCountScanner<'a, 'h> {
+impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     #[inline]
-    fn new(plan: &'a LiteralSetPlan, haystack: &'h [u8], window: Window) -> Option<Self> {
+    fn new(
+        executor: LiteralSetOrdinaryExecutor<'a>,
+        haystack: &'h [u8],
+        window: Window,
+    ) -> Option<Self> {
+        let plan = executor.plan;
         let automaton = plan.automaton.as_ref();
         if automaton.prefilter().is_some() || automaton.match_kind() != MatchKind::LeftmostFirst {
             return None;
@@ -1432,7 +1471,7 @@ impl<'a, 'h> LiteralSetCountScanner<'a, 'h> {
     }
 
     #[inline(always)]
-    fn next(&mut self) -> Option<usize> {
+    fn next<const NEED_PATTERN: bool>(&mut self) -> Option<LiteralSetDfaSelection> {
         let anchored = Anchored::No;
         let mut state = self.start_state;
         let mut at = self.restart;
@@ -1449,12 +1488,36 @@ impl<'a, 'h> LiteralSetCountScanner<'a, 'h> {
                     "a DFA without a prefilter has no other special states",
                 );
                 if self.automaton.is_match(state) {
-                    selected = Some(at);
+                    let pattern = if NEED_PATTERN {
+                        Some(self.automaton.match_pattern(state, 0))
+                    } else {
+                        None
+                    };
+                    selected = Some(LiteralSetDfaSelection { end: at, pattern });
                 }
             }
         }
-        self.restart = selected.unwrap_or(self.end);
+        self.restart = selected.as_ref().map_or(self.end, |matched| matched.end);
         selected
+    }
+
+    #[inline(always)]
+    fn next_end(&mut self) -> Option<usize> {
+        self.next::<false>().map(|matched| matched.end)
+    }
+
+    #[inline(always)]
+    fn next_span(&mut self) -> Option<(usize, usize)> {
+        let restart = self.restart;
+        let matched = self.next::<true>()?;
+        let end = matched.end;
+        let pattern = matched
+            .pattern
+            .expect("span-mode DFA scanning records its selected pattern");
+        let pattern_bytes = self.automaton.pattern_len(pattern);
+        debug_assert!(pattern_bytes > 0);
+        debug_assert!(pattern_bytes <= end.saturating_sub(restart));
+        Some((end - pattern_bytes, end))
     }
 }
 
@@ -1632,19 +1695,52 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         &self,
         haystack: &[u8],
         window: Window,
-        mut visitor: F,
+        visitor: F,
     ) -> Result<Result<(), E>, LiteralSetError>
     where
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
         validate_window(window, haystack.len())?;
+        Ok(self.try_visit_spans_window_value_total(
+            haystack, window, visitor,
+        ))
+    }
+
+    /// Shared span body after the caller has validated `window`.
+    ///
+    /// The direct scanner and canonical fallback are both total over a valid
+    /// window. Once the first callback begins, the only possible error is the
+    /// callback's nested `E`.
+    #[inline]
+    fn try_visit_spans_window_value_total<F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        mut visitor: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        debug_assert!(window.start() <= window.end());
+        debug_assert!(window.end() <= haystack.len());
+        if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
+            while let Some(matched) = scanner.next_span() {
+                match visitor(matched) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(());
+        }
         let mut cursor = window.start();
         loop {
-            let matched = self
-                .plan
-                .try_find_window_value(haystack, Window::new(cursor, window.end()))?;
+            let matched = self.plan.find_window_value_validated_total(
+                haystack,
+                Window::new(cursor, window.end()),
+            );
             let Some(matched) = matched else {
-                return Ok(Ok(()));
+                return Ok(());
             };
             debug_assert!(
                 matched.1 > cursor,
@@ -1653,8 +1749,8 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
             cursor = matched.1;
             match visitor(matched) {
                 Ok(true) => {}
-                Ok(false) => return Ok(Ok(())),
-                Err(error) => return Ok(Err(error)),
+                Ok(false) => return Ok(()),
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1683,9 +1779,9 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     ) -> Result<u64, LiteralSetError> {
         validate_window(window, haystack.len())?;
         let mut count = 0_usize;
-        if let Some(mut scanner) = LiteralSetCountScanner::new(self.plan, haystack, window) {
+        if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
             let mut previous_end = window.start();
-            while let Some(selected_end) = scanner.next() {
+            while let Some(selected_end) = scanner.next_end() {
                 debug_assert!(
                     selected_end > previous_end,
                     "a positive-width literal-set count must advance",
@@ -5968,6 +6064,167 @@ mod tests {
                 &[0, 0, 0, 1, 1, 1, 1],
             ],
         );
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_span_scanner_preserves_priority_windows_and_callbacks() {
+        // Broad byte coverage prevents a heuristic prefilter. At byte 1,
+        // source slot zero is a four-byte literal, slot one is its three-byte
+        // prefix and slot two duplicates slot zero. The direct scanner must
+        // retain slot zero through the delayed LeftmostFirst acceptance, then
+        // recover its start from that exact output's width.
+        let mut patterns = (0_u8..131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        patterns[0] = vec![1; 4];
+        patterns[2] = vec![1; 4];
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert_eq!(plan.automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+        assert!(ordinary.direct_count_scanner_supported());
+
+        let haystack = [250, 251, 1, 1, 1, 1, 1, 1, 1, 252];
+        let window = Window::new(2, 9);
+        let mut visited = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
+                visited.push(matched);
+                Ok::<bool, &'static str>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(visited, [(2, 6), (6, 9)]);
+        assert_eq!(ordinary.count_spans_window_value(&haystack, window), Ok(2));
+
+        visited.clear();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
+                visited.push(matched);
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(visited, [(2, 6)]);
+
+        visited.clear();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
+                visited.push(matched);
+                if visited.len() == 1 {
+                    Ok(true)
+                } else {
+                    Err("callback")
+                }
+            }),
+            Ok(Err("callback")),
+        );
+        assert_eq!(visited, [(2, 6), (6, 9)]);
+
+        let mut callback_called = false;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                &haystack,
+                Window::new(9, 8),
+                |_| {
+                    callback_called = true;
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Err(LiteralSetError::InvalidWindow {
+                start: 9,
+                end: 8,
+                haystack_len: haystack.len(),
+            }),
+        );
+        assert!(!callback_called);
+
+        // Moving the three-byte prefix ahead of the longer duplicate changes
+        // the selected widths. This catches a span mode that records any
+        // output other than priority slot zero.
+        patterns.swap(0, 1);
+        let short_first =
+            LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(short_first.automaton.prefilter().is_none());
+        let ordinary = short_first.ordinary_executor().unwrap();
+        let mut short_spans = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
+                short_spans.push(matched);
+                Ok::<bool, ()>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(short_spans, [(2, 5), (5, 8)]);
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_span_scanner_falls_back_for_other_routes() {
+        // This unequal-width plan is LeftmostFirst but retains a prefilter.
+        // The checked ordinary visitor must keep canonical selection.
+        let prefiltered_patterns = [b"b".to_vec(), b"abc".to_vec(), b"ab".to_vec()];
+        let prefiltered = LiteralSetPlan::new_stable(
+            &prefiltered_patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(prefiltered.automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert!(prefiltered.automaton.prefilter().is_some());
+        let ordinary = prefiltered.ordinary_executor().unwrap();
+        assert!(!ordinary.direct_count_scanner_supported());
+        let mut spans = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(b"abcabc", Window::new(0, 6), |matched| {
+                spans.push(matched);
+                Ok::<bool, ()>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(spans, [(0, 3), (3, 6)]);
+
+        // Broad uniform construction removes the prefilter but seals Standard
+        // semantics. Match kind alone must still keep it out of the shared
+        // delayed-LeftmostFirst scanner.
+        let standard_patterns = (0_u8..=u8::MAX)
+            .map(|byte| vec![byte, byte])
+            .collect::<Vec<_>>();
+        let standard = LiteralSetPlan::new_stable(
+            &standard_patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(standard.automaton.match_kind(), MatchKind::Standard);
+        assert!(standard.automaton.prefilter().is_none());
+        let ordinary = standard.ordinary_executor().unwrap();
+        assert!(!ordinary.direct_count_scanner_supported());
+        let haystack = [1, 1, 2, 2];
+        spans.clear();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                &haystack,
+                Window::full(&haystack),
+                |matched| {
+                    spans.push(matched);
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(spans, [(0, 2), (2, 4)]);
+
+        let nullable = LiteralSetPlan::new(
+            &[b"a".as_slice(), b"".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(nullable.ordinary_executor().is_none());
+
+        let streaming = LiteralSetPlan::new_streaming_any(
+            &[b"ab".as_slice(), b"a".as_slice()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(streaming.ordinary_executor().is_none());
     }
 
     #[test]
