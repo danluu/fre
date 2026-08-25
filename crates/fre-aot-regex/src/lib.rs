@@ -24,6 +24,7 @@ mod context_native;
 mod dfa;
 mod dfa_loop_skip;
 mod direct_count_v3;
+mod direct_span_sum_v1;
 mod error;
 mod finite_language;
 mod grep_count;
@@ -105,6 +106,12 @@ pub use direct_count_v3::{
     DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
     DirectExactSingletonCountAotReport, DirectExactSingletonCountCostShape,
     DirectExactSingletonCountSelectionBasis, DirectExactSingletonCountSuccessorMode,
+};
+pub use direct_span_sum_v1::{
+    DIRECT_EXACT_SINGLETON_SPAN_SUM_AOT_SCHEMA_VERSION,
+    DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+    DirectExactSingletonSpanSumAotReport, DirectExactSingletonSpanSumCostShape,
+    DirectExactSingletonSpanSumSelectionBasis, DirectExactSingletonSpanSumSuccessorMode,
 };
 pub use grep_count::{
     DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES, GREP_COUNT_ACCOUNTING_ID,
@@ -1225,12 +1232,17 @@ pub fn compile_with_independent_exists_batch(
 /// equivalent to [`compile`].
 ///
 /// An optimizing `AArch64` target that explicitly enables
-/// [`CpuFeature::Aarch64Asimd`] may implement a sole `Count` export with the
-/// audited `Count-v3` core when source-independent finite-language facts prove
-/// one exact non-empty 1..=32-byte literal and that core beats the complete
-/// incumbent portfolio. The existing public wrapper still validates every
-/// argument and authenticates the prepared handle before entering that core;
-/// [`CompiledModule::direct_exact_singleton_count_aot_report`] records the
+/// [`CpuFeature::Aarch64Asimd`] may implement a sole `Count` or `SpanSum`
+/// export with the audited `Count-v3` core when source-independent
+/// finite-language facts prove one exact non-empty 1..=32-byte literal and
+/// that core beats the complete incumbent portfolio. `SpanSum` composes the
+/// count with a separately checked exact-width multiply and publishes only
+/// after both operations succeed. Periodic two- and four-byte recipes retain
+/// the established short-input instruction path and enter the focused core
+/// through a cold long-input arm. The public wrappers still validate every
+/// argument and authenticate the prepared handle;
+/// [`CompiledModule::direct_exact_singleton_count_aot_report`] and
+/// [`CompiledModule::direct_exact_singleton_span_sum_aot_report`] record the
 /// selected strategy. Numeric candidate limits preserve the exact incumbent,
 /// while allocation or authentication failures remain terminal.
 ///
@@ -1533,7 +1545,8 @@ fn append_prepared_aggregate_exports_to_compiled(
         }
     };
     if mode == CompileMode::Optimizing
-        && exports == PreparedAggregateExports::COUNT
+        && (exports == PreparedAggregateExports::COUNT
+            || exports == PreparedAggregateExports::SPAN_SUM)
         && let Some(literal) = program.native_exact_singleton_count_literal()
     {
         match direct_count_v3::prepare_direct_exact_singleton_count(
@@ -1544,7 +1557,24 @@ fn append_prepared_aggregate_exports_to_compiled(
         )? {
             direct_count_v3::DirectExactSingletonCountPreparation::Declined => {}
             direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
-                if let Some(rollback) = module.install_direct_exact_singleton_count(
+                if exports == PreparedAggregateExports::COUNT {
+                    if let Some(rollback) = module.install_direct_exact_singleton_count(
+                        literal,
+                        artifact_identity,
+                        &candidate,
+                    )? {
+                        match emit_object(&module, format, max_object_bytes) {
+                            Ok(candidate_object) => object = candidate_object,
+                            Err(error) if is_proven_object_byte_limit(&error) => {
+                                module.rollback_direct_exact_singleton_count(rollback)?;
+                            }
+                            Err(error) => {
+                                module.rollback_direct_exact_singleton_count(rollback)?;
+                                return Err(error.into());
+                            }
+                        }
+                    }
+                } else if let Some(rollback) = module.install_direct_exact_singleton_span_sum(
                     literal,
                     artifact_identity,
                     &candidate,
@@ -1552,10 +1582,10 @@ fn append_prepared_aggregate_exports_to_compiled(
                     match emit_object(&module, format, max_object_bytes) {
                         Ok(candidate_object) => object = candidate_object,
                         Err(error) if is_proven_object_byte_limit(&error) => {
-                            module.rollback_direct_exact_singleton_count(rollback)?;
+                            module.rollback_direct_exact_singleton_span_sum(rollback)?;
                         }
                         Err(error) => {
-                            module.rollback_direct_exact_singleton_count(rollback)?;
+                            module.rollback_direct_exact_singleton_span_sum(rollback)?;
                             return Err(error.into());
                         }
                     }

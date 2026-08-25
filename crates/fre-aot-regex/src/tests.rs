@@ -355,6 +355,574 @@ fn compile_count_with_direct_candidate_declined(
         .expect("compile forced direct Count-v3 incumbent")
 }
 
+fn compile_span_sum_with_direct_candidate_declined(
+    request: CompileRequest,
+) -> crate::CompiledRegex {
+    compile_span_sum_exports_with_direct_candidate_declined(
+        request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+}
+
+fn compile_span_sum_exports_with_direct_candidate_declined(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> crate::CompiledRegex {
+    let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+        crate::direct_count_v3::DirectExactSingletonCountTestPreparation::Decline,
+    );
+    compile_with_prepared_aggregate_exports(request, exports)
+        .expect("compile forced direct SpanSum incumbent")
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_declines_without_changing_ineligible_incumbents() {
+    let asimd = direct_count_asimd_target(OperatingSystem::Linux);
+    let default_cap = CompileLimitsV1::default().max_object_bytes;
+    let cases = [
+        (
+            "a|b",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a?",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "^a",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a{33}",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a",
+            Target::aarch64_linux(),
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a",
+            Target::x86_64_linux(),
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a",
+            asimd,
+            CompileMode::Fast,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM.union(PreparedAggregateExports::COUNT),
+        ),
+    ];
+    for (pattern, target, mode, exports) in cases {
+        let request = direct_count_request(pattern, target, mode, default_cap);
+        let incumbent = compile_span_sum_exports_with_direct_candidate_declined(
+            request.clone(),
+            exports,
+        );
+        let declined = compile_with_prepared_aggregate_exports(request, exports)
+            .expect("compile ineligible direct SpanSum incumbent");
+        assert_eq!(declined.object(), incumbent.object());
+        assert_eq!(declined.module(), incumbent.module());
+        assert!(declined
+            .module()
+            .direct_exact_singleton_span_sum_aot_report()
+            .is_none());
+    }
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_selects_with_the_count_gate_policy() {
+    for target in [Target::aarch64_linux(), Target::aarch64_macos()].map(|target| {
+        target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("valid AArch64 ASIMD target")
+    }) {
+        for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+            let compiled = compile_with_prepared_aggregate_exports(
+                direct_count_request(
+                    "a".repeat(width),
+                    target,
+                    CompileMode::Optimizing,
+                    CompileLimitsV1::default().max_object_bytes,
+                ),
+                PreparedAggregateExports::SPAN_SUM,
+            )
+            .expect("compile direct exact-singleton SpanSum");
+            let report = compiled
+                .module()
+                .direct_exact_singleton_span_sum_aot_report()
+                .expect("direct exact-singleton SpanSum selection");
+            let gated = matches!(width, 2 | 4);
+            assert_eq!(
+                report.schema_version,
+                crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_AOT_SCHEMA_VERSION,
+            );
+            assert_eq!(usize::from(report.literal_bytes), width);
+            assert_eq!(
+                report.successor_mode,
+                crate::DirectExactSingletonSpanSumSuccessorMode::NonOverlapping,
+            );
+            assert_eq!(
+                report.selection_basis,
+                if gated {
+                    crate::DirectExactSingletonSpanSumSelectionBasis::ExactWidthCountCompositionWithShortIncumbent
+                } else {
+                    crate::DirectExactSingletonSpanSumSelectionBasis::ExactWidthCountComposition
+                },
+            );
+            assert_eq!(
+                report.short_fallback_max_bytes,
+                gated.then_some(
+                    crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
+                ),
+            );
+            assert_eq!(report.cold_long_offset.is_some(), gated);
+            assert_eq!(report.cold_long_bytes.is_some(), gated);
+            if gated {
+                assert_eq!(
+                    report.cold_long_offset.unwrap() + report.cold_long_bytes.unwrap(),
+                    report.wrapper_offset,
+                );
+            }
+            let wrapper_end = report
+                .wrapper_offset
+                .checked_add(report.wrapper_bytes)
+                .expect("SpanSum wrapper extent");
+            assert_eq!(
+                wrapper_end.checked_add(report.wrapper_to_core_padding_bytes),
+                Some(report.core_offset),
+            );
+            assert_eq!(
+                report.core_alignment_bytes,
+                crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+            );
+            assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+            assert!(report.wrapper_to_core_padding_bytes < report.core_alignment_bytes);
+            assert!(report.wrapper_to_core_padding_bytes.is_multiple_of(4));
+            let text = compiled
+                .module()
+                .sections()
+                .iter()
+                .find(|section| section.kind == SectionKind::Text)
+                .expect("direct SpanSum text section");
+            assert_eq!(
+                usize::try_from(text.alignment).expect("text alignment"),
+                report.text_section_alignment_bytes,
+            );
+            assert!(
+                report
+                    .text_section_alignment_bytes
+                    .is_multiple_of(report.core_alignment_bytes),
+            );
+            assert!(
+                text.bytes()[wrapper_end..report.core_offset]
+                    .chunks_exact(4)
+                    .all(|word| word == 0xd503_201f_u32.to_le_bytes()),
+            );
+            assert_eq!(report.incumbent_strategy, PreparedAggregateStrategy::NativeFused);
+            assert_eq!(report.incumbent_cost.scan_passes, 1);
+            assert_eq!(report.selected_cost.scan_passes, 1);
+            assert_eq!(report.incumbent_cost.native_scan_entries_per_operation, 1);
+            assert_eq!(report.selected_cost.native_scan_entries_per_operation, 1);
+            assert_eq!(report.incumbent_cost.native_calls_per_match, 1);
+            assert_eq!(report.selected_cost.native_calls_per_match, 0);
+            assert_eq!(report.incumbent_cost.internal_span_publications_per_match, 1);
+            assert_eq!(report.selected_cost.internal_span_publications_per_match, 0);
+            assert_eq!(report.incumbent_cost.unresolved_runtime_helpers, 0);
+            assert_eq!(report.selected_cost.unresolved_runtime_helpers, 0);
+            assert_ne!(report.wrapper_bytes, 0);
+            assert_ne!(report.core_bytes, 0);
+            assert!(compiled
+                .module()
+                .direct_exact_singleton_count_aot_report()
+                .is_none());
+            assert!(compiled.module().required_runtime_symbols().next().is_none());
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_exports,
+                PreparedAggregateExports::SPAN_SUM,
+            );
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            match target.operating_system {
+                OperatingSystem::Linux => assert_eq!(&compiled.object()[..4], b"\x7fELF"),
+                OperatingSystem::Macos => assert_eq!(
+                    &compiled.object()[..4],
+                    &0xfeed_facf_u32.to_le_bytes(),
+                ),
+            }
+        }
+    }
+
+    for target in [Target::x86_64_linux(), Target::x86_64_macos()] {
+        let request = direct_count_request(
+            "abcdefgh",
+            target,
+            CompileMode::Optimizing,
+            CompileLimitsV1::default().max_object_bytes,
+        );
+        let incumbent = compile_span_sum_with_direct_candidate_declined(request.clone());
+        let declined = compile_with_prepared_aggregate_exports(
+            request,
+            PreparedAggregateExports::SPAN_SUM,
+        )
+        .expect("compile x86 direct SpanSum decline");
+        assert_eq!(declined.object(), incumbent.object());
+        assert_eq!(declined.module(), incumbent.module());
+        assert!(declined
+            .module()
+            .direct_exact_singleton_span_sum_aot_report()
+            .is_none());
+    }
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_object_cap_and_allocator_failure_are_fail_closed() {
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let default_cap = CompileLimitsV1::default().max_object_bytes;
+    let request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        default_cap,
+    );
+    let incumbent = compile_span_sum_with_direct_candidate_declined(request.clone());
+    let selected = compile_with_prepared_aggregate_exports(
+        request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("compile selected direct SpanSum");
+    assert!(selected.object().len() > incumbent.object().len());
+    assert!(selected
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .is_some());
+
+    let candidate_cap = selected.object().len() - 1;
+    assert!(candidate_cap >= incumbent.object().len());
+    let capped_request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        candidate_cap,
+    );
+    let capped_incumbent =
+        compile_span_sum_with_direct_candidate_declined(capped_request.clone());
+    let capped = compile_with_prepared_aggregate_exports(
+        capped_request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("proven final direct SpanSum object cap rolls back");
+    assert_eq!(capped.object(), capped_incumbent.object());
+    assert_eq!(capped.module(), capped_incumbent.module());
+    assert!(capped
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .is_none());
+
+    let gated_request = direct_count_request(
+        "aa",
+        target,
+        CompileMode::Optimizing,
+        default_cap,
+    );
+    let gated_incumbent =
+        compile_span_sum_with_direct_candidate_declined(gated_request.clone());
+    let gated_selected = compile_with_prepared_aggregate_exports(
+        gated_request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("compile selected gated direct SpanSum");
+    assert!(gated_selected.object().len() > gated_incumbent.object().len());
+    let gated_cap = gated_selected.object().len() - 1;
+    assert!(gated_cap >= gated_incumbent.object().len());
+    let capped_gated_request = direct_count_request(
+        "aa",
+        target,
+        CompileMode::Optimizing,
+        gated_cap,
+    );
+    let capped_gated_incumbent =
+        compile_span_sum_with_direct_candidate_declined(capped_gated_request.clone());
+    let capped_gated = compile_with_prepared_aggregate_exports(
+        capped_gated_request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("proven final gated SpanSum object cap rolls back");
+    assert_eq!(capped_gated.object(), capped_gated_incumbent.object());
+    assert_eq!(capped_gated.module(), capped_gated_incumbent.module());
+    assert!(capped_gated
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .is_none());
+
+    let low_cap = incumbent.object().len() - 1;
+    let error = compile_with_prepared_aggregate_exports(
+        direct_count_request(
+            "abcdefgh",
+            target,
+            CompileMode::Optimizing,
+            low_cap,
+        ),
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect_err("incumbent SpanSum object cap remains terminal");
+    assert!(matches!(
+        error,
+        CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        }) if limit == low_cap && required == incumbent.object().len()
+    ));
+
+    {
+        let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+            crate::direct_count_v3::DirectExactSingletonCountTestPreparation::AllocationFailure,
+        );
+        let error = compile_with_prepared_aggregate_exports(
+            direct_count_request(
+                "abcdefgh",
+                target,
+                CompileMode::Optimizing,
+                default_cap,
+            ),
+            PreparedAggregateExports::SPAN_SUM,
+        )
+        .expect_err("direct SpanSum candidate allocator failure is terminal");
+        assert!(matches!(
+            error,
+            CompileError::Object(ObjectError::Allocation(
+                "injected direct Count-v3 candidate"
+            ))
+        ));
+    }
+    {
+        let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+            crate::direct_count_v3::DirectExactSingletonCountTestPreparation::UnsupportedBackendFailure,
+        );
+        let error = compile_with_prepared_aggregate_exports(
+            direct_count_request(
+                "abcdefgh",
+                target,
+                CompileMode::Optimizing,
+                default_cap,
+            ),
+            PreparedAggregateExports::SPAN_SUM,
+        )
+        .expect_err("direct SpanSum backend failure is terminal");
+        assert!(matches!(
+            error,
+            CompileError::Object(ObjectError::InvalidModule(
+                "direct Count-v3 backend rejected authenticated target tuple"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_authenticates_incumbent_wrapper_and_core() {
+    let target = direct_count_asimd_target(OperatingSystem::Macos);
+    let incumbent = compile_span_sum_with_direct_candidate_declined(direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    ));
+    let literal = incumbent
+        .program()
+        .native_exact_singleton_count_literal()
+        .expect("authenticated SpanSum singleton witness");
+    let artifact_identity = incumbent.program().artifact_identity();
+    let candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        artifact_identity,
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare direct SpanSum Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported direct SpanSum Count-v3 core declined")
+        }
+    };
+
+    let mut wrong_identity = incumbent.module().clone();
+    assert!(wrong_identity
+        .install_direct_exact_singleton_span_sum(literal, [7; 32], &candidate)
+        .is_err());
+    let wrong_candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        [7; 32],
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare differently bound direct SpanSum Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported differently bound direct SpanSum core declined")
+        }
+    };
+    let mut wrong_binding = incumbent.module().clone();
+    assert!(wrong_binding
+        .install_direct_exact_singleton_span_sum(
+            literal,
+            artifact_identity,
+            &wrong_candidate,
+        )
+        .is_err());
+
+    let span_sum = incumbent
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| {
+            symbol.binding == crate::SymbolBinding::Global
+                && symbol.kind == crate::SymbolKind::Function
+                && symbol
+                    .name
+                    .starts_with("fre_aot_regex_span_sum_exclusive_v1_")
+        })
+        .expect("incumbent SpanSum symbol");
+    let symbol_start = usize::try_from(span_sum.offset).expect("SpanSum symbol start");
+    let symbol_end = usize::try_from(span_sum.offset + span_sum.size)
+        .expect("SpanSum symbol end");
+    let mut tampered_incumbent = incumbent.module().clone();
+    assert!(tampered_incumbent.test_flip_text_byte(symbol_end - 1));
+    assert!(tampered_incumbent
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .is_err());
+    let mut tampered_relocation = incumbent.module().clone();
+    assert!(tampered_relocation
+        .test_flip_text_relocation_addend_in_range(symbol_start, symbol_end));
+    assert!(tampered_relocation
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .is_err());
+
+    let mut selected = incumbent.module().clone();
+    let rollback = selected
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .expect("install authenticated direct SpanSum composition")
+        .expect("selected direct SpanSum rollback checkpoint");
+    let report = *selected
+        .direct_exact_singleton_span_sum_aot_report()
+        .expect("selected direct SpanSum report");
+    let text_index = selected
+        .sections()
+        .iter()
+        .position(|section| section.kind == SectionKind::Text)
+        .expect("selected direct SpanSum text section");
+    let text = selected.sections()[text_index].bytes();
+    let wrapper_end = report
+        .wrapper_offset
+        .checked_add(report.wrapper_bytes)
+        .expect("selected direct SpanSum wrapper extent");
+    let core_end = report
+        .core_offset
+        .checked_add(report.core_bytes)
+        .expect("selected direct SpanSum core extent");
+    assert_eq!(
+        wrapper_end.checked_add(report.wrapper_to_core_padding_bytes),
+        Some(report.core_offset),
+    );
+    assert_eq!(
+        report.core_alignment_bytes,
+        crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+    );
+    assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+    assert_eq!(
+        usize::try_from(selected.sections()[text_index].alignment)
+            .expect("selected text alignment"),
+        report.text_section_alignment_bytes,
+    );
+    assert!(
+        text[wrapper_end..report.core_offset]
+            .chunks_exact(4)
+            .all(|word| word == 0xd503_201f_u32.to_le_bytes()),
+    );
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&text[report.wrapper_offset..wrapper_end])),
+        report.wrapper_sha256,
+    );
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&text[report.core_offset..core_end])),
+        report.core_sha256,
+    );
+    candidate
+        .authenticate_embedded(
+            literal,
+            report.core_offset,
+            &text[report.core_offset..core_end],
+        )
+        .expect("authenticate final-offset direct SpanSum Count-v3 core");
+    let mut tampered_core = text[report.core_offset..core_end].to_vec();
+    tampered_core[0] ^= 1;
+    assert!(candidate
+        .authenticate_embedded(literal, report.core_offset, &tampered_core)
+        .is_err());
+    assert_eq!(
+        crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+            report.literal_bytes,
+            report.wrapper_offset,
+            report.core_offset,
+            &text[report.wrapper_offset..wrapper_end],
+        )
+        .expect("authenticate embedded direct SpanSum wrapper"),
+        report.wrapper_sha256,
+    );
+    let mut tampered_wrapper = text[report.wrapper_offset..wrapper_end].to_vec();
+    tampered_wrapper[0] ^= 1;
+    assert!(
+        crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+            report.literal_bytes,
+            report.wrapper_offset,
+            report.core_offset,
+            &tampered_wrapper,
+        )
+        .is_err(),
+    );
+    assert!(selected.relocations().iter().all(|relocation| {
+        usize::try_from(relocation.offset)
+            .map_or(true, |offset| !(report.wrapper_offset..core_end).contains(&offset))
+    }));
+    assert!(selected.symbols().iter().all(|symbol| {
+        symbol.section != Some(text_index)
+            || usize::try_from(symbol.offset + symbol.size)
+                .is_ok_and(|end| end <= report.wrapper_offset)
+    }));
+    selected
+        .rollback_direct_exact_singleton_span_sum(rollback)
+        .expect("restore exact ungated SpanSum incumbent");
+    assert_eq!(&selected, incumbent.module());
+}
+
 #[test]
 fn direct_exact_singleton_count_declines_without_changing_every_ineligible_incumbent() {
     let asimd = direct_count_asimd_target(OperatingSystem::Linux);
@@ -949,6 +1517,236 @@ fn direct_exact_singleton_count_short_gate_preserves_the_hot_incumbent_layout() 
 }
 
 #[test]
+fn direct_exact_singleton_span_sum_cold_gate_is_additive_authenticated_and_relocatable() {
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let request = direct_count_request(
+        "aa",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    );
+    let incumbent = compile_span_sum_with_direct_candidate_declined(request.clone());
+    let selected = compile_with_prepared_aggregate_exports(
+        request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("compile cold-long direct SpanSum");
+    let report = selected
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .expect("cold-long direct SpanSum report");
+    let cold_offset = report.cold_long_offset.expect("SpanSum cold-long offset");
+    let cold_bytes = report.cold_long_bytes.expect("SpanSum cold-long bytes");
+    assert_eq!(
+        report.short_fallback_max_bytes,
+        Some(crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES),
+    );
+    assert_eq!(cold_offset + cold_bytes, report.wrapper_offset);
+    let wrapper_end = report
+        .wrapper_offset
+        .checked_add(report.wrapper_bytes)
+        .expect("cold-gated SpanSum wrapper extent");
+    assert_eq!(
+        wrapper_end.checked_add(report.wrapper_to_core_padding_bytes),
+        Some(report.core_offset),
+    );
+    assert_eq!(
+        report.core_alignment_bytes,
+        crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+    );
+    assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+
+    let selected_text = selected
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .expect("selected SpanSum text")
+        .bytes();
+    let incumbent_text = incumbent
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .expect("incumbent SpanSum text")
+        .bytes();
+    assert_eq!(cold_offset, incumbent_text.len());
+    assert_eq!(
+        &selected_text[report.authenticated_wrapper_body_offset..cold_offset],
+        &incumbent_text[report.authenticated_wrapper_body_offset..],
+        "the established authenticated SpanSum body stays byte-for-byte in place",
+    );
+    let differences = selected_text[..cold_offset]
+        .chunks_exact(4)
+        .zip(incumbent_text.chunks_exact(4))
+        .enumerate()
+        .filter_map(|(index, (selected, incumbent))| {
+            (selected != incumbent).then_some(index * 4)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(differences.len(), 2, "only the signed-length pair changes");
+    assert_eq!(differences[1], differences[0] + 4);
+
+    let cold_words = selected_text[cold_offset..report.wrapper_offset]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("cold instruction")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cold_words[0] & 0xfff8_001f,
+        0xb7f8_0002,
+        "cold path must reject bit-63 lengths before output/identity",
+    );
+    let wrapper_branches = cold_words
+        .iter()
+        .enumerate()
+        .filter(|(_, instruction)| **instruction & 0xfc00_0000 == 0x1400_0000)
+        .collect::<Vec<_>>();
+    assert_eq!(wrapper_branches.len(), 1);
+    let (branch_index, branch) = wrapper_branches[0];
+    assert_eq!(
+        crate::module::aarch64_direct_branch_target(
+            cold_offset + branch_index * 4,
+            *branch,
+        )
+        .expect("decode cold SpanSum wrapper branch"),
+        Some(report.wrapper_offset),
+    );
+    assert!(
+        selected_text[wrapper_end..report.core_offset]
+            .chunks_exact(4)
+            .all(|word| word == 0xd503_201f_u32.to_le_bytes()),
+    );
+    assert_eq!(
+        crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+            report.literal_bytes,
+            report.wrapper_offset,
+            report.core_offset,
+            &selected_text[report.wrapper_offset..wrapper_end],
+        )
+        .expect("authenticate embedded checked SpanSum wrapper"),
+        report.wrapper_sha256,
+    );
+    let wrapper_words = selected_text[report.wrapper_offset..wrapper_end]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("wrapper instruction")))
+        .collect::<Vec<_>>();
+    assert!(wrapper_words.contains(&(0x9bc0_7c00 | (9 << 16) | (8 << 5) | 10)));
+    assert!(wrapper_words.contains(&(0x9b00_7c00 | (9 << 16) | (8 << 5) | 8)));
+
+    let incumbent_relocations = incumbent.module().relocations();
+    let selected_relocations = selected.module().relocations();
+    assert_eq!(selected_relocations.len(), incumbent_relocations.len() + 2);
+    assert_eq!(
+        &selected_relocations[..incumbent_relocations.len()],
+        incumbent_relocations,
+    );
+    let mut identity_symbols = selected
+        .module()
+        .symbols()
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity")
+        .map(|(index, _)| index);
+    let identity_symbol = identity_symbols
+        .next()
+        .expect("unique prepared aggregate identity symbol");
+    assert!(identity_symbols.next().is_none());
+    for (relocation, kind) in selected_relocations[incumbent_relocations.len()..]
+        .iter()
+        .zip([
+            crate::RelocationKind::Aarch64Page21,
+            crate::RelocationKind::Aarch64PageOff12,
+        ])
+    {
+        assert_eq!(relocation.kind, kind);
+        assert_eq!(relocation.symbol, identity_symbol);
+        assert_eq!(relocation.addend, 0);
+        assert!((cold_offset..report.wrapper_offset).contains(
+            &usize::try_from(relocation.offset).expect("cold relocation offset"),
+        ));
+    }
+
+    let selected_name = selected
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("selected SpanSum symbol");
+    let selected_symbol = selected
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == selected_name)
+        .expect("selected SpanSum symbol record");
+    let incumbent_name = incumbent
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("incumbent SpanSum symbol");
+    let incumbent_symbol = incumbent
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == incumbent_name)
+        .expect("incumbent SpanSum symbol record");
+    assert_eq!(selected_symbol.offset, incumbent_symbol.offset);
+    assert_eq!(
+        selected_symbol.size,
+        incumbent_symbol.size
+            + u64::try_from(
+                cold_bytes + report.wrapper_bytes + report.wrapper_to_core_padding_bytes,
+            )
+            .expect("selected size delta"),
+    );
+    assert_eq!(
+        usize::try_from(selected_symbol.offset + selected_symbol.size)
+            .expect("selected SpanSum extent"),
+        report.core_offset,
+    );
+
+    let literal = incumbent
+        .program()
+        .native_exact_singleton_count_literal()
+        .expect("authenticated SpanSum singleton witness");
+    let artifact_identity = incumbent.program().artifact_identity();
+    let candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        artifact_identity,
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare direct SpanSum Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported direct SpanSum Count-v3 core declined")
+        }
+    };
+    let mut tampered = incumbent.module().clone();
+    let tamper_offset = usize::try_from(incumbent_symbol.offset + incumbent_symbol.size - 1)
+        .expect("incumbent SpanSum tamper offset");
+    assert!(tampered.test_flip_text_byte(tamper_offset));
+    assert!(tampered
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .is_err());
+
+    candidate
+        .authenticate_embedded(
+            literal,
+            report.core_offset,
+            &selected_text[report.core_offset..report.core_offset + report.core_bytes],
+        )
+        .expect("authenticate gated final-offset Count-v3 core");
+    let mut rollback_module = incumbent.module().clone();
+    let rollback = rollback_module
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .expect("install gated direct SpanSum for rollback")
+        .expect("gated direct SpanSum selected");
+    rollback_module
+        .rollback_direct_exact_singleton_span_sum(rollback)
+        .expect("restore exact gated SpanSum incumbent");
+    assert_eq!(&rollback_module, incumbent.module());
+}
+
+#[test]
 fn direct_count_aarch64_relocation_covers_every_immediate_branch_family() {
     let fixtures = [
         (0x1400_0000_u32, 0x03ff_ffff_u32), // B.
@@ -1010,6 +1808,317 @@ fn direct_count_aarch64_relocation_covers_every_immediate_branch_family() {
         0xaa01_03e0,
     ));
 }
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes all 32 direct exact-singleton SpanSum widths"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linked differential authenticates the public SpanSum wrapper, checked composition, Count-v3 core, and non-overlap semantics together"
+)]
+fn linked_host_direct_exact_singleton_span_sum_matches_generated_nonoverlap_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn initializer(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    let operating_system = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Macos
+    };
+    let target = direct_count_asimd_target(operating_system);
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-direct-span-sum-singleton-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create direct SpanSum linker directory");
+    let mut source = format!(
+        "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n#define IDENTITY_OFFSET {}U\nstatic const uint8_t empty_hay[1]={{0}};\n",
+        crate::FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+    );
+    source.push_str(
+        "static uint64_t reference_nonoverlap_span_sum_a(const uint8_t *hay,size_t len,size_t width){size_t offset=0U;uint64_t total=0U;while(offset+width<=len){size_t index=0U;while(index<width&&hay[offset+index]=='a')index++;if(index==width){total+=(uint64_t)width;offset+=width;}else{offset++;}}return total;}\n",
+    );
+    let mut objects = Vec::new();
+    for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+        let pattern = format!("(?-u:{})", "\\x61".repeat(width));
+        let compiled = compile_with_prepared_aggregate_exports(
+            direct_count_request(
+                pattern,
+                target,
+                CompileMode::Optimizing,
+                CompileLimitsV1::default().max_object_bytes,
+            ),
+            PreparedAggregateExports::SPAN_SUM,
+        )
+        .expect("compile linked direct SpanSum width");
+        let report = compiled
+            .module()
+            .direct_exact_singleton_span_sum_aot_report()
+            .expect("linked width selected direct SpanSum");
+        assert_eq!(usize::from(report.literal_bytes), width);
+        assert_eq!(
+            report.core_alignment_bytes,
+            crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+        );
+        assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        let entry = compiled
+            .module()
+            .prepared_span_sum_symbol()
+            .expect("linked direct SpanSum symbol");
+        let object = directory.join(format!("span-sum-{width}.o"));
+        fs::write(&object, compiled.object()).expect("write direct SpanSum object");
+        objects.push(object);
+
+        let identity = initializer(&compiled.program().artifact_identity());
+        let negative = initializer(&vec![b'b'; width.saturating_mul(2).max(1)]);
+        let mut early = vec![b'a'; width];
+        early.push(b'b');
+        let mut late = vec![b'b'; 7];
+        late.extend(std::iter::repeat_n(b'a', width));
+        let dense = vec![b'a'; width * 4 - 1];
+        let overlap = vec![b'a'; width + 3];
+        let early_initializer = initializer(&early);
+        let late_initializer = initializer(&late);
+        let dense_initializer = initializer(&dense);
+        let overlap_initializer = initializer(&overlap);
+        let overlap_sum = ((width + 3) / width) * width;
+        write!(
+            &mut source,
+            r#"
+extern uint32_t {entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t identity_{width}[32]={{{identity}}};
+static const uint8_t negative_{width}[]={{{negative}}};
+static const uint8_t early_{width}[]={{{early_initializer}}};
+static const uint8_t late_{width}[]={{{late_initializer}}};
+static const uint8_t dense_{width}[]={{{dense_initializer}}};
+static const uint8_t overlap_{width}[]={{{overlap_initializer}}};
+static int check_span_sum_{width}(void){{
+  uint8_t handle[IDENTITY_OFFSET+32U];
+  uint8_t wrong[IDENTITY_OFFSET+32U];
+  uint8_t misaligned[16];
+  uint64_t out=99U;
+  memset(handle,0,sizeof(handle));memset(wrong,0,sizeof(wrong));
+  memcpy(handle+IDENTITY_OFFSET,identity_{width},32U);
+  if({entry}(handle,empty_hay,0U,&out)!=0U||out!=0U)return 1;
+  out=99U;if({entry}(handle,negative_{width},sizeof(negative_{width}),&out)!=0U||out!=0U)return 2;
+  out=99U;if({entry}(handle,early_{width},sizeof(early_{width}),&out)!=0U||out!={width}U)return 3;
+  out=99U;if({entry}(handle,late_{width},sizeof(late_{width}),&out)!=0U||out!={width}U)return 4;
+  out=99U;if({entry}(handle,dense_{width},sizeof(dense_{width}),&out)!=0U||out!=3U*{width}U)return 5;
+  out=99U;if({entry}(handle,overlap_{width},sizeof(overlap_{width}),&out)!=0U||out!={overlap_sum}U)return 6;
+  if({width}U==1U){{
+    out=99U;if({entry}(0,early_{width},sizeof(early_{width}),&out)!=5U||out!=99U)return 7;
+    out=99U;if({entry}(wrong,early_{width},sizeof(early_{width}),&out)!=3U||out!=99U)return 8;
+    out=99U;if({entry}(handle,0,sizeof(early_{width}),&out)!=2U||out!=99U)return 9;
+    out=99U;if({entry}(handle,early_{width},(size_t)-1,&out)!=2U||out!=99U)return 10;
+    if({entry}(handle,early_{width},sizeof(early_{width}),0)!=2U)return 11;
+    if({entry}(handle,early_{width},sizeof(early_{width}),(uint64_t *)(void *)(misaligned+1))!=2U)return 12;
+  }}
+  uint8_t exhaustive[10];
+  for(size_t exhaustive_len=0U;exhaustive_len<=sizeof(exhaustive);exhaustive_len++){{
+    uint32_t combinations=1U<<(uint32_t)exhaustive_len;
+    for(uint32_t mask=0U;mask<combinations;mask++){{
+      for(size_t index=0U;index<exhaustive_len;index++)exhaustive[index]=((mask>>index)&1U)!=0U?'a':'b';
+      uint64_t expected=reference_nonoverlap_span_sum_a(exhaustive,exhaustive_len,{width}U);
+      out=99U;
+      if({entry}(handle,exhaustive,exhaustive_len,&out)!=0U||out!=expected)return 13;
+    }}
+  }}
+  return 0;
+}}
+"#,
+        )
+        .expect("write direct SpanSum C fixture");
+    }
+    source.push_str("int main(void){\n");
+    for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+        write!(
+            &mut source,
+            "int status_{width}=check_span_sum_{width}();if(status_{width}!=0)return {width}*100+status_{width};\n",
+        )
+        .expect("write direct SpanSum C main");
+    }
+    source.push_str("return 0;}\n");
+    let c_path = directory.join("direct-span-sum.c");
+    let executable = directory.join("direct-span-sum");
+    fs::write(&c_path, source).expect("write direct SpanSum C source");
+    let mut linker = Command::new(if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    });
+    linker.arg("-O2").arg(&c_path);
+    linker.args(&objects).arg("-o").arg(&executable);
+    let status = linker.status().expect("link direct SpanSum differential");
+    assert!(status.success(), "direct SpanSum differential failed to link");
+    let result = Command::new(&executable)
+        .output()
+        .expect("run direct SpanSum differential");
+    assert!(
+        result.status.success(),
+        "direct SpanSum differential status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove direct SpanSum linker directory");
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes both direct SpanSum cold-gate routes"]
+fn linked_host_direct_exact_singleton_span_sum_cold_gate_matches_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn initializer(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    let operating_system = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Macos
+    };
+    let target = direct_count_asimd_target(operating_system);
+    let compiled = compile_with_prepared_aggregate_exports(
+        direct_count_request(
+            "(?-u:\\x61\\x61)",
+            target,
+            CompileMode::Optimizing,
+            CompileLimitsV1::default().max_object_bytes,
+        ),
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("compile linked cold-gate direct SpanSum");
+    let report = compiled
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .expect("linked cold-gate direct SpanSum selected");
+    let short_max = report
+        .short_fallback_max_bytes
+        .expect("linked SpanSum short threshold");
+    assert_eq!(
+        short_max,
+        crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
+    );
+    assert!(compiled.module().required_runtime_symbols().next().is_none());
+    let entry = compiled
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("linked direct SpanSum symbol");
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-direct-span-sum-cold-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create direct SpanSum linker directory");
+    let object = directory.join("span-sum.o");
+    fs::write(&object, compiled.object()).expect("write direct SpanSum object");
+    let identity = initializer(&compiled.program().artifact_identity());
+    let source = format!(
+        r#"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#define IDENTITY_OFFSET {identity_offset}U
+#define SHORT_MAX {short_max}U
+extern uint32_t {entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t identity[32]={{{identity}}};
+static uint64_t reference_span_sum(const uint8_t *hay,size_t len){{
+  size_t offset=0U;uint64_t total=0U;
+  while(offset+2U<=len){{
+    if(hay[offset]=='a'&&hay[offset+1U]=='a'){{total+=2U;offset+=2U;}}
+    else offset++;
+  }}
+  return total;
+}}
+int main(void){{
+  uint8_t handle[IDENTITY_OFFSET+32U];
+  uint8_t wrong[IDENTITY_OFFSET+32U];
+  uint8_t misaligned[16];
+  static uint8_t hay[SHORT_MAX+3U];
+  memset(handle,0,sizeof(handle));memset(wrong,0,sizeof(wrong));
+  memcpy(handle+IDENTITY_OFFSET,identity,32U);
+  for(size_t index=0U;index<sizeof(hay);index++)hay[index]=(index%7U)==3U?'b':'a';
+  const size_t lengths[6]={{0U,1U,2U,SHORT_MAX,SHORT_MAX+1U,SHORT_MAX+2U}};
+  for(size_t index=0U;index<6U;index++){{
+    uint64_t out=UINT64_C(0x1122334455667788);
+    uint64_t expected=reference_span_sum(hay,lengths[index]);
+    if({entry}(handle,hay,lengths[index],&out)!=0U||out!=expected)return 1;
+  }}
+  uint64_t out=UINT64_C(0x1122334455667788);
+  if({entry}(wrong,hay,SHORT_MAX,&out)!=3U||out!=UINT64_C(0x1122334455667788))return 2;
+  out=UINT64_C(0x1122334455667788);
+  if({entry}(wrong,hay,SHORT_MAX+1U,&out)!=3U||out!=UINT64_C(0x1122334455667788))return 3;
+  out=UINT64_C(0x1122334455667788);
+  if({entry}(0,hay,SHORT_MAX+1U,&out)!=5U||out!=UINT64_C(0x1122334455667788))return 4;
+  if({entry}(handle,hay,SHORT_MAX+1U,0)!=2U)return 5;
+  if({entry}(handle,hay,SHORT_MAX+1U,(uint64_t *)(void *)(misaligned+1))!=2U)return 6;
+  const size_t invalid[3]={{SIZE_MAX,((size_t)UINT64_C(1))<<63,((((size_t)UINT64_C(1))<<63)+SHORT_MAX)}};
+  for(size_t index=0U;index<3U;index++){{
+    out=UINT64_C(0x1122334455667788);
+    if({entry}(wrong,hay,invalid[index],&out)!=2U||out!=UINT64_C(0x1122334455667788))return 7;
+    if({entry}(handle,hay,invalid[index],0)!=2U)return 8;
+  }}
+  return 0;
+}}
+"#,
+        identity_offset = crate::FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+    );
+    let c_path = directory.join("direct-span-sum.c");
+    let executable = directory.join("direct-span-sum");
+    fs::write(&c_path, source).expect("write direct SpanSum C source");
+    let mut linker = Command::new(if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    });
+    let status = linker
+        .arg("-O2")
+        .arg(&c_path)
+        .arg(&object)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("link direct SpanSum differential");
+    assert!(status.success(), "direct SpanSum differential failed to link");
+    let result = Command::new(&executable)
+        .output()
+        .expect("run direct SpanSum differential");
+    assert!(
+        result.status.success(),
+        "direct SpanSum differential status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove direct SpanSum linker directory");
+}
+
 
 #[cfg(all(
     target_arch = "aarch64",

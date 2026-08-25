@@ -37,6 +37,13 @@ use crate::{
         PreparedDirectExactSingletonCount,
         direct_exact_singleton_count_short_fallback_max_bytes,
     },
+    direct_span_sum_v1::{
+        DIRECT_EXACT_SINGLETON_SPAN_SUM_AOT_SCHEMA_VERSION,
+        DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+        DirectExactSingletonSpanSumAotReport, DirectExactSingletonSpanSumCostShape,
+        DirectExactSingletonSpanSumSelectionBasis,
+        DirectExactSingletonSpanSumSuccessorMode,
+    },
     dfa::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
     },
@@ -1693,6 +1700,13 @@ pub(crate) struct DirectExactSingletonCountPatchRollback {
     old_count_symbol_size: u64,
 }
 
+pub(crate) struct DirectExactSingletonSpanSumPatchRollback {
+    original_text: Box<[u8]>,
+    original_relocations: Option<Box<[ModuleRelocation]>>,
+    old_span_sum_symbol_name: String,
+    old_span_sum_symbol_size: u64,
+}
+
 const DIRECT_EXACT_SINGLETON_COUNT_DIRECT_THUNK_BYTES: usize = 16;
 
 struct DirectExactSingletonCountColdLong {
@@ -1700,6 +1714,27 @@ struct DirectExactSingletonCountColdLong {
     identity_page_offset: usize,
     identity_page_off12_offset: usize,
     core_branch_offset: usize,
+}
+
+struct DirectExactSingletonSpanSumColdLong {
+    code: Vec<u8>,
+    identity_page_offset: usize,
+    identity_page_off12_offset: usize,
+    wrapper_branch_offset: usize,
+}
+
+struct DirectExactSingletonSpanSumWrapper {
+    code: Vec<u8>,
+    count_call_offset: usize,
+}
+
+struct AuthenticatedDirectExactSingletonSpanSumIncumbent {
+    symbol_index: usize,
+    symbol_start: usize,
+    symbol_size: usize,
+    authenticated_body_offset: usize,
+    module_identity: [u8; 32],
+    identity_symbol_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1738,7 +1773,12 @@ pub struct CompiledModule {
     /// First instruction after the direct Count wrapper's complete public
     /// argument and artifact-identity authentication prefix.
     prepared_count_authenticated_body_offset: Option<usize>,
+    /// First instruction after the direct `SpanSum` wrapper's complete public
+    /// argument and artifact-identity authentication prefix.
+    prepared_span_sum_authenticated_body_offset: Option<usize>,
     direct_exact_singleton_count_aot_report: Option<DirectExactSingletonCountAotReport>,
+    direct_exact_singleton_span_sum_aot_report:
+        Option<DirectExactSingletonSpanSumAotReport>,
     runtime_symbol_index: Option<usize>,
     runtime_program_symbol_index: Option<usize>,
     start_accelerator: StartAccelerator,
@@ -6280,7 +6320,9 @@ impl CompiledModule {
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
             prepared_count_authenticated_body_offset: None,
+            prepared_span_sum_authenticated_body_offset: None,
             direct_exact_singleton_count_aot_report: None,
+            direct_exact_singleton_span_sum_aot_report: None,
             runtime_symbol_index,
             runtime_program_symbol_index,
             start_accelerator: lowering.start_accelerator,
@@ -6754,12 +6796,38 @@ impl CompiledModule {
         self.direct_exact_singleton_count_aot_report.as_ref()
     }
 
+    /// Return the exact authenticated direct `SpanSum` selection, when the
+    /// explicit aggregate portfolio chose it over the complete incumbent.
+    #[must_use]
+    pub const fn direct_exact_singleton_span_sum_aot_report(
+        &self,
+    ) -> Option<&DirectExactSingletonSpanSumAotReport> {
+        self.direct_exact_singleton_span_sum_aot_report.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn test_flip_text_byte(&mut self, offset: usize) -> bool {
         let Some(byte) = self.sections[TEXT_SECTION].data.get_mut(offset) else {
             return false;
         };
         *byte ^= 1;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_flip_text_relocation_addend_in_range(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        let Some(relocation) = self.relocations.iter_mut().find(|relocation| {
+            relocation.section == TEXT_SECTION
+                && usize::try_from(relocation.offset)
+                    .is_ok_and(|offset| (start..end).contains(&offset))
+        }) else {
+            return false;
+        };
+        relocation.addend ^= 1;
         true
     }
 
@@ -8098,6 +8166,9 @@ impl CompiledModule {
         } else {
             None
         };
+        let direct_span_sum_authenticated_body_relative = native_span_sum_wrapper
+            .as_ref()
+            .and_then(|wrapper| wrapper.authenticated_body_offset);
         let native_grep_count_wrapper = if native_grep_reducer {
             Some(match native_call.ok_or(ObjectError::InvalidModule(
                 "native GrepCount reducer has no local call kind",
@@ -8904,6 +8975,42 @@ impl CompiledModule {
                     ));
                 }
             };
+        let prepared_span_sum_authenticated_body_offset = match (
+            prepared_span_sum_symbol_index,
+            direct_span_sum_authenticated_body_relative,
+        ) {
+            (Some(index), Some(relative)) => {
+                let symbol = symbols.get(index).ok_or(ObjectError::InvalidModule(
+                    "direct SpanSum authentication symbol index is invalid",
+                ))?;
+                let start = usize::try_from(symbol.offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum authentication entry offset",
+                    )
+                })?;
+                let size = usize::try_from(symbol.size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum authentication entry size",
+                    )
+                })?;
+                if relative.checked_add(16).is_none_or(|end| end > size) {
+                    return Err(ObjectError::InvalidModule(
+                        "direct SpanSum authentication body is outside its entry",
+                    ));
+                }
+                Some(start.checked_add(relative).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum authentication body offset",
+                    ),
+                )?)
+            }
+            (None | Some(_), None) => None,
+            (None, Some(_)) => {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum authentication body has no SpanSum entry",
+                ));
+            }
+        };
         let canonical_identity_symbols = [
             (
                 new_runtime_program_symbol_index.unwrap_or(usize::MAX),
@@ -8984,7 +9091,10 @@ impl CompiledModule {
         self.prepared_aggregate_strategy = Some(aggregate_strategy);
         self.prepared_count_authenticated_body_offset =
             prepared_count_authenticated_body_offset;
+        self.prepared_span_sum_authenticated_body_offset =
+            prepared_span_sum_authenticated_body_offset;
         self.direct_exact_singleton_count_aot_report = None;
+        self.direct_exact_singleton_span_sum_aot_report = None;
         self.runtime_program_symbol_index = runtime_program_symbol_index;
         if let Some(entry) = operation_entry_symbol_index {
             self.entry_symbol_index = entry;
@@ -9839,6 +9949,877 @@ impl CompiledModule {
         self.symbols[count_index].name = old_count_symbol_name;
         self.symbols[count_index].size = old_count_symbol_size;
         self.direct_exact_singleton_count_aot_report = None;
+        Ok(())
+    }
+
+    fn authenticate_direct_exact_singleton_span_sum_incumbent(
+        &self,
+        artifact_identity: [u8; 32],
+    ) -> Result<AuthenticatedDirectExactSingletonSpanSumIncumbent, ObjectError> {
+        let authenticated_body_offset = self
+            .prepared_span_sum_authenticated_body_offset
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum incumbent has no authenticated body",
+            ))?;
+        let symbol_index = self.prepared_span_sum_symbol_index.ok_or(
+            ObjectError::InvalidModule("direct SpanSum incumbent has no SpanSum symbol"),
+        )?;
+        let span_sum = self.symbols.get(symbol_index).ok_or(
+            ObjectError::InvalidModule("direct SpanSum symbol index is invalid"),
+        )?;
+        let symbol_start = usize::try_from(span_sum.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum entry offset")
+        })?;
+        let symbol_size = usize::try_from(span_sum.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum entry size")
+        })?;
+        let symbol_end = symbol_start.checked_add(symbol_size).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum entry extent"),
+        )?;
+        let relative_body = authenticated_body_offset.checked_sub(symbol_start).ok_or(
+            ObjectError::InvalidModule(
+                "direct SpanSum authentication body precedes its entry",
+            ),
+        )?;
+        let mut expected = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::SpanSum,
+            NativeSpanReducerCallKind::DirectOrdinary,
+            false,
+        )?;
+        let call_offset = symbol_start
+            .checked_add(expected.prepared_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum incumbent call offset",
+            ))?;
+        let ordinary = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("direct SpanSum ordinary symbol index is invalid"),
+        )?;
+        let ordinary_offset = usize::try_from(ordinary.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum ordinary entry offset")
+        })?;
+        let call_instruction = aarch64_local_call_instruction(call_offset, ordinary_offset)?
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum incumbent call is out of range",
+            ))?;
+        let expected_call_end = expected.prepared_call_offset.checked_add(4).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum incumbent call extent"),
+        )?;
+        expected
+            .code
+            .get_mut(expected.prepared_call_offset..expected_call_end)
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum incumbent call escapes its entry",
+            ))?
+            .copy_from_slice(&call_instruction.to_le_bytes());
+        let NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+            page: identity_page,
+            page_offset: identity_page_offset,
+        } = expected.identity_relocation.ok_or(ObjectError::InvalidModule(
+            "direct SpanSum incumbent has no identity relocation",
+        ))?
+        else {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum incumbent identity relocation has the wrong ISA",
+            ));
+        };
+        let identity_page = symbol_start.checked_add(identity_page).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum identity ADRP offset"),
+        )?;
+        let identity_page_offset = symbol_start.checked_add(identity_page_offset).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum identity ADD offset"),
+        )?;
+        let mut incumbent_relocations = self.relocations.iter().filter(|relocation| {
+            relocation.section == TEXT_SECTION
+                && usize::try_from(relocation.offset)
+                    .is_ok_and(|offset| (symbol_start..symbol_end).contains(&offset))
+        });
+        let identity_page_relocation = incumbent_relocations.next().ok_or(
+            ObjectError::InvalidModule("direct SpanSum identity ADRP is absent"),
+        )?;
+        let identity_page_offset_relocation = incumbent_relocations.next().ok_or(
+            ObjectError::InvalidModule("direct SpanSum identity ADD is absent"),
+        )?;
+        if incumbent_relocations.next().is_some()
+            || identity_page_relocation.offset
+                != u64::try_from(identity_page).unwrap_or(u64::MAX)
+            || identity_page_relocation.kind != RelocationKind::Aarch64Page21
+            || identity_page_relocation.addend != 0
+            || identity_page_offset_relocation.offset
+                != u64::try_from(identity_page_offset).unwrap_or(u64::MAX)
+            || identity_page_offset_relocation.kind != RelocationKind::Aarch64PageOff12
+            || identity_page_offset_relocation.addend != 0
+            || identity_page_relocation.symbol != identity_page_offset_relocation.symbol
+            || identity_page >= authenticated_body_offset
+            || identity_page_offset >= authenticated_body_offset
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum incumbent relocation surface disagrees",
+            ));
+        }
+        let identity_symbol_index = identity_page_relocation.symbol;
+        let identity_data_symbol = self
+            .symbols
+            .get(identity_symbol_index)
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum identity symbol is invalid",
+            ))?;
+        let identity_offset = usize::try_from(identity_data_symbol.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum identity data offset")
+        })?;
+        let identity_end = identity_offset.checked_add(artifact_identity.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum identity data extent"),
+        )?;
+        if span_sum.binding != SymbolBinding::Global
+            || span_sum.kind != SymbolKind::Function
+            || span_sum.section != Some(TEXT_SECTION)
+            || !span_sum.name.starts_with(PREPARED_SPAN_SUM_SYMBOL_PREFIX)
+            || ordinary.binding != SymbolBinding::Global
+            || ordinary.kind != SymbolKind::Function
+            || ordinary.section != Some(TEXT_SECTION)
+            || symbol_size != expected.code.len()
+            || expected.authenticated_body_offset != Some(relative_body)
+            || relative_body.checked_add(16).is_none_or(|end| end > symbol_size)
+            || self.sections[TEXT_SECTION]
+                .data
+                .get(symbol_start..symbol_end)
+                != Some(expected.code.as_slice())
+            || identity_data_symbol.name != ".Lfre_aot_regex_prepared_aggregate_identity"
+            || identity_data_symbol.binding != SymbolBinding::Local
+            || identity_data_symbol.kind != SymbolKind::Object
+            || identity_data_symbol.section != Some(PROGRAM_SECTION)
+            || identity_data_symbol.size != 32
+            || self.sections[PROGRAM_SECTION].data.get(identity_offset..identity_end)
+                != Some(artifact_identity.as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum incumbent authentication prefix disagrees",
+            ));
+        }
+        let canonical = [(symbol_index, PREPARED_SPAN_SUM_SYMBOL_PREFIX)];
+        let module_identity = prepared_aggregate_module_digest(
+            self.target,
+            artifact_identity,
+            PreparedAggregateExports::SPAN_SUM,
+            PreparedAggregateStrategy::NativeFused,
+            self.sections[TEXT_SECTION].bytes(),
+            self.sections[PROGRAM_SECTION].bytes(),
+            &self.symbols,
+            &self.relocations,
+            &canonical,
+        )?;
+        Ok(AuthenticatedDirectExactSingletonSpanSumIncumbent {
+            symbol_index,
+            symbol_start,
+            symbol_size,
+            authenticated_body_offset,
+            module_identity,
+            identity_symbol_index,
+        })
+    }
+
+    /// Compose the audited direct Count-v3 core with a checked fixed-width
+    /// `SpanSum` leaf. Periodic widths retain the incumbent short path in its
+    /// original instruction slots and enter this composition only from a cold
+    /// long-input arm.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "incumbent authentication, failure-atomic layout, and receipt identity form one closed transaction"
+    )]
+    pub(crate) fn install_direct_exact_singleton_span_sum(
+        &mut self,
+        literal: &[u8],
+        artifact_identity: [u8; 32],
+        candidate: &PreparedDirectExactSingletonCount,
+    ) -> Result<Option<DirectExactSingletonSpanSumPatchRollback>, ObjectError> {
+        if self.target.architecture != Architecture::Aarch64
+            || self.target.abi != CallAbi::Aapcs64
+            || !self
+                .target
+                .features
+                .contains(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            || self.prepared_aggregate_exports != PreparedAggregateExports::SPAN_SUM
+            || self.prepared_aggregate_strategy != Some(PreparedAggregateStrategy::NativeFused)
+            || self.required_runtime_symbols().next().is_some()
+            || self.direct_exact_singleton_count_aot_report.is_some()
+            || self.direct_exact_singleton_span_sum_aot_report.is_some()
+            || !(1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+        {
+            return Ok(None);
+        }
+        if candidate.target != self.target
+            || candidate.artifact_identity != artifact_identity
+            || candidate.literal_sha256 != <[u8; 32]>::from(Sha256::digest(literal))
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 candidate binding disagrees",
+            ));
+        }
+        let candidate_recipe = fre_aot_optimizer::inspect_count_recipe_v3(
+            &candidate.canonical_recipe,
+        )
+        .map_err(|_| {
+            ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 canonical recipe authentication failed",
+            )
+        })?;
+        if candidate_recipe.identity().as_bytes() != &candidate.recipe_identity {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 canonical recipe identity disagrees",
+            ));
+        }
+        let Some(_) = self.prepared_span_sum_authenticated_body_offset else {
+            return Ok(None);
+        };
+        let incumbent =
+            self.authenticate_direct_exact_singleton_span_sum_incumbent(artifact_identity)?;
+        let original_text_bytes = self.sections[TEXT_SECTION].data.len();
+        let symbol_end = incumbent
+            .symbol_start
+            .checked_add(incumbent.symbol_size)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum incumbent extent",
+            ))?;
+        if symbol_end > original_text_bytes || !original_text_bytes.is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum incumbent text extent is invalid",
+            ));
+        }
+        let text_alignment = usize::try_from(self.sections[TEXT_SECTION].alignment).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum text section alignment")
+        })?;
+        if !text_alignment
+            .is_multiple_of(DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES)
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum text section cannot honor producer alignment",
+            ));
+        }
+        let short_fallback_max_bytes =
+            direct_exact_singleton_count_short_fallback_max_bytes(
+                candidate_recipe.strategy(),
+                literal.len(),
+            );
+        if short_fallback_max_bytes.is_some() && symbol_end != original_text_bytes {
+            return Ok(None);
+        }
+        if short_fallback_max_bytes.is_some() {
+            for (symbol_index, symbol) in self.symbols.iter().enumerate() {
+                if symbol_index == incumbent.symbol_index
+                    || symbol.section != Some(TEXT_SECTION)
+                {
+                    continue;
+                }
+                let offset = usize::try_from(symbol.offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum incumbent text symbol offset",
+                    )
+                })?;
+                let bytes = usize::try_from(symbol.size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum incumbent text symbol size",
+                    )
+                })?;
+                let end = offset.checked_add(bytes).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum incumbent text symbol extent",
+                    ),
+                )?;
+                if offset >= incumbent.authenticated_body_offset
+                    || end > incumbent.authenticated_body_offset
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "direct SpanSum incumbent body has an unaudited symbol",
+                    ));
+                }
+            }
+        }
+
+        let literal_bytes = u8::try_from(literal.len()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum literal width")
+        })?;
+        let mut cold_long = short_fallback_max_bytes
+            .map(|_| lower_aarch64_direct_exact_singleton_span_sum_cold_long())
+            .transpose()?;
+        let cold_long_offset = cold_long.as_ref().map(|_| original_text_bytes);
+        let cold_long_bytes = cold_long.as_ref().map(|cold| cold.code.len());
+        let mut wrapper =
+            lower_aarch64_direct_exact_singleton_span_sum_wrapper(literal_bytes)?;
+        let wrapper_offset = original_text_bytes
+            .checked_add(cold_long_bytes.unwrap_or(0))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum wrapper offset",
+            ))?;
+        let wrapper_end = wrapper_offset.checked_add(wrapper.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum wrapper extent"),
+        )?;
+        let core_alignment =
+            DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES;
+        if !core_alignment.is_power_of_two() || core_alignment < 4 {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 core alignment is invalid",
+            ));
+        }
+        let core_offset = wrapper_end
+            .checked_add(core_alignment - 1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum Count-v3 core alignment",
+            ))?
+            & !(core_alignment - 1);
+        let wrapper_to_core_padding_bytes = core_offset.checked_sub(wrapper_end).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum Count-v3 core padding"),
+        )?;
+        if !wrapper_to_core_padding_bytes.is_multiple_of(4)
+            || !core_offset.is_multiple_of(core_alignment)
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 core is not producer aligned",
+            ));
+        }
+        let final_text_bytes = core_offset.checked_add(candidate.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum Count-v3 core extent"),
+        )?;
+        let selected_symbol_size = if short_fallback_max_bytes.is_some() {
+            core_offset.checked_sub(incumbent.symbol_start).ok_or(
+                ObjectError::InvalidModule(
+                    "direct SpanSum selected symbol extent is invalid",
+                ),
+            )?
+        } else {
+            incumbent.symbol_size
+        };
+        let selected_symbol_size = u64::try_from(selected_symbol_size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum selected symbol size")
+        })?;
+        let incumbent_code_bytes = u32::try_from(incumbent.symbol_size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum incumbent code bytes")
+        })?;
+        let appended_code_bytes = final_text_bytes.checked_sub(original_text_bytes).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum appended code bytes"),
+        )?;
+        let selected_code_bytes = incumbent
+            .symbol_size
+            .checked_add(appended_code_bytes)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum selected code bytes",
+            ))?;
+        let incumbent_cost = DirectExactSingletonSpanSumCostShape {
+            scan_passes: 1,
+            native_scan_entries_per_operation: 1,
+            native_calls_per_match: 1,
+            internal_span_publications_per_match: 1,
+            unresolved_runtime_helpers: 0,
+            code_bytes: incumbent_code_bytes,
+        };
+        let selected_cost = DirectExactSingletonSpanSumCostShape {
+            scan_passes: 1,
+            native_scan_entries_per_operation: 1,
+            native_calls_per_match: 0,
+            internal_span_publications_per_match: 0,
+            unresolved_runtime_helpers: 0,
+            code_bytes: selected_code_bytes,
+        };
+        let incumbent_components = incumbent_cost.runtime_components();
+        let selected_components = selected_cost.runtime_components();
+        let no_worse = selected_components
+            .iter()
+            .zip(incumbent_components)
+            .all(|(selected, incumbent)| *selected <= incumbent);
+        let strictly_better = selected_components
+            .iter()
+            .zip(incumbent_components)
+            .any(|(selected, incumbent)| *selected < incumbent);
+        if !no_worse
+            || (!strictly_better && selected_cost.code_bytes >= incumbent_cost.code_bytes)
+        {
+            return Ok(None);
+        }
+
+        let relative_body = incumbent
+            .authenticated_body_offset
+            .checked_sub(incumbent.symbol_start)
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum authenticated body precedes its symbol",
+            ))?;
+        let expected = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::SpanSum,
+            NativeSpanReducerCallKind::DirectOrdinary,
+            false,
+        )?;
+        let hot_gate = if let (Some(short_max), Some(cold_offset), Some(cold)) = (
+            short_fallback_max_bytes,
+            cold_long_offset,
+            cold_long.as_mut(),
+        ) {
+            let direct_min = short_max.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("direct SpanSum short threshold"),
+            )?;
+            if !direct_min.is_multiple_of(1 << 12) {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum short threshold is not page aligned",
+                ));
+            }
+            let pages = u16::try_from(direct_min >> 12).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct SpanSum short threshold pages")
+            })?;
+            let (relative_compare, relative_branch) =
+                aarch64_prepared_signed_length_check(&expected.code, relative_body)?;
+            let compare_offset = incumbent
+                .symbol_start
+                .checked_add(relative_compare)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum length compare offset",
+                ))?;
+            let branch_offset = incumbent
+                .symbol_start
+                .checked_add(relative_branch)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum length branch offset",
+                ))?;
+            let Some(cold_branch) = aarch64_local_cond_branch_instruction(
+                branch_offset,
+                cold_offset,
+                AARCH64_HS,
+            )? else {
+                return Ok(None);
+            };
+            let wrapper_branch_offset = cold_offset
+                .checked_add(cold.wrapper_branch_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum cold wrapper branch offset",
+                ))?;
+            let Some(wrapper_branch) =
+                aarch64_local_branch_instruction(wrapper_branch_offset, wrapper_offset)?
+            else {
+                return Ok(None);
+            };
+            let wrapper_branch_end = cold
+                .wrapper_branch_offset
+                .checked_add(4)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum cold wrapper branch extent",
+                ))?;
+            cold.code
+                .get_mut(cold.wrapper_branch_offset..wrapper_branch_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct SpanSum cold wrapper branch escapes its stub",
+                ))?
+                .copy_from_slice(&wrapper_branch.to_le_bytes());
+            Some((
+                compare_offset,
+                [aarch64_cmp_x_imm_lsl12(2, pages)?, cold_branch],
+            ))
+        } else {
+            None
+        };
+        let direct_patch = if hot_gate.is_none() {
+            let branch = aarch64_local_branch_instruction(
+                incumbent.authenticated_body_offset,
+                wrapper_offset,
+            )?
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum wrapper branch is out of range",
+            ))?;
+            Some([branch, 0xd503_201f, 0xd503_201f, 0xd503_201f])
+        } else {
+            None
+        };
+        let call_offset = wrapper_offset
+            .checked_add(wrapper.count_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum Count-v3 call offset",
+            ))?;
+        let call = aarch64_local_call_instruction(call_offset, core_offset)?.ok_or(
+            ObjectError::InvalidModule("direct SpanSum Count-v3 call is out of range"),
+        )?;
+        let call_end = wrapper.count_call_offset.checked_add(4).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum Count-v3 call extent"),
+        )?;
+        wrapper
+            .code
+            .get_mut(wrapper.count_call_offset..call_end)
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 call escapes wrapper",
+            ))?
+            .copy_from_slice(&call.to_le_bytes());
+
+        let mut text = Vec::new();
+        text.try_reserve_exact(final_text_bytes)
+            .map_err(|_| ObjectError::Allocation("direct SpanSum module text"))?;
+        text.extend_from_slice(&self.sections[TEXT_SECTION].data);
+        if let Some((compare_offset, gate)) = hot_gate {
+            let patch_end = compare_offset.checked_add(8).ok_or(
+                ObjectError::ArithmeticOverflow("direct SpanSum cold gate extent"),
+            )?;
+            let patch = text.get_mut(compare_offset..patch_end).ok_or(
+                ObjectError::InvalidModule(
+                    "direct SpanSum cold gate escapes the incumbent wrapper",
+                ),
+            )?;
+            for (slot, instruction) in patch.chunks_exact_mut(4).zip(gate) {
+                slot.copy_from_slice(&instruction.to_le_bytes());
+            }
+            let cold = cold_long.as_ref().ok_or(ObjectError::InvalidModule(
+                "direct SpanSum cold gate lost its long stub",
+            ))?;
+            if cold_long_offset != Some(text.len()) {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum cold-long offset disagrees",
+                ));
+            }
+            text.extend_from_slice(&cold.code);
+        } else {
+            let patch = direct_patch.ok_or(ObjectError::InvalidModule(
+                "direct SpanSum direct patch is absent",
+            ))?;
+            let patch_end = incumbent
+                .authenticated_body_offset
+                .checked_add(16)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum authenticated patch extent",
+                ))?;
+            for (slot, instruction) in text
+                .get_mut(incumbent.authenticated_body_offset..patch_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct SpanSum authenticated patch escapes its entry",
+                ))?
+                .chunks_exact_mut(4)
+                .zip(patch)
+            {
+                slot.copy_from_slice(&instruction.to_le_bytes());
+            }
+        }
+        text.extend_from_slice(&wrapper.code);
+        while text.len() < core_offset {
+            text.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+        }
+        text.extend_from_slice(&candidate.code);
+        let embedded_wrapper = text.get(wrapper_offset..wrapper_end).ok_or(
+            ObjectError::InvalidModule("direct SpanSum wrapper escapes selected text"),
+        )?;
+        let wrapper_sha256 = authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+            literal_bytes,
+            wrapper_offset,
+            core_offset,
+            embedded_wrapper,
+        )?;
+        let embedded_core = text.get(core_offset..final_text_bytes).ok_or(
+            ObjectError::InvalidModule("direct SpanSum Count-v3 core escapes selected text"),
+        )?;
+        candidate.authenticate_embedded(literal, core_offset, embedded_core)?;
+
+        let selected_relocations = if let (Some(cold_offset), Some(cold)) =
+            (cold_long_offset, cold_long.as_ref())
+        {
+            let selected_count = self.relocations.len().checked_add(2).ok_or(
+                ObjectError::ArithmeticOverflow(
+                    "direct SpanSum selected relocation count",
+                ),
+            )?;
+            let mut relocations = Vec::new();
+            relocations
+                .try_reserve_exact(selected_count)
+                .map_err(|_| ObjectError::Allocation("direct SpanSum relocations"))?;
+            relocations.extend_from_slice(&self.relocations);
+            for (relative, kind) in [
+                (cold.identity_page_offset, RelocationKind::Aarch64Page21),
+                (
+                    cold.identity_page_off12_offset,
+                    RelocationKind::Aarch64PageOff12,
+                ),
+            ] {
+                let offset = cold_offset.checked_add(relative).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum cold identity relocation offset",
+                    ),
+                )?;
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: u64::try_from(offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct SpanSum cold identity relocation",
+                        )
+                    })?,
+                    kind,
+                    symbol: incumbent.identity_symbol_index,
+                    addend: 0,
+                });
+            }
+            Some(relocations.into_boxed_slice())
+        } else {
+            None
+        };
+        let selection_basis = if short_fallback_max_bytes.is_some() {
+            DirectExactSingletonSpanSumSelectionBasis::ExactWidthCountCompositionWithShortIncumbent
+        } else {
+            DirectExactSingletonSpanSumSelectionBasis::ExactWidthCountComposition
+        };
+        let mut selected_identity = Sha256::new();
+        selected_identity.update(
+            b"fre-aot-regex/direct-exact-singleton-span-sum-module/v3\0",
+        );
+        selected_identity.update(incumbent.module_identity);
+        selected_identity.update(artifact_identity);
+        selected_identity.update(candidate.recipe_identity);
+        selected_identity.update(wrapper_sha256);
+        selected_identity.update(candidate.core_sha256);
+        selected_identity.update([
+            literal_bytes,
+            1, // NonOverlapping successor.
+            if short_fallback_max_bytes.is_some() { 2 } else { 1 },
+        ]);
+        selected_identity.update(short_fallback_max_bytes.unwrap_or(0).to_le_bytes());
+        for extent in [
+            incumbent.authenticated_body_offset,
+            cold_long_offset.unwrap_or(0),
+            cold_long_bytes.unwrap_or(0),
+            wrapper_offset,
+            wrapper.code.len(),
+            wrapper_to_core_padding_bytes,
+            core_offset,
+            text_alignment,
+            core_alignment,
+            candidate.code.len(),
+        ] {
+            selected_identity.update(
+                u64::try_from(extent)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct SpanSum selected identity extent",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+        }
+        selected_identity.update(selected_symbol_size.to_le_bytes());
+        selected_identity.update(incumbent_cost.runtime_components());
+        selected_identity.update(incumbent_cost.code_bytes.to_le_bytes());
+        selected_identity.update(selected_cost.runtime_components());
+        selected_identity.update(selected_cost.code_bytes.to_le_bytes());
+        selected_identity.update(Sha256::digest(&text));
+        let identity_relocations = selected_relocations
+            .as_deref()
+            .unwrap_or(&self.relocations);
+        selected_identity.update(
+            u64::try_from(identity_relocations.len())
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum selected relocation identity count",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        for relocation in identity_relocations {
+            selected_identity.update(
+                u64::try_from(relocation.section)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct SpanSum selected relocation identity section",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+            selected_identity.update(relocation.offset.to_le_bytes());
+            selected_identity.update([match relocation.kind {
+                RelocationKind::X86PcRelative32 => 1,
+                RelocationKind::X86PltRelative32 => 2,
+                RelocationKind::Aarch64Page21 => 3,
+                RelocationKind::Aarch64PageOff12 => 4,
+                RelocationKind::Aarch64Branch26 => 5,
+            }]);
+            selected_identity.update(
+                u64::try_from(relocation.symbol)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct SpanSum selected relocation identity symbol",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+            selected_identity.update(relocation.addend.to_le_bytes());
+        }
+        let module_identity: [u8; 32] = selected_identity.finalize().into();
+        let span_sum_name =
+            identity_symbol(PREPARED_SPAN_SUM_SYMBOL_PREFIX, &module_identity)?;
+        let selected_text = text.into_boxed_slice();
+        let original_relocations = selected_relocations
+            .map(|selected| std::mem::replace(&mut self.relocations, selected));
+        let original_text =
+            std::mem::replace(&mut self.sections[TEXT_SECTION].data, selected_text);
+        let old_span_sum_symbol_name = std::mem::replace(
+            &mut self.symbols[incumbent.symbol_index].name,
+            span_sum_name,
+        );
+        let old_span_sum_symbol_size = std::mem::replace(
+            &mut self.symbols[incumbent.symbol_index].size,
+            selected_symbol_size,
+        );
+        self.direct_exact_singleton_span_sum_aot_report = Some(
+            DirectExactSingletonSpanSumAotReport {
+                schema_version: DIRECT_EXACT_SINGLETON_SPAN_SUM_AOT_SCHEMA_VERSION,
+                literal_bytes,
+                successor_mode: DirectExactSingletonSpanSumSuccessorMode::NonOverlapping,
+                selection_basis,
+                count_recipe_strategy: candidate_recipe.strategy(),
+                incumbent_strategy: PreparedAggregateStrategy::NativeFused,
+                incumbent_cost,
+                selected_cost,
+                authenticated_wrapper_body_offset: incumbent.authenticated_body_offset,
+                short_fallback_max_bytes,
+                cold_long_offset,
+                cold_long_bytes,
+                wrapper_offset,
+                wrapper_bytes: wrapper.code.len(),
+                wrapper_sha256,
+                wrapper_to_core_padding_bytes,
+                core_offset,
+                text_section_alignment_bytes: text_alignment,
+                core_alignment_bytes: core_alignment,
+                core_bytes: candidate.code.len(),
+                core_sha256: candidate.core_sha256,
+                compile_identity: candidate.compile_identity,
+                object_identity: candidate.object_identity,
+                recipe_identity: candidate.recipe_identity,
+                module_identity,
+            },
+        );
+        Ok(Some(DirectExactSingletonSpanSumPatchRollback {
+            original_text,
+            original_relocations,
+            old_span_sum_symbol_name,
+            old_span_sum_symbol_size,
+        }))
+    }
+
+    /// Restore the byte-identical incumbent after a proven final object-byte
+    /// cap decline. Allocator failure is terminal and never reaches here.
+    pub(crate) fn rollback_direct_exact_singleton_span_sum(
+        &mut self,
+        rollback: DirectExactSingletonSpanSumPatchRollback,
+    ) -> Result<(), ObjectError> {
+        let DirectExactSingletonSpanSumPatchRollback {
+            original_text,
+            original_relocations,
+            old_span_sum_symbol_name,
+            old_span_sum_symbol_size,
+        } = rollback;
+        let report = self
+            .direct_exact_singleton_span_sum_aot_report
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum rollback has no selected report",
+            ))?;
+        let original_text_bytes = original_text.len();
+        let gated = report.short_fallback_max_bytes.is_some();
+        if report.core_alignment_bytes
+            != DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES
+            || !report.core_offset.is_multiple_of(report.core_alignment_bytes)
+            || usize::try_from(self.sections[TEXT_SECTION].alignment).ok()
+                != Some(report.text_section_alignment_bytes)
+            || !report
+                .text_section_alignment_bytes
+                .is_multiple_of(report.core_alignment_bytes)
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum rollback core alignment disagrees",
+            ));
+        }
+        if gated {
+            let (Some(cold_offset), Some(cold_bytes), Some(original_relocations_ref)) = (
+                report.cold_long_offset,
+                report.cold_long_bytes,
+                original_relocations.as_ref(),
+            ) else {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum rollback cold-long fields are absent",
+                ));
+            };
+            if cold_offset != original_text_bytes
+                || cold_offset.checked_add(cold_bytes) != Some(report.wrapper_offset)
+                || self.relocations.len()
+                    != original_relocations_ref.len().checked_add(2).unwrap_or(usize::MAX)
+            {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum rollback cold-long layout disagrees",
+                ));
+            }
+        } else if report.cold_long_offset.is_some()
+            || report.cold_long_bytes.is_some()
+            || original_relocations.is_some()
+            || report.wrapper_offset != original_text_bytes
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum rollback ungated layout disagrees",
+            ));
+        }
+        let wrapper_end = report
+            .wrapper_offset
+            .checked_add(report.wrapper_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum rollback wrapper extent",
+            ))?;
+        if wrapper_end.checked_add(report.wrapper_to_core_padding_bytes)
+                != Some(report.core_offset)
+            || report.wrapper_to_core_padding_bytes >= report.core_alignment_bytes
+            || !report.wrapper_to_core_padding_bytes.is_multiple_of(4)
+            || self.sections[TEXT_SECTION]
+                .data
+                .get(wrapper_end..report.core_offset)
+                .is_none_or(|padding| {
+                    !padding
+                        .chunks_exact(4)
+                        .all(|word| word == 0xd503_201f_u32.to_le_bytes())
+                })
+            || report.core_offset.checked_add(report.core_bytes)
+                != Some(self.sections[TEXT_SECTION].data.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum rollback checkpoint disagrees",
+            ));
+        }
+        let span_sum_index = self.prepared_span_sum_symbol_index.ok_or(
+            ObjectError::InvalidModule("direct SpanSum rollback lost SpanSum symbol"),
+        )?;
+        let span_sum = self.symbols.get(span_sum_index).ok_or(
+            ObjectError::InvalidModule("direct SpanSum rollback symbol is invalid"),
+        )?;
+        let selected_size_delta = if gated {
+            u64::try_from(
+                report
+                    .cold_long_bytes
+                    .unwrap_or(0)
+                    .checked_add(report.wrapper_bytes)
+                    .and_then(|bytes| {
+                        bytes.checked_add(report.wrapper_to_core_padding_bytes)
+                    })
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "direct SpanSum rollback selected size delta",
+                    ))?,
+            )
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "direct SpanSum rollback selected symbol size delta",
+                )
+            })?
+        } else {
+            0
+        };
+        let expected_selected_size = old_span_sum_symbol_size
+            .checked_add(selected_size_delta)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum rollback selected symbol size",
+            ))?;
+        if span_sum.size != expected_selected_size {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum rollback symbol size disagrees",
+            ));
+        }
+        self.sections[TEXT_SECTION].data = original_text;
+        if let Some(original_relocations) = original_relocations {
+            self.relocations = original_relocations;
+        }
+        self.symbols[span_sum_index].name = old_span_sum_symbol_name;
+        self.symbols[span_sum_index].size = old_span_sum_symbol_size;
+        self.direct_exact_singleton_span_sum_aot_report = None;
         Ok(())
     }
 
@@ -29582,7 +30563,9 @@ fn native_regex_redux_module(
         prepared_aggregate_exports: PreparedAggregateExports::NONE,
         prepared_aggregate_strategy: None,
         prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
         direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
         runtime_symbol_index: None,
         runtime_program_symbol_index: None,
         start_accelerator: StartAccelerator::None,
@@ -29728,7 +30711,9 @@ fn native_weighted_capture_module(
         prepared_aggregate_exports: PreparedAggregateExports::NONE,
         prepared_aggregate_strategy: None,
         prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
         direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
         runtime_symbol_index: None,
         runtime_program_symbol_index: None,
         start_accelerator: StartAccelerator::None,
@@ -30168,7 +31153,9 @@ fn native_rebar_multi_grep_module_v1(
         prepared_aggregate_exports: PreparedAggregateExports::NONE,
         prepared_aggregate_strategy: None,
         prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
         direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
         runtime_symbol_index: None,
         runtime_program_symbol_index: None,
         start_accelerator: StartAccelerator::None,
@@ -46585,6 +47572,146 @@ fn lower_aarch64_direct_count_cold_long(
         identity_page_off12_offset: offsets[1],
         core_branch_offset: offsets[2],
     })
+}
+
+fn lower_aarch64_direct_exact_singleton_span_sum_cold_long(
+) -> Result<DirectExactSingletonSpanSumColdLong, ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    // The hot wrapper's unsigned threshold deliberately routes every length
+    // with bit 63 set here. Preserve the incumbent's invalid-length precedence
+    // before inspecting the output pointer or prepared handle.
+    assembler.branch_bit_set_x(2, 63, invalid)?;
+    aarch64_emit_prepared_scalar_output_validation(&mut assembler, invalid)?;
+    let [identity_page, identity_page_offset] =
+        aarch64_emit_prepared_artifact_identity_validation(
+            &mut assembler,
+            wrong_identity,
+        )?;
+    let wrapper_branch = assembler.instruction(0x1400_0000)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [identity_page, identity_page_offset, wrapper_branch];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(DirectExactSingletonSpanSumColdLong {
+        code,
+        identity_page_offset: offsets[0],
+        identity_page_off12_offset: offsets[1],
+        wrapper_branch_offset: offsets[2],
+    })
+}
+
+/// Lower the private, operation-specific bridge from the authenticated
+/// four-argument prepared `SpanSum` ABI to the three-argument Count-v3 core.
+///
+/// The exact-singleton proof makes every accepted non-overlapping span have
+/// `literal_bytes` bytes, so the result is `count * literal_bytes`. The
+/// multiplication is checked independently and the result is not published
+/// until the Count core and both bounds checks succeed.
+fn lower_aarch64_direct_exact_singleton_span_sum_wrapper(
+    literal_bytes: u8,
+) -> Result<DirectExactSingletonSpanSumWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 48;
+    const COUNT_OFFSET: u16 = 0;
+    if !(1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES)
+        .contains(&usize::from(literal_bytes))
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct SpanSum literal width is unsupported",
+        ));
+    }
+
+    let mut assembler = Aarch64Assembler::new();
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+
+    // The public entry or cold arm has already validated the handle, haystack
+    // extent, output pointer/alignment, and artifact identity. Preserve the
+    // original output and length across Count-v3.
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_mov_x(19, 3)?)?;
+    assembler.instruction(aarch64_mov_x(20, 2)?)?;
+
+    // Count-v3: (haystack, length, private_count_out) -> status.
+    assembler.instruction(aarch64_mov_x(0, 1)?)?;
+    assembler.instruction(aarch64_mov_x(1, 2)?)?;
+    assembler.instruction(aarch64_add_x_imm(2, 31, COUNT_OFFSET)?)?;
+    let count_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+
+    assembler.instruction(aarch64_load_x_imm(8, 31, COUNT_OFFSET)?)?;
+    assembler.instruction(aarch64_movz_x(9, u16::from(literal_bytes), 0)?)?;
+    assembler.instruction(aarch64_umulh_x(10, 8, 9)?)?;
+    assembler.branch_nonzero_x(10, overflow)?;
+    assembler.instruction(aarch64_mul_x(8, 8, 9)?)?;
+    // Redundant for a correct Count-v3 core, but independently authenticate
+    // the semantic invariant SpanSum <= haystack length at the seam.
+    assembler.instruction(aarch64_cmp_x(8, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, overflow)?;
+    assembler.instruction(aarch64_store_x(8, 19, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [count_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(DirectExactSingletonSpanSumWrapper {
+        code,
+        count_call_offset: offsets[0],
+    })
+}
+
+/// Regenerate and byte-authenticate the operation-specific wrapper after its
+/// sole local call has been bound to the independently audited Count-v3 core.
+pub(crate) fn authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+    literal_bytes: u8,
+    wrapper_offset: usize,
+    core_offset: usize,
+    embedded: &[u8],
+) -> Result<[u8; 32], ObjectError> {
+    let mut expected =
+        lower_aarch64_direct_exact_singleton_span_sum_wrapper(literal_bytes)?;
+    let call_offset = wrapper_offset
+        .checked_add(expected.count_call_offset)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "direct SpanSum wrapper call offset",
+        ))?;
+    let call = aarch64_local_call_instruction(call_offset, core_offset)?.ok_or(
+        ObjectError::InvalidModule("direct SpanSum wrapper call is out of range"),
+    )?;
+    let call_end = expected.count_call_offset.checked_add(4).ok_or(
+        ObjectError::ArithmeticOverflow("direct SpanSum wrapper call extent"),
+    )?;
+    expected
+        .code
+        .get_mut(expected.count_call_offset..call_end)
+        .ok_or(ObjectError::InvalidModule(
+            "direct SpanSum wrapper call escapes regenerated code",
+        ))?
+        .copy_from_slice(&call.to_le_bytes());
+    if embedded != expected.code.as_slice() {
+        return Err(ObjectError::InvalidModule(
+            "direct SpanSum embedded wrapper authentication failed",
+        ));
+    }
+    Ok(Sha256::digest(embedded).into())
 }
 
 #[allow(
@@ -117402,7 +118529,9 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_aggregate_exports: PreparedAggregateExports::NONE,
                 prepared_aggregate_strategy: None,
                 prepared_count_authenticated_body_offset: None,
+                prepared_span_sum_authenticated_body_offset: None,
                 direct_exact_singleton_count_aot_report: None,
+                direct_exact_singleton_span_sum_aot_report: None,
                 runtime_symbol_index: None,
                 runtime_program_symbol_index: None,
                 start_accelerator: StartAccelerator::None,
@@ -117735,7 +118864,9 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
             prepared_count_authenticated_body_offset: None,
+            prepared_span_sum_authenticated_body_offset: None,
             direct_exact_singleton_count_aot_report: None,
+            direct_exact_singleton_span_sum_aot_report: None,
             runtime_symbol_index: None,
             runtime_program_symbol_index: None,
             start_accelerator: StartAccelerator::None,
