@@ -144,6 +144,28 @@ fn fused_full_existence_preserves_prefix_duplicate_raw_byte_and_incumbent_routes
         );
         assert_eq!(value_flags, expected_flags);
 
+        let mut retained_flags = (0..PATTERNS.len())
+            .map(|index| index % 3 == 0)
+            .collect::<Vec<_>>();
+        let retained_before = retained_flags.clone();
+        let value_matched = set
+            .matches_read_at_value(
+                &mut retained_flags,
+                haystack,
+                start,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("fused caller-buffer search with retained flags");
+        assert_eq!(value_matched, matched);
+        assert_eq!(
+            retained_flags,
+            retained_before
+                .iter()
+                .zip(expected_flags.iter())
+                .map(|(&retained, &matched)| retained || matched)
+                .collect::<Vec<_>>(),
+        );
+
         let mut session = set
             .search_session(PortableRegexSetSessionLimits::unlimited())
             .expect("incumbent constituent sessions");
@@ -193,6 +215,67 @@ fn fused_full_existence_preserves_prefix_duplicate_raw_byte_and_incumbent_routes
             .is_match_value_unlimited(b"__\xFF\x00__")
             .expect("cloned fused full existence")
     );
+}
+
+#[test]
+fn fused_all_id_negative_certificate_preserves_absent_caller_flags_and_ranges() {
+    let patterns = [
+        "literal_00",
+        "literal_01",
+        "literal_02",
+        "literal_03",
+        "literal_04",
+        "literal_05",
+        "literal_06",
+        "literal_07",
+    ];
+    let set = PortableRegexSet::new(patterns).expect("uniform fused exact-literal set");
+    assert!(set.build_report().fused_literal_set_build.is_some());
+    let haystack = b"prefix without any selected word";
+
+    for start in [0, 1, haystack.len()] {
+        let mut flags = [false, true, false, false, true, false, false, true, true];
+        let before = flags;
+        assert!(
+            !set.matches_read_at_value(
+                &mut flags,
+                haystack,
+                start,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("fused all-ID negative certificate")
+        );
+        assert_eq!(flags, before);
+    }
+
+    for matched_id in [None, Some(0_usize), Some(patterns.len() - 1)] {
+        let mut long = [b'x'; 256];
+        if let Some(index) = matched_id {
+            let needle = patterns[index].as_bytes();
+            let at = long.len() - needle.len() - 3;
+            long[at..at + needle.len()].copy_from_slice(needle);
+        }
+        let mut flags = [false, true, false, false, true, false, false, true, true];
+        let before = flags;
+        assert_eq!(
+            set.matches_read_at_value(
+                &mut flags,
+                &long,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("long fused all-ID value route"),
+            matched_id.is_some(),
+        );
+        for index in 0..patterns.len() {
+            assert_eq!(
+                flags[index],
+                before[index] || matched_id == Some(index),
+                "wrong flag for matched ID {matched_id:?} at index {index}",
+            );
+        }
+        assert_eq!(flags[patterns.len()], before[patterns.len()]);
+    }
 }
 
 #[test]

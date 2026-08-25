@@ -59,16 +59,34 @@ fn fused_exact_literal_full_existence_has_no_execution_allocations() {
     }));
     assert!(set.build_report().fused_literal_set_storage_bytes > 0);
 
+    let long_absent = [b'x'; 256];
+    let mut long_first = [b'x'; 256];
+    long_first[200..205].copy_from_slice(b"alpha");
+    let mut long_suffix = [b'x'; 256];
+    long_suffix[200..205].copy_from_slice(b"delta");
+
     let region = Region::new(GLOBAL);
     for haystack in [
         b"no-match".as_slice(),
         b"prefix alphabet suffix".as_slice(),
         b"raw \xFF\x00 bytes".as_slice(),
+        long_absent.as_slice(),
+        long_first.as_slice(),
+        long_suffix.as_slice(),
     ] {
         for _ in 0..32 {
             let _ = set
                 .is_match_value_unlimited(haystack)
                 .expect("fused full existence");
+            let mut flags = [false; 8];
+            let _ = set
+                .matches_read_at_value(
+                    &mut flags,
+                    haystack,
+                    0,
+                    PortableRegexSetRunLimits::unlimited(),
+                )
+                .expect("fused caller-buffer all-ID value search");
         }
     }
     assert_eq!(region.change(), Stats::default());

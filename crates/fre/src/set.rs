@@ -712,9 +712,11 @@ impl PortableRegexSet {
     /// leading-byte-gated origin probe, then search pattern zero independently
     /// and use the sidecar after those misses. Short inputs whose leading byte
     /// could begin a literal retain source-ordered constituent execution.
-    /// Ranged, accounted, session and all-ID APIs always execute every
-    /// independent constituent. Use [`Self::is_match`] when finite work,
-    /// scratch, or pattern-count limits must be enforced.
+    /// Ranged, accounted and session APIs always execute their independent
+    /// constituents. The unlimited caller-buffer all-ID route may use the
+    /// same sidecar only to certify that no suffix ID can match. Use
+    /// [`Self::is_match`] when finite work, scratch, or pattern-count limits
+    /// must be enforced.
     #[inline(always)]
     pub fn is_match_value_unlimited(
         &self,
@@ -1002,7 +1004,11 @@ impl PortableRegexSet {
     /// Calls with any finite set or constituent limit retain the exact
     /// accounted implementation, including cumulative work, partial flag
     /// mutation, and refusal precedence. The value route is selected only
-    /// when every field equals [`PortableRegexSetRunLimits::unlimited`].
+    /// when every field equals [`PortableRegexSetRunLimits::unlimited`]. An
+    /// eligible exact-literal set on a long complete-haystack search executes
+    /// ID zero once, then uses its fused suffix only as a negative certificate.
+    /// A certified miss avoids all remaining constituent searches; a possible
+    /// suffix match retains the source-ID loop.
     ///
     /// # Errors
     ///
@@ -1038,7 +1044,38 @@ impl PortableRegexSet {
         }
         let window = SearchWindow::new(start, haystack.len());
         let mut any = false;
-        for (index, regex) in self.regexes.iter().enumerate() {
+        let mut first_unsearched = 0_usize;
+        if start == 0
+            && haystack.len() >= FUSED_LITERAL_SET_ALL_ID_NEGATIVE_MIN_BYTES
+            && let Some(fused) = &self.fused_literal_set
+        {
+            let first = self.regexes[0]
+                .is_match_window_value(haystack, window, SearchLimits::unlimited())
+                .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                    index: 0,
+                    total_work_before: 0,
+                    remaining_total_work: u64::MAX,
+                    source,
+                })?;
+            first_unsearched = 1;
+            if first {
+                match_flags[0] = true;
+                any = true;
+            } else {
+                let suffix_may_match = fused.plan.ordinary_executor().and_then(|executor| {
+                    executor
+                        .exists_window_value(
+                            haystack,
+                            LiteralWindow::new(window.start(), window.end()),
+                        )
+                        .ok()
+                });
+                if suffix_may_match == Some(false) {
+                    return Ok(false);
+                }
+            }
+        }
+        for (index, regex) in self.regexes.iter().enumerate().skip(first_unsearched) {
             let matched = regex
                 .is_match_window_value(haystack, window, SearchLimits::unlimited())
                 .map_err(|source| PortableRegexSetExecutionError::Pattern {
@@ -2217,6 +2254,12 @@ const fn set_value_route_is_unlimited(limits: PortableRegexSetRunLimits) -> bool
 // followed by aggregate setup. A leading-byte impossibility still takes the
 // fused route at every length.
 const FUSED_LITERAL_SET_ORIGIN_PROBE_MIN_BYTES: usize = 128;
+
+// A possible suffix hit pays for the certificate and then retains the
+// constituent ID loop. Keep that speculative extra scan off short inputs;
+// the stable all-ID gap is on long haystacks where a global miss replaces K
+// independent passes.
+const FUSED_LITERAL_SET_ALL_ID_NEGATIVE_MIN_BYTES: usize = 128;
 
 #[inline(always)]
 fn is_match_window_value_unlimited(
