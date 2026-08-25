@@ -560,16 +560,33 @@ struct LiteralSetDfaScanner<'a, 'h> {
     end: usize,
 }
 
-/// One selected DFA match before an operation-specific projection.
+/// One selected DFA match in the incumbent generic scanner representation.
 ///
 /// `LiteralSetDfaScanner::next::<false>` never reads an output pattern,
 /// so its count-only instantiation retains the incumbent endpoint loop without
-/// pattern bookkeeping. The span instantiation records output slot zero from
-/// the final delayed LeftmostFirst acceptance and resolves its width once.
+/// pattern bookkeeping. Span selection uses the raw-pattern projection below.
 #[derive(Clone, Copy)]
 struct LiteralSetDfaSelection {
     end: usize,
+    // The span projection below deliberately leaves only the count
+    // monomorphization of the incumbent generic scanner.
+    #[allow(
+        dead_code,
+        reason = "the incumbent generic count representation retains its pattern slot"
+    )]
     pattern: Option<PatternID>,
+}
+
+/// Selected span evidence with presence encoded by its restart-relative end.
+///
+/// Positive width proves that every acceptance ends after the current restart,
+/// so the span-only transition loop can keep a raw pattern ID without carrying
+/// an inner option. Count retains `LiteralSetDfaSelection` and its incumbent
+/// generic loop above unchanged.
+#[derive(Clone, Copy)]
+struct LiteralSetDfaSpanSelection {
+    end: usize,
+    pattern: PatternID,
 }
 
 /// Construction-bound capability for deliberately bypassing the optional
@@ -1923,6 +1940,56 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         selected
     }
 
+    #[inline(always)]
+    fn next_pattern(&mut self) -> Option<LiteralSetDfaSpanSelection> {
+        let anchored = Anchored::No;
+        let mut state = self.start_state;
+        let restart = self.restart;
+        let mut at = restart;
+        // Positive width makes the search restart an exact no-selection
+        // sentinel: every acceptance ends strictly after it. Keep that proof
+        // in the endpoint instead of carrying and rewriting a separate
+        // `Option<LiteralSetDfaSelection>` tag through the transition loop.
+        let mut selected_end = restart;
+        let mut selected_pattern = PatternID::ZERO;
+        while at < self.end {
+            state = self.automaton.next_state(anchored, state, self.haystack[at]);
+            at += 1;
+            // The exactly pinned aho-corasick 1.1.4 concrete DFA orders dead
+            // and match states before the unanchored start, followed by its
+            // ordinary states. With no prefilter that start is deliberately
+            // non-special, so the bound start is also the exact special-state
+            // boundary. Reusing it avoids loading the DFA's private maximum
+            // on every byte. The reachable-state closure test is the upgrade
+            // tripwire for this concrete dependency invariant.
+            debug_assert_eq!(
+                self.automaton.is_special(state),
+                state < self.start_state,
+                "Aho's concrete DFA special-state ordering changed",
+            );
+            if state < self.start_state {
+                if self.automaton.is_dead(state) {
+                    break;
+                }
+                debug_assert!(
+                    self.automaton.is_match(state),
+                    "a DFA without a prefilter has no other special states",
+                );
+                selected_end = at;
+                selected_pattern = self.automaton.match_pattern(state, 0);
+            }
+        }
+        if selected_end == restart {
+            self.restart = self.end;
+            return None;
+        }
+        self.restart = selected_end;
+        Some(LiteralSetDfaSpanSelection {
+            end: selected_end,
+            pattern: selected_pattern,
+        })
+    }
+
     /// Seek one exact root before entering the unchanged selected-span DFA
     /// transition loop.
     #[inline(always)]
@@ -1962,12 +2029,9 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     #[inline(always)]
     fn next_span(&mut self) -> Option<(usize, usize)> {
         let restart = self.restart;
-        let matched = self.next::<true>()?;
+        let matched = self.next_pattern()?;
         let end = matched.end;
-        let pattern = matched
-            .pattern
-            .expect("span-mode DFA scanning records its selected pattern");
-        let pattern_bytes = self.automaton.pattern_len(pattern);
+        let pattern_bytes = self.automaton.pattern_len(matched.pattern);
         debug_assert!(pattern_bytes > 0);
         debug_assert!(pattern_bytes <= end.saturating_sub(restart));
         Some((end - pattern_bytes, end))
@@ -5530,12 +5594,12 @@ mod tests {
 
     use aho_corasick::automaton::{Automaton, StateID};
     use aho_corasick::dfa::DFA;
-    use aho_corasick::{Anchored, Input, MatchKind};
+    use aho_corasick::{Anchored, Input, MatchKind, PatternID};
 
     use super::{
         LiteralSetBuildLimits, LiteralSetDfaRoot, LiteralSetDfaRootRange,
-        LiteralSetDfaScanner, LiteralSetDirectDfaIdentity, LiteralSetError,
-        LiteralSetMatchSemantics, LiteralSetOrdinaryExecutor, LiteralSetPlan,
+        LiteralSetDfaScanner, LiteralSetDfaSpanSelection, LiteralSetDirectDfaIdentity,
+        LiteralSetError, LiteralSetMatchSemantics, LiteralSetOrdinaryExecutor, LiteralSetPlan,
         LiteralSetSearchLimits, ORDINARY_DIRECT_DFA_BULK_BYTES,
         ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
         ORDINARY_ROOT_SET4_MIN_BYTES,
@@ -6755,6 +6819,85 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_direct_dfa_raw_pattern_matches_canonical_all_windows() {
+        // Broad root coverage prevents Aho from retaining a prefilter. Slot
+        // one has priority over its three-byte prefix at slot two, so the raw
+        // pattern ID must survive a delayed acceptance and select width four.
+        let mut patterns = (0_u8..131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        patterns[1] = vec![1; 4];
+        patterns[2] = vec![1; 3];
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+        let haystack = [250, 1, 1, 1, 1, 1, 1, 1, 251];
+
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = Window::new(start, end);
+                let expected = plan
+                    .automaton
+                    .try_find(&Input::new(&haystack[start..end]))
+                    .unwrap();
+                let mut scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+                    .expect("the direct span scanner is bound");
+                let selected = scanner.next_pattern();
+                match (expected, selected) {
+                    (Some(expected), Some(selected)) => {
+                        assert_eq!(selected.end, start + expected.end(), "window={window:?}");
+                        assert_eq!(selected.pattern, expected.pattern(), "window={window:?}");
+                        assert_eq!(scanner.restart, selected.end, "window={window:?}");
+                    }
+                    (None, None) => assert_eq!(scanner.restart, end, "window={window:?}"),
+                    _ => panic!("selection presence mismatch: window={window:?}"),
+                }
+
+                let mut expected_spans = Vec::new();
+                let mut cursor = start;
+                while cursor < end {
+                    let Some(matched) = plan
+                        .automaton
+                        .try_find(&Input::new(&haystack).span(cursor..end))
+                        .unwrap()
+                    else {
+                        break;
+                    };
+                    expected_spans.push((matched.start(), matched.end()));
+                    cursor = matched.end();
+                }
+                let mut scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+                    .expect("the direct span scanner is bound");
+                let mut actual_spans = Vec::new();
+                while let Some(matched) = scanner.next_span() {
+                    actual_spans.push(matched);
+                }
+                assert_eq!(actual_spans, expected_spans, "window={window:?}");
+
+                let mut scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+                    .expect("the direct endpoint scanner is bound");
+                let mut actual_count = 0;
+                while scanner.next_end().is_some() {
+                    actual_count += 1;
+                }
+                assert_eq!(actual_count, expected_spans.len(), "window={window:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_raw_pattern_removes_inner_option_layout() {
+        assert!(
+            core::mem::size_of::<PatternID>()
+                < core::mem::size_of::<Option<PatternID>>()
+        );
+        assert_eq!(
+            core::mem::size_of::<LiteralSetDfaSpanSelection>(),
+            core::mem::size_of::<(usize, PatternID)>(),
+        );
+    }
+
+    #[test]
     fn ordinary_direct_dfa_span_scanner_preserves_priority_windows_and_callbacks() {
         // Broad byte coverage prevents a heuristic prefilter. At byte 1,
         // source slot zero is a four-byte literal, slot one is its three-byte
@@ -6774,6 +6917,29 @@ mod tests {
 
         let haystack = [250, 251, 1, 1, 1, 1, 1, 1, 1, 252];
         let window = Window::new(2, 9);
+        // Pin the restart-relative endpoint sentinel directly. The second
+        // selected match ends exactly at the window boundary, while the
+        // nonzero miss window has no acceptance and must advance to its end.
+        let mut span_scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+            .expect("the direct span scanner is bound");
+        assert_eq!(span_scanner.next_span(), Some((2, 6)));
+        assert_eq!(span_scanner.next_span(), Some((6, 9)));
+        assert_eq!(span_scanner.next_span(), None);
+        assert_eq!(span_scanner.restart, window.end());
+
+        let miss_window = Window::new(8, haystack.len());
+        let mut miss_scanner = LiteralSetDfaScanner::new(ordinary, &haystack, miss_window)
+            .expect("the direct miss scanner is bound");
+        assert_eq!(miss_scanner.next_span(), None);
+        assert_eq!(miss_scanner.restart, miss_window.end());
+
+        // The count-only instantiation retains its incumbent optional
+        // selection loop and never resolves either selected pattern.
+        let mut end_scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+            .expect("the direct endpoint scanner is bound");
+        assert_eq!(end_scanner.next_end(), Some(6));
+        assert_eq!(end_scanner.next_end(), Some(9));
+        assert_eq!(end_scanner.next_end(), None);
         assert_eq!(
             ordinary.find_window_value(&haystack, window),
             Ok(Some((2, 6))),
