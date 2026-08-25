@@ -392,6 +392,51 @@ pub struct RegexSetExact64Program {
     edges: Vec<Exact64Edge>,
 }
 
+/// Borrowed, already-authenticated graph surface consumed by optional native
+/// lowerings. Keeping the concrete state and edge records private prevents a
+/// target backend from accidentally treating their in-memory Rust layout as
+/// a wire format.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegexSetExact64GraphView<'a> {
+    program: &'a RegexSetExact64Program,
+}
+
+impl RegexSetExact64GraphView<'_> {
+    pub(crate) fn state_count(&self) -> usize {
+        self.program.states.len()
+    }
+
+    pub(crate) const fn receipt(&self) -> RegexSetExact64Receipt {
+        self.program.receipt
+    }
+
+    pub(crate) fn state_depth(&self, state: usize) -> Option<u32> {
+        self.program.states.get(state).map(|state| state.depth)
+    }
+
+    pub(crate) fn failure_state(&self, state: usize) -> Option<u32> {
+        self.program.states.get(state).map(|state| state.failure)
+    }
+
+    pub(crate) fn output_mask(&self, state: usize) -> Option<u64> {
+        self.program
+            .states
+            .get(state)
+            .map(|state| state.output_mask)
+    }
+
+    pub(crate) fn direct_transition(&self, state: usize, byte: u8) -> Option<u32> {
+        let state = self.program.states.get(state)?;
+        let start = usize::try_from(state.edge_start).ok()?;
+        let end = start.checked_add(usize::from(state.edge_count))?;
+        let edges = self.program.edges.get(start..end)?;
+        edges
+            .binary_search_by_key(&byte, |edge| edge.byte)
+            .ok()
+            .map(|edge| edges[edge].target)
+    }
+}
+
 impl RegexSetExact64Program {
     /// Complete independently compiled semantic incumbent.
     #[must_use]
@@ -403,6 +448,15 @@ impl RegexSetExact64Program {
     #[must_use]
     pub const fn receipt(&self) -> RegexSetExact64Receipt {
         self.receipt
+    }
+
+    /// Authenticate the complete target-neutral graph before lending its
+    /// abstract topology to an optional target backend.
+    pub(crate) fn authenticated_graph(
+        &self,
+    ) -> Result<RegexSetExact64GraphView<'_>, RegexSetExact64AuthenticationError> {
+        self.authenticate()?;
+        Ok(RegexSetExact64GraphView { program: self })
     }
 
     /// Revalidate the target-neutral graph and its binding to the incumbent.

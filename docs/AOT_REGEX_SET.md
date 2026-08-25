@@ -88,8 +88,7 @@ success.
 
 Explicit literal-byte, state, transition, and failure-work ceilings are the
 only resource declines after proof. Allocation, arithmetic, construction
-invariant, and authentication failures are terminal. This substrate does not
-yet claim a generated entry point or native object route. The aggregate
+invariant, and authentication failures are terminal. The aggregate
 literal-byte ceiling is charged while witnesses are captured: its first
 crossing stops later optional fact work, and each finite-language proof is
 bounded by the remaining allowance after the allocation-free exact-width
@@ -97,11 +96,35 @@ proof, so an oversized literal is not first retained as an optional witness. A
 decline does not bypass completion of the authoritative incumbent or any later
 indexed semantic error.
 
+### Opt-in AArch64 dense lowering
+
+`compile_regex_set_exact64_aot_v1` is a second explicit step that consumes an
+already-selected `RegexSetExact64Program` by value. It reauthenticates the
+complete graph, expands it under separate transition-cell and data-byte caps
+to a dense 256-way Aho-Corasick table, and emits one scalar AArch64 entry. The
+table stores a `u32` next-state token for every state/byte pair and the exact
+inherited `u64` output mask for every state. The entry scans the requested
+window once, accumulates all source bits, and stores the caller's word only on
+success. It has no runtime-helper symbol.
+
+The effective data limit is also bounded by the published AArch64 ADRP/ADD
+addressability ceiling, even if a caller raises its own cap. Transition cell
+address formation uses the full address width; only authenticated state tokens
+remain `u32`.
+
+A valid x86-64 target or an explicit dense-cell, dense-data, code, or final
+object byte ceiling returns the exact input program unchanged with a typed
+decline. Target incoherence, graph/data malformation, allocation refusal,
+arithmetic overflow, and object failure are terminal. The receipt binds the
+portable graph and incumbent identities, target tuple, dense-data digest and
+geometry, generated code, relocation-closed object, and every ceiling. This
+entry remains opt-in; `compile_regex_set`, `compile_regex_set_exact64_reported`,
+and all of their defaults are unchanged.
+
 ## Next layer
 
-This foundation deliberately adds no combined stable wire format, object
-layout, generated multi-row loop, or C ABI. Those can be added independently
-without changing `OutputContract` or the stable `CompiledProgram` format. A
-native set lowering should preserve the same ordered artifact identity,
-pre-source authentication, strict bitset geometry, zero tail, and
-transactional publication contract.
+The native object is deliberately a separate exact64 artifact rather than a
+new `CompiledProgram` wire-format variant. A future registry/runtime adapter
+can bind its identity-suffixed C symbol without changing `OutputContract`, the
+stable ordinary program format, or the authoritative independent-row
+fallback.

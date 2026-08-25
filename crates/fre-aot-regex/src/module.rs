@@ -30438,6 +30438,378 @@ fn pad_native_packed_row(
     Ok(())
 }
 
+const REGEX_SET_EXACT64_AOT_TEXT_SECTION: usize = 0;
+const REGEX_SET_EXACT64_AOT_DATA_SECTION: usize = 1;
+const REGEX_SET_EXACT64_AOT_ENTRY_SYMBOL: usize = 0;
+const REGEX_SET_EXACT64_AOT_TRANSITIONS_SYMBOL: usize = 2;
+const REGEX_SET_EXACT64_AOT_OUTPUTS_SYMBOL: usize = 3;
+
+struct NativeRegexSetExact64Aarch64LoweringV1 {
+    code: Vec<u8>,
+    transition_page: usize,
+    transition_page_offset: usize,
+    output_page: usize,
+    output_page_offset: usize,
+}
+
+fn authenticate_regex_set_exact64_dense_data_v1(
+    graph_identity: crate::RegexSetExact64ArtifactIdentity,
+    all_pattern_mask: u64,
+    layout: &crate::regex_set_exact64_aot::RegexSetExact64DenseLayoutV1,
+) -> Result<(), ObjectError> {
+    if layout.state_count == 0
+        || layout.transition_offset != 32
+        || layout.output_offset < layout.transition_offset
+        || !layout.output_offset.is_multiple_of(core::mem::align_of::<u64>())
+        || layout.data.capacity() != layout.data.len()
+        || layout.data.get(..32) != Some(graph_identity.as_bytes().as_slice())
+        || all_pattern_mask == 0
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact64 native dense header or geometry",
+        ));
+    }
+    let expected_cells = layout
+        .state_count
+        .checked_mul(crate::REGEX_SET_EXACT64_AOT_V1_ALPHABET_LEN)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense transition cells",
+        ))?;
+    let transition_bytes = expected_cells
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense transition bytes",
+        ))?;
+    let transition_end = layout
+        .transition_offset
+        .checked_add(transition_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense transition extent",
+        ))?;
+    let output_bytes = layout
+        .state_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense output bytes",
+        ))?;
+    let output_end = layout
+        .output_offset
+        .checked_add(output_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense output extent",
+        ))?;
+    if layout.transition_cells != expected_cells
+        || transition_end > layout.output_offset
+        || output_end != layout.data.len()
+        || u32::try_from(layout.state_count).is_err()
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact64 native dense extents disagree",
+        ));
+    }
+    for cell in layout.data[layout.transition_offset..transition_end].chunks_exact(4) {
+        let target = <[u8; 4]>::try_from(cell)
+            .map(u32::from_le_bytes)
+            .map_err(|_| ObjectError::InvalidModule("exact64 native dense transition cell"))?;
+        if usize::try_from(target).map_or(true, |target| target >= layout.state_count) {
+            return Err(ObjectError::InvalidModule(
+                "exact64 native dense target is outside the graph",
+            ));
+        }
+    }
+    let mut published = 0_u64;
+    for (state, mask) in layout.data[layout.output_offset..output_end]
+        .chunks_exact(8)
+        .enumerate()
+    {
+        let mask = <[u8; 8]>::try_from(mask)
+            .map(u64::from_le_bytes)
+            .map_err(|_| ObjectError::InvalidModule("exact64 native dense output cell"))?;
+        if mask & !all_pattern_mask != 0 || state == 0 && mask != 0 {
+            return Err(ObjectError::InvalidModule(
+                "exact64 native dense output mask is invalid",
+            ));
+        }
+        published |= mask;
+    }
+    if published != all_pattern_mask {
+        return Err(ObjectError::InvalidModule(
+            "exact64 native dense outputs omit a source bit",
+        ));
+    }
+    Ok(())
+}
+
+fn lower_aarch64_regex_set_exact64_scan_v1(
+    all_pattern_mask: u64,
+) -> Result<NativeRegexSetExact64Aarch64LoweringV1, ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let addressable_haystack = assembler.label()?;
+    let scan = assembler.label()?;
+    let publish = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // Public raw boundary. The output is never touched before `publish`.
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_adds_x_imm(5, 4, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(1, addressable_haystack)?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_adds_x_reg(5, 0, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+
+    assembler.bind(addressable_haystack)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 2)?)?;
+    assembler.instruction(aarch64_add_x_reg(13, 0, 3)?)?;
+    assembler.instruction(aarch64_movz_w(6, 0)?)?;
+    assembler.instruction(aarch64_movz_x(7, 0, 0)?)?;
+    aarch64_load_u64_constant(&mut assembler, 12, all_pattern_mask)?;
+
+    let transition_page = assembler.instruction(0x9000_0008)?; // ADRP X8, transitions
+    let transition_page_offset = assembler.instruction(aarch64_add_x_imm(8, 8, 0)?)?;
+    let output_page = assembler.instruction(0x9000_000b)?; // ADRP X11, outputs
+    let output_page_offset = assembler.instruction(aarch64_add_x_imm(11, 11, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    assembler.branch_cond(AARCH64_HS, publish)?;
+
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_load_byte_post_imm(9, 5, 1)?)?;
+    // X10 = transition_base + state * 1024 + byte * 4. State tokens remain
+    // u32, while the byte offset uses the full address width so a caller-raised
+    // dense-data ceiling cannot silently truncate the row address.
+    assembler.instruction(aarch64_add_x_lsl(10, 8, 6, 10)?)?;
+    assembler.instruction(aarch64_add_x_lsl(10, 10, 9, 2)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 10, 0)?)?;
+    assembler.instruction(aarch64_load_x_lsl3(10, 11, 6)?)?;
+    assembler.instruction(aarch64_orr_x(7, 7, 10)?)?;
+    assembler.instruction(aarch64_cmp_x(7, 12)?)?;
+    assembler.branch_cond(AARCH64_EQ, publish)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, scan)?;
+
+    assembler.bind(publish)?;
+    assembler.instruction(aarch64_store_x(7, 4, 0)?)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_EXACT64_AOT_V1_STATUS_SUCCESS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact64 native success status"))?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_EXACT64_AOT_V1_STATUS_INVALID_ARGUMENT)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact64 native invalid status"))?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        transition_page,
+        transition_page_offset,
+        output_page,
+        output_page_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(NativeRegexSetExact64Aarch64LoweringV1 {
+        code,
+        transition_page: relocation_offsets[0],
+        transition_page_offset: relocation_offsets[1],
+        output_page: relocation_offsets[2],
+        output_page_offset: relocation_offsets[3],
+    })
+}
+
+/// Lower the graph-authenticated dense exact64 table into one scalar AArch64
+/// scan. There are no undefined symbols or semantic runtime edges.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact text/data symbols, four local relocations, and standalone module receipt are one native artifact boundary"
+)]
+pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
+    target: Target,
+    operation_identity: [u8; 32],
+    graph_identity: crate::RegexSetExact64ArtifactIdentity,
+    all_pattern_mask: u64,
+    layout: crate::regex_set_exact64_aot::RegexSetExact64DenseLayoutV1,
+    max_code_bytes: usize,
+) -> Result<CompiledModule, ObjectError> {
+    target.validate()?;
+    if target.architecture != Architecture::Aarch64 || target.abi != CallAbi::Aapcs64 {
+        return Err(ObjectError::InvalidModule(
+            "exact64 native lowering requires a valid AArch64 target",
+        ));
+    }
+    authenticate_regex_set_exact64_dense_data_v1(graph_identity, all_pattern_mask, &layout)?;
+    let lowered = lower_aarch64_regex_set_exact64_scan_v1(all_pattern_mask)?;
+    if lowered.code.len() > max_code_bytes {
+        return Err(ObjectError::Resource {
+            resource: CompileResource::CodeBytes,
+            limit: max_code_bytes,
+            required: lowered.code.len(),
+        });
+    }
+    let transition_bytes = layout
+        .transition_cells
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native transition symbol size",
+        ))?;
+    let output_bytes = layout
+        .state_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native output symbol size",
+        ))?;
+    let symbols = vec![
+        ModuleSymbol {
+            name: identity_symbol("fre_aot_regex_set_exact64_v1_", &operation_identity)?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(REGEX_SET_EXACT64_AOT_TEXT_SECTION),
+            offset: 0,
+            size: u64::try_from(lowered.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 native text symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_graph_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_AOT_DATA_SECTION),
+            offset: 0,
+            size: 32,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_transitions_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_AOT_DATA_SECTION),
+            offset: offset_u64(
+                layout.transition_offset,
+                "exact64 native transition symbol offset",
+            )?,
+            size: u64::try_from(transition_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 native transition symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_outputs_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_AOT_DATA_SECTION),
+            offset: offset_u64(layout.output_offset, "exact64 native output symbol offset")?,
+            size: u64::try_from(output_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 native output symbol size")
+            })?,
+        },
+    ];
+    let relocations = vec![
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page,
+                "exact64 native transition page relocation",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_EXACT64_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page_offset,
+                "exact64 native transition page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_EXACT64_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_AOT_TEXT_SECTION,
+            offset: offset_u64(lowered.output_page, "exact64 native output page relocation")?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_EXACT64_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.output_page_offset,
+                "exact64 native output page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_EXACT64_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+    ];
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: lowered.code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.regex-set-exact64",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 64,
+                data: layout.data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REGEX_SET_EXACT64_AOT_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_exists_trusted_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
 const REGEX_REDUX_TEXT_SECTION: usize = 0;
 const REGEX_REDUX_DATA_SECTION: usize = 1;
 const REGEX_REDUX_ENTRY_SYMBOL: usize = 0;
