@@ -1476,7 +1476,12 @@ fn lower_aarch64_wrapper(
             ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
             assembler.branch_cond(AARCH64_LO, scalar)?;
-            aarch64_emit_mandatory_teddy_asimd_candidates(&mut assembler, teddy)?;
+            aarch64_emit_mandatory_teddy_asimd_candidates(
+                &mut assembler,
+                teddy,
+                vector,
+                None,
+            )?;
             assembler.branch_cond(AARCH64_NE, vector_candidate)?;
             assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
             assembler.branch(vector)?;
@@ -1513,7 +1518,7 @@ fn lower_aarch64_wrapper(
             let partial = assembler.label()?;
             let single_candidate = assembler.label()?;
             let batch_candidate = assembler.label()?;
-            let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&teddy.plan)?;
+            let batch_plan = aarch64_mandatory_teddy_column_plan(&teddy.plan)?;
             let single_prefix_vector = if selection_basis
                 == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility
                 && batch_plan.single_prefix_max_vector_bytes.is_some()
@@ -5195,6 +5200,62 @@ mod tests {
             assert!(words.contains(&aarch64_mov_x(21, 2).unwrap()));
             assert!(words.contains(&aarch64_sve_addvl(2, 21, 1).unwrap()));
         }
+    }
+
+    #[test]
+    fn aarch64_asimd_selected_end_teddy_uses_authoritative_pair_miss() {
+        let compiled = compile_selected(
+            &scanner_free_exact_finite_pattern(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        );
+        let report = compiled
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("exact finite SelectedEnd Teddy receipt");
+        let words = compiled.module().sections()[TEXT_SECTION].bytes()
+            [..report.incumbent_code_offset]
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert!(
+            words.windows(5).any(|window| {
+                window[0] == aarch64_umaxv_16b(7, 24).unwrap()
+                    && window[1] == aarch64_umov_b0(12, 7).unwrap()
+                    && window[2] & 0xff00_001f == 0x3500_000c
+                    && window[3] == aarch64_add_x_imm(2, 2, 16).unwrap()
+                    && window[4] & 0xfc00_0000 == 0x1400_0000
+            }),
+            "selected-end wrapper has no authoritative two-column miss edge",
+        );
+        assert!(
+            words.windows(4).any(|window| {
+                window
+                    == [
+                        aarch64_cmtst_16b(24, 24, 24).unwrap(),
+                        aarch64_umaxv_16b(7, 24).unwrap(),
+                        aarch64_umov_b0(12, 7).unwrap(),
+                        aarch64_cmp_w_zero(12).unwrap(),
+                    ]
+            }),
+            "selected-end wrapper does not publish its final exact lane mask",
+        );
+        assert!(
+            words.windows(6).any(|window| {
+                window
+                    == [
+                        aarch64_mov_x(21, 2).unwrap(),
+                        aarch64_orr_16b(28, 24, 24).unwrap(),
+                        aarch64_bsl_16b(28, 29, 31).unwrap(),
+                        aarch64_uminv_16b(28, 28).unwrap(),
+                        aarch64_umov_b0(12, 28).unwrap(),
+                        aarch64_add_x_reg(2, 21, 12).unwrap(),
+                    ]
+            }),
+            "selected-end wrapper no longer reaches exact first-lane selection",
+        );
     }
 
     #[test]

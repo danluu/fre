@@ -66408,14 +66408,31 @@ fn aarch64_emit_mandatory_teddy_sve_constants(
 }
 
 /// Produce one exact 16-lane correlated candidate mask in V24.
+///
+/// Columns are intersected in the stable bucket-aware order shared with the
+/// scalable batch scanner. After the two most selective columns, an empty
+/// V24 is an authoritative miss because every remaining operation can only
+/// clear bucket bits. The reduction borrows V7/W12 without changing V24, so
+/// surviving bucket identities remain exact until the final CMTST converts
+/// them to the ff/00 lane mask required by first-lane selection. A caller may
+/// supply a zero-initialized scratch W register to make the first surviving
+/// pair switch later blocks directly to the full-column path; callers that
+/// re-enter after external verification leave this disabled.
 fn aarch64_emit_mandatory_teddy_asimd_candidates(
     assembler: &mut Aarch64Assembler,
     teddy: NativeMandatoryTeddyLayout,
+    miss: Aarch64Label,
+    dense_mode_register: Option<u8>,
 ) -> Result<(), ObjectError> {
-    for column in 0..usize::from(teddy.plan.columns()) {
-        let scan_offset = u8::try_from(column).map_err(|_| {
-            ObjectError::ArithmeticOverflow("AArch64 mandatory Teddy scan offset")
-        })?;
+    let plan = aarch64_mandatory_teddy_column_plan(&teddy.plan)?;
+    let suffix = assembler.label()?;
+    let activate_dense = dense_mode_register
+        .map(|_| assembler.label())
+        .transpose()?;
+    for (index, &scan_offset) in plan.column_order[..usize::from(teddy.plan.columns())]
+        .iter()
+        .enumerate()
+    {
         aarch64_emit_start_filter_address(assembler, scan_offset)?;
         assembler.instruction(aarch64_load_q(0, 12)?)?;
         assembler.instruction(aarch64_ushr_16b_by_4(25, 0)?)?;
@@ -66433,10 +66450,27 @@ fn aarch64_emit_mandatory_teddy_asimd_candidates(
         assembler.instruction(aarch64_tbl1_16b(28, low, 27)?)?;
         assembler.instruction(aarch64_tbl1_16b(7, high, 25)?)?;
         assembler.instruction(aarch64_and_16b(28, 28, 7)?)?;
-        if column == 0 {
+        if index == 0 {
             assembler.instruction(aarch64_orr_16b(24, 28, 28)?)?;
         } else {
             assembler.instruction(aarch64_and_16b(24, 24, 28)?)?;
+        }
+        if index == 1 {
+            if let Some(register) = dense_mode_register {
+                assembler.branch_nonzero_w(register, suffix)?;
+            }
+            assembler.instruction(aarch64_umaxv_16b(7, 24)?)?;
+            assembler.instruction(aarch64_umov_b0(12, 7)?)?;
+            assembler.branch_nonzero_w(12, activate_dense.unwrap_or(suffix))?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+            assembler.branch(miss)?;
+            if let (Some(register), Some(activate_dense)) =
+                (dense_mode_register, activate_dense)
+            {
+                assembler.bind(activate_dense)?;
+                assembler.instruction(aarch64_movz_w(register, 1)?)?;
+            }
+            assembler.bind(suffix)?;
         }
     }
     // Table bytes are bucket identities, not boolean bytes. Convert every
@@ -66509,23 +66543,23 @@ const AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS: [u8; 4] = [24, 25, 27,
 const AARCH64_MANDATORY_TEDDY_SVE_SINGLE_PREFIX_EXPECTED_HITS: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Aarch64MandatoryTeddySveBatchPlan {
+struct Aarch64MandatoryTeddyColumnPlan {
     column_order: [u8; 4],
     single_prefix_max_vector_bytes: Option<u16>,
 }
 
-fn aarch64_mandatory_teddy_sve_column_union_frequency(
+fn aarch64_mandatory_teddy_column_union_frequency(
     plan: &MandatoryTeddyPlan,
     column: usize,
 ) -> Result<u16, ObjectError> {
     let bank = plan.bank(0).ok_or(ObjectError::InvalidModule(
-        "AArch64 SVE Teddy batch has no mask bank",
+        "AArch64 Teddy column plan has no mask bank",
     ))?;
     let low = bank.low(column).ok_or(ObjectError::InvalidModule(
-        "AArch64 SVE Teddy batch has no low table",
+        "AArch64 Teddy column plan has no low table",
     ))?;
     let high = bank.high(column).ok_or(ObjectError::InvalidModule(
-        "AArch64 SVE Teddy batch has no high table",
+        "AArch64 Teddy column plan has no high table",
     ))?;
     let mut frequency = 0_u16;
     for byte in u8::MIN..=u8::MAX {
@@ -66536,6 +66570,14 @@ fn aarch64_mandatory_teddy_sve_column_union_frequency(
         }
     }
     Ok(frequency)
+}
+
+#[cfg(test)]
+fn aarch64_mandatory_teddy_sve_column_union_frequency(
+    plan: &MandatoryTeddyPlan,
+    column: usize,
+) -> Result<u16, ObjectError> {
+    aarch64_mandatory_teddy_column_union_frequency(plan, column)
 }
 
 /// Order the four possible fingerprint columns so the first two form the
@@ -66549,32 +66591,32 @@ fn aarch64_mandatory_teddy_sve_column_union_frequency(
     clippy::too_many_lines,
     reason = "one bounded planner keeps pair scoring, orientation, and VL admission auditable together"
 )]
-fn aarch64_mandatory_teddy_sve_batch_plan(
+fn aarch64_mandatory_teddy_column_plan(
     plan: &MandatoryTeddyPlan,
-) -> Result<Aarch64MandatoryTeddySveBatchPlan, ObjectError> {
+) -> Result<Aarch64MandatoryTeddyColumnPlan, ObjectError> {
     let columns = usize::from(plan.columns());
     if plan.bank_count() != 1
         || !(3..=4).contains(&columns)
         || !(1..=8).contains(&plan.bucket_count())
     {
         return Err(ObjectError::InvalidModule(
-            "AArch64 SVE Teddy batch does not have a slim 3/4-column plan",
+            "AArch64 Teddy column plan does not have a slim 3/4-column shape",
         ));
     }
     let bank = plan.bank(0).ok_or(ObjectError::InvalidModule(
-        "AArch64 SVE Teddy batch has no mask bank",
+        "AArch64 Teddy column plan has no mask bank",
     ))?;
     let mut frequency = [[0_u16; 8]; 4];
     let mut union_frequency = [0_u16; 4];
     for (column, frequencies) in frequency[..columns].iter_mut().enumerate() {
         let low = bank.low(column).ok_or(ObjectError::InvalidModule(
-            "AArch64 SVE Teddy batch has no low table",
+            "AArch64 Teddy column plan has no low table",
         ))?;
         let high = bank.high(column).ok_or(ObjectError::InvalidModule(
-            "AArch64 SVE Teddy batch has no high table",
+            "AArch64 Teddy column plan has no high table",
         ))?;
         union_frequency[column] =
-            aarch64_mandatory_teddy_sve_column_union_frequency(plan, column)?;
+            aarch64_mandatory_teddy_column_union_frequency(plan, column)?;
         for byte in u8::MIN..=u8::MAX {
             let buckets = low[usize::from(byte & 0x0f)] & high[usize::from(byte >> 4)];
             for (bucket, units) in frequencies
@@ -66583,10 +66625,10 @@ fn aarch64_mandatory_teddy_sve_batch_plan(
                 .enumerate()
             {
                 let bit = 1_u8.checked_shl(u32::try_from(bucket).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch bucket")
+                    ObjectError::ArithmeticOverflow("AArch64 Teddy column-plan bucket")
                 })?)
                 .ok_or(ObjectError::ArithmeticOverflow(
-                    "AArch64 SVE Teddy batch bucket bit",
+                    "AArch64 Teddy column-plan bucket bit",
                 ))?;
                 if buckets & bit != 0 {
                     *units = units
@@ -66642,7 +66684,7 @@ fn aarch64_mandatory_teddy_sve_batch_plan(
     let first_frequency = union_frequency[first];
     if first_frequency == 0 {
         return Err(ObjectError::InvalidModule(
-            "AArch64 SVE Teddy batch has an empty first column",
+            "AArch64 Teddy column plan has an empty first column",
         ));
     }
     let expected_hits_per_vector_byte = u32::try_from(
@@ -66672,10 +66714,17 @@ fn aarch64_mandatory_teddy_sve_batch_plan(
         .then(|| u16::try_from(rounded.min(u32::from(AARCH64_SVE_MAX_VECTOR_BYTES))))
         .transpose()
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy singleton vector bound"))?;
-    Ok(Aarch64MandatoryTeddySveBatchPlan {
+    Ok(Aarch64MandatoryTeddyColumnPlan {
         column_order: order,
         single_prefix_max_vector_bytes,
     })
+}
+
+#[cfg(test)]
+fn aarch64_mandatory_teddy_sve_batch_plan(
+    plan: &MandatoryTeddyPlan,
+) -> Result<Aarch64MandatoryTeddyColumnPlan, ObjectError> {
+    aarch64_mandatory_teddy_column_plan(plan)
 }
 
 #[allow(
@@ -66797,7 +66846,7 @@ fn aarch64_emit_mandatory_teddy_sve_batch4_candidates(
     let batch_vectors = u8::try_from(AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS.len())
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch vectors"))?;
     let batch_suffix = assembler.label()?;
-    let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&teddy.plan)?;
+    let batch_plan = aarch64_mandatory_teddy_column_plan(&teddy.plan)?;
     if single_prefix && batch_plan.single_prefix_max_vector_bytes.is_none() {
         return Err(ObjectError::InvalidModule(
             "AArch64 SVE Teddy singleton prefix was not admitted",
@@ -67018,6 +67067,11 @@ fn aarch64_emit_dynamic_correlated_prefix_gate(
         )?,
     )?;
     assembler.instruction(aarch64_movi_16b(26, 0x0f)?)?;
+    // The root gate returns after its first exact fingerprint candidate, so
+    // W11 is free for one call-local density observation. A selected-pair
+    // survivor switches later blocks to the full scan, avoiding the
+    // horizontal reduction on dense input while sparse misses retain it.
+    assembler.instruction(aarch64_movz_w(11, 0)?)?;
     assembler.bind(vector)?;
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
     let required = u16::from(
@@ -67035,7 +67089,7 @@ fn aarch64_emit_dynamic_correlated_prefix_gate(
     ))?;
     assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
     assembler.branch_cond(AARCH64_LO, scalar)?;
-    aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy)?;
+    aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy, vector, Some(11))?;
     assembler.branch_cond(AARCH64_NE, vector_candidate)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
     assembler.branch(vector)?;
@@ -67118,7 +67172,7 @@ fn aarch64_emit_mandatory_teddy_suffix_prepass(
                 ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
             assembler.branch_cond(AARCH64_LO, scalar)?;
-            aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy)?;
+            aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy, vector, None)?;
             assembler.branch_cond(AARCH64_NE, vector_hit)?;
             assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
             assembler.branch(vector)?;
@@ -135860,6 +135914,319 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 0xc4, 0x42, 0x6d, 0x00, 0xea, // vpshufb ymm10,ymm2,ymm13
                 0xc4, 0x41, 0x7e, 0x6f, 0x81, 32, 0, 0, 0, // vmovdqu 32[r9],ymm8
             ]
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded oracle ties nonchronological planning to the exact ASIMD miss CFG"
+    )]
+    fn aarch64_asimd_teddy_stages_the_best_pair_without_losing_bucket_identity() {
+        fn conditional_target(words: &[u32], branch: usize) -> usize {
+            let encoded = (words[branch] >> 5) & 0x7_ffff;
+            let signed = (i32::try_from(encoded).unwrap() << 13) >> 13;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .unwrap()
+        }
+
+        fn direct_target(words: &[u32], branch: usize) -> usize {
+            let encoded = words[branch] & 0x03ff_ffff;
+            let signed = (i32::try_from(encoded).unwrap() << 6) >> 6;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .unwrap()
+        }
+
+        fn emit(plan: MandatoryTeddyPlan) -> Vec<u32> {
+            let table_end = u32::from(plan.columns()) * 32;
+            let teddy = NativeMandatoryTeddyLayout {
+                plan,
+                isa: MandatoryTeddyIsa::Aarch64Asimd,
+                vector_bytes: 16,
+                table_base: 0,
+                nibble_mask_offset: table_end,
+                table_end,
+            };
+            let mut assembler = Aarch64Assembler::new();
+            let reloop = assembler.label().unwrap();
+            assembler.bind(reloop).unwrap();
+            aarch64_emit_mandatory_teddy_asimd_candidates(&mut assembler, teddy, reloop, None)
+                .unwrap();
+            assembler
+                .finish()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect()
+        }
+
+        let literals: [&[u8]; 4] = [b"aaa\x01", b"aaa\x02", b"aaa\x03", b"aaa\x04"];
+        let portfolio = mandatory_teddy::derive_exact_prefixes(&literals, 4)
+            .expect("public four-literal Teddy portfolio");
+        let three = portfolio
+            .plans()
+            .copied()
+            .find(|plan| plan.columns() == 3 && plan.bank_count() == 1)
+            .expect("three-column slim plan");
+        let four = portfolio
+            .plans()
+            .copied()
+            .find(|plan| plan.columns() == 4 && plan.bank_count() == 1)
+            .expect("four-column slim plan");
+        let four_order = aarch64_mandatory_teddy_column_plan(&four)
+            .unwrap()
+            .column_order;
+        assert_eq!(
+            four_order,
+            [3, 0, 1, 2],
+            "the rare final control byte must lead the stable best pair"
+        );
+
+        // Deterministic shape-equivalent windows prove that changing column
+        // order preserves the exact bucket result. In particular, zero after
+        // the selected pair is always zero after every remaining AND.
+        let mut random = 0x243f_6a88_85a3_08d3_u64;
+        for plan in [three, four] {
+            let column_plan = aarch64_mandatory_teddy_column_plan(&plan).unwrap();
+            let columns = usize::from(plan.columns());
+            let bank = plan.bank(0).unwrap();
+            for _ in 0..65_536 {
+                let mut window = [0_u8; 4];
+                for byte in &mut window[..columns] {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    *byte = random.to_le_bytes()[0];
+                }
+                let mut reordered = u8::MAX;
+                let mut selected_pair = 0_u8;
+                for (rank, &column) in column_plan.column_order[..columns].iter().enumerate() {
+                    let byte = window[usize::from(column)];
+                    reordered &= bank.low(usize::from(column)).unwrap()
+                        [usize::from(byte & 0x0f)]
+                        & bank.high(usize::from(column)).unwrap()[usize::from(byte >> 4)];
+                    if rank == 1 {
+                        selected_pair = reordered;
+                    }
+                }
+                assert_eq!(
+                    u16::from(reordered),
+                    plan.candidate_buckets(&window[..columns])
+                );
+                if selected_pair == 0 {
+                    assert_eq!(reordered, 0, "a cleared bucket bit cannot reappear");
+                }
+            }
+
+            let words = emit(plan);
+            let order = &column_plan.column_order[..columns];
+            let table_positions = order
+                .iter()
+                .map(|&column| {
+                    let low = 16 + column * 2;
+                    words
+                        .iter()
+                        .position(|&word| {
+                            word == aarch64_tbl1_16b(28, low, 27).unwrap()
+                        })
+                        .expect("planned low-nibble table lookup")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                table_positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "machine-code table registers must follow the planned logical columns"
+            );
+
+            let reduction = words
+                .windows(2)
+                .position(|window| {
+                    window
+                        == [
+                            aarch64_umaxv_16b(7, 24).unwrap(),
+                            aarch64_umov_b0(12, 7).unwrap(),
+                        ]
+                })
+                .expect("selected-pair zero reduction");
+            assert!(table_positions[1] < reduction);
+            assert!(reduction < table_positions[2]);
+            let nonempty = reduction + 2;
+            assert_eq!(words[nonempty] & 0xff00_001f, 0x3500_000c);
+            assert_eq!(words[nonempty + 1], aarch64_add_x_imm(2, 2, 16).unwrap());
+            assert_eq!(words[nonempty + 2] & 0xfc00_0000, 0x1400_0000);
+            assert_eq!(
+                conditional_target(&words, nonempty),
+                nonempty + 3,
+                "a surviving pair must skip the miss-only ADD/branch"
+            );
+            assert_eq!(
+                direct_target(&words, nonempty + 2),
+                0,
+                "the empty-pair edge must advance once and re-enter the vector bound"
+            );
+
+            let cmtst = words
+                .iter()
+                .position(|&word| word == aarch64_cmtst_16b(24, 24, 24).unwrap())
+                .expect("final identity-to-lane conversion");
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_cmtst_16b(24, 24, 24).unwrap())
+                    .count(),
+                1
+            );
+            assert!(cmtst > *table_positions.last().unwrap());
+            assert_eq!(
+                &words[cmtst + 1..cmtst + 4],
+                &[
+                    aarch64_umaxv_16b(7, 24).unwrap(),
+                    aarch64_umov_b0(12, 7).unwrap(),
+                    aarch64_cmp_w_zero(12).unwrap(),
+                ],
+                "both three- and four-column hit paths must publish the final mask"
+            );
+        }
+    }
+
+    #[test]
+    fn aarch64_asimd_teddy_staging_is_used_by_dynamic_and_suffix_callers() {
+        fn words(code: &[u8]) -> Vec<u32> {
+            code.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect()
+        }
+
+        fn conditional_target(words: &[u32], branch: usize) -> usize {
+            let encoded = (words[branch] >> 5) & 0x7_ffff;
+            let signed = (i32::try_from(encoded).unwrap() << 13) >> 13;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .unwrap()
+        }
+
+        fn direct_target(words: &[u32], branch: usize) -> usize {
+            let encoded = words[branch] & 0x03ff_ffff;
+            let signed = (i32::try_from(encoded).unwrap() << 6) >> 6;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .unwrap()
+        }
+
+        fn adaptive_pair(words: &[u32]) -> Option<usize> {
+            words.windows(7).position(|window| {
+                window[0] & 0xff00_001f == 0x3500_000b
+                    && window[1] == aarch64_umaxv_16b(7, 24).unwrap()
+                    && window[2] == aarch64_umov_b0(12, 7).unwrap()
+                    && window[3] & 0xff00_001f == 0x3500_000c
+                    && window[4] == aarch64_add_x_imm(2, 2, 16).unwrap()
+                    && window[5] & 0xfc00_0000 == 0x1400_0000
+                    && window[6] == aarch64_movz_w(11, 1).unwrap()
+            })
+        }
+
+        fn assert_staged_caller(words: &[u32], label: &str) {
+            assert!(words.windows(5).any(|window| {
+                window[0] == aarch64_umaxv_16b(7, 24).unwrap()
+                    && window[1] == aarch64_umov_b0(12, 7).unwrap()
+                    && window[2] & 0xff00_001f == 0x3500_000c
+                    && window[3] == aarch64_add_x_imm(2, 2, 16).unwrap()
+                    && window[4] & 0xfc00_0000 == 0x1400_0000
+            }), "{label} has no selected-pair miss edge");
+            assert!(words.windows(4).any(|window| {
+                window
+                    == [
+                        aarch64_cmtst_16b(24, 24, 24).unwrap(),
+                        aarch64_umaxv_16b(7, 24).unwrap(),
+                        aarch64_umov_b0(12, 7).unwrap(),
+                        aarch64_cmp_w_zero(12).unwrap(),
+                    ]
+            }), "{label} has no final exact lane-mask publication");
+            assert!(words.windows(4).any(|window| {
+                window
+                    == [
+                        aarch64_bsl_16b(24, 29, 31).unwrap(),
+                        aarch64_uminv_16b(24, 24).unwrap(),
+                        aarch64_umov_b0(12, 24).unwrap(),
+                        aarch64_add_x_reg(2, 2, 12).unwrap(),
+                    ]
+            }), "{label} final hit does not reach first-lane selection");
+        }
+
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let suffix = compile(
+            CompileRequest::new(MANDATORY_TEDDY_STRUCTURAL_PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let suffix_lowering = lower_native_dfa(suffix.program().native_dfa_view().unwrap(), target)
+            .unwrap()
+            .expect("native mandatory-suffix Teddy");
+        let suffix_words = words(&suffix_lowering.code);
+        assert_staged_caller(&suffix_words, "mandatory suffix");
+        assert_eq!(
+            adaptive_pair(&suffix_words),
+            None,
+            "a verifier-reentrant suffix cannot retain density state"
+        );
+
+        let dynamic = compile(
+            CompileRequest::new("(?:goo|bar|baz){2,4}Q", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+        )
+        .unwrap();
+        let dynamic_view = dynamic
+            .program()
+            .native_dynamic_rows_view()
+            .expect("dynamic correlated-prefix rows");
+        assert_eq!(
+            dynamic_view
+                .correlated_prefix_requirement
+                .expect("correlated-prefix receipt")
+                .teddy_plan
+                .columns(),
+            4
+        );
+        let (dynamic_lowering, _) = lower_native_dynamic_rows_prepared(
+            dynamic.program().serialize().unwrap(),
+            dynamic_view,
+            target,
+        )
+        .unwrap();
+        let dynamic_words = words(&dynamic_lowering.code);
+        assert_staged_caller(&dynamic_words, "dynamic prefix");
+        let adaptive = adaptive_pair(&dynamic_words)
+            .expect("dynamic prefix must retain one call-local density bit");
+        assert_eq!(
+            conditional_target(&dynamic_words, adaptive),
+            adaptive + 7,
+            "dense blocks must bypass the horizontal reduction"
+        );
+        assert_eq!(
+            conditional_target(&dynamic_words, adaptive + 3),
+            adaptive + 6,
+            "the first surviving pair must activate dense mode"
+        );
+        let vector = direct_target(&dynamic_words, adaptive + 5);
+        let initialize = dynamic_words[..adaptive]
+            .iter()
+            .rposition(|&word| word == aarch64_movz_w(11, 0).unwrap())
+            .expect("dynamic prefix density state initialization");
+        assert!(
+            initialize < vector && vector < adaptive,
+            "the miss backedge must preserve, rather than reset, density state"
         );
     }
 
