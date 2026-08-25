@@ -165,6 +165,23 @@ impl std::error::Error for PortableRegexSetBuildError {
     }
 }
 
+enum PortableRegexSetPatternSources<'a> {
+    Borrowed(&'a [String]),
+    Owned {
+        patterns: Vec<String>,
+        pattern_bytes: usize,
+    },
+}
+
+impl PortableRegexSetPatternSources<'_> {
+    fn as_slice(&self) -> &[String] {
+        match self {
+            Self::Borrowed(patterns) => patterns,
+            Self::Owned { patterns, .. } => patterns,
+        }
+    }
+}
+
 /// Borrowing builder that preflights the complete source set before compiling.
 #[derive(Clone, Debug)]
 pub struct PortableRegexSetBuilder<'a> {
@@ -331,13 +348,30 @@ impl<'a> PortableRegexSetBuilder<'a> {
         reason = "one construction transaction keeps preflight, fallible allocation, indexed compilation and publication ordered"
     )]
     pub fn build(&self) -> Result<PortableRegexSet, PortableRegexSetBuildError> {
-        let pattern_count = self.patterns.len();
+        self.build_with_pattern_sources(PortableRegexSetPatternSources::Borrowed(self.patterns))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one construction transaction keeps preflight, fallible allocation, indexed compilation and publication ordered"
+    )]
+    fn build_with_pattern_sources(
+        &self,
+        pattern_sources: PortableRegexSetPatternSources<'_>,
+    ) -> Result<PortableRegexSet, PortableRegexSetBuildError> {
+        let source_patterns = pattern_sources.as_slice();
+        let pattern_count = source_patterns.len();
         enforce(pattern_count, self.limits.max_patterns, |needed, limit| {
             PortableRegexSetBuildError::PatternLimit { needed, limit }
         })?;
-        let pattern_bytes = self.patterns.iter().try_fold(0_usize, |total, pattern| {
-            checked_add(total, pattern.len(), "pattern byte sum")
-        })?;
+        let pattern_bytes = match &pattern_sources {
+            PortableRegexSetPatternSources::Borrowed(patterns) => {
+                patterns.iter().try_fold(0_usize, |total, pattern| {
+                    checked_add(total, pattern.len(), "pattern byte sum")
+                })?
+            }
+            PortableRegexSetPatternSources::Owned { pattern_bytes, .. } => *pattern_bytes,
+        };
         enforce(
             pattern_bytes,
             self.limits.max_pattern_bytes,
@@ -352,13 +386,35 @@ impl<'a> PortableRegexSetBuilder<'a> {
         )?;
         enforce_persistent(logical_persistent, self.limits.max_persistent_bytes)?;
 
-        let mut patterns = Vec::new();
-        patterns.try_reserve_exact(pattern_count).map_err(|_| {
-            PortableRegexSetBuildError::AllocationFailed {
-                structure: "pattern vector",
-                additional: pattern_count,
+        let (borrowed_patterns, mut patterns) = match pattern_sources {
+            PortableRegexSetPatternSources::Borrowed(patterns) => {
+                let mut retained = Vec::new();
+                retained.try_reserve_exact(pattern_count).map_err(|_| {
+                    PortableRegexSetBuildError::AllocationFailed {
+                        structure: "pattern vector",
+                        additional: pattern_count,
+                    }
+                })?;
+                (Some(patterns), retained)
             }
-        })?;
+            PortableRegexSetPatternSources::Owned {
+                mut patterns,
+                pattern_bytes: _,
+            } => {
+                if patterns.capacity() != pattern_count {
+                    let mut retained = Vec::new();
+                    retained.try_reserve_exact(pattern_count).map_err(|_| {
+                        PortableRegexSetBuildError::AllocationFailed {
+                            structure: "pattern vector",
+                            additional: pattern_count,
+                        }
+                    })?;
+                    retained.append(&mut patterns);
+                    patterns = retained;
+                }
+                (None, patterns)
+            }
+        };
         let mut regexes = Vec::new();
         regexes.try_reserve_exact(pattern_count).map_err(|_| {
             PortableRegexSetBuildError::AllocationFailed {
@@ -383,18 +439,23 @@ impl<'a> PortableRegexSetBuilder<'a> {
         let mut matcher_source_bytes = 0_usize;
         let mut capture_name_storage_bytes = 0_usize;
         let mut plan_storage_bytes = 0_usize;
-        for (index, pattern) in self.patterns.iter().enumerate() {
-            let mut owned_pattern = String::new();
-            owned_pattern
-                .try_reserve_exact(pattern.len())
-                .map_err(|_| PortableRegexSetBuildError::AllocationFailed {
-                    structure: "pattern source bytes",
-                    additional: pattern.len(),
-                })?;
-            owned_pattern.push_str(pattern);
+        for index in 0..pattern_count {
+            if let Some(borrowed_patterns) = borrowed_patterns {
+                let pattern = &borrowed_patterns[index];
+                let mut owned_pattern = String::new();
+                owned_pattern
+                    .try_reserve_exact(pattern.len())
+                    .map_err(|_| PortableRegexSetBuildError::AllocationFailed {
+                        structure: "pattern source bytes",
+                        additional: pattern.len(),
+                    })?;
+                owned_pattern.push_str(pattern);
+                patterns.push(owned_pattern);
+            }
+            let pattern = &patterns[index];
             source_buffer_capacity = checked_add(
                 source_buffer_capacity,
-                owned_pattern.capacity(),
+                pattern.capacity(),
                 "pattern source capacity sum",
             )?;
 
@@ -430,7 +491,6 @@ impl<'a> PortableRegexSetBuilder<'a> {
                 "charged persistent bytes",
             )?;
             enforce_persistent(charged, self.limits.max_persistent_bytes)?;
-            patterns.push(owned_pattern);
             regexes.push(regex);
         }
 
@@ -637,7 +697,12 @@ impl PortableRegexSet {
             owned.push(copied);
             pattern_bytes = needed_pattern_bytes;
         }
-        PortableRegexSetBuilder::new(&owned).build()
+        PortableRegexSetBuilder::new(&[]).build_with_pattern_sources(
+            PortableRegexSetPatternSources::Owned {
+                patterns: owned,
+                pattern_bytes,
+            },
+        )
     }
 
     /// Construct the valid empty set, which never matches.
