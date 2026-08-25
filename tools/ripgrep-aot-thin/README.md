@@ -128,7 +128,9 @@ multiline/dotall, CRLF, NUL-data, word/whole-line, or PCRE2 transformation.
 Unsupported semantics and absent vectors return `Ok(None)`; a found registry
 row with invalid authentication is an error. The registry key is
 domain-separated and binds the profile, source count, each source length,
-ordered raw UTF-8 bytes, and duplicates.
+ordered raw UTF-8 bytes, and duplicates. Runtime authentication also requires
+the receipt's target-feature mask to equal the exact mask selected by this
+build; it is not merely reported as metadata.
 
 The selected factory is immutable, `Copy`, `Send`, and `Sync`.
 `prefilter(&[u8])` returns `ConfirmedMiss` or `Candidate { position }`, where
@@ -142,6 +144,13 @@ be retried through a weaker fallback.
 This package publishes the registry/runtime primitive; wiring parsed ripgrep
 flags, decoded-input evidence, and stock verification into a particular
 ripgrep revision remains an explicit integration step.
+
+`verify-default-artifacts.py BASE_OUT_DIR CANDIDATE_OUT_DIR` closes the
+env-absent compatibility boundary against a build of the pre-feature base. It
+compares `registry.rs` byte-for-byte, ordinary object/program filenames and
+payloads byte-for-byte, then compares archive member order and payloads. The
+archive comparison deliberately ignores `ar` header timestamps and hashes the
+logical ordered member stream instead.
 
 ## Exists batching
 

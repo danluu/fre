@@ -251,6 +251,7 @@ impl AotExact64SetReceiptV1 {
             && self.abi_version == REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION
             && self.target_architecture == EXACT64_SET_TARGET_AARCH64
             && self.target_operating_system == exact64_set_runtime_target_os()
+            && self.target_features == generated_exact64_sets::BUILD_EXACT64_SET_TARGET_FEATURES
             && self.line_terminator == REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR
             && self.position_semantics
                 == REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE
@@ -1973,6 +1974,11 @@ mod tests {
     static SINGLETON_EXISTS_SCALAR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SINGLETON_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXACT64_FIRST_ANY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    const EXACT64_PUBLIC_RAW_SENTINELS: [&str; 3] = [
+        "fixture_raw_sentinel_one",
+        "fixture_raw_sentinel_one_suffix",
+        "fixture_raw_sentinel_two",
+    ];
 
     unsafe extern "C" fn exact64_candidate_entry(
         _haystack: *const u8,
@@ -2052,7 +2058,7 @@ mod tests {
                 abi_version: REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
                 target_architecture: EXACT64_SET_TARGET_AARCH64,
                 target_operating_system: exact64_set_runtime_target_os(),
-                target_features: 0,
+                target_features: generated_exact64_sets::BUILD_EXACT64_SET_TARGET_FEATURES,
                 line_terminator: REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR,
                 position_semantics: REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE,
                 no_match: REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH,
@@ -2734,7 +2740,11 @@ mod tests {
     #[test]
     fn exact64_selection_authenticates_ordered_vector_and_receipt_before_haystack() {
         EXACT64_FIRST_ANY_CALLS.store(0, Ordering::Relaxed);
-        let patterns = ["opaque_source_one", "opaque_source_two", "opaque_source_one"];
+        let patterns = [
+            EXACT64_PUBLIC_RAW_SENTINELS[0],
+            EXACT64_PUBLIC_RAW_SENTINELS[1],
+            EXACT64_PUBLIC_RAW_SENTINELS[0],
+        ];
         let profile = RipgrepAotExact64SetProfileV1::supported_rust_regex(false);
         let spec = exact64_test_spec(&patterns, profile, exact64_candidate_entry);
         let selected = select_exact64_set_spec(
@@ -2748,9 +2758,24 @@ mod tests {
         .expect("known vector");
         assert_eq!(selected.registry_key, spec.registry_key);
         for mismatch in [
-            ["opaque_source_one", "opaque_source_one", "opaque_source_two"].as_slice(),
-            ["opaque_source", "_oneopaque_source_two", "opaque_source_one"].as_slice(),
-            ["opaque_source_one", "opaque_source_two", "opaque_source_two"].as_slice(),
+            [
+                EXACT64_PUBLIC_RAW_SENTINELS[0],
+                EXACT64_PUBLIC_RAW_SENTINELS[0],
+                EXACT64_PUBLIC_RAW_SENTINELS[1],
+            ]
+            .as_slice(),
+            [
+                "fixture_raw_sentinel",
+                "_onefixture_raw_sentinel_one_suffix",
+                EXACT64_PUBLIC_RAW_SENTINELS[0],
+            ]
+            .as_slice(),
+            [
+                EXACT64_PUBLIC_RAW_SENTINELS[0],
+                EXACT64_PUBLIC_RAW_SENTINELS[1],
+                EXACT64_PUBLIC_RAW_SENTINELS[1],
+            ]
+            .as_slice(),
         ] {
             assert!(
                 select_exact64_set_spec(
@@ -2777,7 +2802,23 @@ mod tests {
         )
         .expect_err("receipt mismatch is terminal");
         assert!(error.contains("receipt authentication failed"));
-        assert!(!error.contains("opaque_source"));
+        for sentinel in EXACT64_PUBLIC_RAW_SENTINELS {
+            assert!(!error.contains(sentinel));
+        }
+
+        let mut wrong_features = spec;
+        wrong_features.receipt.target_features ^= 1_u64 << 32;
+        assert!(
+            select_exact64_set_spec(
+                std::slice::from_ref(&wrong_features),
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                &patterns,
+                profile,
+            )
+            .expect_err("target feature mismatch is terminal")
+            .contains("receipt authentication failed")
+        );
 
         let duplicate_specs = [spec, spec];
         assert!(
@@ -2820,6 +2861,25 @@ mod tests {
 
     #[test]
     fn generated_exact64_registry_is_raw_free_closed_and_uses_first_any_objects() {
+        let generated_source = include_str!(concat!(env!("OUT_DIR"), "/exact64_set_registry.rs"));
+        let generated_filenames = std::fs::read_dir(env!("OUT_DIR"))
+            .expect("read generated artifact directory")
+            .map(|entry| {
+                entry
+                    .expect("read generated artifact entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        for sentinel in EXACT64_PUBLIC_RAW_SENTINELS {
+            assert!(!generated_source.contains(sentinel));
+            assert!(
+                generated_filenames
+                    .iter()
+                    .all(|filename| !filename.contains(sentinel))
+            );
+        }
         assert_eq!(
             generated_exact64_sets::BUILD_EXACT64_SET_ADMITTED_COUNT,
             generated_exact64_sets::EXACT64_SET_SPECS.len()
@@ -2844,7 +2904,15 @@ mod tests {
             );
             assert_ne!(spec.receipt.object_sha256(), [0; 32]);
             assert_ne!(spec.receipt.artifact_identity_sha256(), [0; 32]);
+            assert_eq!(
+                spec.receipt.target_features(),
+                generated_exact64_sets::BUILD_EXACT64_SET_TARGET_FEATURES
+            );
             assert!((2..=64).contains(&spec.receipt.pattern_count()));
+            for sentinel in EXACT64_PUBLIC_RAW_SENTINELS {
+                assert!(!spec.description.contains(sentinel));
+                assert!(!spec.entry_symbol.contains(sentinel));
+            }
             // SAFETY: the authenticated V1 entry must reject the null output
             // before scanning the deliberately invalid haystack extent.
             let status = unsafe {
@@ -2862,24 +2930,55 @@ mod tests {
             );
         }
 
-        let public = ["alpha", "alphabet", "alpha", "beta"];
-        if let Some(factory) = AotExact64SetFactory::select(
-            AotMode::Optimizing,
-            AotOutput::Exists,
-            &public,
-            RipgrepAotExact64SetProfileV1::supported_rust_regex(false),
-        )
-        .expect("public registry selection")
+        if cfg!(target_arch = "aarch64")
+            && generated_exact64_sets::BUILD_EXACT64_SET_PUBLIC_FIXTURE_SELECTED
         {
+            assert_eq!(generated_exact64_sets::EXACT64_SET_SPECS.len(), 2);
+            let public = [
+                EXACT64_PUBLIC_RAW_SENTINELS[0],
+                EXACT64_PUBLIC_RAW_SENTINELS[1],
+                EXACT64_PUBLIC_RAW_SENTINELS[0],
+                EXACT64_PUBLIC_RAW_SENTINELS[2],
+            ];
+            let factory = AotExact64SetFactory::select(
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                &public,
+                RipgrepAotExact64SetProfileV1::supported_rust_regex(false),
+            )
+            .expect("public overlap registry authentication")
+            .expect("AArch64 public overlap set must be admitted");
             assert!(factory.description().contains("api=exact64-first-any-v1"));
             assert_eq!(factory.receipt().pattern_count(), 4);
+            let hit = format!("--{}--", EXACT64_PUBLIC_RAW_SENTINELS[1]);
             assert_eq!(
-                factory.prefilter(b"--alphabet--").expect("public hit"),
-                AotExact64SetOutcome::Candidate { position: 6 }
+                factory
+                    .prefilter(hit.as_bytes())
+                    .expect("public overlap hit"),
+                AotExact64SetOutcome::Candidate {
+                    position: 2 + EXACT64_PUBLIC_RAW_SENTINELS[0].len() - 1,
+                }
             );
             assert_eq!(
                 factory.prefilter(b"unrelated").expect("public miss"),
                 AotExact64SetOutcome::ConfirmedMiss
+            );
+
+            let case_neutral = ["1234", "5678"];
+            let case_neutral_factory = AotExact64SetFactory::select(
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                &case_neutral,
+                RipgrepAotExact64SetProfileV1::supported_rust_regex(true),
+            )
+            .expect("public case-neutral registry authentication")
+            .expect("AArch64 public case-neutral set must be admitted");
+            assert_eq!(case_neutral_factory.receipt().pattern_count(), 2);
+            assert_eq!(
+                case_neutral_factory
+                    .prefilter(b"xx5678")
+                    .expect("public case-neutral hit"),
+                AotExact64SetOutcome::Candidate { position: 5 }
             );
         }
     }

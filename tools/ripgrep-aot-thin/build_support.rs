@@ -216,13 +216,13 @@ fn parse_exact64_sets(text: &str, source_name: &str) -> Result<Vec<Exact64Set>, 
     let mut current: Option<Exact64Set> = None;
     for (index, line) in text.split('\n').enumerate() {
         let line_number = index + 1;
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
         if line.contains('\r') {
             return Err(format!(
                 "{source_name}:{line_number}: exact64 set manifest must use LF record separators; CR is not permitted"
             ));
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
         let mut columns = line.splitn(4, '\t');
         let id = columns.next().unwrap_or_default();
@@ -456,18 +456,29 @@ mod tests {
 
     #[test]
     fn exact64_set_manifest_fails_closed_without_echoing_regex_sources() {
-        let secret = "source-shaped-private-sentinel";
+        let secret = "fixture_raw_sentinel_one";
         for text in [
             format!("only\t{EXACT64_SET_PROFILE_V1}\t0\t{secret}\n"),
             format!(
                 "mixed\t{EXACT64_SET_PROFILE_V1}\t0\t{secret}\nmixed\t{EXACT64_SET_PROFILE_V1}\t1\tb\n"
             ),
             format!("bad\twrong-profile\t0\t{secret}\nbad\twrong-profile\t0\tb\n"),
-            format!("cr\t{EXACT64_SET_PROFILE_V1}\t0\t{secret}\r\ncr\t{EXACT64_SET_PROFILE_V1}\t0\tb\n"),
+            format!(
+                "cr\t{EXACT64_SET_PROFILE_V1}\t0\t{secret}\r\ncr\t{EXACT64_SET_PROFILE_V1}\t0\tb\n"
+            ),
         ] {
             let error = parse_exact64_sets(&text, "fixture.tsv").expect_err("invalid set TSV");
             assert!(!error.contains(secret), "diagnostic leaked source: {error}");
         }
+        let comment_crlf = format!(
+            "# comment must not hide CR\r\nrows\t{0}\t0\ta\nrows\t{0}\t0\tb\n",
+            EXACT64_SET_PROFILE_V1
+        );
+        assert!(
+            parse_exact64_sets(&comment_crlf, "fixture.tsv")
+                .expect_err("CRLF comment")
+                .contains("CR is not permitted")
+        );
     }
 
     #[test]

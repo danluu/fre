@@ -34,6 +34,7 @@ pub(crate) fn generate(
     target: Target,
     out_dir: &Path,
     manifest_selected: bool,
+    public_fixture_selected: bool,
 ) -> GeneratedExact64Sets {
     let mut declarations = String::new();
     let mut rows = String::new();
@@ -200,7 +201,8 @@ pub(crate) fn generate(
     }
 
     let mut source = format!(
-        "#[allow(unused_imports, reason = \"the opt-in exact64 registry may be empty\")]\nuse super::{{AotExact64SetReceiptV1, Exact64SetSpec}};\n\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_MANIFEST_SELECTED: bool = {manifest_selected};\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_MANIFEST_COUNT: usize = {};\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_INDEPENDENTLY_ELIGIBLE_COUNT: usize = {independently_eligible};\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_ADMITTED_COUNT: usize = {admitted};\n",
+        "#[allow(unused_imports, reason = \"the opt-in exact64 registry may be empty\")]\nuse super::{{AotExact64SetReceiptV1, Exact64SetSpec}};\n\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_MANIFEST_SELECTED: bool = {manifest_selected};\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_PUBLIC_FIXTURE_SELECTED: bool = {public_fixture_selected};\n#[allow(dead_code, reason = \"pins runtime authentication to the exact build target\")]\npub(super) const BUILD_EXACT64_SET_TARGET_FEATURES: u64 = {};\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_MANIFEST_COUNT: usize = {};\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_INDEPENDENTLY_ELIGIBLE_COUNT: usize = {independently_eligible};\n#[allow(dead_code, reason = \"reported by public build-validation tests\")]\npub(super) const BUILD_EXACT64_SET_ADMITTED_COUNT: usize = {admitted};\n",
+        target.features.bits(),
         sets.len()
     );
     if !declarations.is_empty() {

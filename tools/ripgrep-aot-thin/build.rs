@@ -70,6 +70,13 @@ fn main() {
         .transpose()
         .unwrap_or_else(|error| panic!("AOT exact64 set manifest: {error}"))
         .unwrap_or_default();
+    let public_exact64_fixture = manifest_dir.join("testdata/public-exact64-sets.tsv");
+    let public_exact64_fixture_selected = exact64_sets_path.as_deref().is_some_and(|path| {
+        matches!(
+            (fs::canonicalize(path), fs::canonicalize(&public_exact64_fixture)),
+            (Ok(selected), Ok(public)) if selected == public
+        )
+    });
     let mut patterns = read_patterns(&patterns_path)
         .unwrap_or_else(|error| panic!("AOT patterns manifest: {error}"));
     let manifest_pattern_count = patterns.len();
@@ -481,6 +488,7 @@ fn main() {
         target,
         &out_dir,
         exact64_sets_path.is_some(),
+        public_exact64_fixture_selected,
     );
     fs::write(
         out_dir.join("exact64_set_registry.rs"),
