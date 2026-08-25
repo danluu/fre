@@ -524,6 +524,27 @@ impl FusedExactLiteralExists {
     }
 }
 
+#[cfg(test)]
+mod fused_exact_ordinary_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
 impl Clone for PortableRegexSet {
     /// Rebuild an equivalent immutable set under its original profile and
     /// construction limits.
@@ -1043,39 +1064,19 @@ impl PortableRegexSet {
                 .map(|(matched, _report)| matched);
         }
         let window = SearchWindow::new(start, haystack.len());
-        let mut any = false;
-        let mut first_unsearched = 0_usize;
         if start == 0
             && haystack.len() >= FUSED_LITERAL_SET_ALL_ID_NEGATIVE_MIN_BYTES
             && let Some(fused) = &self.fused_literal_set
         {
-            let first = self.regexes[0]
-                .is_match_window_value(haystack, window, SearchLimits::unlimited())
-                .map_err(|source| PortableRegexSetExecutionError::Pattern {
-                    index: 0,
-                    total_work_before: 0,
-                    remaining_total_work: u64::MAX,
-                    source,
-                })?;
-            first_unsearched = 1;
-            if first {
-                match_flags[0] = true;
-                any = true;
-            } else {
-                let suffix_may_match = fused.plan.ordinary_executor().and_then(|executor| {
-                    executor
-                        .exists_window_value(
-                            haystack,
-                            LiteralWindow::new(window.start(), window.end()),
-                        )
-                        .ok()
-                });
-                if suffix_may_match == Some(false) {
-                    return Ok(false);
-                }
-            }
+            return self.matches_read_fused_exact_value(
+                match_flags,
+                haystack,
+                window,
+                fused,
+            );
         }
-        for (index, regex) in self.regexes.iter().enumerate().skip(first_unsearched) {
+        let mut any = false;
+        for (index, regex) in self.regexes.iter().enumerate() {
             let matched = regex
                 .is_match_window_value(haystack, window, SearchLimits::unlimited())
                 .map_err(|source| PortableRegexSetExecutionError::Pattern {
@@ -1084,6 +1085,60 @@ impl PortableRegexSet {
                     remaining_total_work: u64::MAX,
                     source,
                 })?;
+            if matched {
+                match_flags[index] = true;
+                any = true;
+            }
+        }
+        Ok(any)
+    }
+
+    /// Execute the construction-proved positive exact-literal constituents
+    /// without rebuilding finite-search accounting or selected spans. Keeping
+    /// the complete fused-only route outlined leaves mixed and sidecar-free
+    /// sets on their established generic facade loop.
+    #[inline(never)]
+    fn matches_read_fused_exact_value(
+        &self,
+        match_flags: &mut [bool],
+        haystack: &[u8],
+        window: SearchWindow,
+        fused: &FusedExactLiteralExists,
+    ) -> Result<bool, PortableRegexSetExecutionError> {
+        let first = is_match_window_value_unlimited(&self.regexes[0], haystack, window).map_err(
+            |source| PortableRegexSetExecutionError::Pattern {
+                index: 0,
+                total_work_before: 0,
+                remaining_total_work: u64::MAX,
+                source,
+            },
+        )?;
+        let mut any = first;
+        if first {
+            match_flags[0] = true;
+        } else {
+            let suffix_may_match = fused.plan.ordinary_executor().and_then(|executor| {
+                executor
+                    .exists_window_value(
+                        haystack,
+                        LiteralWindow::new(window.start(), window.end()),
+                    )
+                    .ok()
+            });
+            if suffix_may_match == Some(false) {
+                return Ok(false);
+            }
+        }
+
+        for (index, regex) in self.regexes.iter().enumerate().skip(1) {
+            let matched = is_match_window_value_unlimited(regex, haystack, window).map_err(
+                |source| PortableRegexSetExecutionError::Pattern {
+                    index,
+                    total_work_before: 0,
+                    remaining_total_work: u64::MAX,
+                    source,
+                },
+            )?;
             if matched {
                 match_flags[index] = true;
                 any = true;
@@ -2270,6 +2325,8 @@ fn is_match_window_value_unlimited(
     if let PortablePlan::ExactLiteral(literal) = &regex.plan
         && let Some(executor) = literal.ordinary_executor()
     {
+        #[cfg(test)]
+        fused_exact_ordinary_probe::record();
         return executor
             .exists_window_value(haystack, LiteralWindow::new(window.start(), window.end()))
             .map_err(SearchError::from);
@@ -2370,4 +2427,98 @@ fn capacity_bytes<T>(
     capacity
         .checked_mul(size_of::<T>())
         .ok_or(PortableRegexSetBuildError::ArithmeticOverflow { computation })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PortableRegexSet, PortableRegexSetRunLimits, fused_exact_ordinary_probe,
+    };
+
+    const PATTERNS: [&str; 8] = [
+        "literal_00",
+        "literal_01",
+        "literal_02",
+        "literal_03",
+        "literal_04",
+        "literal_05",
+        "literal_06",
+        "literal_07",
+    ];
+
+    #[test]
+    fn fused_all_id_route_uses_ordinary_exact_constituents_only_on_its_gate() {
+        let set = PortableRegexSet::new(PATTERNS).expect("fused exact-literal set");
+        assert!(set.fused_literal_set.is_some());
+
+        let absent = vec![b'x'; 256];
+        let mut first = absent.clone();
+        first[96..106].copy_from_slice(PATTERNS[0].as_bytes());
+        let mut suffix = absent.clone();
+        suffix[192..202].copy_from_slice(PATTERNS[7].as_bytes());
+
+        for (haystack, expected_calls) in [
+            (absent.as_slice(), 1_usize),
+            (first.as_slice(), PATTERNS.len()),
+            (suffix.as_slice(), PATTERNS.len()),
+        ] {
+            let mut expected = [false; 10];
+            expected[8] = true;
+            let (expected_any, _report) = set
+                .matches_read_at(
+                    &mut expected,
+                    haystack,
+                    0,
+                    PortableRegexSetRunLimits::unlimited(),
+                )
+                .expect("accounted all-ID oracle");
+
+            let mut actual = [false; 10];
+            actual[8] = true;
+            fused_exact_ordinary_probe::reset();
+            let actual_any = set
+                .matches_read_at_value(
+                    &mut actual,
+                    haystack,
+                    0,
+                    PortableRegexSetRunLimits::unlimited(),
+                )
+                .expect("fused ordinary all-ID search");
+            assert_eq!(actual_any, expected_any);
+            assert_eq!(actual, expected);
+            assert_eq!(fused_exact_ordinary_probe::calls(), expected_calls);
+        }
+
+        let mut short = vec![b'x'; 127];
+        short[96..106].copy_from_slice(PATTERNS[7].as_bytes());
+        let mut short_flags = [false; 8];
+        fused_exact_ordinary_probe::reset();
+        assert!(
+            set.matches_read_at_value(
+                &mut short_flags,
+                &short,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("short incumbent all-ID search"),
+        );
+        assert_eq!(fused_exact_ordinary_probe::calls(), 0);
+
+        let ineligible = PortableRegexSet::new(&PATTERNS[..7])
+            .expect("sidecar-free exact-literal set");
+        assert!(ineligible.fused_literal_set.is_none());
+        let mut ineligible_flags = [false; 7];
+        fused_exact_ordinary_probe::reset();
+        assert!(
+            !ineligible
+                .matches_read_at_value(
+                    &mut ineligible_flags,
+                    &suffix,
+                    0,
+                    PortableRegexSetRunLimits::unlimited(),
+                )
+                .expect("sidecar-free incumbent all-ID search"),
+        );
+        assert_eq!(fused_exact_ordinary_probe::calls(), 0);
+    }
 }
