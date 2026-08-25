@@ -436,6 +436,23 @@ impl RegexSetExact64GraphView<'_> {
             .map(|edge| edges[edge].target)
     }
 
+    /// Rebuild the exact set of bytes that leave the root.
+    ///
+    /// This is the only safe skip predicate for a shared first-any scan: while
+    /// the AC state is zero, every byte outside this set both fails to finish
+    /// a match and returns to zero. Deriving it from the authenticated root
+    /// edges avoids retaining a second source-derived membership witness.
+    pub(crate) fn root_membership(&self) -> [u64; 4] {
+        let mut membership = [0_u64; 4];
+        for byte in u8::MIN..=u8::MAX {
+            if self.direct_transition(0, byte).is_some() {
+                let byte = usize::from(byte);
+                membership[byte / 64] |= 1_u64 << (byte % 64);
+            }
+        }
+        membership
+    }
+
     /// Return the first source ordinal whose authenticated exact singleton
     /// contains `byte`.
     ///

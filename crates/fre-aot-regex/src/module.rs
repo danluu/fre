@@ -30456,6 +30456,7 @@ fn authenticate_regex_set_exact64_dense_data_v1(
     graph_identity: crate::RegexSetExact64ArtifactIdentity,
     all_pattern_mask: u64,
     layout: &crate::regex_set_exact64_aot::RegexSetExact64DenseLayoutV1,
+    allow_trailing_data: bool,
 ) -> Result<(), ObjectError> {
     if layout.state_count == 0
         || layout.transition_offset != 32
@@ -30500,7 +30501,11 @@ fn authenticate_regex_set_exact64_dense_data_v1(
         ))?;
     if layout.transition_cells != expected_cells
         || transition_end > layout.output_offset
-        || output_end != layout.data.len()
+        || if allow_trailing_data {
+            output_end > layout.data.len()
+        } else {
+            output_end != layout.data.len()
+        }
         || u32::try_from(layout.state_count).is_err()
     {
         return Err(ObjectError::InvalidModule(
@@ -30646,7 +30651,12 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
             "exact64 native lowering requires a valid AArch64 target",
         ));
     }
-    authenticate_regex_set_exact64_dense_data_v1(graph_identity, all_pattern_mask, &layout)?;
+    authenticate_regex_set_exact64_dense_data_v1(
+        graph_identity,
+        all_pattern_mask,
+        &layout,
+        false,
+    )?;
     let lowered = lower_aarch64_regex_set_exact64_scan_v1(all_pattern_mask)?;
     if lowered.code.len() > max_code_bytes {
         return Err(ObjectError::Resource {
@@ -30817,6 +30827,9 @@ const REGEX_SET_EXACT64_FIRST_ANY_AOT_DATA_SECTION: usize = 1;
 const REGEX_SET_EXACT64_FIRST_ANY_AOT_ENTRY_SYMBOL: usize = 0;
 const REGEX_SET_EXACT64_FIRST_ANY_AOT_TRANSITIONS_SYMBOL: usize = 2;
 const REGEX_SET_EXACT64_FIRST_ANY_AOT_OUTPUTS_SYMBOL: usize = 3;
+const REGEX_SET_EXACT64_FIRST_ANY_AOT_ROOT_SKIP_SYMBOL: usize = 4;
+const REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_DENSE_HITS: u16 = 4;
+const REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_BACKOFF_BYTES: u16 = 1024;
 
 struct NativeRegexSetExact64FirstAnyAarch64LoweringV1 {
     code: Vec<u8>,
@@ -30824,21 +30837,38 @@ struct NativeRegexSetExact64FirstAnyAarch64LoweringV1 {
     transition_page_offset: usize,
     output_page: usize,
     output_page_offset: usize,
+    root_skip_page: Option<usize>,
+    root_skip_page_offset: Option<usize>,
 }
 
 /// Lower the first-any-position ABI without changing the existing complete
 /// mask entry. The returned position is the final byte consumed by the first
 /// state, in scan order, whose authenticated owner mask is nonzero. It is
 /// therefore an in-match byte rather than a half-open endpoint.
-fn lower_aarch64_regex_set_exact64_first_any_scan_v1()
--> Result<NativeRegexSetExact64FirstAnyAarch64LoweringV1, ObjectError> {
+fn lower_aarch64_regex_set_exact64_first_any_scan_v1(
+    root_skip: Option<
+        crate::regex_set_exact64_first_any_aot::RegexSetExact64FirstAnyRootSkipLayoutV1,
+    >,
+) -> Result<NativeRegexSetExact64FirstAnyAarch64LoweringV1, ObjectError> {
+    use crate::regex_set_exact64_first_any_aot::{
+        REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_VECTOR_BYTES_V1,
+    };
+
     let mut assembler = Aarch64Assembler::new();
     let addressable_haystack = assembler.label()?;
+    let dispatch = assembler.label()?;
     let scan = assembler.label()?;
+    let dense_scan = assembler.label()?;
+    let vector_hit = assembler.label()?;
+    let vector_hit_sparse = assembler.label()?;
+    let vector_hit_backoff_to_end = assembler.label()?;
     let hit = assembler.label()?;
     let no_match = assembler.label()?;
     let publish = assembler.label()?;
     let invalid = assembler.label()?;
+    let root_skip_vector_bytes =
+        u16::try_from(REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_VECTOR_BYTES_V1)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact64 root-skip vector bytes"))?;
 
     // Public raw boundary: `u32 entry(const u8 *, usize, usize, usize,
     // u64 *)`. No path touches the output before `publish`.
@@ -30865,8 +30895,89 @@ fn lower_aarch64_regex_set_exact64_first_any_scan_v1()
     let transition_page_offset = assembler.instruction(aarch64_add_x_imm(8, 8, 0)?)?;
     let output_page = assembler.instruction(0x9000_000b)?; // ADRP X11, outputs
     let output_page_offset = assembler.instruction(aarch64_add_x_imm(11, 11, 0)?)?;
-    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
-    assembler.branch_cond(AARCH64_HS, no_match)?;
+    let (root_skip_page, root_skip_page_offset) = if root_skip.is_some() {
+        let page = assembler.instruction(0x9000_000e)?; // ADRP X14, root-skip tables
+        let page_offset = assembler.instruction(aarch64_add_x_imm(14, 14, 0)?)?;
+        assembler.instruction(aarch64_load_pair_q(16, 17, 14, 0)?)?;
+        assembler.instruction(aarch64_load_pair_q(18, 29, 14, 32)?)?;
+        assembler.instruction(aarch64_movi_16b(19, 0x0f)?)?;
+        assembler.instruction(aarch64_movi_16b(31, 64)?)?;
+        // X15 is the exclusive end of a bounded scalar backoff. It begins
+        // empty and is advanced only after one classifier block proves a
+        // dense root-byte population.
+        assembler.instruction(aarch64_add_x_imm(15, 5, 0)?)?;
+        (Some(page), Some(page_offset))
+    } else {
+        (None, None)
+    };
+
+    if root_skip.is_some() {
+        // The exact nibble classifier is consulted only at the AC root. A
+        // clear lane cannot begin any authenticated source literal, so an
+        // entire clear block leaves the semantic state at zero.
+        assembler.bind(dispatch)?;
+        assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+        assembler.branch_cond(AARCH64_HS, no_match)?;
+        assembler.instruction(aarch64_cmp_w_zero(6)?)?;
+        assembler.branch_cond(AARCH64_NE, scan)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 13, 5)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, root_skip_vector_bytes)?)?;
+        assembler.branch_cond(AARCH64_LO, scan)?;
+        assembler.instruction(aarch64_load_q(0, 5)?)?;
+        assembler.instruction(aarch64_ushr_16b_by_4(20, 0)?)?;
+        assembler.instruction(aarch64_and_16b(21, 0, 19)?)?;
+        assembler.instruction(aarch64_tbl1_16b(22, 16, 21)?)?;
+        assembler.instruction(aarch64_tbl1_16b(23, 17, 21)?)?;
+        assembler.instruction(aarch64_cmlt_zero_16b(24, 0)?)?;
+        assembler.instruction(aarch64_bsl_16b(24, 23, 22)?)?;
+        assembler.instruction(aarch64_and_16b(20, 20, 19)?)?;
+        assembler.instruction(aarch64_tbl1_16b(20, 18, 20)?)?;
+        assembler.instruction(aarch64_and_16b(24, 24, 20)?)?;
+        assembler.instruction(aarch64_cmtst_16b(24, 24, 24)?)?;
+        assembler.instruction(aarch64_umaxv_16b(7, 24)?)?;
+        assembler.instruction(aarch64_umov_b0(12, 7)?)?;
+        assembler.instruction(aarch64_cmp_w_zero(12)?)?;
+        assembler.branch_cond(AARCH64_NE, vector_hit)?;
+        assembler.instruction(aarch64_add_x_imm(5, 5, root_skip_vector_bytes)?)?;
+        assembler.branch(dispatch)?;
+
+        assembler.bind(vector_hit)?;
+        // Four or more possible starts in one 16-byte block make repeated
+        // classification more expensive than the unchanged dense AC loop.
+        // Back off for a fixed public distance, then sample density again.
+        // The lane sum is exact because the classifier mask is 0xff/0x00.
+        assembler.instruction(aarch64_ushr_16b_by_7(7, 24)?)?;
+        assembler.instruction(aarch64_addv_16b(7, 7)?)?;
+        assembler.instruction(aarch64_umov_b0(12, 7)?)?;
+        assembler.instruction(aarch64_cmp_w_imm(
+            12,
+            REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_DENSE_HITS,
+        )?)?;
+        assembler.branch_cond(AARCH64_LO, vector_hit_sparse)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 13, 5)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(
+            12,
+            REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_BACKOFF_BYTES,
+        )?)?;
+        assembler.branch_cond(AARCH64_LO, vector_hit_backoff_to_end)?;
+        assembler.instruction(aarch64_add_x_imm(
+            15,
+            5,
+            REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_BACKOFF_BYTES,
+        )?)?;
+        assembler.branch(vector_hit_sparse)?;
+        assembler.bind(vector_hit_backoff_to_end)?;
+        assembler.instruction(aarch64_add_x_imm(15, 13, 0)?)?;
+
+        assembler.bind(vector_hit_sparse)?;
+        assembler.instruction(aarch64_bsl_16b(24, 29, 31)?)?;
+        assembler.instruction(aarch64_uminv_16b(24, 24)?)?;
+        assembler.instruction(aarch64_umov_b0(12, 24)?)?;
+        assembler.instruction(aarch64_add_x_reg(5, 5, 12)?)?;
+    } else {
+        assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+        assembler.branch_cond(AARCH64_HS, no_match)?;
+    }
 
     assembler.bind(scan)?;
     assembler.instruction(aarch64_load_byte_post_imm(9, 5, 1)?)?;
@@ -30876,7 +30987,29 @@ fn lower_aarch64_regex_set_exact64_first_any_scan_v1()
     assembler.instruction(aarch64_load_x_lsl3(10, 11, 6)?)?;
     assembler.branch_nonzero_x(10, hit)?;
     assembler.instruction(aarch64_cmp_x(5, 13)?)?;
-    assembler.branch_cond(AARCH64_LO, scan)?;
+    if root_skip.is_some() {
+        assembler.branch_cond(AARCH64_HS, no_match)?;
+        // A dense classifier block installs X15 at a validated position no
+        // later than the window end. Enter a dedicated scalar loop so the
+        // bounded backoff retains the incumbent's one compare/branch per
+        // byte instead of round-tripping through the vector dispatch.
+        assembler.instruction(aarch64_cmp_x(5, 15)?)?;
+        assembler.branch_cond(AARCH64_LO, dense_scan)?;
+        assembler.branch(dispatch)?;
+
+        assembler.bind(dense_scan)?;
+        assembler.instruction(aarch64_load_byte_post_imm(9, 5, 1)?)?;
+        assembler.instruction(aarch64_add_x_lsl(10, 8, 6, 10)?)?;
+        assembler.instruction(aarch64_add_x_lsl(10, 10, 9, 2)?)?;
+        assembler.instruction(aarch64_load_w_imm(6, 10, 0)?)?;
+        assembler.instruction(aarch64_load_x_lsl3(10, 11, 6)?)?;
+        assembler.branch_nonzero_x(10, hit)?;
+        assembler.instruction(aarch64_cmp_x(5, 15)?)?;
+        assembler.branch_cond(AARCH64_LO, dense_scan)?;
+        assembler.branch(dispatch)?;
+    } else {
+        assembler.branch_cond(AARCH64_LO, scan)?;
+    }
 
     assembler.bind(no_match)?;
     aarch64_load_u64_constant(
@@ -30909,24 +31042,48 @@ fn lower_aarch64_regex_set_exact64_first_any_scan_v1()
     )?)?;
     assembler.instruction(0xd65f_03c0)?;
 
-    let mut relocation_offsets = [
-        transition_page,
-        transition_page_offset,
-        output_page,
-        output_page_offset,
-    ];
-    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    let (code, relocation_offsets, root_skip_offsets) = if let (Some(page), Some(page_offset)) =
+        (root_skip_page, root_skip_page_offset)
+    {
+        let mut offsets = [
+            transition_page,
+            transition_page_offset,
+            output_page,
+            output_page_offset,
+            page,
+            page_offset,
+        ];
+        let code = assembler.finish_with_offsets(&mut offsets)?;
+        (
+            code,
+            [offsets[0], offsets[1], offsets[2], offsets[3]],
+            Some([offsets[4], offsets[5]]),
+        )
+    } else {
+        let mut offsets = [
+            transition_page,
+            transition_page_offset,
+            output_page,
+            output_page_offset,
+        ];
+        let code = assembler.finish_with_offsets(&mut offsets)?;
+        (code, offsets, None)
+    };
     Ok(NativeRegexSetExact64FirstAnyAarch64LoweringV1 {
         code,
         transition_page: relocation_offsets[0],
         transition_page_offset: relocation_offsets[1],
         output_page: relocation_offsets[2],
         output_page_offset: relocation_offsets[3],
+        root_skip_page: root_skip_offsets.map(|offsets| offsets[0]),
+        root_skip_page_offset: root_skip_offsets.map(|offsets| offsets[1]),
     })
 }
 
 /// Lower an independently authenticated LF-free exact64 graph into one
-/// helper-free scalar AArch64 first-any-position scan.
+/// helper-free AArch64 first-any-position scan. Explicit ASIMD targets may
+/// skip exact root-state nonmembers in 16-byte blocks; every candidate and
+/// every non-root byte remains owned by the unchanged dense AC transition.
 #[allow(
     clippy::too_many_lines,
     reason = "the separate first-any symbol, dense-data relocations, and standalone receipt must not perturb the existing mask artifact"
@@ -30937,6 +31094,9 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
     graph_identity: crate::RegexSetExact64ArtifactIdentity,
     all_pattern_mask: u64,
     layout: crate::regex_set_exact64_aot::RegexSetExact64DenseLayoutV1,
+    root_skip: Option<
+        crate::regex_set_exact64_first_any_aot::RegexSetExact64FirstAnyRootSkipLayoutV1,
+    >,
     max_code_bytes: usize,
 ) -> Result<CompiledModule, ObjectError> {
     target.validate()?;
@@ -30945,8 +31105,25 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
             "exact64 first-any lowering requires a valid AArch64 target",
         ));
     }
-    authenticate_regex_set_exact64_dense_data_v1(graph_identity, all_pattern_mask, &layout)?;
-    let lowered = lower_aarch64_regex_set_exact64_first_any_scan_v1()?;
+    authenticate_regex_set_exact64_dense_data_v1(
+        graph_identity,
+        all_pattern_mask,
+        &layout,
+        root_skip.is_some(),
+    )?;
+    if let Some(root_skip) = root_skip {
+        if !target.features.has(CpuFeature::Aarch64Asimd)
+            || !crate::regex_set_exact64_first_any_aot::authenticates_exact_root_skip_tables(
+                &layout,
+                root_skip,
+            )
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact64 first-any root-skip proof does not authenticate",
+            ));
+        }
+    }
+    let lowered = lower_aarch64_regex_set_exact64_first_any_scan_v1(root_skip)?;
     if lowered.code.len() > max_code_bytes {
         return Err(ObjectError::Resource {
             resource: CompileResource::CodeBytes,
@@ -30966,7 +31143,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         .ok_or(ObjectError::ArithmeticOverflow(
             "exact64 first-any output symbol size",
         ))?;
-    let symbols = vec![
+    let mut symbols = vec![
         ModuleSymbol {
             name: identity_symbol(
                 "fre_aot_regex_set_exact64_first_any_v1_",
@@ -31015,7 +31192,22 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
             })?,
         },
     ];
-    let relocations = vec![
+    if let Some(root_skip) = root_skip {
+        symbols.push(ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_first_any_root_skip_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_FIRST_ANY_AOT_DATA_SECTION),
+            offset: offset_u64(
+                root_skip.table_offset,
+                "exact64 first-any root-skip symbol offset",
+            )?,
+            size: u64::try_from(root_skip.table_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 first-any root-skip symbol size")
+            })?,
+        });
+    }
+    let mut relocations = vec![
         ModuleRelocation {
             section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
             offset: offset_u64(
@@ -31057,6 +31249,33 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
             addend: 0,
         },
     ];
+    match (lowered.root_skip_page, lowered.root_skip_page_offset, root_skip) {
+        (Some(page), Some(page_offset), Some(_)) => {
+            relocations.push(ModuleRelocation {
+                section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
+                offset: offset_u64(page, "exact64 first-any root-skip page relocation")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: REGEX_SET_EXACT64_FIRST_ANY_AOT_ROOT_SKIP_SYMBOL,
+                addend: 0,
+            });
+            relocations.push(ModuleRelocation {
+                section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
+                offset: offset_u64(
+                    page_offset,
+                    "exact64 first-any root-skip page-offset relocation",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: REGEX_SET_EXACT64_FIRST_ANY_AOT_ROOT_SKIP_SYMBOL,
+                addend: 0,
+            });
+        }
+        (None, None, None) => {}
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "exact64 first-any root-skip relocations are incomplete",
+            ));
+        }
+    }
     Ok(CompiledModule {
         target,
         sections: vec![
@@ -31097,7 +31316,11 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         direct_exact_singleton_span_sum_aot_report: None,
         runtime_symbol_index: None,
         runtime_program_symbol_index: None,
-        start_accelerator: StartAccelerator::None,
+        start_accelerator: if root_skip.is_some() {
+            StartAccelerator::Aarch64Asimd
+        } else {
+            StartAccelerator::None
+        },
         anchored_prefix_filter_bytes: 0,
         slow_aot_report: None,
         slow_context_aot_report: None,
@@ -62916,6 +63139,14 @@ fn aarch64_ld1_three_16b(first_destination: u8, base: u8) -> Result<u32, ObjectE
 
 fn aarch64_ushr_16b_by_4(destination: u8, source: u8) -> Result<u32, ObjectError> {
     Ok(0x6f0c_0400 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_ushr_16b_by_7(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x6f09_0400 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_addv_16b(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x4e31_b800 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_tbl1_16b(
