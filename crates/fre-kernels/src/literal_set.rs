@@ -257,6 +257,7 @@ pub struct LiteralSetPlan {
 #[derive(Clone, Copy, Debug)]
 pub struct LiteralSetOrdinaryExecutor<'a> {
     plan: &'a LiteralSetPlan,
+    direct_dfa_start_state: Option<StateID>,
 }
 
 /// Stateful selected-match scan shared by ordinary literal-set operations.
@@ -603,11 +604,28 @@ impl LiteralSetPlan {
     pub fn ordinary_executor(&self) -> Option<LiteralSetOrdinaryExecutor<'_>> {
         // A generic `AsRef` provider can change between preflight and DFA
         // construction, so bind positive width from the retained owner too.
-        (self.build.match_semantics == LiteralSetMatchSemantics::LeftmostFirst
+        if !(self.build.match_semantics == LiteralSetMatchSemantics::LeftmostFirst
             && self.build.minimum_pattern_bytes > 0
             && self.automaton.min_pattern_len() > 0
             && self.folded_long_tail.is_none())
-            .then_some(LiteralSetOrdinaryExecutor { plan: self })
+        {
+            return None;
+        }
+        let automaton = self.automaton.as_ref();
+        let direct_dfa_start_state = if automaton.prefilter().is_none()
+            && automaton.match_kind() == MatchKind::LeftmostFirst
+        {
+            let start_state = automaton
+                .start_state(Anchored::No)
+                .expect("the literal-set DFA retains its unanchored start state");
+            (!automaton.is_special(start_state)).then_some(start_state)
+        } else {
+            None
+        };
+        Some(LiteralSetOrdinaryExecutor {
+            plan: self,
+            direct_dfa_start_state,
+        })
     }
 
     /// Additional owner bytes beyond the trie owner already in its receipt.
@@ -1453,13 +1471,13 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     ) -> Option<Self> {
         let plan = executor.plan;
         let automaton = plan.automaton.as_ref();
-        if automaton.prefilter().is_some() || automaton.match_kind() != MatchKind::LeftmostFirst {
-            return None;
-        }
-        let anchored = Anchored::No;
-        let start_state = automaton
-            .start_state(anchored)
-            .expect("the literal-set DFA retains its unanchored start state");
+        let start_state = executor.direct_dfa_start_state?;
+        debug_assert!(automaton.prefilter().is_none());
+        debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
+        // Aho's special-state taxonomy is dead, match or start. Requiring an
+        // unspecialized unanchored start lets the scan classify every later
+        // special non-dead state as an acceptance without testing it twice.
+        debug_assert!(!automaton.is_special(start_state));
         debug_assert!(!automaton.is_match(start_state));
         Some(Self {
             automaton,
@@ -1487,14 +1505,12 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
                     self.automaton.is_match(state),
                     "a DFA without a prefilter has no other special states",
                 );
-                if self.automaton.is_match(state) {
-                    let pattern = if NEED_PATTERN {
-                        Some(self.automaton.match_pattern(state, 0))
-                    } else {
-                        None
-                    };
-                    selected = Some(LiteralSetDfaSelection { end: at, pattern });
-                }
+                let pattern = if NEED_PATTERN {
+                    Some(self.automaton.match_pattern(state, 0))
+                } else {
+                    None
+                };
+                selected = Some(LiteralSetDfaSelection { end: at, pattern });
             }
         }
         self.restart = selected.as_ref().map_or(self.end, |matched| matched.end);
@@ -1564,8 +1580,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     #[must_use]
     #[inline]
     pub fn direct_count_scanner_supported(&self) -> bool {
-        self.plan.automaton.prefilter().is_none()
-            && self.plan.automaton.match_kind() == MatchKind::LeftmostFirst
+        self.direct_dfa_start_state.is_some()
     }
 
     /// Bind the capability to select first acceptance by scanning this same
@@ -1895,7 +1910,10 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
     #[must_use]
     #[inline]
     pub const fn ordinary_executor(self) -> LiteralSetOrdinaryExecutor<'a> {
-        LiteralSetOrdinaryExecutor { plan: self.plan }
+        LiteralSetOrdinaryExecutor {
+            plan: self.plan,
+            direct_dfa_start_state: None,
+        }
     }
 
     /// Return the construction-proved common positive literal width.
