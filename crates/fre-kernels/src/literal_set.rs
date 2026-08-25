@@ -1599,6 +1599,9 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         window: Window,
     ) -> Result<Option<(usize, usize)>, LiteralSetError> {
         validate_window(window, haystack.len())?;
+        if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
+            return Ok(scanner.next_span());
+        }
         self.plan.try_find_window_value(haystack, window)
     }
 
@@ -6086,6 +6089,10 @@ mod tests {
 
         let haystack = [250, 251, 1, 1, 1, 1, 1, 1, 1, 252];
         let window = Window::new(2, 9);
+        assert_eq!(
+            ordinary.find_window_value(&haystack, window),
+            Ok(Some((2, 6))),
+        );
         let mut visited = Vec::new();
         assert_eq!(
             ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
@@ -6147,6 +6154,10 @@ mod tests {
             LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
         assert!(short_first.automaton.prefilter().is_none());
         let ordinary = short_first.ordinary_executor().unwrap();
+        assert_eq!(
+            ordinary.find_window_value(&haystack, window),
+            Ok(Some((2, 5))),
+        );
         let mut short_spans = Vec::new();
         assert_eq!(
             ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
