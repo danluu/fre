@@ -236,7 +236,7 @@ impl RegexSetExact64AotReceiptV1 {
 pub struct RegexSetExact64AotArtifactV1 {
     program: RegexSetExact64Program,
     module: CompiledModule,
-    object: Box<[u8]>,
+    object: Vec<u8>,
     receipt: RegexSetExact64AotReceiptV1,
 }
 
@@ -951,7 +951,7 @@ fn authenticate_artifact(
         || receipt.semantic_runtime_calls != 0
         || receipt.artifact_identity_sha256 != artifact_identity(receipt)?
         || artifact.module != rebuilt
-        || artifact.object.as_ref() != rebuilt_object.as_ref()
+        || artifact.object.as_slice() != rebuilt_object.as_slice()
         || module_data(&artifact.module)? != data
         || artifact.module.required_runtime_symbols().next().is_some()
         || artifact.module.required_runtime_program().is_some()

@@ -17,7 +17,7 @@ use fre_automata::K0CompilerPrefillLimits;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CompileError, DeterminizationReport, DeterminizeLimits, DfaStats,
+    CompileError, CompileResource, DeterminizationReport, DeterminizeLimits, DfaStats,
     NativeSlowPartialQuotientReceipt, ObjectError,
     absolute_anchored_cut::AbsoluteAnchoredBounds,
     bit_parallel_exists::NativeBitParallelExistsView,
