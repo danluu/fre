@@ -27,7 +27,7 @@ use crate::{
     PreparedAggregateStrategy, Target,
 };
 
-pub const DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION: u16 = 3;
+pub const DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION: u16 = 4;
 
 /// Largest source length routed to the authenticated incumbent body for the
 /// short-input periodic schedule. The focused core starts at one complete
@@ -63,7 +63,7 @@ pub enum DirectExactSingletonCountSelectionBasis {
     /// per-match search call and internal span publication.
     StructuralSingleScanDominance,
     /// The direct arm has the same structural dominance, while a source-only
-    /// length gate retains the authenticated incumbent for its startup range.
+    /// cold-long gate leaves the incumbent short path byte-for-byte in place.
     StructuralSingleScanDominanceWithShortIncumbent,
 }
 
@@ -108,10 +108,16 @@ pub struct DirectExactSingletonCountAotReport {
     /// Inclusive source-length ceiling for the byte-identical incumbent arm.
     /// `None` means the selected core owns every authenticated source length.
     pub short_fallback_max_bytes: Option<u32>,
-    /// Text extent of the incumbent body relocated after the fall-through
-    /// length gate. The short arm executes this body without taking a branch.
+    /// Text extent of a relocated incumbent body used by an older gate layout.
+    /// Schema V4's cold-long gate leaves both fields absent because the short
+    /// arm and its body remain byte-for-byte in place.
     pub copied_incumbent_body_offset: Option<usize>,
     pub copied_incumbent_body_bytes: Option<usize>,
+    /// Appended cold path that rechecks invalid-length precedence, validates
+    /// the result pointer, reauthenticates the handle, and enters the core.
+    /// The established short path never executes this extent.
+    pub cold_long_offset: Option<usize>,
+    pub cold_long_bytes: Option<usize>,
     pub core_offset: usize,
     pub core_bytes: usize,
     pub core_sha256: [u8; 32],

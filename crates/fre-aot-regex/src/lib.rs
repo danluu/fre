@@ -1305,6 +1305,17 @@ enum NativeFiniteLanguageAttachPolicy {
     FailClosed,
 }
 
+fn is_proven_object_byte_limit(error: &ObjectError) -> bool {
+    matches!(
+        error,
+        ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        } if required > limit
+    )
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1540,10 +1551,7 @@ fn append_prepared_aggregate_exports_to_compiled(
                 )? {
                     match emit_object(&module, format, max_object_bytes) {
                         Ok(candidate_object) => object = candidate_object,
-                        Err(ObjectError::Resource {
-                            resource: CompileResource::ObjectBytes,
-                            ..
-                        }) => {
+                        Err(error) if is_proven_object_byte_limit(&error) => {
                             module.rollback_direct_exact_singleton_count(rollback)?;
                         }
                         Err(error) => {

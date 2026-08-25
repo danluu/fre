@@ -259,12 +259,14 @@ fn direct_exact_singleton_count_selects_for_every_supported_width_and_format() {
             );
             assert_eq!(
                 report.copied_incumbent_body_offset.is_some(),
-                has_short_fallback,
+                false,
             );
             assert_eq!(
                 report.copied_incumbent_body_bytes.is_some(),
-                has_short_fallback,
+                false,
             );
+            assert_eq!(report.cold_long_offset.is_some(), has_short_fallback);
+            assert_eq!(report.cold_long_bytes.is_some(), has_short_fallback);
             assert_eq!(report.incumbent_cost.scan_passes, 1);
             assert_eq!(report.selected_cost.scan_passes, 1);
             assert_eq!(report.incumbent_cost.native_calls_per_match, 1);
@@ -539,6 +541,23 @@ fn direct_exact_singleton_count_object_cap_decline_is_incumbent_exact_and_alloca
 }
 
 #[test]
+fn direct_count_final_object_decline_requires_a_proven_numeric_cap() {
+    assert!(crate::is_proven_object_byte_limit(&ObjectError::Resource {
+        resource: CompileResource::ObjectBytes,
+        limit: 4095,
+        required: 4096,
+    }));
+    assert!(!crate::is_proven_object_byte_limit(&ObjectError::Resource {
+        resource: CompileResource::ObjectBytes,
+        limit: 4096,
+        required: 4096,
+    }));
+    assert!(!crate::is_proven_object_byte_limit(&ObjectError::Allocation(
+        "object output bytes",
+    )));
+}
+
+#[test]
 fn direct_exact_singleton_count_backend_unsupported_is_terminal() {
     let target = direct_count_asimd_target(OperatingSystem::Linux);
     let request = direct_count_request(
@@ -708,7 +727,7 @@ fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface(
 }
 
 #[test]
-fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() {
+fn direct_exact_singleton_count_short_gate_preserves_the_hot_incumbent_layout() {
     fn signed_target(instruction_offset: usize, immediate: u32, bits: u32) -> usize {
         let shift = 64 - bits;
         let words = ((u64::from(immediate) << shift) as i64) >> shift;
@@ -717,27 +736,6 @@ fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() 
                 + words * 4,
         )
         .expect("local branch target is nonnegative")
-    }
-
-    fn direct_branch(instruction: u32) -> Option<(u32, u32, bool)> {
-        if instruction & 0xfc00_0000 == 0x9400_0000 {
-            Some((instruction & 0x03ff_ffff, 26, true))
-        } else if instruction & 0xfc00_0000 == 0x1400_0000 {
-            Some((instruction & 0x03ff_ffff, 26, false))
-        } else if instruction & 0xff00_0010 == 0x5400_0000 {
-            Some(((instruction >> 5) & 0x7ffff, 19, false))
-        } else if instruction & 0x7e00_0000 == 0x3400_0000 {
-            Some(((instruction >> 5) & 0x7ffff, 19, false))
-        } else if instruction & 0x7e00_0000 == 0x3600_0000 {
-            Some(((instruction >> 5) & 0x3fff, 14, false))
-        } else {
-            None
-        }
-    }
-
-    fn is_pc_relative_address_or_literal(instruction: u32) -> bool {
-        instruction & 0x1f00_0000 == 0x1000_0000
-            || instruction & 0x3b00_0000 == 0x1800_0000
     }
 
     let target = direct_count_asimd_target(OperatingSystem::Linux);
@@ -755,11 +753,11 @@ fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() 
         request,
         PreparedAggregateExports::COUNT,
     )
-    .expect("compile short-gated direct Count-v3");
+    .expect("compile cold-long direct Count-v3");
     let report = selected
         .module()
         .direct_exact_singleton_count_aot_report()
-        .expect("short-gated direct Count-v3 report");
+        .expect("cold-long direct Count-v3 report");
     let short_max = report
         .short_fallback_max_bytes
         .expect("periodic width-two short fallback");
@@ -767,12 +765,10 @@ fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() 
         short_max,
         crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
     );
-    let copied_offset = report
-        .copied_incumbent_body_offset
-        .expect("copied incumbent body offset");
-    let copied_bytes = report
-        .copied_incumbent_body_bytes
-        .expect("copied incumbent body bytes");
+    assert_eq!(report.copied_incumbent_body_offset, None);
+    assert_eq!(report.copied_incumbent_body_bytes, None);
+    let cold_offset = report.cold_long_offset.expect("cold-long offset");
+    let cold_bytes = report.cold_long_bytes.expect("cold-long bytes");
 
     let selected_text = selected
         .module()
@@ -788,44 +784,101 @@ fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() 
         .find(|section| section.kind == SectionKind::Text)
         .expect("incumbent text")
         .bytes();
-    let authenticated = report.authenticated_wrapper_body_offset;
-    let gate = selected_text[authenticated..authenticated + 8]
+    assert_eq!(cold_offset, incumbent_text.len());
+    assert_eq!(cold_offset + cold_bytes, report.core_offset);
+    assert_eq!(
+        &selected_text[report.authenticated_wrapper_body_offset..cold_offset],
+        &incumbent_text[report.authenticated_wrapper_body_offset..],
+        "the established authenticated body must stay byte-for-byte in place",
+    );
+
+    let differences = selected_text[..cold_offset]
         .chunks_exact(4)
-        .map(|word| u32::from_le_bytes(word.try_into().expect("instruction")))
+        .zip(incumbent_text.chunks_exact(4))
+        .enumerate()
+        .filter_map(|(index, (selected, incumbent))| {
+            (selected != incumbent).then_some((index * 4, selected, incumbent))
+        })
         .collect::<Vec<_>>();
+    assert_eq!(differences.len(), 2, "only the signed-length pair changes");
+    assert_eq!(differences[1].0, differences[0].0 + 4);
+    let branch_offset = differences[1].0;
+    let incumbent_compare =
+        u32::from_le_bytes(differences[0].2.try_into().expect("incumbent compare"));
+    let incumbent_branch =
+        u32::from_le_bytes(differences[1].2.try_into().expect("incumbent branch"));
+    assert_eq!(incumbent_compare, 0xf100_001f | (2 << 5));
+    assert_eq!(incumbent_branch & 0xff00_001f, 0x5400_0004);
+
+    let selected_compare =
+        u32::from_le_bytes(differences[0].1.try_into().expect("selected compare"));
+    let selected_branch =
+        u32::from_le_bytes(differences[1].1.try_into().expect("selected branch"));
     let direct_min = short_max.checked_add(1).expect("short threshold successor");
     assert!(direct_min.is_multiple_of(1 << 12));
     assert_eq!(
-        gate[0],
+        selected_compare,
         0xf140_001f | ((direct_min >> 12) << 10) | (2 << 5),
     );
-    assert_eq!(gate[1] & 0xff00_001f, 0x5400_0002);
-    let direct_thunk_offset = report
-        .core_offset
-        .checked_sub(16)
-        .expect("direct thunk precedes core");
+    assert_eq!(selected_branch & 0xff00_001f, 0x5400_0002);
     assert_eq!(
-        signed_target(authenticated + 4, (gate[1] >> 5) & 0x7ffff, 19),
-        direct_thunk_offset,
+        signed_target(branch_offset, (selected_branch >> 5) & 0x7ffff, 19),
+        cold_offset,
     );
-    assert_eq!(copied_offset, authenticated + 8);
 
-    let direct_thunk = selected_text[direct_thunk_offset..report.core_offset]
+    let cold_words = selected_text[cold_offset..report.core_offset]
         .chunks_exact(4)
-        .map(|word| u32::from_le_bytes(word.try_into().expect("instruction")))
+        .map(|word| u32::from_le_bytes(word.try_into().expect("cold instruction")))
         .collect::<Vec<_>>();
-    assert_eq!(direct_thunk[0], 0xaa01_03e0);
-    assert_eq!(direct_thunk[1], 0xaa02_03e1);
-    assert_eq!(direct_thunk[2], 0xaa03_03e2);
-    assert_eq!(direct_thunk[3] & 0xfc00_0000, 0x1400_0000);
+    assert_eq!(
+        cold_words[0] & 0xfff8_001f,
+        0xb7f8_0002,
+        "cold path must reject bit-63 lengths first",
+    );
+    let direct_windows = cold_words
+        .windows(4)
+        .enumerate()
+        .filter(|(_, words)| {
+            words[0] == 0xaa01_03e0
+                && words[1] == 0xaa02_03e1
+                && words[2] == 0xaa03_03e2
+                && words[3] & 0xfc00_0000 == 0x1400_0000
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(direct_windows.len(), 1, "one audited direct tail exists");
+    let (direct_index, direct_words) = direct_windows[0];
+    let direct_branch_offset = cold_offset + (direct_index + 3) * 4;
     assert_eq!(
         signed_target(
-            direct_thunk_offset + 12,
-            direct_thunk[3] & 0x03ff_ffff,
+            direct_branch_offset,
+            direct_words[3] & 0x03ff_ffff,
             26,
         ),
         report.core_offset,
     );
+
+    let incumbent_relocations = incumbent.module().relocations();
+    let selected_relocations = selected.module().relocations();
+    assert_eq!(selected_relocations.len(), incumbent_relocations.len() + 2);
+    assert_eq!(
+        &selected_relocations[..incumbent_relocations.len()],
+        incumbent_relocations,
+    );
+    for (relocation, kind) in selected_relocations[incumbent_relocations.len()..]
+        .iter()
+        .zip([
+            crate::RelocationKind::Aarch64Page21,
+            crate::RelocationKind::Aarch64PageOff12,
+        ])
+    {
+        assert_eq!(relocation.section, incumbent_relocations[0].section);
+        assert_eq!(relocation.kind, kind);
+        assert_eq!(relocation.symbol, incumbent_relocations[0].symbol);
+        assert_eq!(relocation.addend, 0);
+        assert!((cold_offset..report.core_offset).contains(
+            &usize::try_from(relocation.offset).expect("cold relocation offset"),
+        ));
+    }
 
     let selected_count_name = selected
         .module()
@@ -848,78 +901,15 @@ fn direct_exact_singleton_count_short_gate_relocates_the_exact_incumbent_body() 
         .find(|symbol| symbol.name == incumbent_count_name)
         .expect("incumbent Count symbol record");
     assert_eq!(selected_count.offset, incumbent_count.offset);
-    assert_eq!(selected_count.size, incumbent_count.size + 24);
+    assert_eq!(
+        selected_count.size,
+        incumbent_count.size + u64::try_from(cold_bytes).expect("cold size"),
+    );
     assert_eq!(
         usize::try_from(selected_count.offset + selected_count.size)
             .expect("selected Count extent"),
         report.core_offset,
     );
-
-    let original_body = &incumbent_text[authenticated..authenticated + copied_bytes];
-    let copied_body = &selected_text[copied_offset..copied_offset + copied_bytes];
-    let differing_words = original_body
-        .chunks_exact(4)
-        .zip(copied_body.chunks_exact(4))
-        .filter(|(original, copied)| original != copied)
-        .collect::<Vec<_>>();
-    assert_eq!(differing_words.len(), 1, "only the local BL is relocated");
-    for word in [differing_words[0].0, differing_words[0].1] {
-        let word = u32::from_le_bytes(word.try_into().expect("BL instruction"));
-        assert_eq!(word & 0xfc00_0000, 0x9400_0000);
-    }
-
-    let ordinary_name = incumbent.module().entry_symbol();
-    let ordinary_offset = usize::try_from(
-        incumbent
-            .module()
-            .symbols()
-            .iter()
-            .find(|symbol| symbol.name == ordinary_name)
-            .expect("ordinary entry symbol")
-            .offset,
-    )
-    .expect("ordinary entry offset");
-    let copied_delta = copied_offset - authenticated;
-    let mut escaping_calls = 0;
-    for (index, (original, copied)) in original_body
-        .chunks_exact(4)
-        .zip(copied_body.chunks_exact(4))
-        .enumerate()
-    {
-        let original = u32::from_le_bytes(original.try_into().expect("original instruction"));
-        let copied = u32::from_le_bytes(copied.try_into().expect("copied instruction"));
-        let Some((immediate, bits, call)) = direct_branch(original) else {
-            assert!(
-                !is_pc_relative_address_or_literal(original),
-                "incumbent body contains an unaudited PC-relative address or literal instruction",
-            );
-            continue;
-        };
-        let original_offset = authenticated + index * 4;
-        let original_target = signed_target(original_offset, immediate, bits);
-        let copied_instruction_offset = copied_offset + index * 4;
-        let (copied_immediate, copied_bits, copied_call) =
-            direct_branch(copied).expect("copied direct branch shape");
-        let copied_target = signed_target(
-            copied_instruction_offset,
-            copied_immediate,
-            copied_bits,
-        );
-        if call {
-            escaping_calls += 1;
-            assert!(copied_call);
-            assert_eq!(original_target, ordinary_offset);
-            assert_eq!(copied_target, ordinary_offset);
-        } else {
-            assert!(!copied_call);
-            assert!(
-                (authenticated..authenticated + copied_bytes).contains(&original_target),
-                "non-call branch at {original_offset:#x} escapes the incumbent body",
-            );
-            assert_eq!(copied_target, original_target + copied_delta);
-        }
-    }
-    assert_eq!(escaping_calls, 1, "the ordinary BL is the sole escaping branch");
 }
 
 #[test]
@@ -1093,13 +1083,20 @@ static int check_{width}(void){{
   out=99U;if({entry}(handle,late_{width},sizeof(late_{width}),&out)!=0U||out!=1U)return 4;
   out=99U;if({entry}(handle,dense_{width},sizeof(dense_{width}),&out)!=0U||out!=3U)return 5;
   out=99U;if({entry}(handle,overlap_{width},sizeof(overlap_{width}),&out)!=0U||out!={overlap_count}U)return 6;
-  if({width}U==1U){{
+  if({width}U==1U||{width}U==2U||{width}U==4U){{
     out=99U;if({entry}(0,early_{width},sizeof(early_{width}),&out)!=5U||out!=99U)return 7;
     out=99U;if({entry}(wrong,early_{width},sizeof(early_{width}),&out)!=3U||out!=99U)return 8;
     out=99U;if({entry}(handle,0,sizeof(early_{width}),&out)!=2U||out!=99U)return 9;
     out=99U;if({entry}(handle,early_{width},(size_t)-1,&out)!=2U||out!=99U)return 10;
     if({entry}(handle,early_{width},sizeof(early_{width}),0)!=2U)return 11;
     if({entry}(handle,early_{width},sizeof(early_{width}),(uint64_t *)(void *)(misaligned+1))!=2U)return 12;
+    const size_t invalid_lengths[3]={{SIZE_MAX,((size_t)UINT64_C(1))<<63,((((size_t)UINT64_C(1))<<63)+8191U)}};
+    for(size_t invalid_index=0U;invalid_index<3U;invalid_index++){{
+      out=99U;
+      if({entry}(handle,early_{width},invalid_lengths[invalid_index],&out)!=2U||out!=99U)return 15;
+      out=99U;
+      if({entry}(wrong,early_{width},invalid_lengths[invalid_index],&out)!=2U||out!=99U)return 19;
+    }}
   }}
   uint8_t exhaustive[10];
   for(size_t exhaustive_len=0U;exhaustive_len<=sizeof(exhaustive);exhaustive_len++){{
@@ -1119,6 +1116,11 @@ static int check_{width}(void){{
     uint64_t expected=reference_nonoverlap_a(boundary,boundary_len,{width}U);
     out=99U;
     if({entry}(handle,boundary,boundary_len,&out)!=0U||out!=expected)return 14;
+  }}
+  if({width}U==2U||{width}U==4U){{
+    out=99U;if({entry}(wrong,boundary,{short_max}U+1U,&out)!=3U||out!=99U)return 16;
+    if({entry}(handle,boundary,{short_max}U+1U,0)!=2U)return 17;
+    if({entry}(handle,boundary,{short_max}U+1U,(uint64_t *)(void *)(misaligned+1))!=2U)return 18;
   }}
   return 0;
 }}
