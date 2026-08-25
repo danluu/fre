@@ -16,14 +16,16 @@ use fre_syntax::RustProfile;
 mod build_proof;
 mod build_support;
 mod build_target;
+mod exact64_set_build;
 mod registry_key;
 
 use build_proof::{exact_crlf_free_finite_language, ripgrep_grep_count_profile};
 use build_support::{
-    BuildMode, BuildOutput, PATTERNS_FILE_ENV, VARIANTS_ENV, VariantPolicy, patterns_path,
-    purge_generated_artifacts, read_patterns,
+    BuildMode, BuildOutput, EXACT64_SETS_FILE_ENV, PATTERNS_FILE_ENV, VARIANTS_ENV, VariantPolicy,
+    exact64_sets_path, patterns_path, purge_generated_artifacts, read_exact64_sets, read_patterns,
 };
 use build_target::{CARGO_TARGET_FEATURE_ENV, FEATURES_ENV, selected_features};
+use exact64_set_build::generate as generate_exact64_sets;
 use registry_key::manifest_profile_key;
 
 #[allow(
@@ -34,24 +36,40 @@ fn main() {
     println!("cargo:rerun-if-changed=build_proof.rs");
     println!("cargo:rerun-if-changed=build_support.rs");
     println!("cargo:rerun-if-changed=build_target.rs");
+    println!("cargo:rerun-if-changed=exact64_set_build.rs");
     println!("cargo:rerun-if-changed=registry_key.rs");
     println!("cargo:rerun-if-env-changed={FEATURES_ENV}");
     println!("cargo:rerun-if-env-changed={CARGO_TARGET_FEATURE_ENV}");
     println!("cargo:rerun-if-env-changed=FRE_RIPGREP_AOT_PATTERN_FILTER");
     println!("cargo:rerun-if-env-changed={PATTERNS_FILE_ENV}");
     println!("cargo:rerun-if-env-changed={VARIANTS_ENV}");
+    println!("cargo:rerun-if-env-changed={EXACT64_SETS_FILE_ENV}");
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo supplies CARGO_MANIFEST_DIR"),
     );
     let patterns_path = patterns_path(&manifest_dir, env::var_os(PATTERNS_FILE_ENV).as_deref())
         .unwrap_or_else(|error| panic!("AOT patterns path: {error}"));
     println!("cargo:rerun-if-changed={}", patterns_path.display());
+    let exact64_sets_path = exact64_sets_path(
+        &manifest_dir,
+        env::var_os(EXACT64_SETS_FILE_ENV).as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("AOT exact64 sets path: {error}"));
+    if let Some(path) = &exact64_sets_path {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     let variant_policy = VariantPolicy::parse(env::var_os(VARIANTS_ENV).as_deref())
         .unwrap_or_else(|error| panic!("AOT variant policy: {error}"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
     purge_generated_artifacts(&out_dir)
         .unwrap_or_else(|error| panic!("purge stale AOT build artifacts: {error}"));
     let target = target().unwrap_or_else(|error| panic!("AOT target: {error}"));
+    let exact64_sets = exact64_sets_path
+        .as_deref()
+        .map(read_exact64_sets)
+        .transpose()
+        .unwrap_or_else(|error| panic!("AOT exact64 set manifest: {error}"))
+        .unwrap_or_default();
     let mut patterns = read_patterns(&patterns_path)
         .unwrap_or_else(|error| panic!("AOT patterns manifest: {error}"));
     let manifest_pattern_count = patterns.len();
@@ -458,6 +476,18 @@ fn main() {
     generated.push_str(&grep_count_rows);
     generated.push_str("];\n");
     fs::write(out_dir.join("registry.rs"), generated).expect("write generated registry");
+    let exact64_generated = generate_exact64_sets(
+        &exact64_sets,
+        target,
+        &out_dir,
+        exact64_sets_path.is_some(),
+    );
+    fs::write(
+        out_dir.join("exact64_set_registry.rs"),
+        exact64_generated.source,
+    )
+    .expect("write generated exact64 set registry");
+    objects.extend(exact64_generated.objects);
     if !objects.is_empty() {
         make_archive(&out_dir, &objects);
     }

@@ -1,0 +1,7 @@
+# Public shape-only exact64 set fixtures. Ordered duplicate rows are intentional.
+public_overlap	rust-regex-lf-bytes-v1	0	alpha
+public_overlap	rust-regex-lf-bytes-v1	0	alphabet
+public_overlap	rust-regex-lf-bytes-v1	0	alpha
+public_overlap	rust-regex-lf-bytes-v1	0	beta
+public_case_neutral	rust-regex-lf-bytes-v1	1	1234
+public_case_neutral	rust-regex-lf-bytes-v1	1	5678

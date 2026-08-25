@@ -5,7 +5,14 @@
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
-use fre_aot_regex::{MatchResult, SearchWindow};
+use fre_aot_regex::{
+    MatchResult, REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS, REGEX_SET_EXACT64_MAX_PATTERNS,
+    REGEX_SET_EXACT64_MIN_PATTERNS, REGEX_SET_EXACT64_SCHEMA_VERSION, SearchWindow,
+};
 pub use fre_aot_regex_runtime::AotMatch;
 use fre_aot_regex_runtime::{
     FreAotRegexExclusiveExistsBatchV1, FreAotRegexExclusiveGrepCountV1,
@@ -20,7 +27,7 @@ use fre_aot_regex_runtime::{
 #[path = "../registry_key.rs"]
 mod registry_key;
 
-use registry_key::manifest_profile_key;
+use registry_key::{exact64_set_registry_key, manifest_profile_key};
 
 /// Explicit general-AOT compilation policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +45,253 @@ pub enum AotOutput {
     Exists,
     /// Return the selected leftmost-first half-open span.
     Span,
+}
+
+/// Matcher implementation selected by the enclosing ripgrep request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RipgrepAotMatcherModeV1 {
+    /// Rust `regex::bytes::RegexSet` syntax and semantics.
+    RustRegex,
+    /// Literal fixed-string matching (`-F`/`--fixed-strings`).
+    FixedStrings,
+}
+
+/// Whether the supplied haystack bytes are already the matcher input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RipgrepAotEncodingV1 {
+    /// No decoding, BOM rewriting, or other transcoding remains.
+    RawBytes,
+    /// Encoding selection or transcoding may change the input bytes.
+    AmbiguousOrTranscoded,
+}
+
+/// Complete versioned ripgrep semantics checked before exact64 set selection.
+///
+/// V1 admits exactly one profile: Optimizing/Exists Rust byte-regex matching
+/// over independently delineated LF domains, Unicode enabled, with optional
+/// case-insensitivity and no enclosing semantic transformations. Fields are
+/// intentionally explicit so an integration cannot silently omit an
+/// unsupported flag when it maps a parsed ripgrep request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the fail-closed adapter surface mirrors distinct ripgrep semantic switches"
+)]
+pub struct RipgrepAotExact64SetProfileV1 {
+    pub matcher_mode: RipgrepAotMatcherModeV1,
+    pub case_insensitive: bool,
+    pub invert_match: bool,
+    pub multiline: bool,
+    pub dot_matches_new_line: bool,
+    pub unicode: bool,
+    pub crlf: bool,
+    pub null_data: bool,
+    pub encoding: RipgrepAotEncodingV1,
+    pub word_regexp: bool,
+    pub line_regexp: bool,
+    pub pcre2: bool,
+}
+
+impl RipgrepAotExact64SetProfileV1 {
+    /// Construct the sole supported semantics after the enclosing adapter has
+    /// independently established that no input decoding remains.
+    #[must_use]
+    pub const fn supported_rust_regex(case_insensitive: bool) -> Self {
+        Self {
+            matcher_mode: RipgrepAotMatcherModeV1::RustRegex,
+            case_insensitive,
+            invert_match: false,
+            multiline: false,
+            dot_matches_new_line: false,
+            unicode: true,
+            crlf: false,
+            null_data: false,
+            encoding: RipgrepAotEncodingV1::RawBytes,
+            word_regexp: false,
+            line_regexp: false,
+            pcre2: false,
+        }
+    }
+
+    const fn is_supported(self) -> bool {
+        matches!(self.matcher_mode, RipgrepAotMatcherModeV1::RustRegex)
+            && !self.invert_match
+            && !self.multiline
+            && !self.dot_matches_new_line
+            && self.unicode
+            && !self.crlf
+            && !self.null_data
+            && matches!(self.encoding, RipgrepAotEncodingV1::RawBytes)
+            && !self.word_regexp
+            && !self.line_regexp
+            && !self.pcre2
+    }
+}
+
+type NativeExact64FirstAny =
+    unsafe extern "C" fn(*const u8, usize, usize, usize, *mut u64) -> u32;
+
+const EXACT64_SET_TARGET_AARCH64: u8 = 1;
+const EXACT64_SET_TARGET_LINUX: u8 = 1;
+const EXACT64_SET_TARGET_MACOS: u8 = 2;
+
+const fn exact64_set_runtime_target_os() -> u8 {
+    if cfg!(target_os = "linux") {
+        EXACT64_SET_TARGET_LINUX
+    } else if cfg!(target_os = "macos") {
+        EXACT64_SET_TARGET_MACOS
+    } else {
+        0
+    }
+}
+
+/// Raw-free build receipt for one statically linked exact64 first-any object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AotExact64SetReceiptV1 {
+    registry_key: [u8; 32],
+    case_insensitive: bool,
+    pattern_count: u8,
+    all_pattern_mask: u64,
+    source_schema_version: u32,
+    abi_version: u32,
+    target_architecture: u8,
+    target_operating_system: u8,
+    target_features: u64,
+    line_terminator: u8,
+    position_semantics: u32,
+    no_match: u64,
+    source_artifact_sha256: [u8; 32],
+    exact64_artifact_sha256: [u8; 32],
+    source_mapping_sha256: [u8; 32],
+    operation_identity_sha256: [u8; 32],
+    artifact_identity_sha256: [u8; 32],
+    dense_data_sha256: [u8; 32],
+    code_sha256: [u8; 32],
+    object_sha256: [u8; 32],
+    state_count: usize,
+    dense_transition_cells: usize,
+    dense_data_bytes: usize,
+    code_bytes: usize,
+    object_bytes: usize,
+    semantic_runtime_calls: usize,
+}
+
+impl AotExact64SetReceiptV1 {
+    /// Ordered source/profile registry identity.
+    #[must_use]
+    pub const fn registry_key(self) -> [u8; 32] {
+        self.registry_key
+    }
+
+    /// Number of ordered source rows, including duplicates.
+    #[must_use]
+    pub const fn pattern_count(self) -> u8 {
+        self.pattern_count
+    }
+
+    /// Common case-insensitive option authenticated for every source row.
+    #[must_use]
+    pub const fn case_insensitive(self) -> bool {
+        self.case_insensitive
+    }
+
+    /// Deterministic first-any object digest authenticated at build time.
+    #[must_use]
+    pub const fn object_sha256(self) -> [u8; 32] {
+        self.object_sha256
+    }
+
+    /// Deterministic first-any artifact identity authenticated at build time.
+    #[must_use]
+    pub const fn artifact_identity_sha256(self) -> [u8; 32] {
+        self.artifact_identity_sha256
+    }
+
+    /// FRE target feature mask incorporated into the authenticated artifact.
+    #[must_use]
+    pub const fn target_features(self) -> u64 {
+        self.target_features
+    }
+
+    fn authenticates_request(
+        self,
+        registry_key: [u8; 32],
+        profile: RipgrepAotExact64SetProfileV1,
+        pattern_count: usize,
+    ) -> bool {
+        if !(REGEX_SET_EXACT64_MIN_PATTERNS..=REGEX_SET_EXACT64_MAX_PATTERNS)
+            .contains(&pattern_count)
+        {
+            return false;
+        }
+        let Ok(pattern_count_u8) = u8::try_from(pattern_count) else {
+            return false;
+        };
+        let all_pattern_mask = if pattern_count == 64 {
+            u64::MAX
+        } else {
+            (1_u64 << pattern_count) - 1
+        };
+        let hashes = [
+            self.source_artifact_sha256,
+            self.exact64_artifact_sha256,
+            self.source_mapping_sha256,
+            self.operation_identity_sha256,
+            self.artifact_identity_sha256,
+            self.dense_data_sha256,
+            self.code_sha256,
+            self.object_sha256,
+        ];
+        self.registry_key == registry_key
+            && profile.is_supported()
+            && self.case_insensitive == profile.case_insensitive
+            && self.pattern_count == pattern_count_u8
+            && self.all_pattern_mask == all_pattern_mask
+            && self.source_schema_version == REGEX_SET_EXACT64_SCHEMA_VERSION
+            && self.abi_version == REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION
+            && self.target_architecture == EXACT64_SET_TARGET_AARCH64
+            && self.target_operating_system == exact64_set_runtime_target_os()
+            && self.line_terminator == REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR
+            && self.position_semantics
+                == REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE
+            && self.no_match == REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH
+            && hashes.iter().all(|hash| *hash != [0; 32])
+            && self.state_count != 0
+            && self.dense_transition_cells != 0
+            && self.dense_data_bytes != 0
+            && self.code_bytes != 0
+            && self.object_bytes != 0
+            && self.semantic_runtime_calls == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Exact64SetSpec {
+    registry_key: [u8; 32],
+    description: &'static str,
+    entry_symbol: &'static str,
+    entry: NativeExact64FirstAny,
+    receipt: AotExact64SetReceiptV1,
+}
+
+/// Safe result of the exact64 first-any prefilter.
+///
+/// A candidate is never a confirmed match: the stock ripgrep matcher remains
+/// authoritative for matching lines, selected pattern IDs, spans, and
+/// captures. A miss is authoritative because registry admission proved every
+/// row is one exact nonempty LF-free literal and authenticated the shared scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AotExact64SetOutcome {
+    /// No source row occurs in the supplied LF-domain bytes.
+    ConfirmedMiss,
+    /// Final byte of the earliest-completing possible match. Stock must verify.
+    Candidate { position: usize },
+}
+
+/// Authenticated stateless handle to one opt-in exact64 set object.
+#[derive(Clone, Copy, Debug)]
+pub struct AotExact64SetFactory {
+    spec: &'static Exact64SetSpec,
 }
 
 type AbiResult = FreAotRegexResultV1;
@@ -196,6 +450,14 @@ struct GrepCountSpec {
 )]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/registry.rs"));
+}
+
+#[allow(
+    unsafe_code,
+    reason = "generated declarations are bound to authenticated exact64 first-any objects"
+)]
+mod generated_exact64_sets {
+    include!(concat!(env!("OUT_DIR"), "/exact64_set_registry.rs"));
 }
 
 #[cfg(test)]
@@ -542,6 +804,134 @@ fn fill_prepared_spans(
         state.finish();
     }
     NativeFillOutcome { written, error }
+}
+
+impl AotExact64SetFactory {
+    /// Select one exact ordered source vector and complete ripgrep profile.
+    ///
+    /// Unsupported request semantics and absent/declined vectors return
+    /// `Ok(None)` before any haystack is acquired or inspected. A registry row
+    /// whose raw-free receipt no longer authenticates is a terminal error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a linked registry row is ambiguous or fails its
+    /// receipt/ABI authentication. Diagnostics never contain regex sources.
+    pub fn select(
+        mode: AotMode,
+        output: AotOutput,
+        patterns: &[&str],
+        profile: RipgrepAotExact64SetProfileV1,
+    ) -> Result<Option<Self>, String> {
+        select_exact64_set_spec(
+            generated_exact64_sets::EXACT64_SET_SPECS,
+            mode,
+            output,
+            patterns,
+            profile,
+        )
+        .map(|spec| spec.map(|spec| Self { spec }))
+    }
+
+    /// Raw-free structural route description.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        self.spec.description
+    }
+
+    /// Authenticated build receipt for the selected static object.
+    #[must_use]
+    pub const fn receipt(&self) -> AotExact64SetReceiptV1 {
+        self.spec.receipt
+    }
+
+    /// Run the stateless native first-any prefilter over a complete byte slice.
+    ///
+    /// A returned [`AotExact64SetOutcome::Candidate`] is only a hint to ask the
+    /// stock matcher to verify the containing line. It never authorizes a match,
+    /// pattern ID, span, or capture. `ConfirmedMiss` is authoritative under the
+    /// receipt's exact nonempty LF-free proof.
+    ///
+    /// # Errors
+    ///
+    /// Every native status or malformed success result is terminal after this
+    /// method receives the haystack. The adapter never converts such a failure
+    /// into a stock fallback, which prevents a second access under weaker proof.
+    pub fn prefilter(&self, haystack: &[u8]) -> Result<AotExact64SetOutcome, String> {
+        native_exact64_first_any(self.spec.entry, haystack)
+    }
+}
+
+fn select_exact64_set_spec<'a>(
+    specs: &'a [Exact64SetSpec],
+    mode: AotMode,
+    output: AotOutput,
+    patterns: &[&str],
+    profile: RipgrepAotExact64SetProfileV1,
+) -> Result<Option<&'a Exact64SetSpec>, String> {
+    if mode != AotMode::Optimizing
+        || output != AotOutput::Exists
+        || !profile.is_supported()
+        || !(REGEX_SET_EXACT64_MIN_PATTERNS..=REGEX_SET_EXACT64_MAX_PATTERNS)
+            .contains(&patterns.len())
+    {
+        return Ok(None);
+    }
+    let registry_key = exact64_set_registry_key(patterns, profile.case_insensitive);
+    let mut matching = specs.iter().filter(|spec| spec.registry_key == registry_key);
+    let Some(spec) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err("exact64 set registry contains an ambiguous authenticated key".to_owned());
+    }
+    if !spec.entry_symbol.starts_with("fre_aot_regex_set_exact64_first_any_v1_")
+        || !spec
+            .receipt
+            .authenticates_request(registry_key, profile, patterns.len())
+    {
+        return Err("exact64 set registry receipt authentication failed".to_owned());
+    }
+    Ok(Some(spec))
+}
+
+#[allow(
+    unsafe_code,
+    reason = "single checked call boundary for an authenticated compiler-produced exact64 first-any entry"
+)]
+fn native_exact64_first_any(
+    entry: NativeExact64FirstAny,
+    haystack: &[u8],
+) -> Result<AotExact64SetOutcome, String> {
+    let mut position = MaybeUninit::<u64>::uninit();
+    // SAFETY: the slice is readable for its complete extent and `position` is
+    // aligned, writable, and disjoint. The authenticated V1 entry retains no
+    // argument and publishes the word transactionally only on status zero.
+    let status = unsafe {
+        entry(
+            haystack.as_ptr(),
+            haystack.len(),
+            0,
+            haystack.len(),
+            position.as_mut_ptr(),
+        )
+    };
+    if status != REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS {
+        return Err(format!(
+            "compiled exact64 first-any entry failed with status {status}"
+        ));
+    }
+    // The compiler-produced ABI initializes the result exactly on success.
+    let position = unsafe { position.assume_init() };
+    if position == REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH {
+        return Ok(AotExact64SetOutcome::ConfirmedMiss);
+    }
+    let position = usize::try_from(position)
+        .map_err(|_| "compiled exact64 first-any entry returned an invalid position".to_owned())?;
+    if position >= haystack.len() {
+        return Err("compiled exact64 first-any entry returned an invalid position".to_owned());
+    }
+    Ok(AotExact64SetOutcome::Candidate { position })
 }
 
 /// Build-time-authenticated factory for one aggregate-only native `GrepCount`
@@ -1566,9 +1956,12 @@ mod tests {
     use super::*;
 
     const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
 
     const _: () = assert_send::<AotMatcher>();
     const _: () = assert_send::<AotGrepCount>();
+    const _: () = assert_send::<AotExact64SetFactory>();
+    const _: () = assert_sync::<AotExact64SetFactory>();
 
     static SEARCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1579,6 +1972,107 @@ mod tests {
     static EXISTS_BATCH_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static SINGLETON_EXISTS_SCALAR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SINGLETON_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXACT64_FIRST_ANY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn exact64_candidate_entry(
+        _haystack: *const u8,
+        haystack_len: usize,
+        window_start: usize,
+        window_end: usize,
+        position: *mut u64,
+    ) -> u32 {
+        EXACT64_FIRST_ANY_CALLS.fetch_add(1, Ordering::Relaxed);
+        if position.is_null() || window_start > window_end || window_end > haystack_len {
+            return fre_aot_regex::REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_INVALID_ARGUMENT;
+        }
+        let result = if haystack_len >= 3 {
+            2
+        } else {
+            REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH
+        };
+        unsafe { position.write(result) };
+        REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS
+    }
+
+    unsafe extern "C" fn exact64_miss_entry(
+        _haystack: *const u8,
+        _haystack_len: usize,
+        _window_start: usize,
+        _window_end: usize,
+        position: *mut u64,
+    ) -> u32 {
+        unsafe { position.write(REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH) };
+        REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS
+    }
+
+    unsafe extern "C" fn exact64_failure_after_write_entry(
+        _haystack: *const u8,
+        _haystack_len: usize,
+        _window_start: usize,
+        _window_end: usize,
+        position: *mut u64,
+    ) -> u32 {
+        unsafe { position.write(0) };
+        9
+    }
+
+    unsafe extern "C" fn exact64_invalid_position_entry(
+        _haystack: *const u8,
+        haystack_len: usize,
+        _window_start: usize,
+        _window_end: usize,
+        position: *mut u64,
+    ) -> u32 {
+        unsafe { position.write(u64::try_from(haystack_len).unwrap_or(u64::MAX - 1)) };
+        REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS
+    }
+
+    fn exact64_test_spec(
+        patterns: &[&str],
+        profile: RipgrepAotExact64SetProfileV1,
+        entry: NativeExact64FirstAny,
+    ) -> Exact64SetSpec {
+        let registry_key = exact64_set_registry_key(patterns, profile.case_insensitive);
+        let pattern_count = patterns.len();
+        Exact64SetSpec {
+            registry_key,
+            description: "public-test-exact64-first-any",
+            entry_symbol: "fre_aot_regex_set_exact64_first_any_v1_public_test",
+            entry,
+            receipt: AotExact64SetReceiptV1 {
+                registry_key,
+                case_insensitive: profile.case_insensitive,
+                pattern_count: u8::try_from(pattern_count).expect("test pattern count"),
+                all_pattern_mask: if pattern_count == 64 {
+                    u64::MAX
+                } else {
+                    (1_u64 << pattern_count) - 1
+                },
+                source_schema_version: REGEX_SET_EXACT64_SCHEMA_VERSION,
+                abi_version: REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
+                target_architecture: EXACT64_SET_TARGET_AARCH64,
+                target_operating_system: exact64_set_runtime_target_os(),
+                target_features: 0,
+                line_terminator: REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR,
+                position_semantics: REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE,
+                no_match: REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH,
+                source_artifact_sha256: [1; 32],
+                exact64_artifact_sha256: [2; 32],
+                source_mapping_sha256: [3; 32],
+                operation_identity_sha256: [4; 32],
+                artifact_identity_sha256: [5; 32],
+                dense_data_sha256: [6; 32],
+                code_sha256: [7; 32],
+                object_sha256: [8; 32],
+                state_count: 3,
+                dense_transition_cells: 768,
+                dense_data_bytes: 3_200,
+                code_bytes: 128,
+                object_bytes: 4_096,
+                semantic_runtime_calls: 0,
+            },
+        }
+    }
 
     unsafe extern "C" fn successful_grep_count(
         _handle: FreAotRegexExclusiveHandleV1,
@@ -2134,6 +2628,259 @@ mod tests {
                 fill: None,
                 exists_batch: Some(batch),
             },
+        }
+    }
+
+    #[test]
+    fn exact64_profile_rejects_every_unsupported_ripgrep_semantic() {
+        let patterns = ["alpha", "beta"];
+        let supported = RipgrepAotExact64SetProfileV1::supported_rust_regex(false);
+        let spec = exact64_test_spec(&patterns, supported, exact64_candidate_entry);
+        assert!(
+            select_exact64_set_spec(
+                std::slice::from_ref(&spec),
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                &patterns,
+                supported,
+            )
+            .expect("supported selection")
+            .is_some()
+        );
+
+        let mut unsupported = Vec::new();
+        let mut profile = supported;
+        profile.matcher_mode = RipgrepAotMatcherModeV1::FixedStrings;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.invert_match = true;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.multiline = true;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.dot_matches_new_line = true;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.unicode = false;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.crlf = true;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.null_data = true;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.encoding = RipgrepAotEncodingV1::AmbiguousOrTranscoded;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.word_regexp = true;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.line_regexp = true;
+        unsupported.push(profile);
+        let mut profile = supported;
+        profile.pcre2 = true;
+        unsupported.push(profile);
+
+        for profile in unsupported {
+            assert!(
+                select_exact64_set_spec(
+                    std::slice::from_ref(&spec),
+                    AotMode::Optimizing,
+                    AotOutput::Exists,
+                    &patterns,
+                    profile,
+                )
+                .expect("unsupported profile is a structural decline")
+                .is_none()
+            );
+        }
+        assert!(
+            select_exact64_set_spec(
+                std::slice::from_ref(&spec),
+                AotMode::Fast,
+                AotOutput::Exists,
+                &patterns,
+                supported,
+            )
+            .expect("Fast decline")
+            .is_none()
+        );
+        assert!(
+            select_exact64_set_spec(
+                std::slice::from_ref(&spec),
+                AotMode::Optimizing,
+                AotOutput::Span,
+                &patterns,
+                supported,
+            )
+            .expect("Span decline")
+            .is_none()
+        );
+        assert!(
+            select_exact64_set_spec(
+                std::slice::from_ref(&spec),
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                &["alpha"],
+                supported,
+            )
+            .expect("singleton decline")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn exact64_selection_authenticates_ordered_vector_and_receipt_before_haystack() {
+        EXACT64_FIRST_ANY_CALLS.store(0, Ordering::Relaxed);
+        let patterns = ["opaque_source_one", "opaque_source_two", "opaque_source_one"];
+        let profile = RipgrepAotExact64SetProfileV1::supported_rust_regex(false);
+        let spec = exact64_test_spec(&patterns, profile, exact64_candidate_entry);
+        let selected = select_exact64_set_spec(
+            std::slice::from_ref(&spec),
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            &patterns,
+            profile,
+        )
+        .expect("authenticated selection")
+        .expect("known vector");
+        assert_eq!(selected.registry_key, spec.registry_key);
+        for mismatch in [
+            ["opaque_source_one", "opaque_source_one", "opaque_source_two"].as_slice(),
+            ["opaque_source", "_oneopaque_source_two", "opaque_source_one"].as_slice(),
+            ["opaque_source_one", "opaque_source_two", "opaque_source_two"].as_slice(),
+        ] {
+            assert!(
+                select_exact64_set_spec(
+                    std::slice::from_ref(&spec),
+                    AotMode::Optimizing,
+                    AotOutput::Exists,
+                    mismatch,
+                    profile,
+                )
+                .expect("mismatch is absent")
+                .is_none()
+            );
+        }
+        assert_eq!(EXACT64_FIRST_ANY_CALLS.load(Ordering::Relaxed), 0);
+
+        let mut corrupted = spec;
+        corrupted.receipt.object_sha256 = [0; 32];
+        let error = select_exact64_set_spec(
+            std::slice::from_ref(&corrupted),
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            &patterns,
+            profile,
+        )
+        .expect_err("receipt mismatch is terminal");
+        assert!(error.contains("receipt authentication failed"));
+        assert!(!error.contains("opaque_source"));
+
+        let duplicate_specs = [spec, spec];
+        assert!(
+            select_exact64_set_spec(
+                &duplicate_specs,
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                &patterns,
+                profile,
+            )
+            .expect_err("duplicate key is terminal")
+            .contains("ambiguous authenticated key")
+        );
+    }
+
+    #[test]
+    fn exact64_native_boundary_publishes_candidate_or_miss_and_keeps_failures_terminal() {
+        assert_eq!(
+            native_exact64_first_any(exact64_candidate_entry, b"abc")
+                .expect("candidate success"),
+            AotExact64SetOutcome::Candidate { position: 2 }
+        );
+        assert_eq!(
+            native_exact64_first_any(exact64_candidate_entry, b"ab").expect("short miss"),
+            AotExact64SetOutcome::ConfirmedMiss
+        );
+        assert_eq!(
+            native_exact64_first_any(exact64_miss_entry, b"anything").expect("explicit miss"),
+            AotExact64SetOutcome::ConfirmedMiss
+        );
+        let failure = native_exact64_first_any(exact64_failure_after_write_entry, b"haystack")
+            .expect_err("nonzero status is terminal despite output write");
+        assert!(failure.contains("status 9"));
+        assert!(
+            native_exact64_first_any(exact64_invalid_position_entry, b"haystack")
+                .expect_err("out-of-range success is terminal")
+                .contains("invalid position")
+        );
+    }
+
+    #[test]
+    fn generated_exact64_registry_is_raw_free_closed_and_uses_first_any_objects() {
+        assert_eq!(
+            generated_exact64_sets::BUILD_EXACT64_SET_ADMITTED_COUNT,
+            generated_exact64_sets::EXACT64_SET_SPECS.len()
+        );
+        assert!(
+            generated_exact64_sets::BUILD_EXACT64_SET_INDEPENDENTLY_ELIGIBLE_COUNT
+                <= generated_exact64_sets::BUILD_EXACT64_SET_MANIFEST_COUNT
+        );
+        assert!(
+            generated_exact64_sets::BUILD_EXACT64_SET_ADMITTED_COUNT
+                <= generated_exact64_sets::BUILD_EXACT64_SET_INDEPENDENTLY_ELIGIBLE_COUNT
+        );
+        if !generated_exact64_sets::BUILD_EXACT64_SET_MANIFEST_SELECTED {
+            assert_eq!(generated_exact64_sets::BUILD_EXACT64_SET_MANIFEST_COUNT, 0);
+            assert!(generated_exact64_sets::EXACT64_SET_SPECS.is_empty());
+        }
+        for spec in generated_exact64_sets::EXACT64_SET_SPECS {
+            assert_eq!(spec.registry_key, spec.receipt.registry_key());
+            assert!(
+                spec.entry_symbol
+                    .starts_with("fre_aot_regex_set_exact64_first_any_v1_")
+            );
+            assert_ne!(spec.receipt.object_sha256(), [0; 32]);
+            assert_ne!(spec.receipt.artifact_identity_sha256(), [0; 32]);
+            assert!((2..=64).contains(&spec.receipt.pattern_count()));
+            // SAFETY: the authenticated V1 entry must reject the null output
+            // before scanning the deliberately invalid haystack extent.
+            let status = unsafe {
+                (spec.entry)(
+                    std::ptr::null(),
+                    usize::MAX,
+                    0,
+                    usize::MAX,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(
+                status,
+                fre_aot_regex::REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_INVALID_ARGUMENT
+            );
+        }
+
+        let public = ["alpha", "alphabet", "alpha", "beta"];
+        if let Some(factory) = AotExact64SetFactory::select(
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            &public,
+            RipgrepAotExact64SetProfileV1::supported_rust_regex(false),
+        )
+        .expect("public registry selection")
+        {
+            assert!(factory.description().contains("api=exact64-first-any-v1"));
+            assert_eq!(factory.receipt().pattern_count(), 4);
+            assert_eq!(
+                factory.prefilter(b"--alphabet--").expect("public hit"),
+                AotExact64SetOutcome::Candidate { position: 6 }
+            );
+            assert_eq!(
+                factory.prefilter(b"unrelated").expect("public miss"),
+                AotExact64SetOutcome::ConfirmedMiss
+            );
         }
     }
 
