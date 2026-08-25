@@ -15,7 +15,7 @@ use crate::Window;
 use crate::literal_set::{
     ALPHABET_LEN, BYTES_PER_DFA_CELL_ENVELOPE, BYTES_PER_TRIE_STATE_ENVELOPE, LiteralSetAccounting,
     LiteralSetBuildAccounting, LiteralSetBuildLimits, LiteralSetError, LiteralSetMatchSemantics,
-    LiteralSetPlan, LiteralSetSearchLimits, preflight, validate_window,
+    LiteralSetPlan, LiteralSetSearchLimits, LiteralSetStablePattern, preflight, validate_window,
 };
 
 const MIN_PATTERNS: usize = 129;
@@ -113,8 +113,11 @@ enum CompactPreflight {
 /// already-sorted source, the deepest pairwise LCP is witnessed by adjacent
 /// patterns, so one bounded pass finds the exact depth without copying or
 /// sorting construction input.
-fn deepest_branch_dense_depth(patterns: &[&[u8]], width: usize) -> Option<usize> {
-    debug_assert!(patterns.iter().all(|pattern| pattern.len() == width));
+fn deepest_branch_dense_depth<P: AsRef<[u8]>>(
+    patterns: &[P],
+    width: usize,
+) -> Option<usize> {
+    debug_assert!(patterns.iter().all(|pattern| pattern.as_ref().len() == width));
     let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
     if probe_depth == 0 || patterns.len() < 2 {
         return Some(0);
@@ -125,8 +128,8 @@ fn deepest_branch_dense_depth(patterns: &[&[u8]], width: usize) -> Option<usize>
 
     let mut deepest = 0_usize;
     for adjacent in patterns.windows(2) {
-        let left = adjacent[0].get(..probe_depth)?;
-        let right = adjacent[1].get(..probe_depth)?;
+        let left = adjacent[0].as_ref().get(..probe_depth)?;
+        let right = adjacent[1].as_ref().get(..probe_depth)?;
         let mut lcp = 0_usize;
         while lcp < probe_depth {
             let left_byte = *left.get(lcp)?;
@@ -160,8 +163,8 @@ fn deepest_branch_build_work_upper_bound(patterns: usize, width: usize) -> Optio
         .checked_mul(probe_depth.checked_add(1)?)
 }
 
-fn compact_preflight(
-    patterns: &[&[u8]],
+fn compact_preflight<P: AsRef<[u8]>>(
+    patterns: &[P],
     limits: LiteralSetBuildLimits,
 ) -> Result<CompactPreflight, LiteralSetError> {
     if !(MIN_PATTERNS..=MAX_PATTERNS).contains(&patterns.len()) {
@@ -243,8 +246,8 @@ fn compact_preflight(
     })
 }
 
-fn canonical_plan(
-    patterns: &[&[u8]],
+fn canonical_plan<P: AsRef<[u8]>>(
+    patterns: &[P],
     build: LiteralSetBuildAccounting,
     limits: LiteralSetBuildLimits,
 ) -> Result<LiteralSetPlan, LiteralSetError> {
@@ -257,26 +260,28 @@ fn canonical_plan(
     };
     let automaton = DFA::builder()
         .match_kind(match_kind)
-        .build(patterns.iter().copied())
+        .build(patterns.iter().map(AsRef::as_ref))
         .map_err(|error| LiteralSetError::AutomatonBuild {
             detail: error.to_string(),
         })?;
     LiteralSetPlan::from_preflight_dfa(build, automaton, limits)
 }
 
-fn canonical_outcome(
-    patterns: &[&[u8]],
+fn canonical_outcome<P: AsRef<[u8]>>(
+    patterns: &[P],
     build: LiteralSetBuildAccounting,
     limits: LiteralSetBuildLimits,
 ) -> Result<LiteralSetCompactBuildOutcome, LiteralSetError> {
     canonical_plan(patterns, build, limits).map(LiteralSetCompactBuildOutcome::Canonical)
 }
 
-fn build_shared(patterns: &[&[u8]]) -> Result<noncontiguous::NFA, LiteralSetError> {
+fn build_shared<P: AsRef<[u8]>>(
+    patterns: &[P],
+) -> Result<noncontiguous::NFA, LiteralSetError> {
     let mut builder = noncontiguous::Builder::new();
     builder.match_kind(MatchKind::Standard);
     builder
-        .build(patterns.iter().copied())
+        .build(patterns.iter().map(AsRef::as_ref))
         .map_err(|error| LiteralSetError::AutomatonBuild {
             detail: error.to_string(),
         })
@@ -332,8 +337,8 @@ pub struct LiteralSetCompactOrdinaryExecutor<'a> {
 impl LiteralSetCompactPlan {
     #[cold]
     #[inline(never)]
-    pub fn try_new_ripgrep_standard_borrowed(
-        patterns: &[&[u8]],
+    pub fn try_new_ripgrep_standard_borrowed<P: LiteralSetStablePattern>(
+        patterns: &[P],
         limits: LiteralSetBuildLimits,
     ) -> Result<LiteralSetCompactBuildOutcome, LiteralSetError> {
         let (canonical_build, mut compact_build, width, dense_depth) =
@@ -436,8 +441,8 @@ impl LiteralSetCompactOrdinaryPlan {
     #[doc(hidden)]
     #[cold]
     #[inline(never)]
-    pub fn try_new_ripgrep_standard_borrowed(
-        patterns: &[&[u8]],
+    pub fn try_new_ripgrep_standard_borrowed<P: LiteralSetStablePattern>(
+        patterns: &[P],
         limits: LiteralSetBuildLimits,
     ) -> Result<LiteralSetCompactOrdinaryBuildOutcome, LiteralSetError> {
         let (canonical_build, mut compact_build, width, dense_depth) =
@@ -1385,6 +1390,65 @@ mod tests {
             ),
             Err(LiteralSetError::PersistentBytesLimit { needed, limit: actual })
                 if needed == canonical_build.persistent_bytes && actual == limit
+        ));
+    }
+
+    #[test]
+    fn stable_text_entry_matches_the_borrowed_byte_policy() {
+        let patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        let text = patterns
+            .iter()
+            .cloned()
+            .map(String::from_utf8)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let borrowed_text = text.iter().map(String::as_str).collect::<Vec<_>>();
+
+        let byte_candidate = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .unwrap();
+        let LiteralSetCompactOrdinaryBuildOutcome::Candidate(text_candidate) =
+            LiteralSetCompactOrdinaryPlan::try_new_ripgrep_standard_borrowed(
+                &borrowed_text,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap()
+        else {
+            panic!("the stable text entry should select the same compact owner");
+        };
+        assert_eq!(
+            text_candidate.build_accounting(),
+            byte_candidate.build_accounting(),
+        );
+
+        let haystack = patterns[37].as_slice();
+        let text_plan = text_candidate.into_ordinary();
+        let byte_plan = byte_candidate.into_ordinary();
+        assert_eq!(
+            text_plan.ordinary_executor().find_window_value(
+                haystack,
+                Window::new(0, haystack.len()),
+            ),
+            byte_plan.ordinary_executor().find_window_value(
+                haystack,
+                Window::new(0, haystack.len()),
+            ),
+        );
+
+        let short = public_patterns(128, MIN_PATTERN_BYTES);
+        let short_text = short
+            .into_iter()
+            .map(String::from_utf8)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let short_borrowed = short_text.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(matches!(
+            LiteralSetCompactOrdinaryPlan::try_new_ripgrep_standard_borrowed(
+                &short_borrowed,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap(),
+            LiteralSetCompactOrdinaryBuildOutcome::NotApplicable,
         ));
     }
 

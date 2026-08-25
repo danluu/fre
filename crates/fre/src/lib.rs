@@ -895,7 +895,7 @@ use fre_kernels::{
     LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
     LiteralSetCompactOrdinaryExecutor, LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
     LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
-    LiteralSetUniformStandardOrdinaryExecutor,
+    LiteralSetStablePattern, LiteralSetUniformStandardOrdinaryExecutor,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetOrdinaryExecutor,
     PackedLiteralSetPlan, PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
@@ -6319,9 +6319,9 @@ fn ripgrep_flat_literal_build_report(
 
 #[cold]
 #[inline(never)]
-fn publish_ripgrep_borrowed_flat_literal_set(
+fn publish_ripgrep_borrowed_flat_literal_set<P: LiteralSetStablePattern>(
     builder: &PortableBuilder,
-    patterns: &[&[u8]],
+    patterns: &[P],
     planner_work: u64,
     publication: RipgrepFlatLiteralPublication,
 ) -> Result<PortableRegex, BuildError> {
@@ -6416,7 +6416,7 @@ fn publish_ripgrep_canonical_flat_literal_set(
 #[inline(never)]
 fn publish_ripgrep_borrowed_flat_literal_set_ordinary(
     builder: &PortableBuilder,
-    patterns: &[&[u8]],
+    patterns: &[&str],
     planner_work: u64,
     publication: RipgrepFlatLiteralPublication,
 ) -> Result<RipgrepStandardLiteralsBuild, BuildError> {
@@ -7558,7 +7558,14 @@ impl PortableBuilder {
             patterns,
             canonical_source_limit,
             None,
-            publish_ripgrep_borrowed_flat_literal_set,
+            |builder, patterns, planner_work, publication| {
+                publish_ripgrep_borrowed_flat_literal_set(
+                    builder,
+                    patterns,
+                    planner_work,
+                    publication,
+                )
+            },
         )
         .map(|built| built.map(|(regex, _census)| regex))
     }
@@ -7623,7 +7630,7 @@ impl PortableBuilder {
     where
         F: FnOnce(
             &PortableBuilder,
-            &[&[u8]],
+            &[&str],
             u64,
             RipgrepFlatLiteralPublication,
         ) -> Result<T, BuildError>,
@@ -7645,12 +7652,7 @@ impl PortableBuilder {
         let census = literal_byte_census.ok_or(BuildError::InternalInvariant(
             "typed ripgrep literal context omitted its byte census",
         ))?;
-        let mut borrowed: [&[u8]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS] =
-            [&[]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS];
-        for (slot, pattern) in borrowed.iter_mut().zip(pattern_texts) {
-            *slot = pattern.as_bytes();
-        }
-        let patterns = &borrowed[..pattern_texts.len()];
+        let patterns = pattern_texts;
         let literal_bytes = usize::try_from(context.syntax.literal_bytes).map_err(|_| {
             BuildError::InternalInvariant("ripgrep literal bytes do not fit usize")
         })?;

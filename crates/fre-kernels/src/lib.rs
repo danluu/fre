@@ -471,7 +471,7 @@ pub use literal_set::{
     LiteralSetAccounting, LiteralSetBuildAccounting, LiteralSetBuildLimits, LiteralSetError,
     LiteralSetFoldAttachment, LiteralSetIterationAccounting, LiteralSetMatchSemantics,
     LiteralSetMatches, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
-    LiteralSetUniformStandardOrdinaryExecutor,
+    LiteralSetStablePattern, LiteralSetUniformStandardOrdinaryExecutor,
 };
 pub use literal_set_compact::{
     LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
