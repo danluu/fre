@@ -1438,6 +1438,31 @@ fn wide_finite_early_numeric_decline(error: &CompileError) -> bool {
     }
 }
 
+fn wide_finite_forward_probe_promotes(
+    outcome: dfa::ForwardCostProbeOutcome,
+) -> Result<bool, CompileError> {
+    match outcome {
+        dfa::ForwardCostProbeOutcome::Complete { .. } => Ok(false),
+        dfa::ForwardCostProbeOutcome::NumericDecline { .. } => Ok(true),
+        dfa::ForwardCostProbeOutcome::AllocationFailure { .. } => {
+            Err(ObjectError::Allocation("wide finite ordered forward cost probe").into())
+        }
+    }
+}
+
+fn wide_finite_crosses_dense_cell_boundary(
+    ordinary_states: usize,
+    graph_classes: usize,
+    max_edges: usize,
+) -> Result<bool, CompileError> {
+    let prospective_dense_cells = ordinary_states.checked_mul(graph_classes).ok_or(
+        CompileError::InternalInvariant(
+            "wide finite prospective dense-cell extent overflowed",
+        ),
+    )?;
+    Ok(prospective_dense_cells > max_edges)
+}
+
 /// Try the compact finite-language native leaf before ordinary DFA
 /// construction for a sole prepared Count or SpanSum export. The caller owns
 /// an untouched request and reruns the exact established compiler whenever
@@ -1477,6 +1502,48 @@ fn try_compile_wide_finite_prepared_aggregate(
             "Rust byte request produced a non-Rust syntax tree",
         ));
     };
+
+    // The inherited allocation-free screen bounds only the cost of this
+    // optional analysis. It cannot select the native route by itself.
+    if !finite_language::NativeFiniteLanguageCandidate::preflight_wide_early(&parsed) {
+        return Ok(None);
+    }
+
+    // Compare against the actual ordinary graph before materializing the
+    // broader finite-language proof. A dense DFA with one row per ordinary
+    // graph state is a source-independent prospective transition-cost
+    // reference available at this boundary. Remaining within the caller's
+    // ordinary graph-edge budget preserves the complete pre-feature
+    // portfolio; crossing it merely admits the bounded probe below.
+    let (ordinary_raw, compact_lower_resource_rescue) = match fre_lower::lower_raw_general(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        limits.lower,
+    ) {
+        Ok(lowered) => (Some(lowered.into_plan()), false),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::States | LowerResource::Edges,
+            ..
+        }) => (None, true),
+        Err(LowerError::ResourceLimit { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let graph_classes = if let Some(ordinary_raw) = ordinary_raw.as_ref() {
+        let Some(graph_classes) = dfa::current_graph_alphabet_class_count(ordinary_raw)? else {
+            return Ok(None);
+        };
+        if !wide_finite_crosses_dense_cell_boundary(
+            ordinary_raw.roles.len(),
+            graph_classes,
+            limits.lower.automata.max_edges,
+        )? {
+            return Ok(None);
+        }
+        Some(graph_classes)
+    } else {
+        None
+    };
+
     let Some(candidate) =
         finite_language::NativeFiniteLanguageCandidate::analyze_for_wide_early(&parsed, output)?
     else {
@@ -1490,6 +1557,45 @@ fn try_compile_wide_finite_prepared_aggregate(
     let Some(raw) = candidate.priority_trie_raw_plan(limits.lower)? else {
         return Ok(None);
     };
+    if !compact_lower_resource_rescue {
+        let graph_classes = graph_classes.ok_or(CompileError::InternalInvariant(
+            "wide finite probe lost its graph alphabet",
+        ))?;
+        let ordinary_raw = ordinary_raw.as_ref().ok_or(
+            CompileError::InternalInvariant("wide finite probe lost its ordinary graph"),
+        )?;
+        let compact_states = raw.roles.len();
+        let compact_transition_cells = compact_states.checked_mul(graph_classes).ok_or(
+            CompileError::InternalInvariant(
+                "wide finite compact transition-cell extent overflowed",
+            ),
+        )?;
+        let requested_probe_limits = limits.determinize.effective_for_stable_artifact();
+        let probe_allocation_bytes = limits.lower.automata.max_storage_bytes;
+        // A caller that deliberately selected a smaller ordinary compiler
+        // budget has not authorized that budget exhaustion to promote a
+        // different runtime. Only run the comparison when its complete
+        // sidecar-relative envelope fits every already-requested limit.
+        if requested_probe_limits.max_states < compact_states
+            || requested_probe_limits.max_transitions < compact_transition_cells
+            || requested_probe_limits.max_work < limits.lower.max_work
+            || slow_aot_limits.max_allocation_bytes < probe_allocation_bytes
+        {
+            return Ok(None);
+        }
+        let probe_limits = DeterminizeLimits {
+            max_states: compact_states,
+            max_transitions: compact_transition_cells,
+            max_work: limits.lower.max_work,
+        };
+        if !wide_finite_forward_probe_promotes(dfa::probe_ordered_forward_cost(
+            ordinary_raw,
+            probe_limits,
+            probe_allocation_bytes,
+        )?)? {
+            return Ok(None);
+        }
+    }
     let compiled = match compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
         source_bytes,
         raw,
