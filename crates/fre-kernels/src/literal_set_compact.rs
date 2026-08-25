@@ -401,30 +401,37 @@ impl<'a, 'h> CompactOrdinaryScanner<'a, 'h> {
     /// an Aho input, iterator or match value.
     #[inline(always)]
     fn next_end(&mut self) -> Option<usize> {
-        while self.at < self.end {
-            self.state = self.automaton.next_state(
-                Anchored::No,
-                self.state,
-                self.haystack[self.at],
-            );
-            self.at += 1;
-            if !self.automaton.is_special(self.state) {
+        let base = self.at;
+        // Restrict the source once so byte iteration needs only its own end
+        // condition. Recover the absolute cursor only when a match escapes.
+        let remaining = &self.haystack[base..self.end];
+        let mut state = self.state;
+        let mut bytes = remaining.iter();
+        while let Some(&byte) = bytes.next() {
+            state = self
+                .automaton
+                .next_state(Anchored::No, state, byte);
+            if !self.automaton.is_special(state) {
                 continue;
             }
-            if self.automaton.is_dead(self.state) {
+            if self.automaton.is_dead(state) {
+                self.state = state;
                 self.at = self.end;
                 return None;
             }
             // Aho deliberately excludes start states from `is_special` when
             // no prefilter is retained, including impossible-root self-loops.
             debug_assert!(
-                self.automaton.is_match(self.state),
+                self.automaton.is_match(state),
                 "a compact NFA without a prefilter has no other special states",
             );
-            let accepted_end = self.at;
+            let accepted_end = self.end - bytes.len();
+            self.at = accepted_end;
             self.state = self.start_state;
             return Some(accepted_end);
         }
+        self.state = state;
+        self.at = self.end;
         None
     }
 
