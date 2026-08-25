@@ -317,7 +317,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
     /// Empty sets are valid and never match. Pattern IDs always correspond to
     /// source order, including duplicate patterns. A set of at least eight
     /// positive exact literals additionally attempts one fused full-haystack
-    /// existence plan for every constituent after pattern zero. Its
+    /// finite-literal plan for every constituent after pattern zero. Its
     /// construction and persistent limits are inherited from the configured
     /// constituent literal-set limits and the residual aggregate byte budget;
     /// any refusal simply retains the independent matcher implementation.
@@ -735,9 +735,10 @@ impl PortableRegexSet {
     /// could begin a literal retain source-ordered constituent execution.
     /// Ranged, accounted and session APIs always execute their independent
     /// constituents. The unlimited caller-buffer all-ID route may use the
-    /// same sidecar only to certify that no suffix ID can match. Use
-    /// [`Self::is_match`] when finite work, scratch, or pattern-count limits
-    /// must be enforced.
+    /// same sidecar either to collect every suffix ID in one bounded DFA scan
+    /// or, when that capability is ineligible, to certify that no suffix ID
+    /// can match. Use [`Self::is_match`] when finite work, scratch, or
+    /// pattern-count limits must be enforced.
     #[inline(always)]
     pub fn is_match_value_unlimited(
         &self,
@@ -1025,14 +1026,15 @@ impl PortableRegexSet {
     /// Calls with any finite set or constituent limit retain the exact
     /// accounted implementation, including cumulative work, partial flag
     /// mutation, and refusal precedence. The value route is selected only
-    /// when every field equals [`PortableRegexSetRunLimits::unlimited`]. An
+    /// when every field equals [`PortableRegexSetRunLimits::unlimited`].
     /// Every positive exact-literal constituent uses its retained ordinary
     /// existence capability on the unlimited path. Empty literals and all
     /// other plans retain the general value facade. An eligible exact-literal
-    /// set on a long complete-haystack search executes ID zero once, then uses
-    /// its fused suffix only as a negative certificate. A certified miss
-    /// avoids all remaining constituent searches; a possible suffix match
-    /// retains the source-ID loop.
+    /// set on a long complete-haystack search executes ID zero once, then may
+    /// collect every matching suffix ID in one bounded DFA scan. If that
+    /// capability is ineligible, the fused suffix remains a negative
+    /// certificate: a certified miss avoids all remaining constituent
+    /// searches, while a possible suffix match retains the source-ID loop.
     ///
     /// # Errors
     ///
@@ -1118,7 +1120,39 @@ impl PortableRegexSet {
         let mut any = first;
         if first {
             match_flags[0] = true;
-        } else {
+        }
+
+        // The fused plan stores source IDs 1..K as local IDs 0..K-1. Its
+        // bounded Standard capability can therefore collapse every duplicate
+        // and overlapping acceptance into one word, which maps back to source
+        // IDs with a single shift. The direct kernel follows the DFA's own
+        // prefilter restarts, so a zero mask is also the existing exact suffix
+        // miss certificate. Other constructions retain the incumbent loop.
+        if self.regexes.len() <= u64::BITS as usize
+            && fused.plan.build_accounting().minimum_pattern_bytes
+                >= FUSED_LITERAL_SET_ALL_ID_MASK_MIN_PATTERN_BYTES
+            && self.regexes.len().saturating_mul(
+                window.end().saturating_sub(window.start()),
+            ) >= FUSED_LITERAL_SET_ALL_ID_MASK_MIN_WORK
+            && let Some(executor) = fused.plan.ordinary_executor()
+            && let Ok(Some(suffix_mask)) = executor
+                .pattern_id_mask_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                )
+        {
+            debug_assert_eq!(suffix_mask >> (self.regexes.len() - 1), 0);
+            let mut source_mask = (suffix_mask << 1) | u64::from(first);
+            let any = source_mask != 0;
+            while source_mask != 0 {
+                let index = source_mask.trailing_zeros() as usize;
+                match_flags[index] = true;
+                source_mask &= source_mask - 1;
+            }
+            return Ok(any);
+        }
+
+        if !first {
             let suffix_may_match = fused.plan.ordinary_executor().and_then(|executor| {
                 executor
                     .exists_window_value(
@@ -2318,6 +2352,17 @@ const FUSED_LITERAL_SET_ORIGIN_PROBE_MIN_BYTES: usize = 128;
 // independent passes.
 const FUSED_LITERAL_SET_ALL_ID_NEGATIVE_MIN_BYTES: usize = 128;
 
+// A complete output-mask traversal classifies accepting states and all of
+// their pattern IDs. Keep this off narrow duplicate/overlap sets whose direct
+// exact constituents already amortize their complete ID loop in a few bytes.
+const FUSED_LITERAL_SET_ALL_ID_MASK_MIN_PATTERN_BYTES: usize = 8;
+
+// The constituent loop's work grows with both source IDs and searched bytes,
+// while aggregate classification has a fixed setup cost. Requiring this
+// product keeps short, low-cardinality multi-hit inputs on their cheaper
+// incumbent path without hard-coding one set width.
+const FUSED_LITERAL_SET_ALL_ID_MASK_MIN_WORK: usize = 4_096;
+
 #[inline(always)]
 fn is_match_window_value_unlimited(
     regex: &PortableRegex,
@@ -2434,7 +2479,7 @@ fn capacity_bytes<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        PortablePlan, PortableRegexSet, PortableRegexSetRunLimits,
+        LiteralWindow, PortablePlan, PortableRegexSet, PortableRegexSetRunLimits,
         fused_exact_ordinary_probe,
     };
 
@@ -2454,7 +2499,7 @@ mod tests {
         let set = PortableRegexSet::new(PATTERNS).expect("fused exact-literal set");
         assert!(set.fused_literal_set.is_some());
 
-        let absent = vec![b'x'; 256];
+        let absent = vec![b'x'; 512];
         let mut first = absent.clone();
         first[96..106].copy_from_slice(PATTERNS[0].as_bytes());
         let mut suffix = absent.clone();
@@ -2462,8 +2507,8 @@ mod tests {
 
         for (haystack, expected_calls) in [
             (absent.as_slice(), 1_usize),
-            (first.as_slice(), PATTERNS.len()),
-            (suffix.as_slice(), PATTERNS.len()),
+            (first.as_slice(), 1_usize),
+            (suffix.as_slice(), 1_usize),
         ] {
             let mut expected = [false; 10];
             expected[8] = true;
@@ -2504,6 +2549,21 @@ mod tests {
                 PortableRegexSetRunLimits::unlimited(),
             )
             .expect("short incumbent all-ID search"),
+        );
+        assert_eq!(fused_exact_ordinary_probe::calls(), PATTERNS.len());
+
+        let mut below_mask_work = vec![b'x'; 256];
+        below_mask_work[192..202].copy_from_slice(PATTERNS[7].as_bytes());
+        let mut below_mask_work_flags = [false; 8];
+        fused_exact_ordinary_probe::reset();
+        assert!(
+            set.matches_read_at_value(
+                &mut below_mask_work_flags,
+                &below_mask_work,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("below-mask-work incumbent all-ID search"),
         );
         assert_eq!(fused_exact_ordinary_probe::calls(), PATTERNS.len());
 
@@ -2568,5 +2628,107 @@ mod tests {
         assert_eq!(actual_any, expected_any);
         assert_eq!(actual, expected);
         assert_eq!(fused_exact_ordinary_probe::calls(), 2);
+    }
+
+    #[test]
+    fn fused_output_mask_maps_suffix_duplicates_overlaps_and_high_source_id() {
+        let patterns = [
+            "zzzzzzzz",
+            "abababab",
+            "abababab",
+            "babababa",
+            "aaaaaaaa",
+            "bbbbbbbb",
+            "cccccccc",
+            "dddddddd",
+        ];
+        let set = PortableRegexSet::new(patterns).expect("uniform fused exact-literal set");
+        let fused = set.fused_literal_set.as_ref().expect("fused suffix");
+        let mut haystack = vec![b'x'; 128];
+        haystack[63..72].copy_from_slice(b"ababababa");
+        let suffix_mask = fused
+            .plan
+            .ordinary_executor()
+            .unwrap()
+            .pattern_id_mask_window_value(
+                &haystack,
+                LiteralWindow::full(&haystack),
+            )
+            .unwrap()
+            .expect("bounded Standard mask");
+        assert_eq!(suffix_mask, 0b111);
+
+        let mut direct_haystack = vec![b'x'; 512];
+        direct_haystack[255..264].copy_from_slice(b"ababababa");
+        let mut expected = [false; 10];
+        expected[9] = true;
+        let (expected_any, _) = set
+            .matches_read_at(
+                &mut expected,
+                &direct_haystack,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .unwrap();
+        let mut actual = [false; 10];
+        actual[9] = true;
+        fused_exact_ordinary_probe::reset();
+        let actual_any = set
+            .matches_read_at_value(
+                &mut actual,
+                &direct_haystack,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(actual_any, expected_any);
+        assert_eq!(actual, expected);
+        assert_eq!(fused_exact_ordinary_probe::calls(), 1);
+
+        let narrow_patterns = ["aa"; 8];
+        let narrow = PortableRegexSet::new(narrow_patterns)
+            .expect("narrow duplicate fused exact-literal set");
+        let narrow_haystack = vec![b'a'; 512];
+        let mut narrow_flags = [false; 8];
+        fused_exact_ordinary_probe::reset();
+        assert!(
+            narrow
+                .matches_read_at_value(
+                    &mut narrow_flags,
+                    &narrow_haystack,
+                    0,
+                    PortableRegexSetRunLimits::unlimited(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(narrow_flags, [true; 8]);
+        assert_eq!(fused_exact_ordinary_probe::calls(), narrow_patterns.len());
+
+        let wide_patterns = (0..64)
+            .map(|index| format!("qz{index:06}"))
+            .collect::<Vec<_>>();
+        let wide = PortableRegexSet::new(wide_patterns.iter()).expect("64-pattern fused set");
+        let mut high_haystack = vec![b'x'; 128];
+        high_haystack[120..].copy_from_slice(wide_patterns[63].as_bytes());
+        let mut high_flags = [false; 64];
+        fused_exact_ordinary_probe::reset();
+        assert!(
+            wide.matches_read_at_value(
+                &mut high_flags,
+                &high_haystack,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            high_flags
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &matched)| matched.then_some(index))
+                .collect::<Vec<_>>(),
+            [63],
+        );
+        assert_eq!(fused_exact_ordinary_probe::calls(), 1);
     }
 }

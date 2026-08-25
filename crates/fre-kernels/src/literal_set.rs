@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aho_corasick::automaton::{Automaton, StateID};
 use aho_corasick::dfa::DFA;
-use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind};
+use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind, Span};
 use fre_exact_alloc::try_box_preserve;
 use fre_simd_kernels::BYTE_BUCKET_BLOCK_BYTES;
 
@@ -1459,6 +1459,42 @@ impl<'a, 'h> LiteralSetCountScanner<'a, 'h> {
 }
 
 impl<'a> LiteralSetOrdinaryExecutor<'a> {
+    /// Collect every matching plan-relative pattern ID in one forward DFA
+    /// traversal when this plan exposes the Standard/K<=64 capability: stable
+    /// Standard semantics and at most one machine word of positive-width
+    /// patterns.
+    ///
+    /// This deliberately bypasses selected-span reconstruction and retains no
+    /// per-search storage. Duplicate alternatives remain distinct output IDs,
+    /// while repeated and overlapping occurrences merely set an already-set
+    /// bit. `None` means this plan lacks the bounded Standard capability and
+    /// its caller must retain the constituent implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralSetError::InvalidWindow`] when `window` lies outside
+    /// the original haystack.
+    #[doc(hidden)]
+    #[inline]
+    pub fn pattern_id_mask_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<u64>, LiteralSetError> {
+        validate_window(window, haystack.len())?;
+        let patterns = self.plan.build.patterns;
+        if self.plan.automaton.match_kind() != MatchKind::Standard
+            || patterns == 0
+            || patterns > u64::BITS as usize
+        {
+            return Ok(None);
+        }
+        debug_assert_eq!(self.plan.automaton.patterns_len(), patterns);
+        Ok(Some(pattern_id_mask_window_value(
+            self.plan, haystack, window,
+        )))
+    }
+
     /// Return whether ordinary counting can seed this plan's bound direct DFA
     /// scanner from one canonical selected match.
     #[doc(hidden)]
@@ -1683,6 +1719,74 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
             computation: "positive-width literal-set match count",
         })
     }
+}
+
+/// Walk the same Standard DFA state stream used by overlapping search, but
+/// collapse every accepting state's complete output list into one local mask.
+/// At a prefilter restart state, mirror Aho-Corasick's own skip so sparse and
+/// absent sources do not devolve into an unconditional byte-by-byte pass.
+#[inline(never)]
+fn pattern_id_mask_window_value(
+    plan: &LiteralSetPlan,
+    haystack: &[u8],
+    window: Window,
+) -> u64 {
+    let automaton = plan.automaton.as_ref();
+    debug_assert_eq!(automaton.match_kind(), MatchKind::Standard);
+    debug_assert!(plan.build.minimum_pattern_bytes > 0);
+    debug_assert!(plan.build.patterns <= u64::BITS as usize);
+    let complete = if plan.build.patterns == u64::BITS as usize {
+        u64::MAX
+    } else {
+        (1_u64 << plan.build.patterns) - 1
+    };
+    let anchored = Anchored::No;
+    let mut state = automaton
+        .start_state(anchored)
+        .expect("the literal-set DFA retains its unanchored start state");
+    debug_assert!(!automaton.is_match(state));
+    let mut matched = 0_u64;
+    let mut at = window.start();
+    while at < window.end() {
+        state = automaton.next_state(anchored, state, haystack[at]);
+        if automaton.is_special(state) {
+            if automaton.is_dead(state) {
+                break;
+            }
+            if automaton.is_match(state) {
+                for output in 0..automaton.match_len(state) {
+                    let pattern = automaton.match_pattern(state, output).as_usize();
+                    debug_assert!(pattern < plan.build.patterns);
+                    matched |= 1_u64 << pattern;
+                }
+                if matched == complete {
+                    break;
+                }
+            } else if let Some(prefilter) = automaton.prefilter() {
+                debug_assert!(
+                    automaton.is_start(state),
+                    "a prefiltered literal-set DFA has no other special states",
+                );
+                let Some(candidate) = prefilter
+                    .find_in(haystack, Span::from(at..window.end()))
+                    .into_option()
+                else {
+                    break;
+                };
+                if candidate > at {
+                    at = candidate;
+                    continue;
+                }
+            } else {
+                debug_assert!(
+                    false,
+                    "a Standard DFA without a prefilter has no unknown special states",
+                );
+            }
+        }
+        at += 1;
+    }
+    matched
 }
 
 impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
@@ -4953,6 +5057,109 @@ mod tests {
             assert_eq!(borrowed.automaton.match_kind(), owned.automaton.match_kind());
             assert_leftmost_window_differential(&patterns, &borrowed, 5);
         }
+    }
+
+    #[test]
+    fn pattern_id_mask_is_exhaustive_for_duplicates_and_overlaps() {
+        let pattern_sets = [
+            vec![b"a".to_vec(), b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            vec![
+                b"aa".to_vec(),
+                b"aa".to_vec(),
+                b"ab".to_vec(),
+                b"ba".to_vec(),
+                b"bb".to_vec(),
+                b"bc".to_vec(),
+                b"cb".to_vec(),
+            ],
+            vec![
+                b"aba".to_vec(),
+                b"bab".to_vec(),
+                b"aba".to_vec(),
+                b"aaa".to_vec(),
+            ],
+        ];
+        for patterns in pattern_sets {
+            let plan =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            assert_eq!(plan.automaton.match_kind(), MatchKind::Standard);
+            let ordinary = plan.ordinary_executor().expect("positive ordinary plan");
+            for haystack_len in 0..=7 {
+                let cases = 3_usize.pow(haystack_len as u32);
+                for encoded in 0..cases {
+                    let mut value = encoded;
+                    let mut haystack = vec![b'a'; haystack_len];
+                    for byte in &mut haystack {
+                        *byte = b'a' + (value % 3) as u8;
+                        value /= 3;
+                    }
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let expected = patterns.iter().enumerate().fold(
+                                0_u64,
+                                |mask, (pattern_id, pattern)| {
+                                    let matched = haystack[start..end]
+                                        .windows(pattern.len())
+                                        .any(|window| window == pattern);
+                                    mask | (u64::from(matched) << pattern_id)
+                                },
+                            );
+                            assert_eq!(
+                                ordinary.pattern_id_mask_window_value(
+                                    &haystack,
+                                    Window::new(start, end),
+                                ),
+                                Ok(Some(expected)),
+                                "patterns={patterns:?} haystack={haystack:?} window={start}..{end}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_id_mask_declines_unbounded_or_nonstandard_plans() {
+        let too_many = vec![b"aa".to_vec(); u64::BITS as usize + 1];
+        let too_many_plan =
+            LiteralSetPlan::new_stable(&too_many, LiteralSetBuildLimits::default()).unwrap();
+        assert_eq!(
+            too_many_plan
+                .ordinary_executor()
+                .unwrap()
+                .pattern_id_mask_window_value(b"aa", Window::new(0, 2)),
+            Ok(None),
+        );
+
+        let nonuniform = vec![b"a".to_vec(), b"aa".to_vec()];
+        let nonuniform_plan =
+            LiteralSetPlan::new_stable(&nonuniform, LiteralSetBuildLimits::default()).unwrap();
+        assert_eq!(nonuniform_plan.automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert_eq!(
+            nonuniform_plan
+                .ordinary_executor()
+                .unwrap()
+                .pattern_id_mask_window_value(b"aa", Window::new(0, 2)),
+            Ok(None),
+        );
+
+        let bounded = LiteralSetPlan::new_stable(
+            &[b"aa".to_vec(), b"bb".to_vec()],
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            bounded
+                .ordinary_executor()
+                .unwrap()
+                .pattern_id_mask_window_value(b"aa", Window::new(0, 3)),
+            Err(LiteralSetError::InvalidWindow {
+                start: 0,
+                end: 3,
+                haystack_len: 2,
+            }),
+        );
     }
 
     #[test]
