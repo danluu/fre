@@ -2689,31 +2689,28 @@ impl PortableTextCaptureBuilder {
     /// byte-stable executor.
     pub fn build(self) -> Result<PortableTextCaptureRegex, PortableTextCaptureBuildError> {
         let text_profile = CompatibilityProfile::RustText(self.profile.clone());
-        let text = fre_syntax::parse(
-            fre_syntax::ParseRequest::rust(self.pattern.clone(), text_profile.clone())
-                .with_admission(self.limits.admission)
-                .with_safety_envelope(self.limits.syntax_safety),
-        )
-        .map_err(PortableTextCaptureBuildError::TextSyntax)?;
-        let text_syntax = text.summary.clone();
-        let CanonicalPattern::Rust(text_pattern) = text.pattern else {
+        let text_request = fre_syntax::ParseRequest::rust(self.pattern, text_profile)
+            .with_admission(self.limits.admission)
+            .with_safety_envelope(self.limits.syntax_safety);
+        let text = fre_syntax::parse_attempt(text_request)
+            .map_err(|error| PortableTextCaptureBuildError::TextSyntax(error.into_source()))?;
+        let bytes_profile = self.profile.clone();
+        let Some(text) =
+            text.into_rust_reparse_handoff(CompatibilityProfile::RustBytes(bytes_profile.clone()))
+        else {
             return Err(PortableTextCaptureBuildError::InternalInvariant(
                 "RustText parse produced non-Rust syntax",
             ));
         };
+        let text_syntax = text.summary;
+        let text_pattern = text.rust;
+        let text_profile = text.source_profile;
 
-        let bytes_profile = self.profile.clone();
-        let bytes = fre_syntax::parse(
-            fre_syntax::ParseRequest::rust(
-                self.pattern.clone(),
-                CompatibilityProfile::RustBytes(bytes_profile.clone()),
-            )
-            .with_admission(self.limits.admission)
-            .with_safety_envelope(self.limits.syntax_safety),
-        )
-        .map_err(PortableTextCaptureBuildError::BytesProofSyntax)?;
-        let bytes_syntax = bytes.summary.clone();
-        let CanonicalPattern::Rust(bytes_pattern) = bytes.pattern else {
+        let bytes = fre_syntax::parse_attempt(text.request).map_err(|error| {
+            PortableTextCaptureBuildError::BytesProofSyntax(error.into_source())
+        })?;
+        let bytes_syntax = bytes.record().summary.clone();
+        let CanonicalPattern::Rust(bytes_pattern) = &bytes.record().pattern else {
             return Err(PortableTextCaptureBuildError::InternalInvariant(
                 "RustBytes proof parse produced non-Rust syntax",
             ));
@@ -2724,10 +2721,11 @@ impl PortableTextCaptureBuilder {
         if !text_pattern.hir.properties().is_utf8() {
             return Err(PortableTextCaptureBuildError::InvalidUtf8Hir);
         }
-        let inner = CaptureBuilder::new(self.pattern)
+        drop(text_pattern);
+        let inner = CaptureBuilder::new(String::new())
             .profile(bytes_profile)
             .limits(self.limits)
-            .build()
+            .build_from_parse_attempt(bytes)
             .map_err(PortableTextCaptureBuildError::Capture)?;
         let report = PortableTextCaptureBuildReport {
             profile: text_profile,
@@ -3728,24 +3726,87 @@ impl CaptureBuilder {
     }
 
     /// Compile a capture-participation reducer for non-empty matches.
+    pub fn build(mut self) -> Result<CaptureRegex, CaptureBuildError> {
+        let simd_dispatch = SimdDispatchContext::capture();
+        let limits = self.limits;
+        let profile = CompatibilityProfile::RustBytes(self.profile.clone());
+        let pattern = core::mem::take(&mut self.pattern);
+        let parsed = fre_syntax::parse_attempt(
+            fre_syntax::ParseRequest::rust(pattern, profile)
+                .with_admission(limits.admission)
+                .with_safety_envelope(limits.syntax_safety),
+        )
+        .map_err(|error| CaptureBuildError::Syntax(error.into_source()))?;
+        self.build_from_parse_attempt_with_dispatch(parsed, simd_dispatch)
+    }
+
+    /// Build from the authoritative source and HIR in one closed RustBytes
+    /// parse attempt. The text facade uses this after its independent profile
+    /// proof so capture construction cannot parse the same source a third
+    /// time.
+    fn build_from_parse_attempt(
+        self,
+        parsed: fre_syntax::ParseAttempt,
+    ) -> Result<CaptureRegex, CaptureBuildError> {
+        let simd_dispatch = SimdDispatchContext::capture();
+        self.build_from_parse_attempt_with_dispatch(parsed, simd_dispatch)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the single-parse proof, selector, one-pass sidecar, replay, identity, and accounting publication remain locally auditable"
     )]
-    pub fn build(self) -> Result<CaptureRegex, CaptureBuildError> {
-        let simd_dispatch = SimdDispatchContext::capture();
+    fn build_from_parse_attempt_with_dispatch(
+        self,
+        parsed: fre_syntax::ParseAttempt,
+        simd_dispatch: SimdDispatchContext,
+    ) -> Result<CaptureRegex, CaptureBuildError> {
         let limits = self.limits;
         let unicode = self.profile.options.unicode;
         let case_insensitive = self.profile.options.case_insensitive;
         let line_terminator = self.profile.options.line_terminator;
         let build_onepass_capture = self.build_onepass_capture;
+        if !self.pattern.is_empty() {
+            return Err(CaptureBuildError::InternalInvariant(
+                "capture parse handoff retained another builder source",
+            ));
+        }
         let profile = CompatibilityProfile::RustBytes(self.profile);
-        let parsed = fre_syntax::parse(
-            fre_syntax::ParseRequest::rust(self.pattern, profile)
-                .with_admission(limits.admission)
-                .with_safety_envelope(limits.syntax_safety),
-        )
-        .map_err(CaptureBuildError::Syntax)?;
+        if !parsed.closes() {
+            return Err(CaptureBuildError::InternalInvariant(
+                "capture builder received an unauthenticated parse attempt",
+            ));
+        }
+        let (parsed, _receipt) = parsed.into_parts();
+        if parsed.key.schema_version != fre_syntax::SCHEMA_VERSION {
+            return Err(CaptureBuildError::InternalInvariant(
+                "capture builder received another parse schema",
+            ));
+        }
+        if parsed.key.profile != profile {
+            return Err(CaptureBuildError::InternalInvariant(
+                "capture builder received a parsed record for another profile",
+            ));
+        }
+        if parsed.key.admission != limits.admission {
+            return Err(CaptureBuildError::InternalInvariant(
+                "capture builder received another parse admission policy",
+            ));
+        }
+        if parsed.key.safety != limits.syntax_safety {
+            return Err(CaptureBuildError::InternalInvariant(
+                "capture builder received another parse safety envelope",
+            ));
+        }
+        let expected_admission = match limits.admission {
+            AdmissionPolicy::Strict(_) => AdmissionStatus::StrictChecked,
+            AdmissionPolicy::Quota(_) => AdmissionStatus::QuotaChecked,
+        };
+        if parsed.admission_status != expected_admission {
+            return Err(CaptureBuildError::InternalInvariant(
+                "capture builder received inconsistent admission evidence",
+            ));
+        }
         let syntax_key = Arc::new(parsed.key);
         let admission = parsed.admission_status;
         let syntax = parsed.summary;
@@ -10035,6 +10096,31 @@ mod tests {
             panic!("Rust byte request produced non-Rust syntax");
         };
         rust.hir
+    }
+
+    #[test]
+    fn capture_parse_handoff_rejects_another_profile() {
+        let source_profile = RustProfile::default();
+        let limits = CaptureBuildLimits::default();
+        let request = fre_syntax::ParseRequest::rust(
+            "(?P<name>a)",
+            CompatibilityProfile::RustBytes(source_profile.clone()),
+        )
+        .with_admission(limits.admission)
+        .with_safety_envelope(limits.syntax_safety);
+        let parsed = fre_syntax::parse_attempt(request).expect("closed RustBytes parse attempt");
+
+        let mut target_profile = source_profile;
+        target_profile.options.unicode = false;
+        assert!(matches!(
+            CaptureBuilder::new(String::new())
+                .profile(target_profile)
+                .limits(limits)
+                .build_from_parse_attempt(parsed),
+            Err(CaptureBuildError::InternalInvariant(
+                "capture builder received a parsed record for another profile"
+            ))
+        ));
     }
 
     #[test]
