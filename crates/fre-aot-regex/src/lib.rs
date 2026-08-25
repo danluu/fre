@@ -388,7 +388,17 @@ pub use rebar_multi_grep::{
     RebarMultiGrepReducerAotArtifactV1, RebarMultiGrepReducerAotCompileDeclineV1,
     RebarMultiGrepReducerAotCompileDispositionV1, RebarMultiGrepReducerAotErrorV1,
     RebarMultiGrepReducerAotReceiptV1, RebarMultiGrepReducerRowV1,
+    RebarNativeRowScalarOperationV1, RebarNativeRowScalarReducerAotArtifactV1,
+    RebarNativeRowScalarReducerAotCompileDeclineV1,
+    RebarNativeRowScalarReducerAotCompileDispositionV1,
+    RebarNativeRowScalarReducerAotErrorV1, RebarNativeRowScalarReducerAotReceiptV1,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_INVALID_ARGUMENT,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_RUNTIME_FAILURE,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_SUCCESS,
     compile_rebar_multi_grep_reducer_aot_v1,
+    compile_rebar_native_row_scalar_reducer_aot_v1,
 };
 pub use rebar_single_capture::{
     REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,

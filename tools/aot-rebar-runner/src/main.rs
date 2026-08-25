@@ -750,6 +750,34 @@ fn strict_linked_native_multi_grep_reduce(haystack: &[u8]) -> Result<u64, String
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "route authentication binds the statically linked helper-free row-scalar ABI"
+)]
+fn strict_linked_native_row_scalar_reduce(haystack: &[u8]) -> Result<u64, String> {
+    let mut value = u64::MAX;
+    // SAFETY: route authentication binds the exact operation, ordered source
+    // topology, ordinary-row closure, relocations, and reducer symbol to this
+    // ABI. The complete haystack and aligned output remain live and disjoint.
+    let status = unsafe {
+        linked::reduce_native_rows(haystack.as_ptr(), haystack.len(), &mut value)
+    };
+    match status {
+        fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_SUCCESS
+            if value != u64::MAX => Ok(value),
+        fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_SUCCESS => Err(
+            "native row-scalar reducer returned success without publishing its output".to_owned(),
+        ),
+        other if value != u64::MAX => Err(format!(
+            "native row-scalar reducer returned status {other} after modifying its transactional output"
+        )),
+        other => Err(format!(
+            "native row-scalar reducer {:?} returned status {other}",
+            linked::ROW_SCALAR_REDUCER_SYMBOL,
+        )),
+    }
+}
+
 fn search_native_rows_with(
     row_count: usize,
     haystack_len: usize,
@@ -1997,6 +2025,57 @@ fn print_provenance() {
             )
             .expect("format native-row component provenance");
         }
+        if linked::NATIVE_ROW_SCALAR_REDUCER {
+            let relocation_sections = linked::ROW_SCALAR_REDUCER_RELOCATION_SECTIONS
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let relocation_offsets = linked::ROW_SCALAR_REDUCER_RELOCATION_OFFSETS
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let relocation_kinds = linked::ROW_SCALAR_REDUCER_RELOCATION_KINDS
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let relocation_symbols = linked::ROW_SCALAR_REDUCER_RELOCATION_SYMBOLS
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let relocation_addends = linked::ROW_SCALAR_REDUCER_RELOCATION_ADDENDS
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(
+                &mut provenance,
+                " native_row_scalar_reducer=true row_scalar_reducer_abi_version={} row_scalar_reducer_operation={} row_scalar_reducer_source_cardinality={} row_scalar_reducer_source_bytes={} row_scalar_reducer_ordered_sources_sha256={} row_scalar_reducer_symbol={} row_scalar_reducer_operation_identity_sha256={} row_scalar_reducer_code_sha256={} row_scalar_reducer_object_sha256={} row_scalar_reducer_relocation_count={} row_scalar_reducer_relocation_sections={} row_scalar_reducer_relocation_offsets={} row_scalar_reducer_relocation_kinds={} row_scalar_reducer_relocation_symbols={} row_scalar_reducer_relocation_addends={} row_scalar_reducer_semantic_runtime_calls={} row_scalar_reducer_object_bytes={} row_scalar_reducer_max_object_bytes={} row_scalar_reducer_artifact_identity_sha256={}",
+                linked::ROW_SCALAR_REDUCER_ABI_VERSION,
+                linked::ROW_SCALAR_REDUCER_OPERATION,
+                linked::ROW_SCALAR_REDUCER_SOURCE_CARDINALITY,
+                linked::ROW_SCALAR_REDUCER_SOURCE_BYTES,
+                hex(&linked::ROW_SCALAR_REDUCER_ORDERED_SOURCES_SHA256),
+                linked::ROW_SCALAR_REDUCER_SYMBOL,
+                hex(&linked::ROW_SCALAR_REDUCER_OPERATION_IDENTITY_SHA256),
+                hex(&linked::ROW_SCALAR_REDUCER_CODE_SHA256),
+                hex(&linked::ROW_SCALAR_REDUCER_OBJECT_SHA256),
+                linked::ROW_SCALAR_REDUCER_RELOCATION_OFFSETS.len(),
+                relocation_sections,
+                relocation_offsets,
+                relocation_kinds,
+                relocation_symbols,
+                relocation_addends,
+                linked::ROW_SCALAR_REDUCER_SEMANTIC_RUNTIME_CALLS,
+                linked::ROW_SCALAR_REDUCER_OBJECT_BYTES,
+                linked::ROW_SCALAR_REDUCER_MAX_OBJECT_BYTES,
+                hex(&linked::ROW_SCALAR_REDUCER_ARTIFACT_IDENTITY_SHA256),
+            )
+            .expect("format native row-scalar reducer provenance");
+        }
         if linked::NATIVE_MULTI_GREP_REDUCER {
             write!(
                 &mut provenance,
@@ -2074,7 +2153,9 @@ fn print_provenance() {
             )
             .expect("format uniform-capture proof provenance");
         }
-        let boundary = if linked::NATIVE_MULTI_GREP_REDUCER {
+        let boundary = if linked::NATIVE_ROW_SCALAR_REDUCER {
+            "single-call-helper-free-native-row-scalar-reducer"
+        } else if linked::NATIVE_MULTI_GREP_REDUCER {
             "single-call-helper-free-native-multi-grep-reducer"
         } else if linked::UNIFORM_CAPTURE_BRIDGE {
             "native-search-core-static-uniform-capture-resolution"
@@ -2325,6 +2406,119 @@ fn expected_multi_grep_artifact_identity(
         linked::MULTI_GREP_REDUCER_MAX_OBJECT_BYTES,
     )?;
     Ok(digest.finalize().into())
+}
+
+fn expected_native_row_scalar_operation_identity(
+    benchmark: &shared::Benchmark,
+) -> Result<[u8; 32], String> {
+    let operation_tag = match benchmark.model {
+        shared::Model::Count => 1_u8,
+        shared::Model::SpanSum => 2_u8,
+        _ => {
+            return Err(
+                "native row-scalar identity requested for an unsupported operation".to_owned(),
+            );
+        }
+    };
+    let target = shared::target_from_parts(
+        linked::TARGET_ARCH,
+        linked::TARGET_OS,
+        linked::FEATURE_BITS,
+    )?;
+    let ordered_sources_sha256 = shared::ordered_many_source_sha256(&benchmark.patterns)?;
+    let source_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "row-scalar runtime source byte sum overflowed".to_owned())?;
+    let mut digest = Sha256::new();
+    digest.update(fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_IDENTITY_DOMAIN);
+    digest.update(
+        fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes(),
+    );
+    digest.update([operation_tag]);
+    digest.update([
+        target.architecture as u8,
+        target.operating_system as u8,
+        target.abi as u8,
+    ]);
+    digest.update(target.features.bits().to_le_bytes());
+    update_multi_grep_identity_usize(&mut digest, benchmark.patterns.len())?;
+    update_multi_grep_identity_usize(&mut digest, source_bytes)?;
+    digest.update(ordered_sources_sha256);
+    update_multi_grep_identity_usize(&mut digest, linked::SOURCE_TO_ARTIFACT.len())?;
+    for &row in linked::SOURCE_TO_ARTIFACT {
+        update_multi_grep_identity_usize(&mut digest, row)?;
+    }
+    update_multi_grep_identity_usize(&mut digest, linked::ROW_ARTIFACT_COUNT)?;
+    for row in 0..linked::ROW_ARTIFACT_COUNT {
+        update_multi_grep_identity_usize(&mut digest, linked::ROW_FIRST_SOURCE_ORDINALS[row])?;
+        update_multi_grep_identity_field(&mut digest, linked::ROW_ENTRY_SYMBOLS[row].as_bytes())?;
+        digest.update(linked::ROW_AUTOMATON_SHA256[row]);
+        digest.update(linked::ROW_PROGRAM_SHA256[row]);
+        digest.update(linked::ROW_OBJECT_SHA256[row]);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn expected_native_row_scalar_artifact_identity(
+    operation_identity: [u8; 32],
+) -> Result<[u8; 32], String> {
+    let relocation_count = linked::ROW_SCALAR_REDUCER_RELOCATION_OFFSETS.len();
+    if linked::ROW_SCALAR_REDUCER_RELOCATION_SECTIONS.len() != relocation_count
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_KINDS.len() != relocation_count
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_SYMBOLS.len() != relocation_count
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_ADDENDS.len() != relocation_count
+    {
+        return Err("row-scalar relocation receipt cardinalities disagree".to_owned());
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/rebar-native-row-scalar-reducer-artifact/v1\0");
+    digest.update(operation_identity);
+    update_multi_grep_identity_field(&mut digest, linked::ROW_SCALAR_REDUCER_SYMBOL.as_bytes())?;
+    digest.update(linked::ROW_SCALAR_REDUCER_CODE_SHA256);
+    digest.update(linked::ROW_SCALAR_REDUCER_OBJECT_SHA256);
+    update_multi_grep_identity_usize(&mut digest, relocation_count)?;
+    for relocation in 0..relocation_count {
+        update_multi_grep_identity_usize(
+            &mut digest,
+            linked::ROW_SCALAR_REDUCER_RELOCATION_SECTIONS[relocation],
+        )?;
+        digest.update(linked::ROW_SCALAR_REDUCER_RELOCATION_OFFSETS[relocation].to_le_bytes());
+        digest.update([linked::ROW_SCALAR_REDUCER_RELOCATION_KINDS[relocation]]);
+        update_multi_grep_identity_usize(
+            &mut digest,
+            linked::ROW_SCALAR_REDUCER_RELOCATION_SYMBOLS[relocation],
+        )?;
+        digest.update(linked::ROW_SCALAR_REDUCER_RELOCATION_ADDENDS[relocation].to_le_bytes());
+    }
+    update_multi_grep_identity_usize(&mut digest, linked::ROW_SCALAR_REDUCER_OBJECT_BYTES)?;
+    update_multi_grep_identity_usize(
+        &mut digest,
+        linked::ROW_SCALAR_REDUCER_MAX_OBJECT_BYTES,
+    )?;
+    Ok(digest.finalize().into())
+}
+
+fn native_row_scalar_reducer_receipt_is_empty() -> bool {
+    linked::ROW_SCALAR_REDUCER_ABI_VERSION == 0
+        && linked::ROW_SCALAR_REDUCER_OPERATION.is_empty()
+        && linked::ROW_SCALAR_REDUCER_SOURCE_CARDINALITY == 0
+        && linked::ROW_SCALAR_REDUCER_SOURCE_BYTES == 0
+        && linked::ROW_SCALAR_REDUCER_SEMANTIC_RUNTIME_CALLS == 0
+        && linked::ROW_SCALAR_REDUCER_OBJECT_BYTES == 0
+        && linked::ROW_SCALAR_REDUCER_MAX_OBJECT_BYTES == 0
+        && linked::ROW_SCALAR_REDUCER_SYMBOL.is_empty()
+        && linked::ROW_SCALAR_REDUCER_RELOCATION_OFFSETS.is_empty()
+        && linked::ROW_SCALAR_REDUCER_RELOCATION_SECTIONS.is_empty()
+        && linked::ROW_SCALAR_REDUCER_RELOCATION_KINDS.is_empty()
+        && linked::ROW_SCALAR_REDUCER_RELOCATION_SYMBOLS.is_empty()
+        && linked::ROW_SCALAR_REDUCER_RELOCATION_ADDENDS.is_empty()
+        && linked::ROW_SCALAR_REDUCER_ORDERED_SOURCES_SHA256 == [0; 32]
+        && linked::ROW_SCALAR_REDUCER_OPERATION_IDENTITY_SHA256 == [0; 32]
+        && linked::ROW_SCALAR_REDUCER_CODE_SHA256 == [0; 32]
+        && linked::ROW_SCALAR_REDUCER_OBJECT_SHA256 == [0; 32]
+        && linked::ROW_SCALAR_REDUCER_ARTIFACT_IDENTITY_SHA256 == [0; 32]
 }
 
 fn multi_grep_reducer_receipt_is_empty() -> bool {
@@ -2941,6 +3135,12 @@ fn authenticate_linked_capture_next_reducer_source() -> Result<(), String> {
 }
 
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
+    if linked::NATIVE_ROW_SCALAR_REDUCER && !linked::NATIVE_ROW_BRIDGE {
+        return Err("row-scalar reducer is detached from its native-row closure".to_owned());
+    }
+    if !linked::NATIVE_ROW_BRIDGE && !native_row_scalar_reducer_receipt_is_empty() {
+        return Err("non-row route contains a row-scalar reducer receipt".to_owned());
+    }
     if linked::NATIVE_MULTI_GREP_REDUCER && !linked::NATIVE_ROW_BRIDGE {
         return Err("multi-grep reducer is detached from its native-row closure".to_owned());
     }
@@ -3973,6 +4173,111 @@ fn authenticate_linked_shared_ordered_many(benchmark: &shared::Benchmark) -> Res
     Ok(())
 }
 
+fn authenticate_native_row_scalar_reducer(
+    benchmark: &shared::Benchmark,
+    has_prepared_v15: bool,
+) -> Result<(), String> {
+    if !linked::NATIVE_ROW_SCALAR_REDUCER {
+        return native_row_scalar_reducer_receipt_is_empty()
+            .then_some(())
+            .ok_or_else(|| {
+                "native-row adapter fallback contains a row-scalar reducer receipt".to_owned()
+            });
+    }
+    let expected_operation = match benchmark.model {
+        shared::Model::Count => "count",
+        shared::Model::SpanSum => "span-sum",
+        _ => {
+            return Err("linked row-scalar reducer has a non-scalar operation".to_owned());
+        }
+    };
+    let source_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "row-scalar runtime source byte sum overflowed".to_owned())?;
+    let ordered_sources_sha256 = shared::ordered_many_source_sha256(&benchmark.patterns)?;
+    let operation_identity = expected_native_row_scalar_operation_identity(benchmark)?;
+    let artifact_identity = expected_native_row_scalar_artifact_identity(operation_identity)?;
+    let operation_identity_hex = hex(&operation_identity);
+    let symbol_identity = native_symbol_identity(
+        linked::ROW_SCALAR_REDUCER_SYMBOL,
+        "fre_aot_regex_rebar_row_scalar_v1_",
+    );
+    let reducer_limit = shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        .checked_sub(linked::ROW_TOTAL_OBJECT_BYTES)
+        .ok_or_else(|| "row-scalar linked object-byte remainder underflowed".to_owned())?;
+    let total_object_bytes = linked::ROW_TOTAL_OBJECT_BYTES
+        .checked_add(linked::ROW_SCALAR_REDUCER_OBJECT_BYTES)
+        .ok_or_else(|| "row-scalar linked object-byte total overflowed".to_owned())?;
+    let relocation_count = linked::ROW_SCALAR_REDUCER_RELOCATION_OFFSETS.len();
+    let expected_relocation_kind = match linked::TARGET_ARCH {
+        "x86_64" => 1_u8,
+        "aarch64" => 4_u8,
+        other => return Err(format!("unsupported row-scalar relocation architecture {other:?}")),
+    };
+    let expected_relocation_addend = if linked::TARGET_ARCH == "x86_64" {
+        -4_i64
+    } else {
+        0_i64
+    };
+    let final_digests = [
+        linked::ROW_SCALAR_REDUCER_ORDERED_SOURCES_SHA256,
+        linked::ROW_SCALAR_REDUCER_OPERATION_IDENTITY_SHA256,
+        linked::ROW_SCALAR_REDUCER_CODE_SHA256,
+        linked::ROW_SCALAR_REDUCER_OBJECT_SHA256,
+        linked::ROW_SCALAR_REDUCER_ARTIFACT_IDENTITY_SHA256,
+    ];
+    if benchmark.patterns.len() < 2
+        || has_prepared_v15
+        || linked::NATIVE_MULTI_GREP_REDUCER
+        || linked::UNIFORM_CAPTURE_BRIDGE
+        || linked::STRICT_CAPTURE_BRIDGE
+        || linked::PARTICIPATION_CAPTURE_BRIDGE
+        || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
+        || linked::ROW_SCALAR_REDUCER_ABI_VERSION
+            != fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION
+        || linked::ROW_SCALAR_REDUCER_OPERATION != expected_operation
+        || linked::ROW_SCALAR_REDUCER_SOURCE_CARDINALITY != benchmark.patterns.len()
+        || linked::ROW_SCALAR_REDUCER_SOURCE_BYTES != source_bytes
+        || linked::ROW_SCALAR_REDUCER_ORDERED_SOURCES_SHA256 != ordered_sources_sha256
+        || linked::ROW_SCALAR_REDUCER_OPERATION_IDENTITY_SHA256 != operation_identity
+        || linked::ROW_SCALAR_REDUCER_ARTIFACT_IDENTITY_SHA256 != artifact_identity
+        || symbol_identity != Some(operation_identity_hex.as_str())
+        || relocation_count != linked::ROW_ARTIFACT_COUNT
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_SECTIONS.len() != relocation_count
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_KINDS.len() != relocation_count
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_SYMBOLS.len() != relocation_count
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_ADDENDS.len() != relocation_count
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_SECTIONS
+            .iter()
+            .any(|&section| section != 0)
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_KINDS
+            .iter()
+            .any(|&kind| kind != expected_relocation_kind)
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_SYMBOLS
+            .iter()
+            .enumerate()
+            .any(|(row, &symbol)| symbol != row + 1)
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_ADDENDS
+            .iter()
+            .any(|&addend| addend != expected_relocation_addend)
+        || linked::ROW_SCALAR_REDUCER_RELOCATION_OFFSETS
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || linked::ROW_SCALAR_REDUCER_SEMANTIC_RUNTIME_CALLS != 0
+        || linked::ROW_SCALAR_REDUCER_OBJECT_BYTES == 0
+        || linked::ROW_SCALAR_REDUCER_MAX_OBJECT_BYTES != reducer_limit
+        || linked::ROW_SCALAR_REDUCER_OBJECT_BYTES
+            > linked::ROW_SCALAR_REDUCER_MAX_OBJECT_BYTES
+        || total_object_bytes > shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || final_digests.contains(&[0; 32])
+    {
+        return Err("linked native row-scalar reducer receipt is inconsistent".to_owned());
+    }
+    Ok(())
+}
+
 fn authenticate_native_multi_grep_reducer(
     benchmark: &shared::Benchmark,
     has_prepared_v15: bool,
@@ -4051,6 +4356,8 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     const GREP_ROW_STRATEGY: &str = "per-line-native-independent-span-row-exists-v1";
     const MIXED_GREP_ROW_STRATEGY: &str =
         "per-line-native-independent-span-row-exists-mixed-prepared-v15-v1";
+    const NATIVE_ROW_SCALAR_STRATEGY: &str =
+        "native-independent-span-row-whole-scalar-reducer-v1";
     const NATIVE_MULTI_GREP_STRATEGY: &str =
         "native-independent-span-row-whole-grep-reducer-v1";
     const LINKED_NATIVE_MULTI_GREP_STRATEGY: &str =
@@ -4126,6 +4433,7 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     let has_prepared_v15 = linked::ROW_REQUIRED_PREPARE_CAPABILITIES
         .iter()
         .any(|&capabilities| capabilities != 0);
+    authenticate_native_row_scalar_reducer(benchmark, has_prepared_v15)?;
     authenticate_native_multi_grep_reducer(benchmark, has_prepared_v15)?;
     let expected_caps = PrepareV3Caps::for_required_capabilities(if has_prepared_v15 {
         PREPARE_CAPABILITY_ORDERED_NFA_V15
@@ -4160,7 +4468,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table exposes a forbidden global prepared route".to_owned());
     }
-    let expected_aggregate_strategy = if linked::NATIVE_MULTI_GREP_REDUCER {
+    let expected_aggregate_strategy = if linked::NATIVE_ROW_SCALAR_REDUCER {
+        NATIVE_ROW_SCALAR_STRATEGY
+    } else if linked::NATIVE_MULTI_GREP_REDUCER {
         NATIVE_MULTI_GREP_STRATEGY
     } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
         WEIGHTED_CAPTURE_STRATEGY
@@ -4184,7 +4494,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         ROW_STRATEGY
     };
     let expected_span_strategy = if benchmark.model == shared::Model::SpanSum {
-        if has_prepared_v15 {
+        if linked::NATIVE_ROW_SCALAR_REDUCER {
+            NATIVE_ROW_SCALAR_STRATEGY
+        } else if has_prepared_v15 {
             MIXED_ROW_STRATEGY
         } else {
             ROW_STRATEGY
@@ -4222,7 +4534,15 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table has the wrong scalar iteration route".to_owned());
     }
-    let expected_adapter = if linked::NATIVE_MULTI_GREP_REDUCER {
+    let expected_adapter = if linked::NATIVE_ROW_SCALAR_REDUCER {
+        match benchmark.model {
+            shared::Model::Count => "general-aot-native-row-count-whole-operation-reducer-v1",
+            shared::Model::SpanSum => {
+                "general-aot-native-row-span-sum-whole-operation-reducer-v1"
+            }
+            _ => return Err("row-scalar bridge has a non-scalar adapter".to_owned()),
+        }
+    } else if linked::NATIVE_MULTI_GREP_REDUCER {
         "general-aot-native-multi-grep-whole-operation-reducer-v1"
     } else if linked::WEIGHTED_CAPTURE_REDUCER_BRIDGE {
         match benchmark.model {
@@ -5090,6 +5410,7 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         || linked::PARTICIPATION_CAPTURE_BRIDGE
         || linked::STRICT_CAPTURE_BRIDGE
         || linked::UNIFORM_CAPTURE_BRIDGE
+        || linked::NATIVE_ROW_SCALAR_REDUCER
         || linked::NATIVE_MULTI_GREP_REDUCER
     {
         None
@@ -5110,6 +5431,8 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
             strict_capture_reduce(benchmark.model, haystack, &mut capture_slots)
         } else if linked::UNIFORM_CAPTURE_BRIDGE {
             strict_uniform_capture_reduce(benchmark.model, haystack)
+        } else if linked::NATIVE_ROW_SCALAR_REDUCER {
+            strict_linked_native_row_scalar_reduce(haystack)
         } else if linked::NATIVE_MULTI_GREP_REDUCER {
             strict_linked_native_multi_grep_reduce(haystack)
         } else {

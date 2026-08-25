@@ -358,7 +358,9 @@ def expected_object_hashes(provenance: dict[str, object]) -> list[str]:
         hashes.append(provenance["object_sha256"])
     if provenance.get("kind") == "weighted-capture-reducer-v6":
         hashes.append(provenance["object_sha256"])
-    if provenance.get("composite_kind") == "native-multi-grep-reducer-v1":
+    if provenance.get("composite_kind") in {
+        "native-multi-grep-reducer-v1", "native-row-scalar-reducer-v1",
+    }:
         hashes.append(provenance["object_sha256"])
     return hashes
 

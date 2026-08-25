@@ -1793,10 +1793,19 @@ class TrueNativeCensusTests(unittest.TestCase):
             "native-multi-grep-reducer-v1",
             definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
+        self.assertIn(
+            "native-row-scalar-reducer-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
+        )
         multi_grep = definitions["multiGrepReducerProvenance"]
         self.assertFalse(multi_grep["additionalProperties"])
         self.assertEqual(
             multi_grep["properties"]["semantic_runtime_calls"]["const"], 0
+        )
+        row_scalar = definitions["rowScalarReducerProvenance"]
+        self.assertFalse(row_scalar["additionalProperties"])
+        self.assertEqual(
+            row_scalar["properties"]["semantic_runtime_calls"]["const"], 0
         )
         self.assertIn("uniform_capture", definitions["provenance"]["required"])
         proof = definitions["uniformCaptureProvenance"]
@@ -2622,6 +2631,9 @@ class TrueNativeCensusTests(unittest.TestCase):
             "linked-native-multi-grep-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
+            "linked-native-row-scalar-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
             "linked-uniform-capture-row-adapter-loop": (
                 True,
                 False,
@@ -3236,6 +3248,123 @@ class TrueNativeCensusTests(unittest.TestCase):
             CENSUS.validate_provenance_record(
                 poisoned_reducer, "poisoned native multi-Grep reducer"
             )
+
+        for model, operation_name, operation_tag, adapter in (
+            (
+                "count", "count", 1,
+                "general-aot-native-row-count-whole-operation-reducer-v1",
+            ),
+            (
+                "count-spans", "span-sum", 2,
+                "general-aot-native-row-span-sum-whole-operation-reducer-v1",
+            ),
+        ):
+            scalar_fields = dict(fields)
+            scalar_fields.update({
+                "model": model,
+                "adapter": adapter,
+                "aggregate_strategy": (
+                    "native-independent-span-row-whole-scalar-reducer-v1"
+                ),
+                "boundary": "single-call-helper-free-native-row-scalar-reducer",
+                "native_row_scalar_reducer": "true",
+                "row_scalar_reducer_abi_version": "1",
+                "row_scalar_reducer_operation": operation_name,
+                "row_scalar_reducer_source_cardinality": "3",
+                "row_scalar_reducer_source_bytes": "12",
+                "row_scalar_reducer_ordered_sources_sha256": "d" * 64,
+                "row_scalar_reducer_code_sha256": "e" * 64,
+                "row_scalar_reducer_object_sha256": "f" * 64,
+                "row_scalar_reducer_relocation_count": "2",
+                "row_scalar_reducer_relocation_sections": "0,0",
+                "row_scalar_reducer_relocation_offsets": "64,128",
+                "row_scalar_reducer_relocation_kinds": "1,1",
+                "row_scalar_reducer_relocation_symbols": "1,2",
+                "row_scalar_reducer_relocation_addends": "-4,-4",
+                "row_scalar_reducer_semantic_runtime_calls": "0",
+                "row_scalar_reducer_object_bytes": "1232",
+                "row_scalar_reducer_max_object_bytes": str(268435456 - 4096),
+            })
+            operation_digest = hashlib.sha256()
+            operation_digest.update(
+                b"fre-aot-regex/rebar-native-row-scalar-reducer/v1\0"
+            )
+            operation_digest.update((1).to_bytes(4, "little"))
+            operation_digest.update(bytes((operation_tag, 0, 0, 0)))
+            operation_digest.update((0).to_bytes(8, "little"))
+            operation_digest.update((3).to_bytes(8, "little"))
+            operation_digest.update((12).to_bytes(8, "little"))
+            operation_digest.update(bytes.fromhex("d" * 64))
+            operation_digest.update((3).to_bytes(8, "little"))
+            for row in (0, 1, 0):
+                operation_digest.update(row.to_bytes(8, "little"))
+            operation_digest.update((2).to_bytes(8, "little"))
+            for index, first_source in enumerate((0, 1)):
+                operation_digest.update(first_source.to_bytes(8, "little"))
+                entry = scalar_fields[
+                    f"component_{index}_entry_symbol"
+                ].encode("ascii")
+                operation_digest.update(len(entry).to_bytes(8, "little"))
+                operation_digest.update(entry)
+                for suffix in (
+                    "automaton_sha256", "program_sha256", "object_sha256",
+                ):
+                    operation_digest.update(bytes.fromhex(
+                        scalar_fields[f"component_{index}_{suffix}"]
+                    ))
+            scalar_identity = operation_digest.hexdigest()
+            scalar_symbol = (
+                f"fre_aot_regex_rebar_row_scalar_v1_{scalar_identity}"
+            )
+            scalar_fields["row_scalar_reducer_operation_identity_sha256"] = (
+                scalar_identity
+            )
+            scalar_fields["row_scalar_reducer_symbol"] = scalar_symbol
+            scalar_artifact = hashlib.sha256()
+            scalar_artifact.update(
+                b"fre-aot-regex/rebar-native-row-scalar-reducer-artifact/v1\0"
+            )
+            scalar_artifact.update(bytes.fromhex(scalar_identity))
+            scalar_symbol_bytes = scalar_symbol.encode("ascii")
+            scalar_artifact.update(len(scalar_symbol_bytes).to_bytes(8, "little"))
+            scalar_artifact.update(scalar_symbol_bytes)
+            scalar_artifact.update(bytes.fromhex("e" * 64))
+            scalar_artifact.update(bytes.fromhex("f" * 64))
+            scalar_artifact.update((2).to_bytes(8, "little"))
+            for offset, symbol in ((64, 1), (128, 2)):
+                scalar_artifact.update((0).to_bytes(8, "little"))
+                scalar_artifact.update(offset.to_bytes(8, "little"))
+                scalar_artifact.update(bytes((1,)))
+                scalar_artifact.update(symbol.to_bytes(8, "little"))
+                scalar_artifact.update((-4).to_bytes(8, "little", signed=True))
+            scalar_artifact.update((1232).to_bytes(8, "little"))
+            scalar_artifact.update((268435456 - 4096).to_bytes(8, "little"))
+            scalar_fields["row_scalar_reducer_artifact_identity_sha256"] = (
+                scalar_artifact.hexdigest()
+            )
+            scalar_encoded = " ".join(
+                f"{key}={value}" for key, value in scalar_fields.items()
+            ).encode()
+            scalar_receipt = CENSUS.provenance_receipt(
+                CENSUS.parse_provenance(scalar_encoded)
+            )
+            CENSUS.validate_provenance_record(
+                scalar_receipt, f"synthetic native row-scalar {model} reducer"
+            )
+            self.assertEqual(
+                scalar_receipt["composite_kind"],
+                "native-row-scalar-reducer-v1",
+            )
+            self.assertEqual(
+                CENSUS.operation_route_from_provenance_record(scalar_receipt),
+                ([scalar_symbol], "linked-native-row-scalar-reducer"),
+            )
+            poisoned_scalar = copy.deepcopy(scalar_receipt)
+            poisoned_scalar["row_scalar_reducer"]["relocation_addends"][0] = 0
+            with self.assertRaisesRegex(CENSUS.CensusError, "relocation closure"):
+                CENSUS.validate_provenance_record(
+                    poisoned_scalar, "poisoned native row-scalar reducer"
+                )
 
         poisoned_grep = dict(grep_fields)
         poisoned_grep["aggregate_strategy"] = "native-independent-span-row-selector-v1"

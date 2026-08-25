@@ -2175,6 +2175,21 @@ pub fn try_compile_shared_ordered_many_aggregate(
     benchmark: &Benchmark,
     target: Target,
 ) -> Result<SharedOrderedManyAggregateDisposition, String> {
+    try_compile_shared_ordered_many_aggregate_with_object_limit(
+        benchmark,
+        target,
+        MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES,
+    )
+}
+
+/// Explicit object-limit counterpart used only by the fallback-equivalence
+/// regression. Production keeps the fixed bridge-wide object envelope.
+#[doc(hidden)]
+pub(crate) fn try_compile_shared_ordered_many_aggregate_with_object_limit(
+    benchmark: &Benchmark,
+    target: Target,
+    max_object_bytes: usize,
+) -> Result<SharedOrderedManyAggregateDisposition, String> {
     if benchmark.patterns.len() <= 1
         || benchmark.patterns.len() > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         || !matches!(
@@ -2211,7 +2226,7 @@ pub fn try_compile_shared_ordered_many_aggregate(
         .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
         .ok_or_else(|| "shared ordered-many source byte sum overflowed".to_owned())?;
     limits.compile = rebar_recovery_compile_limits();
-    limits.compile.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+    limits.compile.max_object_bytes = max_object_bytes;
     let disposition = compile_ordered_many_aot_reported(
         OrderedManyAotCompileRequest::new(rows, target)
             .profile(profile.clone())
@@ -3807,6 +3822,142 @@ pub fn try_compile_native_multi_grep_reducer(
     Ok(NativeMultiGrepReducerDisposition::Selected(selected))
 }
 
+/// Build-time selection for a helper-free whole-operation Count or SpanSum
+/// reducer over the independently authenticated ordinary row closure.
+#[derive(Clone, Debug)]
+pub enum NativeRowScalarReducerDisposition {
+    Selected(fre_aot_regex::RebarNativeRowScalarReducerAotArtifactV1),
+    DeclinedPreparedRow { artifact: usize },
+    DeclinedObjectBytes { limit: usize, required: usize },
+}
+
+/// Attempt to replace the Rust ordered-row iterator with one native scalar
+/// transaction. Prepared rows retain the exact incumbent handle-taking route;
+/// only the final numeric object cap can decline after ordinary rows exist.
+pub fn try_compile_native_row_scalar_reducer(
+    benchmark: &Benchmark,
+    bridge: &NativeRowBridge,
+) -> Result<NativeRowScalarReducerDisposition, String> {
+    let operation = match benchmark.model {
+        Model::Count => fre_aot_regex::RebarNativeRowScalarOperationV1::Count,
+        Model::SpanSum => fre_aot_regex::RebarNativeRowScalarOperationV1::SpanSum,
+        _ => {
+            return Err(
+                "native row-scalar reducer requires a multi-pattern Count or SpanSum bridge"
+                    .to_owned(),
+            );
+        }
+    };
+    if benchmark.patterns.len() < 2
+        || !benchmark.uses_native_row_bridge()
+        || bridge.artifacts.is_empty()
+        || bridge.source_to_artifact.len() != benchmark.patterns.len()
+        || bridge.total_object_bytes == 0
+        || bridge.total_object_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err(
+            "native row-scalar reducer requires an authenticated multi-pattern row bridge"
+                .to_owned(),
+        );
+    }
+    let exact_row_bytes = bridge
+        .artifacts
+        .iter()
+        .try_fold(0_usize, |total, artifact| {
+            total.checked_add(artifact.compiled.object().len())
+        })
+        .ok_or_else(|| "native row-scalar row object-byte sum overflowed".to_owned())?;
+    if exact_row_bytes != bridge.total_object_bytes {
+        return Err("native row-scalar row object-byte receipt mismatch".to_owned());
+    }
+    if let Some((artifact, _)) = bridge
+        .artifacts
+        .iter()
+        .enumerate()
+        .find(|(_, artifact)| artifact.route.is_prepared())
+    {
+        return Ok(NativeRowScalarReducerDisposition::DeclinedPreparedRow {
+            artifact,
+        });
+    }
+    let source_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "native row-scalar source byte sum overflowed".to_owned())?;
+    let ordered_sources_sha256 = ordered_many_source_sha256(&benchmark.patterns)?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(bridge.artifacts.len())
+        .map_err(|_| "native row-scalar descriptor allocation failed".to_owned())?;
+    rows.extend(bridge.artifacts.iter().map(|artifact| {
+        fre_aot_regex::RebarMultiGrepReducerRowV1::new(
+            &artifact.compiled,
+            artifact.first_source_ordinal,
+        )
+    }));
+    let reducer_limit = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        .checked_sub(bridge.total_object_bytes)
+        .ok_or_else(|| "native row-scalar object-byte remainder underflowed".to_owned())?;
+    let disposition = fre_aot_regex::compile_rebar_native_row_scalar_reducer_aot_v1(
+        operation,
+        ordered_sources_sha256,
+        benchmark.patterns.len(),
+        source_bytes,
+        &bridge.source_to_artifact,
+        &rows,
+        reducer_limit,
+    )
+    .map_err(|error| format!("native row-scalar reducer compilation failed: {error}"))?;
+    let selected = match disposition {
+        fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(selected) => {
+            selected
+        }
+        fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Declined(
+            fre_aot_regex::RebarNativeRowScalarReducerAotCompileDeclineV1::ObjectBytes {
+                limit,
+                required,
+            },
+        ) => {
+            return Ok(NativeRowScalarReducerDisposition::DeclinedObjectBytes {
+                limit,
+                required,
+            });
+        }
+    };
+    let receipt = selected.receipt();
+    let total_link_bytes = bridge
+        .total_object_bytes
+        .checked_add(selected.object().len())
+        .ok_or_else(|| "native row-scalar total linked object bytes overflowed".to_owned())?;
+    if !selected.authenticates_rows(
+        operation,
+        ordered_sources_sha256,
+        benchmark.patterns.len(),
+        source_bytes,
+        &bridge.source_to_artifact,
+        &rows,
+    ) || receipt.max_object_bytes() != reducer_limit
+        || receipt.object_bytes() != selected.object().len()
+        || receipt.reducer_relocations() != selected.module().relocations()
+        || receipt.reducer_relocations().len() != bridge.artifacts.len()
+        || receipt.semantic_runtime_calls() != 0
+        || !receipt
+            .row_entry_symbols()
+            .iter()
+            .map(String::as_str)
+            .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        || !selected
+            .module()
+            .required_runtime_symbols()
+            .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        || selected.object().is_empty()
+        || total_link_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err("native row-scalar reducer adapter authentication failed".to_owned());
+    }
+    Ok(NativeRowScalarReducerDisposition::Selected(selected))
+}
+
 fn authenticate_native_row(compiled: &CompiledRegex, source_ordinal: usize) -> Result<(), String> {
     let module = compiled.module();
     let receipt = compiled.receipt();
@@ -5343,6 +5494,129 @@ mod tests {
             disposition,
             NativeMultiGrepReducerDisposition::DeclinedPreparedRow { artifact: 1 },
         ));
+    }
+
+    #[test]
+    fn native_row_scalar_reducer_seals_count_and_span_sum_row_closure() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for (model, operation) in [
+            (
+                "count",
+                fre_aot_regex::RebarNativeRowScalarOperationV1::Count,
+            ),
+            (
+                "count-spans",
+                fre_aot_regex::RebarNativeRowScalarOperationV1::SpanSum,
+            ),
+        ] {
+            let mut multi = fixture(model, b"a", b"aba");
+            let offset = multi
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            multi.splice(
+                offset..offset,
+                b"pattern:1:a\npattern:2:ab\n".iter().copied(),
+            );
+            let benchmark = Benchmark::parse(&multi).expect("row-scalar fixture");
+            let bridge = compile_native_row_bridge(&benchmark, target)
+                .expect("independent ordinary rows");
+            assert_eq!(bridge.source_to_artifact, [0, 0, 1]);
+            let disposition = try_compile_native_row_scalar_reducer(&benchmark, &bridge)
+                .expect("native row-scalar adapter");
+            let NativeRowScalarReducerDisposition::Selected(artifact) = disposition else {
+                panic!("ordinary public rows unexpectedly declined their scalar reducer");
+            };
+            let receipt = artifact.receipt();
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.source_cardinality(), benchmark.patterns.len());
+            assert_eq!(receipt.source_to_row(), bridge.source_to_artifact);
+            assert_eq!(receipt.reducer_relocations().len(), bridge.artifacts.len());
+            assert_eq!(receipt.semantic_runtime_calls(), 0);
+            assert!(artifact.module().required_runtime_symbols().eq(
+                bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol)
+            ));
+            assert!(
+                receipt.object_bytes() + bridge.total_object_bytes
+                    <= MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn native_row_scalar_reducer_declines_prepared_rows_without_changing_adapter() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut multi = fixture("count", b"a+", b"foo bar");
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, b"pattern:7:\\bfoo\\b\n".iter().copied());
+        let mut benchmark = Benchmark::parse(&multi).expect("prepared row-scalar fixture");
+        benchmark.unicode = true;
+        let bridge = compile_native_row_bridge(&benchmark, target)
+            .expect("runtime-dependent row selects explicit prepared V15");
+        assert_eq!(bridge.artifacts[0].route, NativeRowRoute::Ordinary);
+        assert_eq!(
+            bridge.artifacts[1].route,
+            NativeRowRoute::PreparedOrderedNfaV15,
+        );
+        assert!(matches!(
+            try_compile_native_row_scalar_reducer(&benchmark, &bridge)
+                .expect("prepared row is a typed scalar-wrapper decline"),
+            NativeRowScalarReducerDisposition::DeclinedPreparedRow { artifact: 1 },
+        ));
+    }
+
+    #[test]
+    fn shared_object_decline_selects_the_same_authenticated_row_scalar_incumbent() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for model in ["count", "count-spans"] {
+            let mut multi = fixture(model, b"a", b"abab");
+            let offset = multi
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            multi.splice(offset..offset, b"pattern:2:ab\n".iter().copied());
+            let benchmark = Benchmark::parse(&multi).expect("fallback fixture");
+            let shared = try_compile_shared_ordered_many_aggregate_with_object_limit(
+                &benchmark,
+                target,
+                256,
+            )
+            .expect("shared numeric-cap transaction");
+            assert!(matches!(
+                shared,
+                SharedOrderedManyAggregateDisposition::Declined(
+                    OrderedManyAotCompileDecline::ObjectBytes { limit: 256, required }
+                ) if required > 256
+            ), "unexpected shared numeric-cap disposition: {shared:?}");
+            let bridge = compile_native_row_bridge(&benchmark, target)
+                .expect("prior independent-row incumbent");
+            let NativeRowScalarReducerDisposition::Selected(reducer) =
+                try_compile_native_row_scalar_reducer(&benchmark, &bridge)
+                    .expect("whole-operation row-scalar fallback")
+            else {
+                panic!("ordinary fallback rows unexpectedly declined");
+            };
+            assert_eq!(reducer.receipt().source_to_row(), bridge.source_to_artifact);
+            assert_eq!(reducer.receipt().semantic_runtime_calls(), 0);
+        }
     }
 
     #[test]

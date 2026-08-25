@@ -55,7 +55,12 @@ whole-operation reducer once, so its LF/CRLF split and checked scalar reduction
 do not retain that Rust outer loop. An all-ordinary multi-pattern `grep` table
 now does the same through `linked-native-multi-grep-reducer`; its child rows
 remain authenticated identities, while the single wrapper owns both line and
-row loops. The uniform route is labelled separately
+row loops. After a typed shared ordered-many decline, an all-ordinary
+multi-pattern `count` or `count-spans` table may likewise use
+`linked-native-row-scalar-reducer`; one helper-free wrapper owns source-priority
+selection, byte-wise empty progress, and the checked scalar transaction. Its
+zero-runtime-call receipt makes it eligible for the strict whole-operation
+numerator. The uniform route is labelled separately
 from both a fused capture
 operation and capture-offset materialization: its native entries select spans;
 the adapter applies an independently sealed per-row participation count. The
@@ -345,6 +350,11 @@ claimed operation entry. Its receipt authenticates the ordered raw-source
 digest, source map, first ordinals, every row automaton/program/object identity,
 exact relocation closure, wrapper code/object identities, empty semantic
 runtime-call surface, and the row-plus-wrapper object envelope.
+`native-row-scalar-reducer-v1` uses the same object order and final-wrapper
+operation boundary for Count and SpanSum. Its receipt additionally binds the
+operation tag and every relocation section, offset, kind, child-symbol index,
+and addend. Prepared rows retain the legacy adapter; only the final numeric
+wrapper object cap is a safe post-row decline.
 Native-row v3 additionally seals the complete
 source-to-artifact map, each retained artifact's first source ordinal, source
 cardinality, total object bytes, and the exact composite boundary. Every row
@@ -463,6 +473,9 @@ Three fresh processes authenticate each job:
    `native-multi-grep-reducer-v1` instead traps exactly its final wrapper; its
    ordinary row entries are inventoried as required defined identities and are
    not substituted as Rust-loop operation entries.
+   `native-row-scalar-reducer-v1` follows the same rule: trap its final Count or
+   SpanSum wrapper, and inventory each ordinary row entry as an authenticated
+   child identity rather than treating the rows as separate operation entries.
    The variable-width native-row bridge and uniform-capture row bridge receive
    the same independent negative control for every retained row artifact. The
    exact-span participation v4 runs two independent negative controls: one for
