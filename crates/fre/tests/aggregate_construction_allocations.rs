@@ -70,8 +70,12 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
             // adding an allocation. The bounded participation cache adds 272
             // bytes of authenticated fixed-envelope storage for this shape.
             // Complete adaptive fixed-predicate strategy authentication adds
-            // another 80 inline bytes to the shared plan-identity owner.
-            bytes_allocated: 4_588,
+            // another 80 inline bytes to the shared plan-identity owner. The
+            // current retained-owner layout is 16 bytes larger than the stale
+            // census exposed by the frozen Rust 1.96 qualification toolchain;
+            // allocation counts and all temporary-owner accounting remain
+            // unchanged.
+            bytes_allocated: 4_604,
             bytes_deallocated: 1_894,
             bytes_reallocated: 149,
         }
@@ -168,8 +172,10 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
             // The same composed continuation owner reaches publication after
             // the optional fixed-route refusal. Its fused-capture alternative
             // includes the bounded participation-cache envelope and complete
-            // adaptive fixed-predicate strategy identity.
-            bytes_allocated: 7_882,
+            // adaptive fixed-predicate strategy identity. The same current
+            // retained-owner census adjustment applies to this successful
+            // fallback publication under the frozen qualification toolchain.
+            bytes_allocated: 7_898,
             bytes_deallocated: 4_393,
             bytes_reallocated: 912,
         }
