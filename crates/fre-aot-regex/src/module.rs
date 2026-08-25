@@ -13407,26 +13407,27 @@ fn lower_native_ordered_nfa_prepared_reported(
                 )
             }
             Architecture::Aarch64 => {
+                let allow_asimd = target.features.has(CpuFeature::Aarch64Asimd);
                 let entry = match surface {
                     PreparedOrderedNfaV15Surface::Compatibility => {
-                        ordered_nfa_aarch64_codegen::lower_aarch64_with_start_prefix_vector_policy(
+                        ordered_nfa_aarch64_codegen::lower_aarch64_with_vector_policies(
                             &image,
-                            allow_start_prefix_vector
-                                && target.features.has(CpuFeature::Aarch64Asimd),
+                            allow_start_prefix_vector && allow_asimd,
+                            allow_asimd,
                         )?
                     }
                     PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
-                        ordered_nfa_aarch64_codegen::lower_aarch64_operation_only_with_start_prefix_vector_policy(
+                        ordered_nfa_aarch64_codegen::lower_aarch64_operation_only_with_vector_policies(
                             &image,
-                            allow_start_prefix_vector
-                                && target.features.has(CpuFeature::Aarch64Asimd),
+                            allow_start_prefix_vector && allow_asimd,
+                            allow_asimd,
                         )?
                     }
                     PreparedOrderedNfaV15Surface::RowSearchOnly => {
-                        ordered_nfa_aarch64_codegen::lower_aarch64_row_search_only_with_start_prefix_vector_policy(
+                        ordered_nfa_aarch64_codegen::lower_aarch64_row_search_only_with_vector_policies(
                             &image,
-                            allow_start_prefix_vector
-                                && target.features.has(CpuFeature::Aarch64Asimd),
+                            allow_start_prefix_vector && allow_asimd,
+                            allow_asimd,
                         )?
                     }
                 };
@@ -78947,6 +78948,77 @@ mod tests {
                 "V2 retained a data relocation on {target:?}",
             );
         }
+    }
+
+    #[test]
+    fn aarch64_ordered_nfa_terminal_asimd_requires_the_target_feature() {
+        const PATTERN: &str =
+            r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x01-\x08])\b";
+        let scalar_target = Target::aarch64_linux();
+        assert_eq!(scalar_target.features, FeatureSet::EMPTY);
+        let asimd_target = scalar_target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("ASIMD target");
+        let compile_target = |target| {
+            let request = CompileRequest::new(PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                });
+            let mut slow_limits = SlowAotLimits::default();
+            slow_limits.determinize.max_states = 0;
+            slow_limits.determinize.max_transitions = 0;
+            slow_limits.determinize.max_work = 0;
+            crate::compile_with_slow_aot_limits(request, slow_limits)
+                .expect("sparse-terminal Ordered-NFA fixture")
+        };
+        let scalar = compile_target(scalar_target);
+        let asimd = compile_target(asimd_target);
+        for compiled in [&scalar, &asimd] {
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert!(compiled.module().has_ordered_nfa_terminal_range_object());
+            assert!(!compiled.module().has_ordered_nfa_start_prefix_vector());
+        }
+
+        let text_words = |compiled: &CompiledRegex| {
+            compiled.module().sections()[TEXT_SECTION]
+                .data
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let scalar_words = text_words(&scalar);
+        let asimd_words = text_words(&asimd);
+        let terminal_asimd_words = [
+            aarch64_ld1_four_16b(24, 12).unwrap(),
+            aarch64_load_q(24, 12).unwrap(),
+            aarch64_cmhs_16b(5, 24, 16).unwrap(),
+            aarch64_and_16b(5, 5, 6).unwrap(),
+            aarch64_umaxv_16b(7, 24).unwrap(),
+            0x4e18_3f0c, // umov x12, v24.d[1]
+            0x4e08_3f0c, // umov x12, v24.d[0]
+        ];
+        assert!(terminal_asimd_words
+            .iter()
+            .all(|instruction| !scalar_words.contains(instruction)));
+        assert!(terminal_asimd_words
+            .iter()
+            .all(|instruction| asimd_words.contains(instruction)));
+        assert!(
+            asimd.module().sections()[TEXT_SECTION].data.len()
+                > scalar.module().sections()[TEXT_SECTION].data.len(),
+            "the ASIMD target must retain the additive terminal scanner",
+        );
+        assert_eq!(
+            scalar.module().sections()[PROGRAM_SECTION].data,
+            asimd.module().sections()[PROGRAM_SECTION].data,
+            "target feature selection must not alter the retained Ordered-NFA graph",
+        );
     }
 
     #[test]

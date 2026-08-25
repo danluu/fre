@@ -7179,6 +7179,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
     const ORDERED_TERMINAL_LOW_PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x00-\x29])\b";
+    const ORDERED_TERMINAL_SPARSE_PATTERN: &str =
+        r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x01-\x08])\b";
     const ORDERED_TERMINAL_EXACT_PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}[0-24-6](?-u:\b)";
     const ORDERED_TERMINAL_EXACT_BOUNDARIES_PATTERN: &str = concat!(
@@ -7205,8 +7207,12 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         }
     } else if cfg!(target_os = "linux") {
         Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
     } else {
         Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
     };
     let terminal_boundary_haystack = |byte| {
         let mut haystack = vec![b'A'; 100];
@@ -7458,6 +7464,48 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             ],
         ),
         (
+            ORDERED_TERMINAL_SPARSE_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                vec![b'A'; 96],
+                vec![b'A'; 4_096],
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.extend_from_slice(&[0x01, b'A']);
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.extend_from_slice(&[0x08, b'A']);
+                    haystack
+                },
+                {
+                    let mut haystack = Vec::new();
+                    for (index, padding) in [0_usize, 1, 15, 16, 17, 63, 64, 65]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        haystack.extend(std::iter::repeat_n(b'!', padding));
+                        haystack.extend(std::iter::repeat_n(b'A', 100));
+                        haystack.push(1 + u8::try_from(index).unwrap());
+                        haystack.extend_from_slice(b"A!");
+                    }
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.extend_from_slice(&[0x01, b'A', b'!']);
+                    haystack.extend(std::iter::repeat_n(b'!', 128));
+                    haystack.extend_from_slice(&[0x08, b'!']);
+                    haystack
+                },
+            ],
+        ),
+        (
             ORDERED_TERMINAL_EXACT_PATTERN,
             CompileMode::Optimizing,
             EngineKind::OrderedNfa,
@@ -7607,7 +7655,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             .mode(*mode)
             .output(OutputContract::Span);
         let terminal_prefilter_fixture = *pattern == ORDERED_EDGE_DISPATCH_PATTERN
-            || *pattern == ORDERED_TERMINAL_LOW_PATTERN;
+            || *pattern == ORDERED_TERMINAL_LOW_PATTERN
+            || *pattern == ORDERED_TERMINAL_SPARSE_PATTERN;
         let terminal_exact_set_trim_fixture = *pattern == ORDERED_TERMINAL_EXACT_PATTERN
             || *pattern == ORDERED_TERMINAL_EXACT_BOUNDARIES_PATTERN;
         let terminal_exact_set_width_fixture = *pattern == ORDERED_TERMINAL_EXACT_WIDTH_PATTERN;
@@ -7697,11 +7746,15 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     Some(crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
                         start: if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
                             0x80
+                        } else if *pattern == ORDERED_TERMINAL_SPARSE_PATTERN {
+                            0x01
                         } else {
                             0x00
                         },
                         end: if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
                             0xff
+                        } else if *pattern == ORDERED_TERMINAL_SPARSE_PATTERN {
+                            0x08
                         } else {
                             0x29
                         },
@@ -7711,6 +7764,23 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 );
                 assert!(artifact.module().has_ordered_nfa_terminal_range_object());
                 assert!(artifact.module().has_ordered_edge_dispatch_object());
+                if cfg!(target_arch = "aarch64")
+                    && *pattern == ORDERED_TERMINAL_SPARSE_PATTERN
+                {
+                    let text = artifact
+                        .module()
+                        .sections()
+                        .iter()
+                        .find(|section| section.kind == SectionKind::Text)
+                        .expect("sparse terminal fixture text");
+                    assert!(text
+                        .bytes()
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .any(|word| word == 0x4c40_2198),
+                        "linked sparse terminal fixture lost its four-vector LD1"
+                    );
+                }
                 assert!(
                     artifact
                         .module()
