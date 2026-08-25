@@ -7207,8 +7207,12 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         }
     } else if cfg!(target_os = "linux") {
         Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
     } else {
         Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
     };
     let terminal_boundary_haystack = |byte| {
         let mut haystack = vec![b'A'; 100];

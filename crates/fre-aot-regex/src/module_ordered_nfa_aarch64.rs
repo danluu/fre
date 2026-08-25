@@ -2915,18 +2915,20 @@ pub(super) fn lower_aarch64(
     )
 }
 
-/// Rebuild the exact compatibility entry while independently disabling only
-/// the compiler-text ASIMD prefix scanner. The canonical graph, retained
-/// object, scalar prefix proof and every other accelerator remain unchanged.
-pub(super) fn lower_aarch64_with_start_prefix_vector_policy(
+/// Rebuild the exact compatibility entry with independent compiler-text ASIMD
+/// policy for the start-prefix and terminal-range scanners. The canonical
+/// graph, retained object, scalar proofs and every other accelerator remain
+/// unchanged.
+pub(super) fn lower_aarch64_with_vector_policies(
     image: &NativeOrderedNfaObjectImage<'_>,
     allow_start_prefix_vector: bool,
+    allow_terminal_range_vector: bool,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
     lower_aarch64_with_surface_and_vector_policies(
         image,
         OrderedNfaEntrySurface::Compatibility,
         allow_start_prefix_vector,
-        true,
+        allow_terminal_range_vector,
     )
 }
 
@@ -2959,31 +2961,33 @@ pub(super) fn lower_aarch64_operation_only(
 }
 
 /// Operation-only counterpart to
-/// [`lower_aarch64_with_start_prefix_vector_policy`].
-pub(super) fn lower_aarch64_operation_only_with_start_prefix_vector_policy(
+/// [`lower_aarch64_with_vector_policies`].
+pub(super) fn lower_aarch64_operation_only_with_vector_policies(
     image: &NativeOrderedNfaObjectImage<'_>,
     allow_start_prefix_vector: bool,
+    allow_terminal_range_vector: bool,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
     lower_aarch64_with_surface_and_vector_policies(
         image,
         OrderedNfaEntrySurface::OperationOnly,
         allow_start_prefix_vector,
-        true,
+        allow_terminal_range_vector,
     )
 }
 
 /// Emit one externally callable V15 Span search with no compatibility
 /// fallback. The handle and immutable object are fully reauthenticated on
 /// every call; no enclosing aggregate gate is trusted.
-pub(super) fn lower_aarch64_row_search_only_with_start_prefix_vector_policy(
+pub(super) fn lower_aarch64_row_search_only_with_vector_policies(
     image: &NativeOrderedNfaObjectImage<'_>,
     allow_start_prefix_vector: bool,
+    allow_terminal_range_vector: bool,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
     lower_aarch64_with_surface_and_vector_policies(
         image,
         OrderedNfaEntrySurface::RowSearchOnly,
         allow_start_prefix_vector,
-        true,
+        allow_terminal_range_vector,
     )
 }
 
@@ -3741,7 +3745,7 @@ mod tests {
             "the ready interval must not cross a local or external call",
         );
         assert!(exact_entry.start_prefix_vector_lowered);
-        let scalar_exact = lower_aarch64_with_start_prefix_vector_policy(&exact, false).unwrap();
+        let scalar_exact = lower_aarch64_with_vector_policies(&exact, false, true).unwrap();
         assert!(!scalar_exact.start_prefix_vector_lowered);
         assert!(!scalar_exact
             .code
@@ -3771,7 +3775,7 @@ mod tests {
             .start_prefix_vector_lowered);
         assert_eq!(
             lower_aarch64(&common).unwrap(),
-            lower_aarch64_with_start_prefix_vector_policy(&common, false).unwrap(),
+            lower_aarch64_with_vector_policies(&common, false, true).unwrap(),
         );
 
         let range_program = optimizing_ordered_nfa(r"a?b?c?d?e?f?g?h?[a-z]x");
@@ -3795,7 +3799,7 @@ mod tests {
         assert!(!range_words.contains(&aarch64_load_q(0, 12).unwrap()));
         assert_eq!(
             range_entry,
-            lower_aarch64_with_start_prefix_vector_policy(&range, false).unwrap(),
+            lower_aarch64_with_vector_policies(&range, false, true).unwrap(),
         );
     }
 
@@ -3993,7 +3997,7 @@ mod tests {
         let compatibility = lower_aarch64(&minimal_image()).unwrap();
         let operation = lower_aarch64_operation_only(&minimal_image()).unwrap();
         let reauthenticated =
-            lower_aarch64_row_search_only_with_start_prefix_vector_policy(&minimal_image(), true)
+            lower_aarch64_row_search_only_with_vector_policies(&minimal_image(), true, true)
                 .unwrap();
 
         assert!(!operation.code.is_empty());
