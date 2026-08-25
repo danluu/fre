@@ -46642,8 +46642,13 @@ fn x86_rebar_row_scalar_accumulate(
             assembler.instruction(&[0x49, 0x83, 0xc7, 1])?; // total += 1
         }
         crate::RebarNativeRowScalarOperationV1::SpanSum => {
-            assembler.instruction(&[0x48, 0x29, 0xc2])?; // end -= start
-            assembler.instruction(&[0x49, 0x01, 0xd7])?; // total += width
+            // Keep RDX live as the selected end: the caller commits it as
+            // both the next search cursor and last-match end after this
+            // checked update. RCX is caller-saved and dead after the row
+            // calls, so it can hold the temporary width.
+            assembler.instruction(&[0x48, 0x89, 0xd1])?; // width = end
+            assembler.instruction(&[0x48, 0x29, 0xc1])?; // width -= start
+            assembler.instruction(&[0x49, 0x01, 0xcf])?; // total += width
         }
     }
     assembler.branch(&[0x0f, 0x82], runtime_failure)?;
@@ -76773,6 +76778,81 @@ mod tests {
     // work below its general cap while making the correlated lookup cheaper
     // than both the primary-only and fully refined incumbent extremes.
     const MANDATORY_TEDDY_STRUCTURAL_PATTERN: &str = r"(?:\x00\x00\x00|\x01\x01\x01|\x02\x02\x02|\x03\x03\x03|\x04\x04\x04|\x0e\x0e\x0e|\x0f\x0f\x0f|\x10\x10\x10|\x11\x11\x11|\x14\x14\x14|\x15\x15\x15|\x16\x16\x16|\x17\x17\x17|\x1c\x1c\x1c|\x1d\x1d\x1d|\x1e\x1e\x1e|\x1f\x1f\x1f){2}";
+
+    #[test]
+    fn row_scalar_span_sum_preserves_selected_end_on_both_isas() {
+        let (x86, calls) = lower_x86_64_native_rebar_row_scalar_v1(
+            2,
+            crate::RebarNativeRowScalarOperationV1::SpanSum,
+        )
+        .expect("lower x86 SpanSum row reducer");
+        assert_eq!(calls.len(), 2);
+        let x86_accumulate = [
+            0x48, 0x89, 0xd1, // RCX = selected end
+            0x48, 0x29, 0xc1, // RCX -= selected start
+            0x49, 0x01, 0xcf, // total += width
+        ];
+        let x86_sites = x86
+            .windows(x86_accumulate.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == x86_accumulate).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(x86_sites.len(), 2, "positive and empty aggregation tails");
+        for offset in x86_sites {
+            let branch = offset + x86_accumulate.len();
+            let branch_bytes = if x86[branch] == 0x72 {
+                2
+            } else {
+                assert_eq!(&x86[branch..][..2], &[0x0f, 0x82]);
+                6
+            };
+            let committed = branch + branch_bytes;
+            assert_eq!(
+                &x86[committed..][..6],
+                &[
+                    0x48, 0x89, 0xd3, // cursor = selected end
+                    0x48, 0x89, 0xd5, // last end = selected end
+                ],
+            );
+        }
+        assert!(
+            !x86.windows(3).any(|bytes| bytes == [0x48, 0x29, 0xc2]),
+            "SpanSum must not turn the selected-end register into a width",
+        );
+
+        let (aarch64, calls) = lower_aarch64_native_rebar_row_scalar_v1(
+            2,
+            crate::RebarNativeRowScalarOperationV1::SpanSum,
+        )
+        .expect("lower AArch64 SpanSum row reducer");
+        assert_eq!(calls.len(), 2);
+        let words = aarch64
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let aarch64_accumulate = [
+            aarch64_sub_x_reg(5, 28, 27).unwrap(),
+            aarch64_adds_x_reg(22, 22, 5).unwrap(),
+        ];
+        let aarch64_sites = words
+            .windows(aarch64_accumulate.len())
+            .enumerate()
+            .filter_map(|(offset, instructions)| {
+                (instructions == aarch64_accumulate).then_some(offset)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aarch64_sites.len(),
+            2,
+            "positive and empty aggregation tails",
+        );
+        for offset in aarch64_sites {
+            assert_eq!(words[offset + 2] & 0xff00_0010, 0x5400_0000);
+            assert_eq!(words[offset + 2] & 0xf, u32::from(AARCH64_HS));
+            assert_eq!(words[offset + 3], aarch64_mov_x(23, 28).unwrap());
+            assert_eq!(words[offset + 4], aarch64_mov_x(24, 28).unwrap());
+        }
+    }
 
     #[test]
     fn x86_capture_grep_wrapper_preserves_rbp_and_aligns_private_calls() {
