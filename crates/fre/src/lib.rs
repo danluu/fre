@@ -98,6 +98,7 @@ mod k0_casefold_prefix_class_span;
 mod k0_class_delimiter_exists;
 mod k0_line_prefix_tail;
 mod k0_line_token_loop_exists;
+mod k0_literal_class_corridor;
 mod k0_literal_prefix_class_exists;
 mod k0_uri_exists;
 mod k0_reverse_suffix_span;
@@ -6057,6 +6058,39 @@ pub enum RipgrepStandardLiteralsBuild {
     Portable(PortableRegex),
 }
 
+/// Bytes observed while authenticating ripgrep's standard literal handoff.
+///
+/// This receipt is transient construction data. It is not retained by either
+/// FRE owner and therefore does not change persistent-byte accounting.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RipgrepStandardLiteralByteCensus {
+    matching_bytes: [u64; 4],
+}
+
+impl RipgrepStandardLiteralByteCensus {
+    fn empty() -> RipgrepStandardLiteralByteCensus {
+        RipgrepStandardLiteralByteCensus {
+            matching_bytes: [0; 4],
+        }
+    }
+
+    fn insert(&mut self, byte: u8) {
+        let word = usize::from(byte >> 6);
+        let bit = byte & 0x3F;
+        self.matching_bytes[word] |= 1_u64 << bit;
+    }
+
+    /// Whether this byte occurred in an authenticated literal.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn contains(&self, byte: u8) -> bool {
+        let word = usize::from(byte >> 6);
+        let bit = byte & 0x3F;
+        self.matching_bytes[word] & (1_u64 << bit) != 0
+    }
+}
+
 /// Ripgrep-only owner for one authenticated ordinary compact literal set.
 ///
 /// Identity and construction reporting remain bound to the same immutable
@@ -6565,16 +6599,30 @@ fn append_ripgrep_literal_source<const META_REJECTED: bool>(
 /// ASCII, so inspecting bytes proves the remaining facts without decoding
 /// every Unicode scalar. An empty string is refused independently here even
 /// though the caller has already checked its byte slice.
+#[cfg(test)]
 #[inline]
 fn classify_ripgrep_standard_literal_text(text: &str) -> Option<bool> {
+    let mut census = RipgrepStandardLiteralByteCensus::empty();
+    classify_ripgrep_standard_literal_text_with_census(text, None, &mut census)
+}
+
+/// Fuse the byte census into the mandatory typed-value validation pass. The
+/// incumbent parse-work receipt already charges every visited literal byte.
+#[inline]
+fn classify_ripgrep_standard_literal_text_with_census(
+    text: &str,
+    forbidden_byte: Option<u8>,
+    census: &mut RipgrepStandardLiteralByteCensus,
+) -> Option<bool> {
     let first = text.chars().next()?;
     for &byte in text.as_bytes() {
         if byte == b'\n'
-            || (byte.is_ascii()
-                && regex_syntax::is_meta_character(char::from(byte)))
+            || forbidden_byte == Some(byte)
+            || (byte.is_ascii() && regex_syntax::is_meta_character(char::from(byte)))
         {
             return None;
         }
+        census.insert(byte);
     }
     Some(first.len_utf8() < text.len())
 }
@@ -6607,6 +6655,40 @@ where
     Literal: RipgrepStandardLiteral<'literal>,
     LiteralAt: Fn(usize) -> Option<Literal>,
 {
+    ripgrep_standard_literal_context_from_with_census::<_, _, REJECT_META_CHARACTERS>(
+        pattern_count,
+        literal_at,
+        limits,
+        canonical_source_limit,
+        None,
+    )
+    .map(|(context, _census)| context)
+}
+
+#[cold]
+#[inline(never)]
+fn ripgrep_standard_literal_context_from_with_census<
+    'literal,
+    Literal,
+    LiteralAt,
+    const REJECT_META_CHARACTERS: bool,
+>(
+    pattern_count: usize,
+    literal_at: LiteralAt,
+    limits: BuildLimits,
+    canonical_source_limit: usize,
+    forbidden_byte: Option<u8>,
+) -> Option<(
+    RipgrepStandardLiteralContext,
+    Option<RipgrepStandardLiteralByteCensus>,
+)>
+where
+    Literal: RipgrepStandardLiteral<'literal>,
+    LiteralAt: Fn(usize) -> Option<Literal>,
+{
+    if REJECT_META_CHARACTERS && !matches!(forbidden_byte, None | Some(b'\x00')) {
+        return None;
+    }
     let pattern_count_u64 = u64::try_from(pattern_count).ok()?;
     let (hir_nodes, max_depth, traversal_stack) = match pattern_count {
         0 => return None,
@@ -6675,6 +6757,8 @@ where
         return None;
     }
     let mut all_single_character = true;
+    let mut literal_byte_census =
+        REJECT_META_CHARACTERS.then_some(RipgrepStandardLiteralByteCensus::empty());
     for index in 0..pattern_count {
         let literal = literal_at(index)?;
         let bytes_slice = literal.bytes();
@@ -6692,7 +6776,13 @@ where
         }
         let text = literal.text()?;
         let (escapes, grouped) = if REJECT_META_CHARACTERS {
-            (0_u64, classify_ripgrep_standard_literal_text(text)?)
+            let Some(census) = literal_byte_census.as_mut() else {
+                return None;
+            };
+            (
+                0_u64,
+                classify_ripgrep_standard_literal_text_with_census(text, forbidden_byte, census)?,
+            )
         } else {
             // Raw HIR bytes independently validate UTF-8 above and retain
             // the incumbent scalar scan and exact escaping calculation.
@@ -6758,24 +6848,27 @@ where
     }
     debug_assert_eq!(source.len(), source_bytes_usize);
 
-    Some(RipgrepStandardLiteralContext {
-        source: source.into_boxed_str(),
-        admission: match limits.admission {
-            AdmissionPolicy::Strict(_) => AdmissionStatus::StrictChecked,
-            AdmissionPolicy::Quota(_) => AdmissionStatus::QuotaChecked,
+    Some((
+        RipgrepStandardLiteralContext {
+            source: source.into_boxed_str(),
+            admission: match limits.admission {
+                AdmissionPolicy::Strict(_) => AdmissionStatus::StrictChecked,
+                AdmissionPolicy::Quota(_) => AdmissionStatus::QuotaChecked,
+            },
+            syntax: ParseSummary {
+                hir_nodes,
+                max_depth,
+                parse_work,
+                literal_bytes,
+                class_ranges: 0,
+                captures: 0,
+                repetitions: 0,
+                largest_finite_repeat: None,
+                guarantees_valid_utf8_nonempty: true,
+            },
         },
-        syntax: ParseSummary {
-            hir_nodes,
-            max_depth,
-            parse_work,
-            literal_bytes,
-            class_ranges: 0,
-            captures: 0,
-            repetitions: 0,
-            largest_finite_repeat: None,
-            guarantees_valid_utf8_nonempty: true,
-        },
-    })
+        literal_byte_census,
+    ))
 }
 
 #[cold]
@@ -7382,11 +7475,13 @@ impl PortableBuilder {
         {
             return Ok(None);
         }
-        self.build_ripgrep_standard_literal_bytes(
+        self.build_ripgrep_standard_literal_bytes_with_census(
             patterns,
             canonical_source_limit,
+            None,
             publish_ripgrep_borrowed_flat_literal_set,
         )
+        .map(|built| built.map(|(regex, _census)| regex))
     }
 
     /// Build the same authenticated literal handoff for ripgrep's ordinary
@@ -7398,24 +7493,54 @@ impl PortableBuilder {
         patterns: &[&str],
         canonical_source_limit: usize,
     ) -> Result<Option<RipgrepStandardLiteralsBuild>, BuildError> {
+        self.build_ripgrep_standard_literals_ordinary_with_census(
+            patterns,
+            canonical_source_limit,
+            None,
+        )
+        .map(|built| built.map(|(regex, _census)| regex))
+    }
+
+    /// Build ripgrep's ordinary literal-set owner and return the byte census
+    /// produced by the same authenticated validation pass.
+    ///
+    /// Only ripgrep's exact optional NUL ban is accepted. Any option, value,
+    /// resource or engine refusal remains `Ok(None)` so the caller can run its
+    /// established configured-HIR fallback over the unchanged input snapshot.
+    #[doc(hidden)]
+    pub fn build_ripgrep_standard_literals_ordinary_with_census(
+        self,
+        patterns: &[&str],
+        canonical_source_limit: usize,
+        forbidden_byte: Option<u8>,
+    ) -> Result<
+        Option<(
+            RipgrepStandardLiteralsBuild,
+            RipgrepStandardLiteralByteCensus,
+        )>,
+        BuildError,
+    > {
         if patterns.len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
             || patterns.len() > finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS
+            || !matches!(forbidden_byte, None | Some(b'\x00'))
         {
             return Ok(None);
         }
-        self.build_ripgrep_standard_literal_bytes(
+        self.build_ripgrep_standard_literal_bytes_with_census(
             patterns,
             canonical_source_limit,
+            forbidden_byte,
             publish_ripgrep_borrowed_flat_literal_set_ordinary,
         )
     }
 
-    fn build_ripgrep_standard_literal_bytes<T, F>(
+    fn build_ripgrep_standard_literal_bytes_with_census<T, F>(
         self,
         pattern_texts: &[&str],
         canonical_source_limit: usize,
+        forbidden_byte: Option<u8>,
         publish: F,
-    ) -> Result<Option<T>, BuildError>
+    ) -> Result<Option<(T, RipgrepStandardLiteralByteCensus)>, BuildError>
     where
         F: FnOnce(
             &PortableBuilder,
@@ -7427,14 +7552,20 @@ impl PortableBuilder {
         if !self.accepts_ripgrep_standard_literal_hir() {
             return Ok(None);
         }
-        let Some(context) = ripgrep_standard_literal_context_from::<_, _, true>(
-            pattern_texts.len(),
-            |index| pattern_texts.get(index).copied(),
-            self.limits,
-            canonical_source_limit,
-        ) else {
+        let Some((context, literal_byte_census)) =
+            ripgrep_standard_literal_context_from_with_census::<_, _, true>(
+                pattern_texts.len(),
+                |index| pattern_texts.get(index).copied(),
+                self.limits,
+                canonical_source_limit,
+                forbidden_byte,
+            )
+        else {
             return Ok(None);
         };
+        let census = literal_byte_census.ok_or(BuildError::InternalInvariant(
+            "typed ripgrep literal context omitted its byte census",
+        ))?;
         let mut borrowed: [&[u8]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS] =
             [&[]; finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS];
         for (slot, pattern) in borrowed.iter_mut().zip(pattern_texts) {
@@ -7485,7 +7616,7 @@ impl PortableBuilder {
             static_captures_len: Some(1),
             minimum_match_bytes,
         };
-        publish(&self, patterns, planner_work, publication).map(Some)
+        publish(&self, patterns, planner_work, publication).map(|built| Some((built, census)))
     }
 
     fn accepts_ripgrep_standard_literal_hir(&self) -> bool {
@@ -8016,6 +8147,7 @@ impl PortableBuilder {
         }
         let mut literal_class_run_work = required_work;
         let mut deferred_bounded_literal_class_run = None;
+        let mut deferred_unbounded_literal_class_corridor = false;
         if self.selection == PlanSelection::Auto && !ripgrep_flat_literal {
             let remaining = self
                 .limits
@@ -8045,8 +8177,13 @@ impl PortableBuilder {
                 literal_class_run_literal::InspectionOutcome::Eligible(inspection) => {
                     inspection.work
                 }
-                literal_class_run_literal::InspectionOutcome::Ineligible { work, finite } => {
+                literal_class_run_literal::InspectionOutcome::Ineligible {
+                    work,
+                    finite,
+                    unbounded_corridor,
+                } => {
                     deferred_bounded_literal_class_run = finite;
+                    deferred_unbounded_literal_class_corridor = unbounded_corridor;
                     work
                 }
             };
@@ -11109,9 +11246,6 @@ impl PortableBuilder {
             }
             Some(_) | None => None,
         };
-        let line_storage_bytes = line
-            .as_deref()
-            .map_or(0, |_| K0LinePlan::storage_bytes());
         // Spend only residual planner authority on the compact ordinary Span
         // proof after every incumbent K0 owner has been retained. Success
         // mutates no layout or storage accounting: an all-ASCII consumption
@@ -11126,6 +11260,94 @@ impl PortableBuilder {
             fallback_planner_work,
             self.limits.max_planner_work,
         )?;
+        // This exact ordinary-only proof is deliberately last among all K0
+        // planners and persistent owners. It recognizes a greedy literal /
+        // 255-member byte class / literal corridor, but cannot change any
+        // bounded, accounted, windowed, session, iterator, or capture surface.
+        let literal_class_corridor_candidate = if correlated_terminal.is_none()
+            && packed_frontier_plan.is_none()
+            && line.is_none()
+            && uri_exists.is_none()
+            && deferred_unbounded_literal_class_corridor
+            && self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && minimum_match_bytes.is_some_and(|minimum| minimum > 0)
+            && rust.hir.properties().maximum_len().is_none()
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match k0_literal_class_corridor::inspect(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(k0_literal_class_corridor::InspectionOutcome::Eligible {
+                    plan,
+                    planner_work,
+                }) => {
+                    fallback_planner_work = planner_work;
+                    Some(plan)
+                }
+                Ok(k0_literal_class_corridor::InspectionOutcome::Ineligible {
+                    planner_work,
+                }) => {
+                    fallback_planner_work = planner_work;
+                    None
+                }
+                Err(k0_literal_class_corridor::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_literal_class_corridor::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "literal/class corridor planner arithmetic overflowed",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        // Preserve every established owner before spending residual storage
+        // on this boxed proof. Optional allocation failure leaves canonical
+        // K0 authoritative.
+        let literal_class_corridor = if literal_class_corridor_candidate
+            .as_ref()
+            .is_some_and(|_| {
+                K0LinePlan::storage_bytes()
+                    <= available_optional_bytes
+                        .saturating_sub(incumbent_optional_bytes)
+            })
+        {
+            match try_box_k0_literal_class_corridor(
+                literal_class_corridor_candidate.expect("checked corridor candidate"),
+            ) {
+                Ok(plan) => Some(plan),
+                Err((fre_exact_alloc::CopyError::AllocationFailed, _)) => None,
+                Err((fre_exact_alloc::CopyError::LayoutOverflow, _)) => {
+                    return Err(BuildError::InternalInvariant(
+                        "literal/class corridor owner layout overflowed",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let line = match (line, literal_class_corridor) {
+            (Some(plan), None) | (None, Some(plan)) => Some(plan),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(BuildError::InternalInvariant(
+                    "exclusive K0 line owners were published together",
+                ));
+            }
+        };
+        let line_storage_bytes = line
+            .as_deref()
+            .map_or(0, |_| K0LinePlan::storage_bytes());
         let plan_storage_bytes = automaton_stats
             .storage_bytes()
             .checked_add(lazy_delimited_repeat_storage_bytes)
@@ -11479,6 +11701,7 @@ enum K0LinePlan {
     PrefixTail(k0_line_prefix_tail::Plan),
     TokenLoop(k0_line_token_loop_exists::Plan),
     UnanchoredTokenLoop(k0_line_token_loop_exists::UnanchoredPlan),
+    LiteralClassCorridor(k0_literal_class_corridor::Plan),
 }
 
 impl K0LinePlan {
@@ -11490,7 +11713,9 @@ impl K0LinePlan {
     const fn token_loop(&self) -> Option<&k0_line_token_loop_exists::Plan> {
         match self {
             Self::TokenLoop(plan) => Some(plan),
-            Self::PrefixTail(_) | Self::UnanchoredTokenLoop(_) => None,
+            Self::PrefixTail(_)
+            | Self::UnanchoredTokenLoop(_)
+            | Self::LiteralClassCorridor(_) => None,
         }
     }
 
@@ -11500,7 +11725,15 @@ impl K0LinePlan {
     ) -> Option<&k0_line_token_loop_exists::UnanchoredPlan> {
         match self {
             Self::UnanchoredTokenLoop(plan) => Some(plan),
-            Self::PrefixTail(_) | Self::TokenLoop(_) => None,
+            Self::PrefixTail(_) | Self::TokenLoop(_) | Self::LiteralClassCorridor(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    const fn literal_class_corridor(&self) -> Option<&k0_literal_class_corridor::Plan> {
+        match self {
+            Self::LiteralClassCorridor(plan) => Some(plan),
+            Self::PrefixTail(_) | Self::TokenLoop(_) | Self::UnanchoredTokenLoop(_) => None,
         }
     }
 
@@ -11508,6 +11741,7 @@ impl K0LinePlan {
         match self {
             Self::PrefixTail(_) | Self::TokenLoop(_) => k0_line_token_loop_exists::MIN_INPUT_BYTES,
             Self::UnanchoredTokenLoop(plan) => plan.minimum_input_bytes(),
+            Self::LiteralClassCorridor(plan) => plan.minimum_input_bytes(),
         }
     }
 
@@ -11517,6 +11751,14 @@ impl K0LinePlan {
             Self::PrefixTail(plan) => Some(plan.is_match_full(haystack)),
             Self::TokenLoop(plan) => plan.try_is_match_full(haystack),
             Self::UnanchoredTokenLoop(plan) => plan.try_is_match_full(haystack),
+            Self::LiteralClassCorridor(plan) => {
+                let matched = plan.try_ordinary_is_match_full(haystack);
+                #[cfg(test)]
+                if matched.is_some() {
+                    k0_literal_class_corridor_ordinary_facade_probe::record_exists();
+                }
+                matched
+            }
         }
     }
 
@@ -11526,6 +11768,14 @@ impl K0LinePlan {
             Self::PrefixTail(plan) => Some(plan.find_full(haystack)),
             Self::TokenLoop(plan) => plan.try_find_full(haystack),
             Self::UnanchoredTokenLoop(plan) => plan.try_find_full(haystack),
+            Self::LiteralClassCorridor(plan) => {
+                let matched = plan.try_ordinary_find_full(haystack);
+                #[cfg(test)]
+                if matched.is_some() {
+                    k0_literal_class_corridor_ordinary_facade_probe::record_span();
+                }
+                matched
+            }
         }
     }
 }
@@ -11565,6 +11815,14 @@ impl K0ExclusivePlan {
     fn unanchored_token_loop(&self) -> Option<&k0_line_token_loop_exists::UnanchoredPlan> {
         match self {
             Self::Line(plan) => plan.unanchored_token_loop(),
+            Self::None | Self::Correlated(_) | Self::Packed(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn literal_class_corridor(&self) -> Option<&k0_literal_class_corridor::Plan> {
+        match self {
+            Self::Line(plan) => plan.literal_class_corridor(),
             Self::None | Self::Correlated(_) | Self::Packed(_) => None,
         }
     }
@@ -12089,6 +12347,75 @@ mod k0_ordinary_exists_route_probe {
             });
         });
     }
+}
+
+#[cfg(test)]
+mod k0_literal_class_corridor_ordinary_facade_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set((0, 0));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists.saturating_add(1), span));
+    }
+
+    pub(super) fn record_span() {
+        let (exists, span) = COUNTS.get();
+        COUNTS.set((exists, span.saturating_add(1)));
+    }
+}
+
+#[cfg(test)]
+mod k0_literal_class_corridor_owner_allocation_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) struct Guard;
+
+    pub(super) fn fail_next() -> Guard {
+        FAIL_NEXT.with(|failure| {
+            assert!(!failure.replace(true), "corridor owner failure already armed");
+        });
+        Guard
+    }
+
+    pub(super) fn take_failure() -> bool {
+        FAIL_NEXT.with(|failure| failure.replace(false))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_NEXT.with(|failure| failure.set(false));
+        }
+    }
+}
+
+fn try_box_k0_literal_class_corridor(
+    plan: k0_literal_class_corridor::Plan,
+) -> Result<
+    Box<K0LinePlan>,
+    (fre_exact_alloc::CopyError, K0LinePlan),
+> {
+    let owner = K0LinePlan::LiteralClassCorridor(plan);
+    #[cfg(test)]
+    if k0_literal_class_corridor_owner_allocation_probe::take_failure() {
+        return Err((fre_exact_alloc::CopyError::AllocationFailed, owner));
+    }
+    fre_exact_alloc::try_box_preserve(owner)
 }
 
 #[cfg(test)]
@@ -28629,6 +28956,312 @@ mod tests {
     use std::fmt::Write as _;
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one route-isolation matrix covers every public explicit-state family"
+    )]
+    fn k0_literal_class_corridor_ordinary_facades_are_exact_and_isolated() {
+        let pattern = r"(?-u:BEGIN.*END)";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let PortablePlan::K0(k0) = &regex.plan else {
+            unreachable!("literal/class corridor selected another plan");
+        };
+        assert!(matches!(
+            &k0.exclusive,
+            super::K0ExclusivePlan::Line(plan)
+                if plan.literal_class_corridor().is_some()
+        ));
+        assert_eq!(regex.captures_len(), 1);
+
+        let length = super::k0_literal_class_corridor::MIN_INPUT_BYTES + 64;
+        let mut haystack = vec![b'x'; length];
+        let corridor = b"BEGINaENDbEND";
+        let match_start = haystack.len() - corridor.len();
+        haystack[match_start..].copy_from_slice(corridor);
+        let expected = Some(Match {
+            start: match_start,
+            end: haystack.len(),
+        });
+        let full = SearchWindow::full(&haystack);
+        let unlimited = SearchLimits::unlimited();
+
+        super::k0_literal_class_corridor_ordinary_facade_probe::reset();
+        assert!(regex.is_match_value(&haystack, unlimited).unwrap());
+        assert!(regex.is_match_at(&haystack, 0, unlimited).unwrap().0);
+        assert!(regex
+            .is_match_value_at(&haystack, 0, unlimited)
+            .unwrap());
+        assert!(regex.is_match_window(&haystack, full, unlimited).unwrap().0);
+        assert!(regex
+            .is_match_window_value(&haystack, full, unlimited)
+            .unwrap());
+        assert_eq!(regex.find_value(&haystack, unlimited).unwrap(), expected);
+        assert_eq!(regex.find_accounted(&haystack, unlimited).unwrap().0, expected);
+        assert_eq!(regex.find_at(&haystack, 0, unlimited).unwrap().0, expected);
+        assert_eq!(
+            regex.find_at_value(&haystack, 0, unlimited).unwrap(),
+            expected
+        );
+        assert_eq!(regex.find_window(&haystack, full, unlimited).unwrap().0, expected);
+        assert_eq!(
+            regex.find_window_value(&haystack, full, unlimited).unwrap(),
+            expected
+        );
+        assert_eq!(regex.selected_end_value(&haystack, unlimited).unwrap(), Some(length));
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert!(session.is_match_value(&haystack, unlimited).unwrap());
+        assert_eq!(session.find_value(&haystack, unlimited).unwrap(), expected);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(ordinary.is_match_at(&haystack, 0).unwrap());
+        assert_eq!(ordinary.find_at(&haystack, 0).unwrap(), expected);
+        assert_eq!(
+            regex
+                .find_iter(&haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .next()
+                .transpose()
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            regex
+                .find_iter_value(&haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .next()
+                .transpose()
+                .unwrap(),
+            expected,
+        );
+
+        let mut locations = regex.capture_locations();
+        assert_eq!(
+            regex
+                .captures_read_value(&mut locations, &haystack, unlimited)
+                .unwrap()
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                }),
+            expected,
+        );
+        assert_eq!(locations.get(0), Some((match_start, length)));
+        assert_eq!(
+            regex
+                .captures_read(&mut locations, &haystack, unlimited)
+                .unwrap()
+                .0
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                }),
+            expected,
+        );
+        assert_eq!(
+            super::k0_literal_class_corridor_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "bounded, accounted, session, iterator, and capture APIs stay canonical",
+        );
+
+        let short = vec![b'x'; super::k0_literal_class_corridor::MIN_INPUT_BYTES - 1];
+        assert!(!regex.is_match(&short));
+        assert_eq!(regex.find(&short), None);
+        assert_eq!(
+            super::k0_literal_class_corridor_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "a below-threshold ordinary call stays canonical",
+        );
+
+        assert!(regex.is_match(&haystack));
+        assert_eq!(
+            super::k0_literal_class_corridor_ordinary_facade_probe::snapshot(),
+            (1, 0),
+        );
+        assert_eq!(regex.find(&haystack), expected);
+        assert_eq!(
+            super::k0_literal_class_corridor_ordinary_facade_probe::snapshot(),
+            (1, 1),
+        );
+
+        let address = haystack.as_ptr();
+        haystack[match_start] = b'Q';
+        assert_eq!(haystack.as_ptr(), address);
+        assert!(!regex.is_match(&haystack));
+        assert_eq!(regex.find(&haystack), None);
+        assert_eq!(
+            super::k0_literal_class_corridor_ordinary_facade_probe::snapshot(),
+            (2, 2),
+            "same-address mutation cannot reuse source-dependent results",
+        );
+    }
+
+    #[test]
+    fn k0_literal_class_corridor_capture_refusal_is_contained() {
+        let regex = PortableBuilder::new(r"(?-u:(BEGIN).*(END))")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let PortablePlan::K0(k0) = &regex.plan else {
+            unreachable!("captured literal/class corridor selected another plan");
+        };
+        assert!(matches!(
+            &k0.exclusive,
+            super::K0ExclusivePlan::Line(plan)
+                if plan.literal_class_corridor().is_some()
+        ));
+        assert_eq!(regex.captures_len(), 3);
+
+        let length = super::k0_literal_class_corridor::MIN_INPUT_BYTES + 17;
+        let mut haystack = vec![b'x'; length];
+        let corridor = b"BEGINaENDbEND";
+        let match_start = haystack.len() - corridor.len();
+        haystack[match_start..].copy_from_slice(corridor);
+        let expected = Some(Match {
+            start: match_start,
+            end: length,
+        });
+        let unlimited = SearchLimits::unlimited();
+        let mut locations = regex.capture_locations();
+
+        super::k0_literal_class_corridor_ordinary_facade_probe::reset();
+        assert!(matches!(
+            regex.captures_read_value(&mut locations, &haystack, unlimited),
+            Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 2 })
+        ));
+        assert!(matches!(
+            regex.captures_read(&mut locations, &haystack, unlimited),
+            Err(super::PortableCapturesReadError::ExplicitCapturesUnsupported { captures: 2 })
+        ));
+        for index in 0..regex.captures_len() {
+            assert_eq!(locations.get(index), None);
+        }
+        assert_eq!(
+            super::k0_literal_class_corridor_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "explicit capture refusal stays on canonical K0",
+        );
+
+        assert!(regex.is_match(&haystack));
+        assert_eq!(regex.find(&haystack), expected);
+        assert_eq!(
+            super::k0_literal_class_corridor_ordinary_facade_probe::snapshot(),
+            (1, 1),
+            "whole-match ordinary values may use the capture-transparent proof",
+        );
+    }
+
+    #[test]
+    fn k0_literal_class_corridor_resource_refusal_keeps_canonical_k0() {
+        let pattern = r"(?-u:BEGIN.*END)";
+        let baseline = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let baseline_report = baseline.build_report();
+        let PortablePlan::K0(baseline_k0) = &baseline.plan else {
+            unreachable!("corridor baseline selected another plan");
+        };
+        assert!(baseline_k0.exclusive.literal_class_corridor().is_some());
+        assert!(baseline_report.charged_persistent_bytes > 0);
+        assert!(baseline_report.planner_work > 0);
+
+        let exact = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: baseline_report.planner_work,
+                max_persistent_bytes: baseline_report.charged_persistent_bytes,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("the exact corridor resource envelope replays");
+        let PortablePlan::K0(exact_k0) = &exact.plan else {
+            unreachable!("exact-envelope corridor selected another plan");
+        };
+        assert!(exact_k0.exclusive.literal_class_corridor().is_some());
+        assert_eq!(exact.build_report().planner_work, baseline_report.planner_work);
+        assert_eq!(
+            exact.build_report().charged_persistent_bytes,
+            baseline_report.charged_persistent_bytes,
+        );
+
+        let persistent_limit = baseline_report.charged_persistent_bytes - 1;
+        let persistent_refusal = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_persistent_bytes: persistent_limit,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("optional corridor storage refusal keeps canonical K0");
+        let PortablePlan::K0(persistent_k0) = &persistent_refusal.plan else {
+            unreachable!("persistent refusal changed the incumbent family");
+        };
+        assert!(persistent_k0.exclusive.literal_class_corridor().is_none());
+        assert!(persistent_refusal.build_report().charged_persistent_bytes <= persistent_limit);
+        assert_eq!(
+            baseline_report.plan_storage_bytes
+                - persistent_refusal.build_report().plan_storage_bytes,
+            super::K0LinePlan::storage_bytes(),
+        );
+
+        let planner_limit = baseline_report.planner_work - 1;
+        let planner_refusal = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: planner_limit,
+                ..BuildLimits::default()
+            })
+            .build()
+            .expect("optional corridor planner refusal keeps canonical K0");
+        let PortablePlan::K0(planner_k0) = &planner_refusal.plan else {
+            unreachable!("planner refusal changed the incumbent family");
+        };
+        assert!(planner_k0.exclusive.literal_class_corridor().is_none());
+        assert!(planner_refusal.build_report().planner_work <= planner_limit);
+
+        let _failure = super::k0_literal_class_corridor_owner_allocation_probe::fail_next();
+        let allocation_refusal = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("optional corridor allocation failure keeps canonical K0");
+        let PortablePlan::K0(allocation_k0) = &allocation_refusal.plan else {
+            unreachable!("allocation refusal changed the incumbent family");
+        };
+        assert!(allocation_k0.exclusive.literal_class_corridor().is_none());
+        assert_eq!(
+            baseline_report.plan_storage_bytes
+                - allocation_refusal.build_report().plan_storage_bytes,
+            super::K0LinePlan::storage_bytes(),
+        );
+
+        let mut haystack = vec![b'x'; super::k0_literal_class_corridor::MIN_INPUT_BYTES];
+        let suffix = b"BEGINEND";
+        let start = haystack.len() - suffix.len();
+        haystack[start..].copy_from_slice(suffix);
+        let expected = Some(Match {
+            start,
+            end: haystack.len(),
+        });
+        super::k0_literal_class_corridor_ordinary_facade_probe::reset();
+        for regex in [&persistent_refusal, &planner_refusal, &allocation_refusal] {
+            assert!(regex.is_match(&haystack));
+            assert_eq!(regex.find(&haystack), expected);
+        }
+        assert_eq!(
+            super::k0_literal_class_corridor_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "every resource refusal uses canonical K0 ordinary execution",
+        );
+    }
+
+    #[test]
     fn class_plus_literal_class_plus_ordinary_facades_are_exact_and_stateless() {
         let regex = PortableBuilder::new(r"(?-u:[a-z]+MID[0-9]+)")
             .unicode(false)
@@ -29723,6 +30356,65 @@ mod tests {
     }
 
     #[test]
+    fn ripgrep_ordinary_literal_census_is_fused_and_transient() {
+        let mut patterns = (0..129)
+            .map(|index| format!("value{index:04}"))
+            .collect::<Vec<_>>();
+        patterns[0] = "valueé\0".to_owned();
+        let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let (_built, census) = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literals_ordinary_with_census(&borrowed, usize::MAX, None)
+            .expect("censused ordinary literal construction completes")
+            .expect("censused ordinary literals are admitted");
+        let mut expected = [false; 256];
+        for &byte in patterns.iter().flat_map(|pattern| pattern.as_bytes()) {
+            expected[usize::from(byte)] = true;
+        }
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                census.contains(byte),
+                expected[usize::from(byte)],
+                "literal census differs for byte {byte:#04x}",
+            );
+        }
+
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literals_ordinary_with_census(
+                    &borrowed,
+                    usize::MAX,
+                    Some(b'\0'),
+                )
+                .expect("NUL-ban refusal completes")
+                .is_none()
+        );
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literals_ordinary_with_census(
+                    &borrowed,
+                    usize::MAX,
+                    Some(b'x'),
+                )
+                .expect("unsupported-ban refusal completes")
+                .is_none()
+        );
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literals_ordinary_with_census(
+                    &borrowed,
+                    0,
+                    None,
+                )
+                .expect("resource refusal completes")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn ripgrep_ordinary_builder_preserves_portable_fallbacks_and_global_limits() {
         let short = public_uniform_ripgrep_literals(256, 127);
         assert!(matches!(
@@ -30065,6 +30757,16 @@ mod tests {
     fn ripgrep_standard_literal_text_byte_classifier_is_exact() {
         assert_eq!(super::classify_ripgrep_standard_literal_text(""), None);
 
+        let classify = |text: &str, forbidden_byte| {
+            let mut census = super::RipgrepStandardLiteralByteCensus::empty();
+            let classified = super::classify_ripgrep_standard_literal_text_with_census(
+                text,
+                forbidden_byte,
+                &mut census,
+            );
+            (classified, census)
+        };
+
         for byte in 0_u8..=0x7f {
             let character = char::from(byte);
             let text = character.to_string();
@@ -30073,6 +30775,13 @@ mod tests {
                 super::classify_ripgrep_standard_literal_text(&text),
                 (!rejected).then_some(false),
                 "typed classifier disagrees for ASCII byte {byte:#04x}"
+            );
+            let (classified, census) = classify(&text, None);
+            assert_eq!(classified, (!rejected).then_some(false));
+            assert_eq!(
+                census.contains(byte),
+                !rejected,
+                "typed census disagrees for ASCII byte {byte:#04x}"
             );
         }
 
@@ -30090,6 +30799,11 @@ mod tests {
                 Some(false),
                 "one Unicode scalar must not be grouped: {scalar:?}"
             );
+            let (classified, census) = classify(scalar, None);
+            assert_eq!(classified, Some(false));
+            for &byte in scalar.as_bytes() {
+                assert!(census.contains(byte), "missing UTF-8 byte {byte:#04x}");
+            }
         }
         for grouped in ["éa", "aé", "é界", "e\u{301}", "🦀界"] {
             assert_eq!(
@@ -30106,6 +30820,12 @@ mod tests {
             super::classify_ripgrep_standard_literal_text("é[界"),
             None
         );
+        assert_eq!(classify("a\0b", Some(b'\0')).0, None);
+        let (classified, census) = classify("a\0b", None);
+        assert_eq!(classified, Some(true));
+        for &byte in b"a\0b" {
+            assert!(census.contains(byte));
+        }
     }
 
     #[test]

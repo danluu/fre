@@ -19,10 +19,11 @@
 //! one-to-eight-byte terminal has a lead byte outside the token alphabet.
 //! Terminal leads are therefore barriers, and a complete terminal can be
 //! authenticated before decoding the preceding token exactly in reverse.
-//! The one-byte case can additionally decode the maximal valid token suffix
-//! for leftmost span recovery. Multi-byte predicate execution gives a bounded
-//! number of rejected terminal leads to this direct route, then fails open to
-//! the retained canonical suffix owner on dense inputs.
+//! Selected-span execution authenticates the complete terminal before
+//! decoding the maximal valid token suffix for leftmost recovery. Both
+//! multi-byte direct routes bound rejected terminal leads; selected-span
+//! execution also bounds scalar decoding through unbounded atoms. Exhausting
+//! either applicable budget fails open to the retained canonical owner.
 
 use memchr::{memchr, memrchr};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
@@ -36,6 +37,8 @@ pub(crate) const MIN_INPUT_BYTES: usize = 1_024;
 pub(crate) const UNANCHORED_MIN_INPUT_BYTES: usize = 32;
 pub(crate) const UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES: usize = 4_096;
 const UNANCHORED_MULTIBYTE_MAX_REJECTIONS: usize = 1;
+const UNANCHORED_MULTIBYTE_FIND_MAX_REJECTIONS: usize = 2;
+const UNANCHORED_MULTIBYTE_MAX_UNBOUNDED_REVERSE_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Atom {
@@ -155,12 +158,22 @@ impl UnanchoredPlan {
         Some(false)
     }
 
-    /// Attempt the complete ordinary full-input leftmost-first span. Once the
-    /// size gate admits the source, the result is authoritative.
+    /// Attempt the ordinary full-input leftmost-first span. A multi-byte route
+    /// may fail open after a bounded number of rejected terminal leads or
+    /// scalar bytes consumed by unbounded atoms, just like its predicate
+    /// counterpart.
     #[inline]
     pub(crate) fn try_find_full(&self, haystack: &[u8]) -> Option<Option<(usize, usize)>> {
-        let output = (self.0.terminal_len == 1 && haystack.len() >= self.minimum_input_bytes())
-            .then(|| self.find_full_impl(haystack));
+        let output = if self.0.terminal_len == 1 {
+            (haystack.len() >= self.minimum_input_bytes()).then(|| self.find_full_impl(haystack))
+        } else if haystack.len() < self.minimum_input_bytes() {
+            None
+        } else {
+            self.try_find_multibyte_full_impl::<
+                UNANCHORED_MULTIBYTE_FIND_MAX_REJECTIONS,
+                UNANCHORED_MULTIBYTE_MAX_UNBOUNDED_REVERSE_BYTES,
+            >(haystack)
+        };
         #[cfg(test)]
         unanchored_route_probe::record_span(output);
         output
@@ -181,6 +194,66 @@ impl UnanchoredPlan {
             search_start = candidate.saturating_add(1);
         }
         None
+    }
+
+    #[cfg(test)]
+    fn find_multibyte_full_impl(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+        self.try_find_multibyte_full_impl::<{ usize::MAX }, { usize::MAX }>(haystack)
+            .expect("the unlimited multi-byte span oracle cannot decline")
+    }
+
+    #[inline(never)]
+    fn try_find_multibyte_full_impl<
+        const MAX_REJECTIONS: usize,
+        const MAX_UNBOUNDED_BYTES: usize,
+    >(
+        &self,
+        haystack: &[u8],
+    ) -> Option<Option<(usize, usize)>> {
+        debug_assert!(MAX_REJECTIONS > 0);
+        debug_assert!(MAX_UNBOUNDED_BYTES > 0);
+        let terminal_len = usize::from(self.0.terminal_len);
+        debug_assert!((2..=MAX_TERMINAL_BYTES).contains(&terminal_len));
+        let Some(last_start) = haystack.len().checked_sub(terminal_len) else {
+            return Some(None);
+        };
+        let terminal = &self.0.terminal[..terminal_len];
+        let mut search_start = 0_usize;
+        let mut rejections = 0_usize;
+        while search_start <= last_start {
+            // A prior terminal lead is a proven token-alphabet barrier. Keep
+            // its successor as the inclusive floor for this candidate's
+            // reverse body proof, including when terminals overlap.
+            let candidate_floor = search_start;
+            let Some(relative) = memchr(terminal[0], &haystack[search_start..=last_start]) else {
+                return Some(None);
+            };
+            let candidate = search_start.checked_add(relative)?;
+            let candidate_end = candidate.checked_add(terminal_len)?;
+            if &haystack[candidate..candidate_end] == terminal {
+                let start = if MAX_UNBOUNDED_BYTES == usize::MAX {
+                    self.0.match_body_reverse(haystack, candidate)
+                } else {
+                    self.0.try_match_body_reverse_bounded(
+                        haystack,
+                        candidate,
+                        candidate_floor,
+                        MAX_UNBOUNDED_BYTES,
+                    )?
+                };
+                if let Some(start) = start {
+                    return Some(Some((start, candidate_end)));
+                }
+            }
+            rejections = rejections.checked_add(1)?;
+            if rejections >= MAX_REJECTIONS {
+                return None;
+            }
+            // `candidate` indexes the source, so this addition is bounded by
+            // `haystack.len()` and preserves a strictly forward scan.
+            search_start = candidate.checked_add(1)?;
+        }
+        Some(None)
     }
 }
 
@@ -459,6 +532,86 @@ impl Plan {
             tokens = tokens.saturating_add(1);
         }
         (tokens > 0).then_some(position)
+    }
+
+    /// Bounded counterpart used only by the fail-open multi-byte span route.
+    /// The limit counts scalar bytes consumed by unbounded atoms; fixed and
+    /// bounded atoms cannot turn one rejected terminal into an unbounded retry
+    /// tax. At exhaustion, a vectorized reverse search may still prove that a
+    /// required globally unique branch start is absent.
+    fn try_match_body_reverse_bounded(
+        &self,
+        haystack: &[u8],
+        end: usize,
+        floor: usize,
+        unbounded_limit: usize,
+    ) -> Option<Option<usize>> {
+        debug_assert!(floor <= end);
+        let mut position = end;
+        let mut tokens = 0_usize;
+        let mut unbounded_bytes = 0_usize;
+        while position > floor {
+            let Some(branch) = self.branch_for_end(haystack[position.saturating_sub(1)]) else {
+                break;
+            };
+            let Some(before) = self.try_match_branch_reverse_bounded(
+                branch,
+                haystack,
+                position,
+                floor,
+                unbounded_limit,
+                &mut unbounded_bytes,
+            )?
+            else {
+                break;
+            };
+            if before >= position {
+                break;
+            }
+            position = before;
+            tokens = tokens.checked_add(1)?;
+        }
+        Some((tokens > 0).then_some(position))
+    }
+
+    fn try_match_branch_reverse_bounded(
+        &self,
+        branch: Branch,
+        haystack: &[u8],
+        mut position: usize,
+        floor: usize,
+        unbounded_limit: usize,
+        unbounded_bytes: &mut usize,
+    ) -> Option<Option<usize>> {
+        for atom in self.atoms[usize::from(branch.start)..usize::from(branch.end)]
+            .iter()
+            .rev()
+        {
+            let unbounded = atom.maximum == UNBOUNDED;
+            let maximum = atom.maximum().unwrap_or(usize::MAX);
+            let mut consumed = 0_usize;
+            while consumed < maximum
+                && position > floor
+                && haystack[position.saturating_sub(1)] == atom.byte
+            {
+                if unbounded && *unbounded_bytes >= unbounded_limit {
+                    let first = self.atoms[usize::from(branch.start)].byte;
+                    if memrchr(first, &haystack[floor..position]).is_none() {
+                        return Some(None);
+                    }
+                    return None;
+                }
+                consumed = consumed.checked_add(1)?;
+                position = position.checked_sub(1)?;
+                if unbounded {
+                    *unbounded_bytes = unbounded_bytes.checked_add(1)?;
+                }
+            }
+            if consumed < usize::from(atom.minimum) {
+                return Some(None);
+            }
+        }
+        Some(Some(position))
     }
 
     fn matches_one_token_reverse(&self, haystack: &[u8], end: usize) -> bool {
@@ -1877,7 +2030,7 @@ mod tests {
     }
 
     #[test]
-    fn unanchored_multibyte_predicate_is_exact_and_span_declines() {
+    fn unanchored_multibyte_predicate_and_span_are_exact_or_fail_open() {
         for (pattern, terminal, sources) in [
             (
                 r"(?-u:(?:ab|cd)+XY)",
@@ -1917,17 +2070,49 @@ mod tests {
             let oracle = regex::bytes::Regex::new(pattern).unwrap();
             assert_eq!(usize::from(plan.0.terminal_len), terminal.len());
             for source in sources {
+                let expected = oracle
+                    .find(source)
+                    .map(|matched| (matched.start(), matched.end()));
                 assert_eq!(
                     plan.is_match_full_impl(source),
-                    oracle.is_match(source),
+                    expected.is_some(),
                     "pattern={pattern:?} source={source:?}",
+                );
+                assert_eq!(
+                    plan.find_multibyte_full_impl(source),
+                    expected,
+                    "unbounded span pattern={pattern:?} source={source:?}",
                 );
                 let mut admitted = vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES];
                 admitted.extend_from_slice(source);
+                let admitted_expected = oracle
+                    .find(&admitted)
+                    .map(|matched| (matched.start(), matched.end()));
+                let direct = plan.try_find_full(&admitted);
+                let last_start = admitted.len() - terminal.len();
+                let leads: Vec<_> = admitted[..=last_start]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, &byte)| (byte == terminal[0]).then_some(index))
+                    .collect();
+                let selected_lead =
+                    admitted_expected.and_then(|(_, end)| end.checked_sub(terminal.len()));
+                let selected_rank = selected_lead
+                    .and_then(|selected| leads.iter().position(|&lead| lead == selected));
+                let expected_direct = if selected_rank
+                    .is_some_and(|rank| rank < super::UNANCHORED_MULTIBYTE_FIND_MAX_REJECTIONS)
+                {
+                    Some(admitted_expected)
+                } else if selected_rank.is_some()
+                    || leads.len() >= super::UNANCHORED_MULTIBYTE_FIND_MAX_REJECTIONS
+                {
+                    None
+                } else {
+                    Some(None)
+                };
                 assert_eq!(
-                    plan.try_find_full(&admitted),
-                    None,
-                    "multi-byte span must decline before source inspection",
+                    direct, expected_direct,
+                    "bounded span pattern={pattern:?} source={source:?}",
                 );
             }
         }
@@ -1941,11 +2126,15 @@ mod tests {
             b"abXYXYX".as_slice(),
             b"abXY".as_slice(),
         ] {
+            let expected = overlap_oracle
+                .find(source)
+                .map(|matched| (matched.start(), matched.end()));
             assert_eq!(
                 overlap.is_match_full_impl(source),
-                overlap_oracle.is_match(source),
+                expected.is_some(),
                 "overlap source={source:?}",
             );
+            assert_eq!(overlap.find_multibyte_full_impl(source), expected);
         }
 
         const ADVANCE_PATTERN: &str = r"(?-u:(?:ab|cd)+XabX)";
@@ -1957,6 +2146,267 @@ mod tests {
             advance_oracle.is_match(b"XabXabX"),
             "the rejected terminal at zero must not skip the overlapping valid terminal at three",
         );
+        assert_eq!(
+            advance.find_multibyte_full_impl(b"XabXabX"),
+            advance_oracle
+                .find(b"XabXabX")
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        let mut admitted_overlap =
+            vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES - b"XabXabX".len()];
+        admitted_overlap.extend_from_slice(b"XabXabX");
+        let admitted_overlap_expected = advance_oracle
+            .find(&admitted_overlap)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            advance.try_find_full(&admitted_overlap),
+            Some(admitted_overlap_expected),
+            "the prior lead's successor remains an inclusive body floor",
+        );
+
+        let mut admitted = vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES];
+        admitted.extend_from_slice(b"X!cdXYX");
+        let admitted_expected = overlap_oracle
+            .find(&admitted)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            overlap.try_find_full(&admitted),
+            Some(admitted_expected),
+            "one rejected terminal lead may continue to a later valid span",
+        );
+        let mut saturated = vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES];
+        saturated.extend_from_slice(b"X!X!cdXYX");
+        assert_eq!(
+            overlap.try_find_full(&saturated),
+            None,
+            "two rejected terminal leads saturate the bounded span route",
+        );
+        assert_eq!(
+            overlap.try_find_full(&vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES]),
+            Some(None),
+            "a source without a terminal lead completes negatively",
+        );
+
+        const UNICODE_PATTERN: &str = r"(?:ab+c|de?f)+λ";
+        let unicode = PortableBuilder::new(UNICODE_PATTERN).build().unwrap();
+        let PortablePlan::K0(unicode_k0) = &unicode.plan else {
+            panic!("Unicode variable-token target must remain K0");
+        };
+        let unicode_direct = unicode_k0
+            .exclusive
+            .unanchored_token_loop()
+            .expect("Unicode variable-token target must retain the direct owner");
+        assert_eq!(
+            &unicode_direct.0.terminal[..usize::from(unicode_direct.0.terminal_len)],
+            "λ".as_bytes(),
+        );
+        let unicode_oracle = regex::bytes::Regex::new(UNICODE_PATTERN).unwrap();
+        let tail = "abbbcdefλ".as_bytes();
+        let mut unicode_source =
+            vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES - tail.len()];
+        unicode_source.extend_from_slice(tail);
+        super::unanchored_route_probe::reset();
+        let expected = unicode_oracle
+            .find(&unicode_source)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            unicode
+                .find(&unicode_source)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            super::unanchored_route_probe::snapshot(),
+            super::unanchored_route_probe::Counts {
+                span_attempts: 1,
+                span_completed: 1,
+                ..super::unanchored_route_probe::Counts::default()
+            },
+        );
+
+        let preceding_token_end = unicode_source.len() - "λ".len();
+        unicode_source[preceding_token_end - 1] = b'Q';
+        let expected = unicode_oracle
+            .find(&unicode_source)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(expected, None);
+        assert_eq!(
+            unicode
+                .find(&unicode_source)
+                .map(|matched| (matched.start(), matched.end())),
+            expected,
+        );
+        assert_eq!(
+            super::unanchored_route_probe::snapshot(),
+            super::unanchored_route_probe::Counts {
+                span_attempts: 2,
+                span_completed: 2,
+                ..super::unanchored_route_probe::Counts::default()
+            },
+            "one malformed Unicode candidate followed by exhaustion is authoritative",
+        );
+
+        const VARIABLE_PATTERN: &str = r"(?-u:(?:ab+c|de?f)+XYZ)";
+        let variable = unanchored_plan_with_terminal(VARIABLE_PATTERN, b"XYZ");
+        let variable_oracle = regex::bytes::Regex::new(VARIABLE_PATTERN).unwrap();
+        let body_len = super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES - b"XYZ".len();
+        let mut long_valid = vec![b'b'; body_len];
+        long_valid[0] = b'a';
+        long_valid[body_len - 1] = b'c';
+        long_valid.extend_from_slice(b"XYZ");
+        let mut long_malformed = long_valid.clone();
+        long_malformed[0] = b'b';
+        let valid_expected = variable_oracle
+            .find(&long_valid)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            variable.find_multibyte_full_impl(&long_valid),
+            valid_expected
+        );
+        assert_eq!(
+            variable.try_find_full(&long_valid),
+            None,
+            "an over-budget possible unbounded branch must fail open",
+        );
+        assert_eq!(variable.find_multibyte_full_impl(&long_malformed), None,);
+        assert_eq!(
+            variable.try_find_full(&long_malformed),
+            Some(None),
+            "absence of the globally unique required branch start is authoritative",
+        );
+
+        let mut preserved_suffix = vec![b'b'; body_len - b"cdef".len()];
+        preserved_suffix.extend_from_slice(b"cdefXYZ");
+        let preserved_expected = variable_oracle
+            .find(&preserved_suffix)
+            .map(|matched| (matched.start(), matched.end()));
+        assert_eq!(
+            variable.try_find_full(&preserved_suffix),
+            Some(preserved_expected),
+            "an over-budget earlier token must preserve an authenticated suffix",
+        );
+
+        let variable_facade = PortableBuilder::new(VARIABLE_PATTERN).build().unwrap();
+        for source in [&long_valid, &long_malformed, &preserved_suffix] {
+            let expected = variable_oracle
+                .find(source)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(
+                variable_facade
+                    .find(source)
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn unanchored_multibyte_span_bounds_unbounded_reverse_work_exactly() {
+        const PATTERN: &str = r"(?-u:(?:ab+c|de?f)+XYZ)";
+
+        fn token(bs: usize) -> Vec<u8> {
+            let mut token = Vec::with_capacity(bs.saturating_add(2));
+            token.push(b'a');
+            token.extend(vec![b'b'; bs]);
+            token.push(b'c');
+            token
+        }
+
+        fn malformed_token(bs: usize) -> Vec<u8> {
+            let mut token = vec![b'b'; bs];
+            token.push(b'c');
+            token
+        }
+
+        fn admitted(tail: Vec<u8>) -> Vec<u8> {
+            assert!(tail.len() <= super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES);
+            let mut source = vec![b'!'; super::UNANCHORED_MULTIBYTE_MIN_INPUT_BYTES - tail.len()];
+            source.extend_from_slice(&tail);
+            source
+        }
+
+        let plan = unanchored_plan_with_terminal(PATTERN, b"XYZ");
+        let oracle = regex::bytes::Regex::new(PATTERN).unwrap();
+        let facade = PortableBuilder::new(PATTERN).build().unwrap();
+
+        let mut scalar_exact = token(32);
+        scalar_exact.extend_from_slice(b"XYZ");
+        let scalar_exact = admitted(scalar_exact);
+
+        let mut scalar_over = token(33);
+        scalar_over.extend_from_slice(b"XYZ");
+        let scalar_over = admitted(scalar_over);
+
+        let mut scalar_over_absent = malformed_token(33);
+        scalar_over_absent.extend_from_slice(b"XYZ");
+        let scalar_over_absent = admitted(scalar_over_absent);
+
+        let mut cumulative_exact = token(16);
+        cumulative_exact.extend_from_slice(&token(16));
+        cumulative_exact.extend_from_slice(b"XYZ");
+        let cumulative_exact = admitted(cumulative_exact);
+
+        let mut cumulative_over = token(17);
+        cumulative_over.extend_from_slice(&token(16));
+        cumulative_over.extend_from_slice(b"XYZ");
+        let cumulative_over = admitted(cumulative_over);
+
+        let mut later_candidate = malformed_token(33);
+        later_candidate.extend_from_slice(b"XYZ!abcXYZ");
+        let later_candidate = admitted(later_candidate);
+
+        let mut preserved_suffix = malformed_token(33);
+        preserved_suffix.extend_from_slice(b"defXYZ");
+        let preserved_suffix = admitted(preserved_suffix);
+
+        let mut corridor_local = b"aXYZ".to_vec();
+        corridor_local.extend_from_slice(&malformed_token(33));
+        corridor_local.extend_from_slice(b"defXYZ");
+        let corridor_local = admitted(corridor_local);
+
+        for (label, source, direct) in [
+            ("scalar exact cap", scalar_exact, Some(Some((4_059, 4_096)))),
+            ("scalar cap plus one", scalar_over, None),
+            ("scalar absent start", scalar_over_absent, Some(None)),
+            (
+                "cumulative exact cap",
+                cumulative_exact,
+                Some(Some((4_057, 4_096))),
+            ),
+            ("cumulative cap plus one", cumulative_over, None),
+            (
+                "authoritative rejection then later candidate",
+                later_candidate,
+                Some(Some((4_090, 4_096))),
+            ),
+            (
+                "preserved authenticated suffix",
+                preserved_suffix,
+                Some(Some((4_090, 4_096))),
+            ),
+            (
+                "candidate-local start proof",
+                corridor_local,
+                Some(Some((4_090, 4_096))),
+            ),
+        ] {
+            let expected = oracle
+                .find(&source)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(
+                plan.find_multibyte_full_impl(&source),
+                expected,
+                "unlimited oracle: {label}",
+            );
+            assert_eq!(plan.try_find_full(&source), direct, "bounded: {label}");
+            assert_eq!(
+                facade
+                    .find(&source)
+                    .map(|matched| (matched.start(), matched.end())),
+                expected,
+                "public facade: {label}",
+            );
+        }
     }
 
     #[test]
@@ -1975,6 +2425,13 @@ mod tests {
                 plan.is_match_full_impl(source),
                 oracle.is_match(source),
                 "source={source:?}",
+            );
+            assert_eq!(
+                plan.find_multibyte_full_impl(source),
+                oracle
+                    .find(source)
+                    .map(|matched| (matched.start(), matched.end())),
+                "span source={source:?}",
             );
             if depth == 6 {
                 return;
@@ -2030,10 +2487,22 @@ mod tests {
             multi.is_match_full_impl(&multi_source),
             multi_oracle.is_match(&multi_source),
         );
+        assert_eq!(
+            multi.find_multibyte_full_impl(&multi_source),
+            multi_oracle
+                .find(&multi_source)
+                .map(|matched| (matched.start(), matched.end())),
+        );
         multi_source[36] = 0xFB;
         assert_eq!(
             multi.is_match_full_impl(&multi_source),
             multi_oracle.is_match(&multi_source),
+        );
+        assert_eq!(
+            multi.find_multibyte_full_impl(&multi_source),
+            multi_oracle
+                .find(&multi_source)
+                .map(|matched| (matched.start(), matched.end())),
         );
     }
 
@@ -2147,7 +2616,7 @@ mod tests {
     }
 
     #[test]
-    fn unanchored_multibyte_publication_is_exists_only_and_coexists_with_suffix() {
+    fn unanchored_multibyte_publication_is_ordinary_only_and_coexists_with_suffix() {
         const PATTERN: &str = r"(?-u:(?:ab|cd)+XYZ)";
         fn retained(regex: &crate::PortableRegex) -> bool {
             matches!(
@@ -2297,7 +2766,7 @@ mod tests {
                 exists_attempts: 1,
                 exists_completed: 1,
                 span_attempts: 1,
-                span_completed: 0,
+                span_completed: 1,
             },
         );
 
@@ -2318,7 +2787,7 @@ mod tests {
             "one rejected multi-byte terminal fails open to canonical K0",
         );
         assert_eq!(after_mutations.span_attempts, 3);
-        assert_eq!(after_mutations.span_completed, 0);
+        assert_eq!(after_mutations.span_completed, 3);
 
         assert!(
             complete
@@ -2348,11 +2817,17 @@ mod tests {
         super::unanchored_route_probe::reset();
         assert!(complete.is_match(&dense_then_late));
         assert_eq!(
+            complete
+                .find(&dense_then_late)
+                .map(|matched| (matched.start(), matched.end())),
+            Some((dense_then_late.len() - 5, dense_then_late.len())),
+        );
+        assert_eq!(
             super::unanchored_route_probe::snapshot(),
             super::unanchored_route_probe::Counts {
                 exists_attempts: 1,
                 exists_completed: 0,
-                span_attempts: 0,
+                span_attempts: 1,
                 span_completed: 0,
             },
             "multi-byte candidate saturation fails open to canonical K0",

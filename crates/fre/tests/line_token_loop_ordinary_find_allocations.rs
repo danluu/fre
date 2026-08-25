@@ -73,6 +73,12 @@ fn line_token_loop_ordinary_values_allocate_nothing() {
     assert!(unanchored.is_match(&unanchored_rejected_then_late));
 
     let (multibyte, multibyte_late, multibyte_absent, multibyte_dense) = multibyte_fixture();
+    let cold_multibyte_hit = PortableBuilder::new(r"(?-u:(?:ab|cd)+XYZ)")
+        .build()
+        .unwrap();
+    let cold_multibyte_miss = PortableBuilder::new(r"(?-u:(?:ab|cd)+XYZ)")
+        .build()
+        .unwrap();
 
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
@@ -124,6 +130,15 @@ fn line_token_loop_ordinary_values_allocate_nothing() {
         assert!(black_box(multibyte.is_match(black_box(&multibyte_late))));
         assert!(!black_box(multibyte.is_match(black_box(&multibyte_absent))));
         assert!(!black_box(multibyte.is_match(black_box(&multibyte_dense))));
+        assert_eq!(
+            black_box(cold_multibyte_hit.find(black_box(&multibyte_late)))
+                .map(|matched| (matched.start(), matched.end())),
+            Some((4_089, 4_096)),
+        );
+        assert_eq!(
+            black_box(cold_multibyte_miss.find(black_box(&multibyte_absent))),
+            None,
+        );
     }
     assert_eq!(measured.change(), Stats::default());
 }
