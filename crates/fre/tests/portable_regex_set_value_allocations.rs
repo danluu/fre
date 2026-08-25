@@ -93,6 +93,56 @@ fn fused_exact_literal_full_existence_has_no_execution_allocations() {
 }
 
 #[test]
+fn fused_exact_literal_all_id_ordinary_constituents_do_not_allocate() {
+    let patterns = [
+        "literal_00",
+        "literal_01",
+        "literal_02",
+        "literal_03",
+        "literal_04",
+        "literal_05",
+        "literal_06",
+        "literal_07",
+    ];
+    let set = PortableRegexSet::new(patterns).expect("fused exact-literal byte set");
+    assert!(set.build_report().fused_literal_set_build.is_some());
+
+    let absent = [b'x'; 256];
+    let mut first = absent;
+    first[96..106].copy_from_slice(patterns[0].as_bytes());
+    let mut suffix = absent;
+    suffix[192..202].copy_from_slice(patterns[7].as_bytes());
+
+    let region = Region::new(GLOBAL);
+    for (haystack, expected_any, expected_id) in [
+        (absent.as_slice(), false, None),
+        (first.as_slice(), true, Some(0_usize)),
+        (suffix.as_slice(), true, Some(7_usize)),
+    ] {
+        for _ in 0..32 {
+            let mut flags = [false; 10];
+            flags[8] = true;
+            assert_eq!(
+                set.matches_read_at_value(
+                    &mut flags,
+                    haystack,
+                    0,
+                    PortableRegexSetRunLimits::unlimited(),
+                )
+                .expect("fused ordinary caller-buffer all-ID value search"),
+                expected_any,
+            );
+            for (index, &flag) in flags[..patterns.len()].iter().enumerate() {
+                assert_eq!(flag, expected_id == Some(index));
+            }
+            assert!(flags[8]);
+            assert!(!flags[9]);
+        }
+    }
+    assert_eq!(region.change(), Stats::default());
+}
+
+#[test]
 fn ineligible_exact_literal_existence_and_empty_fallback_do_not_allocate() {
     let positive = PortableRegexSet::new(["ab", "bc"]).expect("two positive literals");
     let nullable = PortableRegexSet::new(["", "bc"]).expect("empty-literal fallback set");

@@ -279,6 +279,54 @@ fn fused_all_id_negative_certificate_preserves_absent_caller_flags_and_ranges() 
 }
 
 #[test]
+fn fused_ordinary_constituents_preserve_long_prefix_duplicate_and_raw_ids() {
+    let set = PortableRegexSet::new(PATTERNS).expect("fused mixed-width exact-literal set");
+    assert!(set.build_report().fused_literal_set_build.is_some());
+
+    let absent = vec![b'x'; 256];
+    let mut prefix_and_duplicates = absent.clone();
+    prefix_and_duplicates[192..195].copy_from_slice(b"abc");
+    let mut raw = absent.clone();
+    raw[160..162].copy_from_slice(b"\xFF\x00");
+    let mut multiple_suffixes = absent.clone();
+    multiple_suffixes[80..84].copy_from_slice(b"tail");
+    multiple_suffixes[208..213].copy_from_slice(b"seven");
+
+    for haystack in [
+        absent.as_slice(),
+        prefix_and_duplicates.as_slice(),
+        raw.as_slice(),
+        multiple_suffixes.as_slice(),
+    ] {
+        let mut expected = [false; 10];
+        expected[1] = true;
+        expected[8] = true;
+        let (expected_any, _report) = set
+            .matches_read_at(
+                &mut expected,
+                haystack,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("accounted exact-literal ID oracle");
+
+        let mut actual = [false; 10];
+        actual[1] = true;
+        actual[8] = true;
+        let actual_any = set
+            .matches_read_at_value(
+                &mut actual,
+                haystack,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("fused ordinary exact-literal ID search");
+        assert_eq!(actual_any, expected_any);
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
 fn ineligible_two_literal_value_routes_preserve_offsets_ids_and_empty_fallback() {
     for patterns in [["ab", "bc"], ["", "bc"]] {
         let regexes = patterns
