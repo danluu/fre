@@ -1342,6 +1342,35 @@ impl LiteralPlan {
         })
     }
 
+    /// Adopt and preprocess one already-owned exact byte needle.
+    ///
+    /// This construction seam preserves the allocation supplied by an
+    /// authenticated sibling planner. It deliberately repeats the public
+    /// needle-width admission before transferring ownership to the finder, so
+    /// callers cannot use ownership provenance to bypass the literal limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralError::NeedleLimit`] before construction if the
+    /// declared payload cap is too small.
+    #[doc(hidden)]
+    pub fn from_owned_box(
+        needle: Box<[u8]>,
+        limits: LiteralBuildLimits,
+    ) -> Result<Self, LiteralError> {
+        let needle_bytes = needle.len();
+        if needle_bytes > limits.max_needle_bytes {
+            return Err(LiteralError::NeedleLimit {
+                needed: needle_bytes,
+                limit: limits.max_needle_bytes,
+            });
+        }
+        Ok(Self {
+            finder: FinderBuilder::new().build_forward_owned(needle),
+            needle_bytes,
+        })
+    }
+
     /// Logical persistent pattern payload bytes.
     #[must_use]
     pub const fn storage_bytes(&self) -> usize {
@@ -2181,6 +2210,40 @@ mod tests {
             assert_eq!(owned, source);
             assert_eq!(owned.capacity(), len);
         }
+    }
+
+    #[test]
+    fn owned_literal_box_is_adopted_without_copy_and_rechecks_the_limit() {
+        for len in [1_usize, 2, 3, 7, 8, 15, 16, 31, 32, 255, 256, 4096] {
+            let owned = (0_u8..=u8::MAX)
+                .cycle()
+                .take(len)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let pointer = owned.as_ptr();
+            exact_literal_copy_probe::reset();
+            let plan = LiteralPlan::from_owned_box(owned, LiteralBuildLimits::default()).unwrap();
+            assert_eq!(plan.needle().as_ptr(), pointer);
+            assert_eq!(plan.needle().len(), len);
+            assert_eq!(exact_literal_copy_probe::calls(), 0);
+        }
+
+        let owned = b"needle".to_vec().into_boxed_slice();
+        exact_literal_copy_probe::reset();
+        assert_eq!(
+            LiteralPlan::from_owned_box(
+                owned,
+                LiteralBuildLimits {
+                    max_needle_bytes: 5,
+                },
+            )
+            .unwrap_err(),
+            LiteralError::NeedleLimit {
+                needed: 6,
+                limit: 5,
+            }
+        );
+        assert_eq!(exact_literal_copy_probe::calls(), 0);
     }
 
     #[test]

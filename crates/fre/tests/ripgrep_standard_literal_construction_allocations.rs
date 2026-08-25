@@ -127,3 +127,63 @@ fn borrowed_fixed_metacharacters_avoid_the_owned_hir_leaf_graph() {
         "borrowed={borrowed_allocations}, owned-HIR={hir_allocations}",
     );
 }
+
+#[test]
+fn owned_singleton_literal_adopts_the_hir_leaf_without_copy() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().unwrap();
+    const TRANSFER_BYTES: usize = 65_537;
+    drop(
+        PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literal_hir_owned(
+                Hir::literal(vec![b'q'; 32]),
+                usize::MAX,
+            )
+            .expect("warm owned singleton construction completes"),
+    );
+    let borrowed_hir = Hir::literal(vec![b'q'; TRANSFER_BYTES]);
+    let owned_hir = Hir::literal(vec![b'q'; TRANSFER_BYTES]);
+
+    let borrowed_region = Region::new(GLOBAL);
+    let borrowed = PortableBuilder::new("")
+        .multi_line(true)
+        .build_ripgrep_standard_literal_hir(&borrowed_hir, usize::MAX)
+        .expect("borrowed singleton construction completes")
+        .expect("borrowed singleton HIR is admitted");
+    let borrowed_stats = borrowed_region.change();
+    drop(borrowed_region);
+
+    let owned_region = Region::new(GLOBAL);
+    let owned = PortableBuilder::new("")
+        .multi_line(true)
+        .build_ripgrep_standard_literal_hir_owned(owned_hir, usize::MAX)
+        .expect("owned singleton construction completes");
+    let RipgrepStandardLiteralHirBuild::Built(owned) = owned else {
+        panic!("owned singleton HIR was refused");
+    };
+    let owned_stats = owned_region.change();
+    drop(owned_region);
+
+    assert_eq!(owned.as_str(), borrowed.as_str());
+    assert_eq!(owned.build_report(), borrowed.build_report());
+    assert_eq!(owned.find(b"not present"), borrowed.find(b"not present"));
+    assert!(
+        owned_stats.allocations.saturating_add(2) <= borrowed_stats.allocations,
+        "borrowed singleton omitted its independent HIR clone cost: borrowed={borrowed_stats:?}, owned={owned_stats:?}",
+    );
+    assert!(
+        owned_stats.allocations <= 3,
+        "owned singleton retained a needle-copy allocation: {owned_stats:?}",
+    );
+    assert!(
+        owned_stats.bytes_allocated < TRANSFER_BYTES.saturating_mul(2),
+        "owned singleton retained a pattern-sized leaf copy: {owned_stats:?}",
+    );
+    assert!(
+        owned_stats
+            .bytes_allocated
+            .saturating_add(TRANSFER_BYTES)
+            <= borrowed_stats.bytes_allocated,
+        "borrowed singleton omitted its cloned literal bytes: borrowed={borrowed_stats:?}, owned={owned_stats:?}",
+    );
+}

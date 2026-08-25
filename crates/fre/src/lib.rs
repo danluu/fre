@@ -5144,6 +5144,31 @@ fn capture_free_name_metadata() -> CaptureNameMetadata {
     }
 }
 
+/// Consume the exact literal leaf authenticated by the capture-transparent
+/// singleton handoff.
+///
+/// The borrowed handoff closes before this function is called. Consequently,
+/// reaching any other HIR kind indicates an internal disagreement between the
+/// proof and the same immutable HIR owner, not a semantic fallback.
+fn into_capture_transparent_literal_box(mut hir: Hir) -> Result<Box<[u8]>, BuildError> {
+    loop {
+        match hir.into_kind() {
+            HirKind::Capture(capture) => hir = *capture.sub,
+            HirKind::Literal(literal) => return Ok(literal.0),
+            HirKind::Empty
+            | HirKind::Class(_)
+            | HirKind::Look(_)
+            | HirKind::Repetition(_)
+            | HirKind::Concat(_)
+            | HirKind::Alternation(_) => {
+                return Err(BuildError::InternalInvariant(
+                    "singleton literal handoff disagreed with its owned HIR",
+                ));
+            }
+        }
+    }
+}
+
 /// Per-search accounting with the selected plan kept explicit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SearchAccounting {
@@ -9625,14 +9650,59 @@ impl PortableBuilder {
                 .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
         }
-        let singleton_literal = singleton_literal_handoff
-            .as_ref()
-            .map(finite::SingletonLiteralHandoff::literal)
-            .or_else(|| {
-                finite_words
-                    .as_ref()
-                    .and_then(|words| (words.len() == 1).then(|| words[0].as_slice()))
+        if let Some(singleton_literal_handoff) = singleton_literal_handoff {
+            let borrowed_literal = singleton_literal_handoff.literal();
+            let literal = if borrowed_literal.is_empty() {
+                LiteralPlan::new(borrowed_literal, self.limits.literal)?
+            } else {
+                let authenticated_pointer = borrowed_literal.as_ptr();
+                let authenticated_bytes = borrowed_literal.len();
+                // Only copied identity facts survive this point, so the
+                // handoff's borrow ends before its exact HIR owner moves.
+                let owned = into_capture_transparent_literal_box(rust.hir)?;
+                if owned.len() != authenticated_bytes || owned.as_ptr() != authenticated_pointer {
+                    return Err(BuildError::InternalInvariant(
+                        "owned singleton literal differs from its authenticated borrow",
+                    ));
+                }
+                LiteralPlan::from_owned_box(owned, self.limits.literal)?
+            };
+            let storage = literal.storage_bytes();
+            return Ok(PortableRegex {
+                source,
+                capture_names,
+                line_total_grep_plan,
+                plan: PortablePlan::ExactLiteral(literal),
+                profile: profile.clone(),
+                limits: self.limits,
+                selection: self.selection,
+                report: BuildReport {
+                    profile: profile.clone(),
+                    admission,
+                    syntax,
+                    plan: PlanKind::ExactLiteral,
+                    planner_work: finite_work,
+                    lowering: None,
+                    states: 0,
+                    edges: 0,
+                    plan_storage_bytes: storage,
+                    source_storage_bytes,
+                    capture_name_storage_bytes,
+                    charged_persistent_bytes: 0,
+                    persistent_byte_limit: 0,
+                    captures_len,
+                    static_captures_len,
+                    minimum_match_bytes,
+                    required_literal: None,
+                    literal_class_run_literal: None,
+                    forward_anchored: None,
+                }
+                .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
+        }
+        let singleton_literal = finite_words
+            .as_ref()
+            .and_then(|words| (words.len() == 1).then(|| words[0].as_slice()));
         if let Some(singleton_literal) = singleton_literal {
             let literal = LiteralPlan::new(singleton_literal, self.limits.literal)?;
             let storage = literal.storage_bytes();
@@ -32331,6 +32401,62 @@ mod tests {
         };
         assert_eq!(owned.build_report().plan, PlanKind::K0);
         assert_eq!(owned.find(b"xxccc"), borrowed.find(b"xxccc"));
+    }
+
+    #[test]
+    fn owned_singleton_literal_handoff_adopts_the_authenticated_hir_leaf() {
+        let leaf = b"needle".to_vec().into_boxed_slice();
+        let leaf_pointer = leaf.as_ptr();
+        let built = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literal_hir_owned(Hir::literal(leaf), usize::MAX)
+            .expect("owned direct construction completes");
+        let super::RipgrepStandardLiteralHirBuild::Built(regex) = built else {
+            panic!("owned singleton literal was refused");
+        };
+        let PortablePlan::ExactLiteral(literal) = &regex.plan else {
+            panic!("owned singleton literal selected another plan");
+        };
+        assert_eq!(literal.needle(), b"needle");
+        assert_eq!(literal.needle().as_ptr(), leaf_pointer);
+        assert_eq!(regex.find(b"xxneedleyy"), Some(Match { start: 2, end: 8 }));
+
+        let nested_leaf = b"thread".to_vec().into_boxed_slice();
+        let nested_pointer = nested_leaf.as_ptr();
+        let nested = Hir::capture(regex_syntax::hir::Capture {
+            index: 1,
+            name: Some(Box::from("outer")),
+            sub: Box::new(Hir::capture(regex_syntax::hir::Capture {
+                index: 2,
+                name: None,
+                sub: Box::new(Hir::literal(nested_leaf)),
+            })),
+        });
+        let transferred = super::into_capture_transparent_literal_box(nested)
+            .expect("capture-transparent literal owner transfers");
+        assert_eq!(&*transferred, b"thread");
+        assert_eq!(transferred.as_ptr(), nested_pointer);
+
+        let captured = PortableBuilder::new("(?P<outer>(needle))")
+            .build()
+            .expect("captured exact literal construction completes");
+        assert_eq!(captured.build_report().plan, PlanKind::ExactLiteral);
+        assert_eq!(captured.captures_len(), 3);
+        assert_eq!(captured.find(b"xxneedleyy"), regex.find(b"xxneedleyy"));
+
+        let mut refusing_limits = BuildLimits::default();
+        refusing_limits.literal.max_needle_bytes = b"needle".len() - 1;
+        let refused = PortableBuilder::new("needle")
+            .limits(refusing_limits)
+            .build()
+            .expect_err("owned transfer must recheck the literal needle limit");
+        assert!(matches!(
+            refused,
+            BuildError::Literal(fre_kernels::LiteralError::NeedleLimit {
+                needed: 6,
+                limit: 5,
+            })
+        ));
     }
 
     #[test]
