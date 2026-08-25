@@ -279,6 +279,11 @@ struct LiteralSetDfaRootRange {
 }
 
 impl LiteralSetDfaRootRange {
+    #[inline(always)]
+    fn contains(self, byte: u8) -> bool {
+        byte.wrapping_sub(self.origin) <= self.maximum_delta
+    }
+
     fn encode(self) -> NonZeroU16 {
         debug_assert!(self.origin.checked_add(self.maximum_delta).is_some());
         let raw = (u16::from(self.origin) << 8) | u16::from(self.maximum_delta);
@@ -296,6 +301,24 @@ impl LiteralSetDfaRootRange {
             maximum_delta: u8::try_from(raw & 0xff).expect("the low encoding half fits u8"),
         }
     }
+}
+
+/// Find the first exact root after the caller has rejected the current byte.
+///
+/// Both the selected-span scanner and the post-native Exists continuation use
+/// this leaf, so its probe accounting also proves that they share one range
+/// predicate and one first-position implementation.
+#[inline(always)]
+fn find_direct_dfa_root_after_initial_miss(
+    range: LiteralSetDfaRootRange,
+    remaining: &[u8],
+) -> Option<usize> {
+    debug_assert!(remaining.len() >= ORDINARY_ROOT_RANGE_MIN_BYTES);
+    debug_assert!(!range.contains(remaining[0]));
+    let relative = find_byte_delta(range.origin, range.maximum_delta, remaining);
+    #[cfg(test)]
+    ordinary_direct_probe::record_root_range(relative.unwrap_or(remaining.len()));
+    relative
 }
 
 #[inline]
@@ -1670,18 +1693,14 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         let Some(range) = self.root_range else {
             return true;
         };
-        if self.haystack[at].wrapping_sub(range.origin) <= range.maximum_delta {
+        if range.contains(self.haystack[at]) {
             return true;
         }
         let remaining = &self.haystack[at..self.end];
-        let Some(relative) = find_byte_delta(range.origin, range.maximum_delta, remaining) else {
-            #[cfg(test)]
-            ordinary_direct_probe::record_root_range(remaining.len());
+        let Some(relative) = find_direct_dfa_root_after_initial_miss(range, remaining) else {
             self.restart = self.end;
             return false;
         };
-        #[cfg(test)]
-        ordinary_direct_probe::record_root_range(relative);
         self.restart = at + relative;
         true
     }
@@ -1771,6 +1790,29 @@ fn ordinary_direct_dfa_first_acceptance_tail(
     None
 }
 
+/// Continue Exists only after the native prefix ended at the unanchored start
+/// and its current suffix byte was proved not to be an exact root.
+///
+/// Outlining this branch keeps the native entry and early-acceptance loop from
+/// preserving DFA and slice registers across the optional native range leaf.
+#[inline(never)]
+fn ordinary_direct_dfa_first_acceptance_after_root_miss(
+    automaton: &DFA,
+    start_state: StateID,
+    range: LiteralSetDfaRootRange,
+    haystack: &[u8],
+    base_at: usize,
+) -> Option<usize> {
+    let relative = find_direct_dfa_root_after_initial_miss(range, haystack)?;
+    ordinary_direct_dfa_first_acceptance_tail(
+        automaton,
+        start_state,
+        start_state,
+        &haystack[relative..],
+        base_at + relative,
+    )
+}
+
 /// Stop at the first direct-DFA acceptance without selecting a pattern or
 /// reconstructing its start.
 ///
@@ -1782,6 +1824,7 @@ fn ordinary_direct_dfa_first_acceptance_end(
     automaton: &DFA,
     start_state: StateID,
     haystack: &[u8],
+    root_range: Option<NonZeroU16>,
 ) -> Option<usize> {
     debug_assert!(automaton.prefilter().is_none());
     debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
@@ -1808,11 +1851,25 @@ fn ordinary_direct_dfa_first_acceptance_end(
             }
         }
     }
+    let remaining = &haystack[at..];
+    if remaining.len() >= ORDINARY_ROOT_RANGE_MIN_BYTES && state == start_state {
+        if let Some(range) = root_range.map(LiteralSetDfaRootRange::decode)
+            && !range.contains(remaining[0])
+        {
+            return ordinary_direct_dfa_first_acceptance_after_root_miss(
+                automaton,
+                start_state,
+                range,
+                remaining,
+                at,
+            );
+        }
+    }
     ordinary_direct_dfa_first_acceptance_tail(
         automaton,
         start_state,
         state,
-        &haystack[at..],
+        remaining,
         at,
     )
 }
@@ -1946,6 +2003,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
                 self.plan.automaton.as_ref(),
                 decode_direct_dfa_start_state(encoded),
                 &haystack[base..window.end()],
+                self.direct_dfa_root_range,
             );
             return Ok(relative_end.map(|end| {
                 debug_assert!(end <= window_bytes);
@@ -7006,6 +7064,7 @@ mod tests {
                     automaton,
                     start_state,
                     &haystack[BASE..BASE + full_window_bytes],
+                    None,
                 ),
                 Some(relative_end),
                 "relative_end={relative_end}",
@@ -7029,6 +7088,7 @@ mod tests {
                     automaton,
                     start_state,
                     &haystack[BASE..BASE + window_bytes],
+                    None,
                 ),
                 Some(window_bytes),
                 "positive remainder={remainder}",
@@ -7050,6 +7110,7 @@ mod tests {
                     automaton,
                     start_state,
                     &haystack[BASE..BASE + window_bytes],
+                    None,
                 ),
                 None,
                 "miss window_bytes={window_bytes}",
@@ -7062,6 +7123,257 @@ mod tests {
                 Ok(None),
                 "miss window_bytes={window_bytes}",
             );
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_post_native_root_seek_preserves_edges_and_counters() {
+        fn assert_first_and_exists(
+            ordinary: LiteralSetOrdinaryExecutor<'_>,
+            haystack: &[u8],
+            window: Window,
+            expected: Option<usize>,
+            expected_calls: usize,
+            expected_skipped: usize,
+            context: &str,
+        ) {
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                ordinary.first_acceptance_window_value(haystack, window),
+                Ok(expected),
+                "first acceptance: {context}",
+            );
+            assert_eq!(
+                ordinary_direct_probe::root_range_calls(),
+                expected_calls,
+                "first-acceptance calls: {context}",
+            );
+            assert_eq!(
+                ordinary_direct_probe::root_range_skipped_bytes(),
+                expected_skipped,
+                "first-acceptance skipped bytes: {context}",
+            );
+
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                ordinary.exists_window_value(haystack, window),
+                Ok(expected.is_some()),
+                "exists: {context}",
+            );
+            assert_eq!(
+                ordinary_direct_probe::root_range_calls(),
+                expected_calls,
+                "exists calls: {context}",
+            );
+            assert_eq!(
+                ordinary_direct_probe::root_range_skipped_bytes(),
+                expected_skipped,
+                "exists skipped bytes: {context}",
+            );
+        }
+
+        const BASE: usize = 5;
+        const PATTERN_BYTES: usize = 3;
+        const LONG_WINDOW_BYTES: usize =
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_RANGE_MIN_BYTES + 8;
+
+        let patterns = (1_u8..=131)
+            .map(|byte| vec![byte; PATTERN_BYTES])
+            .collect::<Vec<_>>();
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        assert_eq!(
+            ordinary
+                .direct_dfa_root_range
+                .map(LiteralSetDfaRootRange::decode),
+            Some(LiteralSetDfaRootRange {
+                origin: 1,
+                maximum_delta: 130,
+            }),
+        );
+
+        // Exact native window lengths stay in the incumbent prefix/tail path.
+        for window_bytes in [
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES - 1,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1,
+        ] {
+            let haystack = vec![200_u8; BASE + window_bytes + 7];
+            assert_first_and_exists(
+                ordinary,
+                &haystack,
+                Window::new(BASE, BASE + window_bytes),
+                None,
+                0,
+                0,
+                "native window boundary miss",
+            );
+        }
+
+        // Accept immediately before and at the native boundary, then complete
+        // one in-flight candidate on the first tail byte. Even with a long
+        // terminal window, none may enter the root leaf.
+        for relative_end in [
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES - 1,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1,
+        ] {
+            let mut haystack = vec![200_u8; BASE + LONG_WINDOW_BYTES + 7];
+            let start = BASE + relative_end - PATTERN_BYTES;
+            haystack[start..start + PATTERN_BYTES].fill(1);
+            assert_first_and_exists(
+                ordinary,
+                &haystack,
+                Window::new(BASE, BASE + LONG_WINDOW_BYTES),
+                Some(BASE + relative_end),
+                0,
+                0,
+                "native endpoint boundary hit",
+            );
+        }
+
+        let mut dense = vec![200_u8; BASE + LONG_WINDOW_BYTES + 7];
+        dense[BASE..BASE + LONG_WINDOW_BYTES].fill(1);
+        assert_first_and_exists(
+            ordinary,
+            &dense,
+            Window::new(BASE, BASE + LONG_WINDOW_BYTES),
+            Some(BASE + PATTERN_BYTES),
+            0,
+            0,
+            "early dense hit",
+        );
+
+        // A root exactly at the tail boundary is retained by the scalar guard.
+        // Moving it one byte later enters the shared range leaf exactly once.
+        for (root_offset, expected_calls, expected_skipped) in [
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES, 0, 0),
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1, 1, 1),
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES + 10, 1, 10),
+        ] {
+            let mut haystack = vec![200_u8; BASE + LONG_WINDOW_BYTES + 7];
+            let root = BASE + root_offset;
+            haystack[root..root + PATTERN_BYTES].fill(1);
+            assert_first_and_exists(
+                ordinary,
+                &haystack,
+                Window::new(BASE, BASE + LONG_WINDOW_BYTES),
+                Some(root + PATTERN_BYTES),
+                expected_calls,
+                expected_skipped,
+                "post-native delayed root",
+            );
+        }
+
+        // The leaf's recorded displacement is relative to the post-native
+        // suffix. A clipped pattern cannot read its final byte beyond `end`.
+        let root_offset = ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_RANGE_MIN_BYTES;
+        let mut truncated = vec![200_u8; BASE + LONG_WINDOW_BYTES + 7];
+        let root = BASE + root_offset;
+        truncated[root..root + PATTERN_BYTES].fill(1);
+        assert_first_and_exists(
+            ordinary,
+            &truncated,
+            Window::new(BASE, root + PATTERN_BYTES - 1),
+            None,
+            1,
+            ORDINARY_ROOT_RANGE_MIN_BYTES,
+            "nonzero truncated window",
+        );
+
+        // Activation is based on the suffix remaining after the exact native
+        // prefix, not on the complete input length.
+        for (window_bytes, expected_calls, expected_skipped) in [
+            (
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_RANGE_MIN_BYTES - 1,
+                0,
+                0,
+            ),
+            (
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_RANGE_MIN_BYTES,
+                1,
+                ORDINARY_ROOT_RANGE_MIN_BYTES,
+            ),
+        ] {
+            let haystack = vec![200_u8; BASE + window_bytes + 7];
+            assert_first_and_exists(
+                ordinary,
+                &haystack,
+                Window::new(BASE, BASE + window_bytes),
+                None,
+                expected_calls,
+                expected_skipped,
+                "post-native activation boundary miss",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_post_native_root_seek_matches_earliest_dfa_in_every_window() {
+        let patterns = (1_u8..=131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        let start_state = ordinary
+            .direct_dfa_start_state
+            .map(decode_direct_dfa_start_state)
+            .unwrap();
+        assert!(ordinary.direct_dfa_root_range.is_some());
+
+        let miss = vec![200_u8; 72];
+        let mut boundary_hits = vec![200_u8; 72];
+        for start in [0, 28, 30, 32, 33, 63, 69] {
+            if start + 3 <= boundary_hits.len() {
+                boundary_hits[start..start + 3].fill(1);
+            }
+        }
+        let mut decoys = (0_u8..72)
+            .map(|index| if index % 5 == 0 { 57 } else { 200 })
+            .collect::<Vec<_>>();
+        for start in [29, 31, 34, 62] {
+            decoys[start..start + 2].fill(1);
+        }
+        decoys[66..69].fill(57);
+
+        for haystack in [&miss[..], &boundary_hits[..], &decoys[..]] {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = Window::new(start, end);
+                    let input = Input::new(haystack)
+                        .span(start..end)
+                        .earliest(true);
+                    let expected = plan
+                        .automaton
+                        .as_ref()
+                        .try_find(&input)
+                        .expect("the direct DFA supports earliest unanchored input")
+                        .map(|matched| matched.end());
+                    let incumbent = ordinary_direct_dfa_first_acceptance_end(
+                        plan.automaton.as_ref(),
+                        start_state,
+                        &haystack[start..end],
+                        None,
+                    )
+                    .map(|relative_end| start + relative_end);
+                    assert_eq!(
+                        incumbent, expected,
+                        "incumbent haystack={haystack:?}, window={window:?}",
+                    );
+                    assert_eq!(
+                        ordinary.first_acceptance_window_value(haystack, window),
+                        Ok(expected),
+                        "first acceptance haystack={haystack:?}, window={window:?}",
+                    );
+                    assert_eq!(
+                        ordinary.exists_window_value(haystack, window),
+                        Ok(expected.is_some()),
+                        "exists haystack={haystack:?}, window={window:?}",
+                    );
+                }
+            }
         }
     }
 
