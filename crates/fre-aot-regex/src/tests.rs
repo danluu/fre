@@ -6346,6 +6346,376 @@ fn direct_native_reducers_reenter_authenticated_span_core_cross_target() {
 #[test]
 #[allow(
     clippy::too_many_lines,
+    reason = "the cross-target one-shot reducer audit binds public-entry identity, local-call topology, and table provenance"
+)]
+fn direct_native_single_reducer_uses_authenticated_complete_span_scan_cross_target() {
+    for pattern in ["[ab]+z", "(?:ab|a)+z", "(?:|a)", "a*"] {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let request = || {
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+            };
+            let ordinary = compile(request()).expect("direct public Span module");
+            assert_eq!(ordinary.receipt().engine, EngineKind::OrderedDfa);
+            let exports = PreparedAggregateExports::COUNT;
+            {
+                let reduced = compile_with_prepared_aggregate_exports(request(), exports)
+                    .expect("single direct native reducer");
+                assert_eq!(reduced.receipt().engine, EngineKind::OrderedDfa);
+                assert_eq!(
+                    reduced.receipt().prepared_aggregate_strategy,
+                    Some(PreparedAggregateStrategy::NativeFused),
+                );
+                assert!(!reduced.receipt().runtime_helper_required);
+                assert!(reduced.module().required_runtime_symbols().next().is_none());
+                assert!(reduced.module().uses_complete_span_reduce_aggregate());
+                assert!(!reduced.module().uses_direct_span_trusted_core_aggregate());
+
+                let ordinary_entry = reduced
+                    .module()
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == reduced.module().entry_symbol())
+                    .expect("ordinary entry");
+                let ordinary_start = usize::try_from(ordinary_entry.offset).unwrap();
+                let ordinary_end = ordinary_start
+                    .checked_add(usize::try_from(ordinary_entry.size).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    reduced.module().sections()[0]
+                        .bytes()
+                        .get(ordinary_start..ordinary_end),
+                    ordinary.module().sections()[0]
+                        .bytes()
+                        .get(ordinary_start..ordinary_end),
+                    "{pattern:?}/{target:?}/{exports:?} changed public Span bytes",
+                );
+                let core_offset = reduced
+                    .module()
+                    .complete_span_reduce_core_offset()
+                    .expect("authenticated complete reducer core");
+                assert!(core_offset >= ordinary_end);
+                let reducer_name = reduced.module().prepared_count_symbol().unwrap();
+                let reducer = reduced
+                    .module()
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == reducer_name)
+                    .expect("single reducer symbol");
+                let reducer_start = usize::try_from(reducer.offset).unwrap();
+                let reducer_end = reducer_start
+                    .checked_add(usize::try_from(reducer.size).unwrap())
+                    .unwrap();
+                let calls = generated_local_call_sites(
+                    target.architecture,
+                    reduced.module().sections()[0].bytes(),
+                    reducer_start,
+                    reducer_end,
+                );
+                assert_eq!(calls.len(), 1, "{pattern:?}/{target:?}/{exports:?}");
+                assert_eq!(calls[0].1, core_offset);
+                let core_text = &reduced.module().sections()[0].bytes()
+                    [core_offset..reducer_start];
+                match target.architecture {
+                    Architecture::X86_64 => {
+                        let validation = [
+                            0x48, 0x8b, 0x4c, 0x24, 40, // full end from private frame
+                            0x49, 0x39, 0xf2, // selected start >= requested start
+                        ];
+                        assert!(
+                            core_text.windows(validation.len()).any(|bytes| {
+                                bytes == validation
+                            }),
+                            "{pattern:?}/{target:?}/{exports:?} did not restore the x86 semantic end before matched-result validation",
+                        );
+                    }
+                    Architecture::Aarch64 => {
+                        const RESTORE_END: u32 = 0xf940_17e3; // ldr x3, [sp, #40]
+                        const VALIDATE_START: u32 = 0xeb09_00df; // cmp x6, x9
+                        let words = core_text
+                            .chunks_exact(4)
+                            .map(|bytes| {
+                                u32::from_le_bytes(bytes.try_into().expect("AArch64 core word"))
+                            })
+                            .collect::<Vec<_>>();
+                        assert!(
+                            words.windows(2).any(|pair| {
+                                pair == [RESTORE_END, VALIDATE_START]
+                            }),
+                            "{pattern:?}/{target:?}/{exports:?} did not restore the AArch64 semantic end before matched-result validation",
+                        );
+                    }
+                }
+                assert!(reduced.module().relocations().iter().any(|relocation| {
+                    relocation.section == 0
+                        && usize::try_from(relocation.offset)
+                            .is_ok_and(|offset| offset >= core_offset && offset < reducer_start)
+                        && relocation.symbol == 1
+                }));
+            }
+
+            // SpanSum is deliberately outside the Count-only transaction.
+            // Reconstruct the ce964 append from the ordinary module and bind
+            // both the selected route and emitted bytes to that incumbent.
+            let expected_span_sum = compile_ce964_style_prepared_aggregate(
+                request(),
+                PreparedAggregateExports::SPAN_SUM,
+            )
+            .expect("compile ce964 SpanSum incumbent");
+            let span_sum = compile_with_prepared_aggregate_exports(
+                request(),
+                PreparedAggregateExports::SPAN_SUM,
+            )
+            .expect("Count-only candidate SpanSum incumbent");
+            assert_eq!(span_sum.module(), expected_span_sum.module());
+            assert_eq!(span_sum.object(), expected_span_sum.object());
+            assert_eq!(span_sum.receipt(), expected_span_sum.receipt());
+            assert!(span_sum.module().uses_direct_span_trusted_core_aggregate());
+            assert!(!span_sum.module().uses_complete_span_reduce_aggregate());
+            assert!(!span_sum.module().has_complete_span_reduce_source_for_test());
+        }
+    }
+}
+
+fn compile_ce964_style_prepared_aggregate(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> Result<crate::CompiledRegex, CompileError> {
+    let target = request.target;
+    let mode = request.mode;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let compiled = compile(request)?;
+    crate::append_prepared_aggregate_exports_to_compiled(
+        compiled,
+        exports,
+        target,
+        mode,
+        max_object_bytes,
+        SlowAotLimits::default(),
+    )
+}
+
+#[test]
+fn complete_span_reduce_source_allocation_failure_is_terminal() {
+    let failure = crate::module::complete_span_reduce_source_allocation::<()>(Err((
+        fre_exact_alloc::CopyError::AllocationFailed,
+        (),
+    )));
+    assert!(matches!(
+        failure,
+        Err(ObjectError::Allocation("complete Span reducer source")),
+    ));
+}
+
+#[test]
+fn complete_span_scan_excludes_context_mixed_and_exact_singleton_incumbents() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let context_request = || {
+            CompileRequest::new(r"(?-u:\b(?:foo|bar)\b)", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let context = compile_with_prepared_aggregate_exports(
+            context_request(),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("context Count incumbent");
+        let expected_context = compile_ce964_style_prepared_aggregate(
+            context_request(),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("ce964 context Count reconstruction");
+        assert_eq!(context.receipt().engine, EngineKind::OrderedContextDfa);
+        assert!(!context.module().uses_complete_span_reduce_aggregate());
+        assert_eq!(context.module(), expected_context.module());
+        assert_eq!(context.object(), expected_context.object());
+        assert_eq!(context.receipt(), expected_context.receipt());
+
+        let mixed_request = || {
+            CompileRequest::new("[ab]+z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let mixed_exports =
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM);
+        let mixed = compile_with_prepared_aggregate_exports(
+            mixed_request(),
+            mixed_exports,
+        )
+        .expect("mixed ce964 incumbent");
+        let expected_mixed = compile_ce964_style_prepared_aggregate(
+            mixed_request(),
+            mixed_exports,
+        )
+        .expect("ce964 mixed-export reconstruction");
+        assert!(mixed.module().uses_direct_span_trusted_core_aggregate());
+        assert!(!mixed.module().uses_complete_span_reduce_aggregate());
+        assert_eq!(mixed.module(), expected_mixed.module());
+        assert_eq!(mixed.object(), expected_mixed.object());
+        assert_eq!(mixed.receipt(), expected_mixed.receipt());
+
+        for exports in [
+            PreparedAggregateExports::GREP_COUNT,
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::GREP_COUNT),
+            PreparedAggregateExports::ALL,
+        ] {
+            let grep_or_mixed = compile_with_prepared_aggregate_exports(
+                CompileRequest::new("[ab]+z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                exports,
+            )
+            .expect("Grep or mixed-export incumbent");
+            let expected = compile_ce964_style_prepared_aggregate(
+                mixed_request(),
+                exports,
+            )
+            .expect("ce964 Grep/mixed reconstruction");
+            assert!(
+                !grep_or_mixed
+                    .module()
+                    .uses_complete_span_reduce_aggregate(),
+                "target={target:?} exports={exports:?}",
+            );
+            assert_eq!(grep_or_mixed.module(), expected.module());
+            assert_eq!(grep_or_mixed.object(), expected.object());
+            assert_eq!(grep_or_mixed.receipt(), expected.receipt());
+        }
+
+        for exports in [
+            PreparedAggregateExports::COUNT,
+            PreparedAggregateExports::SPAN_SUM,
+        ] {
+            let exact_request = || {
+                CompileRequest::new("abc", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+            };
+            let ordinary = compile(exact_request()).expect("exact-singleton ordinary source");
+            let serialized = ordinary.program().serialize().unwrap();
+            let expected = ordinary
+                .module()
+                .clone()
+                .without_complete_span_reduce_for_aggregate()
+                .expect("suppress generic exact-singleton recipe")
+                .append_prepared_aggregate_exports(
+                    exports,
+                    ordinary.program().artifact_identity(),
+                    &serialized,
+                )
+                .expect("append pre-feature exact-singleton incumbent");
+            let expected_object = emit_object(
+                &expected,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit pre-feature exact-singleton incumbent");
+            let exact = compile_with_prepared_aggregate_exports(
+                exact_request(),
+                exports,
+            )
+            .expect("exact-singleton incumbent");
+            let expected_compiled = compile_ce964_style_prepared_aggregate(
+                exact_request(),
+                exports,
+            )
+            .expect("ce964 exact-singleton reconstruction");
+            assert_eq!(exact.module(), &expected, "target={target:?} exports={exports:?}");
+            assert_eq!(exact.object(), expected_object, "target={target:?} exports={exports:?}");
+            assert_eq!(exact.module(), expected_compiled.module());
+            assert_eq!(exact.object(), expected_compiled.object());
+            assert_eq!(exact.receipt(), expected_compiled.receipt());
+            assert!(!exact.module().uses_complete_span_reduce_aggregate());
+            assert!(!exact.module().has_complete_span_reduce_source_for_test());
+        }
+
+        let asimd_target = target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd));
+        if let Ok(asimd_target) = asimd_target {
+            let exact = compile_with_prepared_aggregate_exports(
+                CompileRequest::new("abc", asimd_target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::COUNT,
+            )
+            .expect("eligible exact-singleton Count follow-on");
+            assert!(exact.module().direct_exact_singleton_count_aot_report().is_some());
+            assert!(!exact.module().uses_complete_span_reduce_aggregate());
+            assert!(!exact.module().has_complete_span_reduce_source_for_test());
+        }
+    }
+}
+
+#[test]
+fn complete_span_scan_authentication_rejects_public_entry_relocation_and_program_tamper() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let request = || {
+            CompileRequest::new("[ab]+z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let ordinary = crate::module::with_complete_span_reduce_recipe(|| {
+            compile(request())
+        })
+        .expect("complete Span tamper source");
+        assert!(ordinary.module().has_complete_span_reduce_source_for_test());
+        let serialized = ordinary.program().serialize().expect("tamper source program");
+        let identity = ordinary.program().artifact_identity();
+        let entry = ordinary
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == ordinary.module().entry_symbol())
+            .expect("tamper source entry");
+        let entry_start = usize::try_from(entry.offset).expect("tamper entry start");
+        let entry_end = entry_start
+            .checked_add(usize::try_from(entry.size).expect("tamper entry size"))
+            .expect("tamper entry end");
+
+        let mut text = ordinary.module().clone();
+        assert!(text.test_flip_text_byte(entry_end - 1));
+        assert!(matches!(
+            text.append_prepared_aggregate_exports(
+                PreparedAggregateExports::COUNT,
+                identity,
+                &serialized,
+            ),
+            Err(ObjectError::InvalidModule(_)),
+        ));
+
+        let mut relocation = ordinary.module().clone();
+        assert!(relocation.test_flip_text_relocation_addend_in_range(entry_start, entry_end));
+        assert!(matches!(
+            relocation.append_prepared_aggregate_exports(
+                PreparedAggregateExports::COUNT,
+                identity,
+                &serialized,
+            ),
+            Err(ObjectError::InvalidModule(_)),
+        ));
+
+        let mut program = ordinary.module().clone();
+        assert!(program.test_flip_program_byte(0));
+        assert!(matches!(
+            program.append_prepared_aggregate_exports(
+                PreparedAggregateExports::COUNT,
+                identity,
+                &serialized,
+            ),
+            Err(ObjectError::InvalidModule(_)),
+        ));
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
     reason = "the cross-target reducer audit keeps both ISAs, engine shapes, and local-call decoding in one matrix"
 )]
 fn direct_native_context_reducers_retain_ordinary_entry_cross_target() {
@@ -7136,6 +7506,8 @@ fn direct_native_aggregate_object_limit_has_exact_boundary() {
     let incumbent = ordinary
         .module()
         .clone()
+        .without_complete_span_reduce_for_aggregate()
+        .expect("remove optional complete Span reducer recipe")
         .without_direct_span_trusted_core_for_aggregate()
         .expect("remove optional direct Span core receipt")
         .append_prepared_aggregate_exports(
@@ -7195,6 +7567,125 @@ fn direct_native_aggregate_object_limit_has_exact_boundary() {
         panic!("double ObjectBytes decline changed error class");
     };
     assert_eq!(error, incumbent_error);
+}
+
+#[test]
+fn complete_span_reduce_object_limit_restores_each_exact_incumbent() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let exports = PreparedAggregateExports::COUNT;
+        {
+            let request = |max_object_bytes| {
+                CompileRequest::new("[ab]+z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+                    .limits(CompileLimitsV1 {
+                        max_object_bytes,
+                        ..CompileLimitsV1::default()
+                    })
+            };
+            let ordinary = compile(request(usize::MAX)).expect("complete reducer base");
+            let serialized = ordinary
+                .program()
+                .serialize()
+                .expect("serialize complete reducer base");
+            let identity = ordinary.program().artifact_identity();
+            let trusted_incumbent = ordinary
+                .module()
+                .clone()
+                .without_complete_span_reduce_for_aggregate()
+                .expect("suppress complete reducer recipe")
+                .append_prepared_aggregate_exports(exports, identity, &serialized)
+                .expect("append trusted-core incumbent");
+            let trusted_object = emit_object(
+                &trusted_incumbent,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit trusted-core incumbent");
+            assert!(trusted_incumbent.uses_direct_span_trusted_core_aggregate());
+            assert!(!trusted_incumbent.uses_complete_span_reduce_aggregate());
+
+            let direct_incumbent = ordinary
+                .module()
+                .clone()
+                .without_complete_span_reduce_for_aggregate()
+                .expect("suppress complete reducer for DirectOrdinary")
+                .without_direct_span_trusted_core_for_aggregate()
+                .expect("suppress trusted core for DirectOrdinary")
+                .append_prepared_aggregate_exports(exports, identity, &serialized)
+                .expect("append DirectOrdinary incumbent");
+            let direct_object = emit_object(
+                &direct_incumbent,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit DirectOrdinary incumbent");
+            assert!(!direct_incumbent.uses_direct_span_trusted_core_aggregate());
+            assert!(!direct_incumbent.uses_complete_span_reduce_aggregate());
+
+            let selected = compile_with_prepared_aggregate_exports(
+                request(usize::MAX),
+                exports,
+            )
+            .expect("selected complete reducer");
+            assert!(selected.module().uses_complete_span_reduce_aggregate());
+            assert!(
+                direct_object.len() <= trusted_object.len(),
+                "DirectOrdinary object ({}) was larger than trusted-core object ({}) for {target:?} {exports:?}",
+                direct_object.len(),
+                trusted_object.len(),
+            );
+            assert!(
+                trusted_object.len() < selected.object().len(),
+                "trusted-core object ({}) was not smaller than complete-reducer object ({}) for {target:?} {exports:?}",
+                trusted_object.len(),
+                selected.object().len(),
+            );
+
+            let exact = compile_with_prepared_aggregate_exports(
+                request(selected.object().len()),
+                exports,
+            )
+            .expect("exact complete reducer object boundary");
+            assert_eq!(exact.object(), selected.object());
+            assert_eq!(exact.module(), selected.module());
+
+            let trusted = compile_with_prepared_aggregate_exports(
+                request(selected.object().len() - 1),
+                exports,
+            )
+            .expect("complete reducer decline restores trusted core");
+            assert_eq!(trusted.object(), trusted_object);
+            assert_eq!(trusted.module(), &trusted_incumbent);
+
+            if direct_object.len() < trusted_object.len() {
+                let direct = compile_with_prepared_aggregate_exports(
+                    request(trusted_object.len() - 1),
+                    exports,
+                )
+                .expect("trusted-core decline restores DirectOrdinary");
+                assert_eq!(direct.object(), direct_object);
+                assert_eq!(direct.module(), &direct_incumbent);
+            }
+
+            let direct_one_below = direct_object.len() - 1;
+            let expected = emit_object(
+                &direct_incumbent,
+                crate::ObjectFormat::for_target(target),
+                direct_one_below,
+            )
+            .expect_err("DirectOrdinary one-below must remain terminal");
+            let actual = compile_with_prepared_aggregate_exports(
+                request(direct_one_below),
+                exports,
+            )
+            .expect_err("complete reducer final incumbent cap remains terminal");
+            let CompileError::Object(actual) = actual else {
+                panic!("complete reducer final decline changed error class");
+            };
+            assert_eq!(actual, expected);
+        }
+    }
 }
 
 #[cfg(all(
@@ -8765,4 +9256,219 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         String::from_utf8_lossy(&output.stderr),
     );
     fs::remove_dir_all(&directory).expect("remove native aggregate linker directory");
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links the exact Count-only complete reducer to the real runtime"]
+fn linked_host_complete_span_count_matches_regex_find_iter() {
+    use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+    let target = if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        }
+    } else if cfg!(target_os = "linux") {
+        Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
+    } else {
+        Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
+    };
+    let fixtures = [
+        (
+            "[ab]+z",
+            vec![
+                Vec::new(),
+                b"zz".to_vec(),
+                b"zzabzyaaz".to_vec(),
+                b"abzXbbzYa".to_vec(),
+            ],
+        ),
+        (
+            "(?:|a)",
+            vec![Vec::new(), b"a".to_vec(), b"ba".to_vec(), b"aaa".to_vec()],
+        ),
+        (
+            "a*",
+            vec![
+                Vec::new(),
+                b"b".to_vec(),
+                b"aa".to_vec(),
+                b"baab".to_vec(),
+            ],
+        ),
+        (
+            r"(?-u:\xFF+|a)",
+            vec![
+                vec![0xff],
+                vec![b'a', 0xff, 0xff, b'b', 0x80, b'a'],
+                vec![0x80, 0xfe],
+            ],
+        ),
+    ];
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+    let compiler = if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    };
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-complete-span-reduce-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create complete-reducer linker directory");
+
+    let export_index = 0;
+    let export = PreparedAggregateExports::COUNT;
+    {
+        let mut source = String::from(
+            "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n\
+             typedef void *handle_t;\n\
+             typedef struct {uint32_t size;uint32_t version;uint64_t operations;uint64_t start_work;uint64_t grep_bytes;uint64_t reserved[4];} prepare_v2_t;\n\
+             extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v2(const unsigned char*,size_t,const prepare_v2_t*,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n",
+        );
+        let mut objects = Vec::new();
+        let mut case_functions = Vec::new();
+        for (fixture_index, (pattern, haystacks)) in fixtures.iter().enumerate() {
+            let artifact = compile_with_prepared_aggregate_exports(
+                CompileRequest::new(*pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                export,
+            )
+            .expect("compile exact complete Span reducer fixture");
+            assert_eq!(artifact.receipt().engine, EngineKind::OrderedDfa, "{pattern:?}");
+            assert!(
+                artifact.module().uses_complete_span_reduce_aggregate(),
+                "fixture {pattern:?}/{export:?} did not select CompleteSpanReduce",
+            );
+            assert_eq!(artifact.receipt().required_prepare_capabilities, 0);
+            assert!(artifact.module().required_runtime_symbols().next().is_none());
+            let (program_symbol, program_len) = artifact
+                .module()
+                .required_runtime_program()
+                .expect("complete reducer preparation program");
+            let reducer_symbol = artifact
+                .module()
+                .prepared_count_symbol()
+                .expect("complete reducer Count symbol");
+            writeln!(source, "extern const unsigned char {program_symbol}[];")
+                .expect("declare complete reducer program");
+            writeln!(
+                source,
+                "extern uint32_t {reducer_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);"
+            )
+            .expect("declare complete reducer export");
+            let oracle = Regex::new(pattern).expect("complete reducer bytes oracle");
+            for (case_index, haystack) in haystacks.iter().enumerate() {
+                let spans = oracle
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect::<Vec<_>>();
+                let expected =
+                    u64::try_from(spans.len()).expect("complete reducer Count oracle");
+                let initializer = if haystack.is_empty() {
+                    String::from("0")
+                } else {
+                    haystack
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                writeln!(
+                    source,
+                    "static const unsigned char h{fixture_index}_{case_index}[]={{{initializer}}};"
+                )
+                .expect("write complete reducer haystack");
+                let function = format!("run{fixture_index}_{case_index}");
+                writeln!(
+                    source,
+                    concat!(
+                        "static int {function}(void){{",
+                        "const prepare_v2_t v2={{64U,2U,UINT64_C(15),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}}}};",
+                        "handle_t h=0;uint64_t out=UINT64_C(0x1122334455667788);uint32_t q;",
+                        "if(fre_aot_regex_runtime_prepare_exclusive_v2({program_symbol},{program_len}U,&v2,&h)!=0U)return 1;",
+                        "q={reducer_symbol}(h,h{fixture_index}_{case_index},{length}U,&out);",
+                        "if(q!=0U||out!=UINT64_C({expected}))return 2;",
+                        "out=UINT64_C(0x1122334455667788);",
+                        "q={reducer_symbol}(h,h{fixture_index}_{case_index},(size_t)-1,&out);",
+                        "if(q!=2U||out!=UINT64_C(0x1122334455667788))return 3;",
+                        "if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 4;return 0;}}"
+                    ),
+                    function = function,
+                    program_symbol = program_symbol,
+                    program_len = program_len,
+                    reducer_symbol = reducer_symbol,
+                    fixture_index = fixture_index,
+                    case_index = case_index,
+                    length = haystack.len(),
+                    expected = expected,
+                )
+                .expect("write complete reducer differential case");
+                case_functions.push(function);
+            }
+            let object = directory.join(format!(
+                "complete-{export_index}-{fixture_index}.o"
+            ));
+            fs::write(&object, artifact.object()).expect("write complete reducer object");
+            objects.push(object);
+        }
+        source.push_str("int main(void){int status;\n");
+        for function in &case_functions {
+            writeln!(
+                source,
+                "status={function}();if(status){{fprintf(stderr,\"{function}: status=%d\\n\",status);return 1;}}"
+            )
+            .expect("invoke complete reducer case");
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join(format!("complete-{export_index}.c"));
+        let executable = directory.join(format!("complete-{export_index}"));
+        fs::write(&c_path, source).expect("write complete reducer C harness");
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link complete reducer real-runtime harness");
+        assert!(status.success(), "complete reducer harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute complete reducer harness");
+        assert!(
+            output.status.success(),
+            "complete reducer export={export:?} status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    fs::remove_dir_all(&directory).expect("remove complete-reducer linker directory");
 }

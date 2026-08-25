@@ -14,6 +14,7 @@
 use core::fmt::Write as _;
 
 use fre_automata::K0CompilerPrefillLimits;
+use fre_exact_alloc::{CopyError, try_box_preserve};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -1157,6 +1158,219 @@ struct NativeDirectSearchTrustedCore {
     prologue: NativeDirectSearchTrustedCorePrologue,
 }
 
+/// Exact selected-layout receipt from which an aggregate-only complete Span
+/// scan may be regenerated. The public entry and the exact program-symbol
+/// extent are authenticated independently before this recipe is consumed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCompleteSpanReduceSource {
+    layout: NativeDfaLayout,
+    aarch64_sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    aarch64_sve_suffix_kind: Option<Aarch64SveFilterKind>,
+    program_bytes: usize,
+    program_sha256: [u8; 32],
+}
+
+const COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE: &str =
+    "complete Span reducer source";
+
+std::thread_local! {
+    static COMPLETE_SPAN_REDUCE_RECIPE_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct CompleteSpanReduceRecipeScope {
+    previous: bool,
+}
+
+impl Drop for CompleteSpanReduceRecipeScope {
+    fn drop(&mut self) {
+        COMPLETE_SPAN_REDUCE_RECIPE_ENABLED.with(|enabled| {
+            enabled.set(self.previous);
+        });
+    }
+}
+
+/// Enable the private regeneration recipe for one exact Count compile and
+/// append transaction. The scope is thread-local and restores nested state on
+/// normal return or unwind, so unrelated compiler calls retain the ce964
+/// lowering and allocation behavior.
+#[cfg(test)]
+pub(crate) fn with_complete_span_reduce_recipe<T>(run: impl FnOnce() -> T) -> T {
+    with_complete_span_reduce_recipe_policy(true, run)
+}
+
+#[cfg(test)]
+pub(crate) fn without_complete_span_reduce_recipe<T>(
+    run: impl FnOnce() -> T,
+) -> T {
+    with_complete_span_reduce_recipe_policy(false, run)
+}
+
+#[cfg(test)]
+fn with_complete_span_reduce_recipe_policy<T>(
+    requested: bool,
+    run: impl FnOnce() -> T,
+) -> T {
+    let scope = complete_span_reduce_recipe_scope(requested);
+    let result = run();
+    drop(scope);
+    result
+}
+
+pub(crate) fn complete_span_reduce_recipe_scope(
+    requested: bool,
+) -> CompleteSpanReduceRecipeScope {
+    let previous = COMPLETE_SPAN_REDUCE_RECIPE_ENABLED.with(|enabled| {
+        enabled.replace(requested)
+    });
+    CompleteSpanReduceRecipeScope { previous }
+}
+
+fn complete_span_reduce_recipe_enabled() -> bool {
+    COMPLETE_SPAN_REDUCE_RECIPE_ENABLED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct CompleteSpanReduceSourceAllocationInjection;
+
+#[cfg(test)]
+impl CompleteSpanReduceSourceAllocationInjection {
+    fn arm() -> Self {
+        COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.replace(1),
+                0,
+                "complete Span reducer allocation injection was already armed",
+            );
+        });
+        Self
+    }
+
+    fn assert_failed_once(&self) {
+        COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.get(),
+                2,
+                "complete Span reducer allocation injection was not consumed exactly once",
+            );
+        });
+    }
+
+    fn assert_not_attempted(&self) {
+        COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.get(),
+                1,
+                "complete Span reducer allocation injection was unexpectedly consumed",
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for CompleteSpanReduceSourceAllocationInjection {
+    fn drop(&mut self) {
+        COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| state.set(0));
+    }
+}
+
+#[cfg(test)]
+fn with_complete_span_reduce_source_allocation_failure<T>(
+    run: impl FnOnce() -> T,
+) -> T {
+    let injection = CompleteSpanReduceSourceAllocationInjection::arm();
+    let result = run();
+    injection.assert_failed_once();
+    result
+}
+
+#[cfg(test)]
+fn without_complete_span_reduce_source_allocation_attempt<T>(
+    run: impl FnOnce() -> T,
+) -> T {
+    let injection = CompleteSpanReduceSourceAllocationInjection::arm();
+    let result = run();
+    injection.assert_not_attempted();
+    result
+}
+
+pub(crate) fn complete_span_reduce_source_allocation<T>(
+    allocation: Result<Box<T>, (CopyError, T)>,
+) -> Result<Box<T>, ObjectError> {
+    allocation.map_err(|_| {
+        ObjectError::Allocation(COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE)
+    })
+}
+
+fn is_complete_span_reduce_source_allocation(error: &ObjectError) -> bool {
+    matches!(
+        error,
+        ObjectError::Allocation(site)
+            if *site == COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+    )
+}
+
+fn allocate_complete_span_reduce_source(
+    source: NativeCompleteSpanReduceSource,
+) -> Result<Box<NativeCompleteSpanReduceSource>, ObjectError> {
+    #[cfg(test)]
+    {
+        let inject = COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| {
+            match state.get() {
+                0 => false,
+                1 => {
+                    state.set(2);
+                    true
+                }
+                2 => panic!(
+                    "complete Span reducer source allocation was retried after failure"
+                ),
+                _ => unreachable!("invalid complete Span reducer allocation injection state"),
+            }
+        });
+        if inject {
+            return complete_span_reduce_source_allocation(Err((
+                CopyError::AllocationFailed,
+                source,
+            )));
+        }
+    }
+    complete_span_reduce_source_allocation(try_box_preserve(source))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCompleteSpanReduceCore {
+    code_offset: usize,
+    code_size: usize,
+    code_sha256: [u8; 32],
+    public_entry_sha256: [u8; 32],
+    program_bytes: usize,
+    program_sha256: [u8; 32],
+    entry_contract: NativeCompleteSpanReduceEntryContract,
+    result_abi: NativeCompleteSpanReduceResultAbi,
+}
+
+struct NativeCompleteSpanReducePending {
+    emission: NativeDfaEmission,
+    core: NativeCompleteSpanReduceCore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCompleteSpanReduceEntryContract {
+    AuthenticatedCompleteSpanV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCompleteSpanReduceResultAbi {
+    CountAndSpanSumU64V1,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeDirectSearchEntryContract {
     PublicCompleteV1,
@@ -1449,21 +1663,29 @@ enum NativeDfaEntryContract {
     /// Variable-width Span completion may therefore return that start without
     /// a reverse-K0 postflight. Hole exits retain the ordinary resume ABI.
     PreparedPartialPropagatedStartCore,
+    /// Compiler-private complete Span scan used only after one additive
+    /// aggregate wrapper authenticates the public artifact identity. It
+    /// returns both Count and SpanSum in a private two-word result and never
+    /// publishes a partial match.
+    CompleteSpanReduceCoreV1,
 }
 
 impl NativeDfaEntryContract {
     const fn validates_public_args(self) -> bool {
-        !matches!(
-            self,
-            Self::PreparedPartialCore | Self::PreparedPartialPropagatedStartCore
-        )
+        matches!(self, Self::Public | Self::ExactAbsoluteAnchored { .. })
     }
 
     const fn register_outcome(self) -> bool {
         matches!(
             self,
-            Self::PreparedPartialCore | Self::PreparedPartialPropagatedStartCore
+            Self::PreparedPartialCore
+                | Self::PreparedPartialPropagatedStartCore
+                | Self::CompleteSpanReduceCoreV1
         )
+    }
+
+    const fn complete_span_reduce(self) -> bool {
+        matches!(self, Self::CompleteSpanReduceCoreV1)
     }
 
     const fn propagates_partial_span_window_start(self) -> bool {
@@ -1479,7 +1701,8 @@ impl NativeDfaEntryContract {
             Self::ExactAbsoluteAnchored { bounds, width } => Some((bounds, width)),
             Self::Public
             | Self::PreparedPartialCore
-            | Self::PreparedPartialPropagatedStartCore => None,
+            | Self::PreparedPartialPropagatedStartCore
+            | Self::CompleteSpanReduceCoreV1 => None,
         }
     }
 }
@@ -1537,6 +1760,245 @@ enum Aarch64MixedVectorPreference {
     )]
     PreferAsimd,
     PreferSve,
+}
+
+impl CompiledModule {
+    /// Authenticate the exact public complete-Span DFA and its table extent,
+    /// then lower an aggregate-only copy of that selected layout. This is an
+    /// additive compiler transaction: absence is an ordinary route decline,
+    /// while a present but inconsistent receipt is always terminal.
+    fn prepare_complete_span_reduce_core(
+        &self,
+        trusted_core: NativeDirectSearchTrustedCore,
+    ) -> Result<Option<NativeCompleteSpanReducePending>, ObjectError> {
+        if self.native_complete_span_reduce_core.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer source was already consumed",
+            ));
+        }
+        let Some(source) = self.native_complete_span_reduce_source.as_deref() else {
+            return Ok(None);
+        };
+        if source.layout.output != OutputContract::Span || source.layout.partial.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer source has an incompatible layout",
+            ));
+        }
+        match self.target.architecture {
+            Architecture::X86_64
+                if source.aarch64_sve_filter_plan.is_some()
+                    || source.aarch64_sve_suffix_kind.is_some() =>
+            {
+                return Err(ObjectError::InvalidModule(
+                    "x86 complete Span reducer source retained an AArch64 plan",
+                ));
+            }
+            Architecture::X86_64 | Architecture::Aarch64 => {}
+        }
+
+        let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("complete Span reducer entry index is invalid"),
+        )?;
+        let entry_start = usize::try_from(entry.offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("complete Span reducer entry offset"))?;
+        let entry_size = usize::try_from(entry.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("complete Span reducer entry size"))?;
+        let entry_end = entry_start
+            .checked_add(entry_size)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "complete Span reducer entry extent",
+            ))?;
+        let text = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "complete Span reducer module has no text section",
+            ))?
+            .data
+            .as_ref();
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text.len()
+        {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer entry is not a complete text function",
+            ));
+        }
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            text,
+            entry_start,
+            entry_end,
+            trusted_core,
+            OutputContract::Span,
+        )?;
+
+        let program = self.symbols.get(PROGRAM_SYMBOL).ok_or(
+            ObjectError::InvalidModule("complete Span reducer program symbol is absent"),
+        )?;
+        let program_offset = usize::try_from(program.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("complete Span reducer program offset")
+        })?;
+        let program_size = usize::try_from(program.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("complete Span reducer program size"))?;
+        let program_data = self
+            .sections
+            .get(PROGRAM_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "complete Span reducer module has no program section",
+            ))?
+            .data
+            .as_ref();
+        let program_end = program_offset.checked_add(program_size).ok_or(
+            ObjectError::ArithmeticOverflow("complete Span reducer program extent"),
+        )?;
+        if program.binding != SymbolBinding::Local
+            || program.kind != SymbolKind::Object
+            || program.section != Some(PROGRAM_SECTION)
+            || program_offset != 0
+            || program_size != source.program_bytes
+            || program_end != program_data.len()
+            || Sha256::digest(
+                program_data
+                    .get(program_offset..program_end)
+                    .ok_or(ObjectError::InvalidModule(
+                        "complete Span reducer program extent is outside data",
+                    ))?,
+            )
+            .as_slice()
+                != source.program_sha256
+        {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer program identity is inconsistent",
+            ));
+        }
+
+        let regenerated = match self.target.architecture {
+            Architecture::X86_64 => {
+                lower_x86_64_dfa_with_emission(source.layout, self.target.features)?
+            }
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                source.layout,
+                self.target.features,
+                self.target.operating_system,
+                source.aarch64_sve_filter_plan,
+                source.aarch64_sve_suffix_kind,
+                NativeDfaEntryContract::Public,
+            )?,
+        };
+        let regenerated_core = regenerated.direct_search_trusted_core.ok_or(
+            ObjectError::InvalidModule(
+                "regenerated public Span DFA omitted its trusted-core receipt",
+            ),
+        )?;
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &regenerated.code,
+            0,
+            regenerated.code.len(),
+            regenerated_core,
+            OutputContract::Span,
+        )?;
+        if regenerated.code.as_slice() != &text[entry_start..entry_end]
+            || regenerated_core.code_offset.checked_add(entry_start)
+                != Some(trusted_core.code_offset)
+            || regenerated_core.output != trusted_core.output
+            || regenerated_core.entry_contract != trusted_core.entry_contract
+            || regenerated_core.result_abi != trusted_core.result_abi
+            || regenerated_core.entry_code_sha256 != trusted_core.entry_code_sha256
+            || regenerated_core.prologue != trusted_core.prologue
+        {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer public entry regeneration disagrees",
+            ));
+        }
+        let entry_start_u64 = u64::try_from(entry_start).map_err(|_| {
+            ObjectError::ArithmeticOverflow("complete Span reducer relocation base")
+        })?;
+        let entry_end_u64 = u64::try_from(entry_end).map_err(|_| {
+            ObjectError::ArithmeticOverflow("complete Span reducer relocation extent")
+        })?;
+        let mut actual_relocations = self.relocations.iter().filter(|relocation| {
+            relocation.section == TEXT_SECTION
+                && (entry_start_u64..entry_end_u64).contains(&relocation.offset)
+        });
+        for expected in &regenerated.relocations {
+            if expected.section != TEXT_SECTION || expected.symbol != PROGRAM_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "regenerated public Span DFA has an unexpected relocation",
+                ));
+            }
+            let actual = actual_relocations.next().ok_or(ObjectError::InvalidModule(
+                "complete Span reducer public entry lost a relocation",
+            ))?;
+            if actual.section != expected.section
+                || actual.offset != expected.offset.checked_add(entry_start_u64).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "complete Span reducer relocation offset",
+                    ),
+                )?
+                || actual.kind != expected.kind
+                || actual.symbol != expected.symbol
+                || actual.addend != expected.addend
+            {
+                return Err(ObjectError::InvalidModule(
+                    "complete Span reducer public relocation regeneration disagrees",
+                ));
+            }
+        }
+        if actual_relocations.next().is_some() {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer public entry has an extra relocation",
+            ));
+        }
+
+        let emission = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                source.layout,
+                self.target.features,
+                NativeDfaEntryContract::CompleteSpanReduceCoreV1,
+            )?,
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                source.layout,
+                self.target.features,
+                self.target.operating_system,
+                source.aarch64_sve_filter_plan,
+                source.aarch64_sve_suffix_kind,
+                NativeDfaEntryContract::CompleteSpanReduceCoreV1,
+            )?,
+        };
+        if emission.code.is_empty()
+            || emission.direct_search_trusted_core.is_some()
+            || emission
+                .relocations
+                .iter()
+                .any(|relocation| {
+                    relocation.section != TEXT_SECTION || relocation.symbol != PROGRAM_SYMBOL
+                })
+        {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer private emission is inconsistent",
+            ));
+        }
+        let code_size = emission.code.len();
+        let code_sha256 = Sha256::digest(&emission.code).into();
+        Ok(Some(NativeCompleteSpanReducePending {
+            emission,
+            core: NativeCompleteSpanReduceCore {
+                code_offset: 0,
+                code_size,
+                code_sha256,
+                public_entry_sha256: trusted_core.entry_code_sha256,
+                program_bytes: source.program_bytes,
+                program_sha256: source.program_sha256,
+                entry_contract:
+                    NativeCompleteSpanReduceEntryContract::AuthenticatedCompleteSpanV1,
+                result_abi: NativeCompleteSpanReduceResultAbi::CountAndSpanSumU64V1,
+            },
+        }))
+    }
 }
 
 /// Explicit Linux policy for a target that reports both fixed-width ASIMD and
@@ -1859,6 +2321,8 @@ pub struct CompiledModule {
     prepared_exists_batch_symbol_index: Option<usize>,
     direct_exists_batch_symbol_index: Option<usize>,
     native_direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
+    native_complete_span_reduce_source: Option<Box<NativeCompleteSpanReduceSource>>,
+    native_complete_span_reduce_core: Option<NativeCompleteSpanReduceCore>,
     prepared_count_symbol_index: Option<usize>,
     prepared_span_sum_symbol_index: Option<usize>,
     prepared_grep_count_symbol_index: Option<usize>,
@@ -2192,6 +2656,7 @@ struct NativeLowering {
     /// portfolio and never enters frozen data.
     exact_pair_suffix_lowered: bool,
     direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
+    complete_span_reduce_source: Option<Box<NativeCompleteSpanReduceSource>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5188,7 +5653,10 @@ impl CompiledModule {
     ) -> Result<Self, ObjectError> {
         let prelowered = if native_materialized_fallback {
             native
-                .map(|view| lower_native_dfa(view, target).unwrap_or(None))
+                .map(|view| {
+                    materialized_native_fallback_outcome(lower_native_dfa(view, target))
+                })
+                .transpose()?
                 .flatten()
         } else {
             None
@@ -6618,6 +7086,8 @@ impl CompiledModule {
             prepared_exists_batch_symbol_index,
             direct_exists_batch_symbol_index: None,
             native_direct_search_trusted_core: lowering.direct_search_trusted_core,
+            native_complete_span_reduce_source: lowering.complete_span_reduce_source,
+            native_complete_span_reduce_core: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -7125,8 +7595,56 @@ impl CompiledModule {
                     && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
                     && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
             })
+            && self.native_complete_span_reduce_core.is_none()
             && self.prepared_entry_symbol_index.is_none()
             && self.required_runtime_symbols().next().is_none()
+    }
+
+    /// Whether one exact Count or SpanSum export calls a single authenticated
+    /// complete-Span reduction core rather than iterating the public Span ABI.
+    pub(crate) fn uses_complete_span_reduce_aggregate(&self) -> bool {
+        let Some(core) = self.native_direct_search_trusted_core else {
+            return false;
+        };
+        let Some(reduce) = self.native_complete_span_reduce_core else {
+            return false;
+        };
+        let code_end = reduce.code_offset.checked_add(reduce.code_size);
+        self.prepared_aggregate_strategy == Some(PreparedAggregateStrategy::NativeFused)
+            && (self.prepared_aggregate_exports == PreparedAggregateExports::COUNT
+                || self.prepared_aggregate_exports == PreparedAggregateExports::SPAN_SUM)
+            && core.output == OutputContract::Span
+            && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+            && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
+            && reduce.entry_contract
+                == NativeCompleteSpanReduceEntryContract::AuthenticatedCompleteSpanV1
+            && reduce.result_abi == NativeCompleteSpanReduceResultAbi::CountAndSpanSumU64V1
+            && reduce.public_entry_sha256 == core.entry_code_sha256
+            && reduce.program_bytes != 0
+            && self.native_complete_span_reduce_source.is_none()
+            && reduce.code_size != 0
+            && code_end.is_some_and(|end| {
+                self.sections
+                    .get(TEXT_SECTION)
+                    .and_then(|section| section.data.get(reduce.code_offset..end))
+                    .is_some_and(|code| {
+                        <[u8; 32]>::from(Sha256::digest(code)) == reduce.code_sha256
+                    })
+            })
+            && self.prepared_entry_symbol_index.is_none()
+            && self.required_runtime_symbols().next().is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn has_complete_span_reduce_source_for_test(&self) -> bool {
+        self.native_complete_span_reduce_source.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_span_reduce_core_offset(&self) -> Option<usize> {
+        let reduce = self.native_complete_span_reduce_core?;
+        self.uses_complete_span_reduce_aggregate()
+            .then_some(reduce.code_offset)
     }
 
     pub(crate) fn direct_span_trusted_core_entry_sha256(&self) -> Option<[u8; 32]> {
@@ -7169,6 +7687,46 @@ impl CompiledModule {
         }
     }
 
+    /// Suppress only the optional complete-reduction recipe on a freshly
+    /// reconstructed ordinary module. The public trusted Span core remains
+    /// available, yielding the exact ce964 aggregate incumbent.
+    pub(crate) fn without_complete_span_reduce_for_aggregate(
+        mut self,
+    ) -> Result<Self, ObjectError> {
+        let Some(core) = self.native_direct_search_trusted_core else {
+            return if self.native_complete_span_reduce_source.is_none()
+                && self.native_complete_span_reduce_core.is_none()
+            {
+                Ok(self)
+            } else {
+                Err(ObjectError::InvalidModule(
+                    "complete Span reducer fallback lost its trusted-core receipt",
+                ))
+            };
+        };
+        match (
+            self.native_complete_span_reduce_source.as_deref(),
+            self.native_complete_span_reduce_core,
+        ) {
+            (Some(source), None)
+                if core.output == OutputContract::Span
+                    && core.entry_contract
+                        == NativeDirectSearchEntryContract::PublicCompleteV1
+                    && core.result_abi
+                        == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
+                    && source.layout.output == OutputContract::Span
+                    && source.layout.partial.is_none() =>
+            {
+                self.native_complete_span_reduce_source = None;
+                Ok(self)
+            }
+            (None, None) => Ok(self),
+            _ => Err(ObjectError::InvalidModule(
+                "complete Span reducer fallback has an inconsistent receipt",
+            )),
+        }
+    }
+
     /// Return the authenticated direct Count-v3 selection, when the explicit
     /// Count aggregate portfolio chose it over the complete incumbent.
     #[must_use]
@@ -7190,6 +7748,15 @@ impl CompiledModule {
     #[cfg(test)]
     pub(crate) fn test_flip_text_byte(&mut self, offset: usize) -> bool {
         let Some(byte) = self.sections[TEXT_SECTION].data.get_mut(offset) else {
+            return false;
+        };
+        *byte ^= 1;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_flip_program_byte(&mut self, offset: usize) -> bool {
+        let Some(byte) = self.sections[PROGRAM_SECTION].data.get_mut(offset) else {
             return false;
         };
         *byte ^= 1;
@@ -8314,12 +8881,87 @@ impl CompiledModule {
         } else {
             None
         };
+        let complete_span_reduce_requested =
+            exports == PreparedAggregateExports::COUNT;
+        let mut complete_span_reduce_pending = if complete_span_reduce_requested {
+            direct_span_trusted_core
+                .map(|core| self.prepare_complete_span_reduce_core(core))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let complete_span_reduce_selection = if let (
+            Some(ordinary_target),
+            Some(pending),
+        ) = (direct_search_target, complete_span_reduce_pending.as_mut()) {
+            let alignment_mask = match self.target.architecture {
+                Architecture::X86_64 => 15,
+                Architecture::Aarch64 => 3,
+            };
+            let core_offset = self.sections[TEXT_SECTION]
+                .data
+                .len()
+                .checked_add(alignment_mask)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "complete Span reducer core alignment",
+                ))?
+                & !alignment_mask;
+            let core_end = core_offset.checked_add(pending.emission.code.len()).ok_or(
+                ObjectError::ArithmeticOverflow("complete Span reducer core extent"),
+            )?;
+            pending.core.code_offset = core_offset;
+            let count_wrapper = (exports == PreparedAggregateExports::COUNT)
+                .then(|| match self.target.architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_complete_span_reduce_export(PreparedSpanSink::Count)
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_complete_span_reduce_export(PreparedSpanSink::Count)
+                    }
+                })
+                .transpose()?;
+            let span_sum_wrapper = (exports == PreparedAggregateExports::SPAN_SUM)
+                .then(|| match self.target.architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_complete_span_reduce_export(PreparedSpanSink::SpanSum)
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_complete_span_reduce_export(PreparedSpanSink::SpanSum)
+                    }
+                })
+                .transpose()?;
+            let target = NativeSpanReducerTarget::DirectOrdinary(core_offset);
+            if native_aggregate_wrappers_fit(
+                self.target.architecture,
+                core_end,
+                target.offset(),
+                &[&count_wrapper, &span_sum_wrapper],
+            )? {
+                Some((
+                    Some(target),
+                    count_wrapper,
+                    span_sum_wrapper,
+                    None,
+                ))
+            } else {
+                // A local-call range decline restores the exact ce964 target
+                // and wrappers; no candidate bytes have been appended yet.
+                complete_span_reduce_pending = None;
+                let _ = ordinary_target;
+                None
+            }
+        } else {
+            None
+        };
         let (
             direct_search_target,
             direct_count_wrapper,
             direct_span_sum_wrapper,
             direct_grep_count_wrapper,
-        ) =
+        ) = if let Some(selection) = complete_span_reduce_selection {
+            selection
+        } else {
             if let Some(target) = direct_search_target {
                 let direct_span_call_kind = direct_span_trusted_core.map_or(
                     NativeSpanReducerCallKind::DirectOrdinary,
@@ -8393,7 +9035,8 @@ impl CompiledModule {
                 }
             } else {
                 (None, None, None, None)
-            };
+            }
+        };
         if prepared_search_target.is_some() && direct_search_target.is_some() {
             return Err(ObjectError::InvalidModule(
                 "prepared aggregate selected overlapping native search targets",
@@ -8738,6 +9381,17 @@ impl CompiledModule {
             Architecture::Aarch64 => 3,
         };
         let mut final_text_len = text.len();
+        if let Some(pending) = complete_span_reduce_pending.as_ref() {
+            final_text_len = align(
+                final_text_len,
+                code_alignment_mask,
+                "complete Span reducer core alignment",
+            )?
+            .checked_add(pending.emission.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "complete Span reducer core extent",
+            ))?;
+        }
         let entry_code_sizes = [
             exports
                 .contains(PreparedAggregateExports::COUNT)
@@ -8805,6 +9459,13 @@ impl CompiledModule {
                     .checked_mul(native_relocations_per_export)
                     .and_then(|native| runtime.checked_add(native))
             })
+            .and_then(|count| {
+                count.checked_add(
+                    complete_span_reduce_pending
+                        .as_ref()
+                        .map_or(0, |pending| pending.emission.relocations.len()),
+                )
+            })
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate relocation count",
             ))?;
@@ -8869,6 +9530,74 @@ impl CompiledModule {
             offset: offset_u64(identity_offset, "prepared aggregate identity offset")?,
             size: 32,
         });
+
+        if let Some(pending) = complete_span_reduce_pending.take() {
+            let core_offset = align(
+                text.len(),
+                code_alignment_mask,
+                "complete Span reducer core append alignment",
+            )?;
+            let pending_code_sha256: [u8; 32] = Sha256::digest(&pending.emission.code).into();
+            if core_offset != pending.core.code_offset
+                || pending.core.code_size != pending.emission.code.len()
+                || pending.core.code_sha256 != pending_code_sha256
+                || pending.core.entry_contract
+                    != NativeCompleteSpanReduceEntryContract::AuthenticatedCompleteSpanV1
+                || pending.core.result_abi
+                    != NativeCompleteSpanReduceResultAbi::CountAndSpanSumU64V1
+            {
+                return Err(ObjectError::InvalidModule(
+                    "complete Span reducer pending receipt is inconsistent",
+                ));
+            }
+            match architecture {
+                Architecture::X86_64 => text.resize(core_offset, 0x90),
+                Architecture::Aarch64 => {
+                    while text.len() < core_offset {
+                        push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                    }
+                }
+            }
+            push_bytes(&mut text, &pending.emission.code)?;
+            let relocation_base = offset_u64(
+                core_offset,
+                "complete Span reducer relocation base",
+            )?;
+            for mut relocation in pending.emission.relocations {
+                if relocation.section != TEXT_SECTION || relocation.symbol != PROGRAM_SYMBOL {
+                    return Err(ObjectError::InvalidModule(
+                        "complete Span reducer core has an unexpected relocation",
+                    ));
+                }
+                relocation.offset = relocation.offset.checked_add(relocation_base).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "complete Span reducer relocation offset",
+                    ),
+                )?;
+                relocations.push(relocation);
+            }
+            let trusted_core = self.native_direct_search_trusted_core.ok_or(
+                ObjectError::InvalidModule(
+                    "complete Span reducer append lost its source receipt",
+                ),
+            )?;
+            let source = self.native_complete_span_reduce_source.as_deref().ok_or(
+                ObjectError::InvalidModule(
+                    "complete Span reducer append lost its layout recipe",
+                ),
+            )?;
+            if self.native_complete_span_reduce_core.is_some()
+                || source.program_bytes != pending.core.program_bytes
+                || source.program_sha256 != pending.core.program_sha256
+                || trusted_core.entry_code_sha256 != pending.core.public_entry_sha256
+            {
+                return Err(ObjectError::InvalidModule(
+                    "complete Span reducer append source identity changed",
+                ));
+            }
+            self.native_complete_span_reduce_source = None;
+            self.native_complete_span_reduce_core = Some(pending.core);
+        }
 
         let append_runtime = |text: &mut Vec<u8>,
                               symbols: &mut Vec<ModuleSymbol>,
@@ -13621,6 +14350,7 @@ fn lower_runtime_adapter(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -13870,6 +14600,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -14302,6 +15033,7 @@ fn lower_native_endpoint_oracle_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         composed_prepared,
         Some(mode),
@@ -14649,6 +15381,7 @@ fn lower_native_dynamic_rows_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -14871,6 +15604,7 @@ fn lower_native_slow_partial_with_data_limit(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         direct_search_trusted_core: None,
+        complete_span_reduce_source: None,
     }))
 }
 
@@ -16165,6 +16899,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -16220,6 +16955,7 @@ fn slow_partial_prepared_outcome(
 ) -> Result<SlowPartialPreparedOutcome, ObjectError> {
     match outcome {
         Ok(lowering) => Ok(lowering),
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => Ok(SlowPartialPreparedOutcome::AllocationFailure),
         Err(ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
@@ -16920,6 +17656,7 @@ fn lower_native_partial_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -24370,6 +25107,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         report,
     )))
@@ -24443,6 +25181,7 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         report,
     )))
@@ -24574,6 +25313,7 @@ fn measured_native_dfa_outcome(
     match outcome {
         Ok(Some(lowering)) => Ok(MeasuredNativeDfaOutcome::Lowered(lowering)),
         Ok(None) => Ok(MeasuredNativeDfaOutcome::Declined),
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => {
             Ok(MeasuredNativeDfaOutcome::AllocationFailure)
         }
@@ -24651,6 +25391,7 @@ fn legacy_fixed_k0_lowering_outcome(
             lowering: None,
             may_continue_compilation: true,
         }),
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => Ok(LegacyFixedK0LoweringAttempt {
             lowering: None,
             may_continue_compilation: false,
@@ -24668,6 +25409,26 @@ struct CompilerK0Lowering {
 struct CompilerK0LoweringAttempt {
     lowering: Option<CompilerK0Lowering>,
     may_continue_compilation: bool,
+}
+
+fn compiler_k0_lowering_error(
+    error: ObjectError,
+) -> Result<CompilerK0LoweringAttempt, ObjectError> {
+    match error {
+        ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        } => Ok(CompilerK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: true,
+        }),
+        error if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        ObjectError::Allocation(_) => Ok(CompilerK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: false,
+        }),
+        error => Err(error),
+    }
 }
 
 /// Prefer the graph-derived fallback filters, but retry a complete semantic
@@ -24705,18 +25466,7 @@ fn lower_optional_compiler_k0_with_data_limit(
                     }),
                     may_continue_compilation: true,
                 }),
-                Err(ObjectError::Resource {
-                    resource: crate::CompileResource::ProgramBytes,
-                    ..
-                }) => Ok(CompilerK0LoweringAttempt {
-                    lowering: None,
-                    may_continue_compilation: true,
-                }),
-                Err(ObjectError::Allocation(_)) => Ok(CompilerK0LoweringAttempt {
-                    lowering: None,
-                    may_continue_compilation: false,
-                }),
-                Err(error) => Err(error),
+                Err(error) => compiler_k0_lowering_error(error),
             }
         }
         Ok(None)
@@ -24727,11 +25477,7 @@ fn lower_optional_compiler_k0_with_data_limit(
             lowering: None,
             may_continue_compilation: true,
         }),
-        Err(ObjectError::Allocation(_)) => Ok(CompilerK0LoweringAttempt {
-            lowering: None,
-            may_continue_compilation: false,
-        }),
-        Err(error) => Err(error),
+        Err(error) => compiler_k0_lowering_error(error),
     }
 }
 
@@ -24773,11 +25519,27 @@ fn optional_native_lowering_outcome(
 ) -> Result<Option<NativeLowering>, ObjectError> {
     match outcome {
         Ok(lowering) => Ok(lowering),
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
         Err(ObjectError::Allocation(_) | ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
             ..
         }) => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// Preserve the legacy materialized-K0 fallback policy for all established
+/// lowering failures, while keeping the new complete-Span recipe allocation
+/// terminal. The latter is required metadata for a successfully selected
+/// public lowering; losing it and entering a fresh fallback transaction would
+/// violate the allocator-failure boundary.
+fn materialized_native_fallback_outcome(
+    outcome: Result<Option<NativeLowering>, ObjectError>,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    match outcome {
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        Ok(lowering) => Ok(lowering),
+        Err(_) => Ok(None),
     }
 }
 
@@ -24898,9 +25660,19 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             required: data.len(),
         });
     }
-    if entry_contract.register_outcome() && layout.partial.is_none() {
+    if entry_contract.register_outcome()
+        && !entry_contract.complete_span_reduce()
+        && layout.partial.is_none()
+    {
         return Err(ObjectError::InvalidModule(
             "trusted prepared core has no partial continuation layout",
+        ));
+    }
+    if entry_contract.complete_span_reduce()
+        && (layout.output != OutputContract::Span || layout.partial.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "complete Span reducer core has an incompatible DFA layout",
         ));
     }
     if entry_contract.propagates_partial_span_window_start()
@@ -24921,7 +25693,8 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             }
             NativeDfaEntryContract::ExactAbsoluteAnchored { .. }
             | NativeDfaEntryContract::PreparedPartialCore
-            | NativeDfaEntryContract::PreparedPartialPropagatedStartCore => {
+            | NativeDfaEntryContract::PreparedPartialPropagatedStartCore
+            | NativeDfaEntryContract::CompleteSpanReduceCoreV1 => {
                 lower_x86_64_dfa_with_entry_contract(layout, target.features, entry_contract)?
             }
         },
@@ -24970,6 +25743,39 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
     {
         return Ok(None);
     }
+    // Retain the private regeneration recipe only while the sole-Count
+    // compile transaction is enabled and after every target-specific gate has
+    // selected this complete public Span lowering. The outer compiler disables
+    // the scope again after recognizing its exact-singleton program fact. This
+    // allocation is not a speculative scanner attempt: if refused, every
+    // optional classifier must propagate the distinct site unchanged instead
+    // of entering a fresh fallback transaction.
+    let complete_span_reduce_source = if complete_span_reduce_recipe_enabled()
+        && entry_contract == NativeDfaEntryContract::Public
+        && layout.output == OutputContract::Span
+        && layout.partial.is_none()
+    {
+        emission.direct_search_trusted_core.as_ref().ok_or(
+            ObjectError::InvalidModule(
+                "complete public Span DFA did not publish its trusted core",
+            ),
+        )?;
+        Some(allocate_complete_span_reduce_source(
+            NativeCompleteSpanReduceSource {
+                layout,
+                aarch64_sve_filter_plan: (target.architecture == Architecture::Aarch64)
+                    .then_some(sve_filter_plan)
+                    .flatten(),
+                aarch64_sve_suffix_kind: (target.architecture == Architecture::Aarch64)
+                    .then_some(sve_suffix_kind)
+                    .flatten(),
+                program_bytes: data.len(),
+                program_sha256: Sha256::digest(&data).into(),
+            },
+        )?)
+    } else {
+        None
+    };
     let start_accelerator = selected_start_accelerator(
         layout,
         target,
@@ -24999,6 +25805,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
         direct_search_trusted_core: emission.direct_search_trusted_core,
+        complete_span_reduce_source,
     }))
 }
 
@@ -31432,6 +32239,8 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -31768,6 +32577,8 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -32286,6 +33097,8 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -32444,6 +33257,8 @@ fn native_regex_redux_module(
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -32795,6 +33610,8 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -32907,6 +33724,8 @@ fn native_weighted_capture_module(
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -33362,6 +34181,8 @@ fn native_rebar_multi_grep_module_v1(
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -33607,6 +34428,8 @@ fn native_rebar_row_scalar_module_v1(
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -45019,6 +45842,13 @@ fn lower_x86_64_dfa_with_entry_contract(
             "x86 fixed candidate retained a moving Teddy scanner",
         ));
     }
+    if entry_contract.complete_span_reduce()
+        && (layout.output != OutputContract::Span || layout.partial.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 complete Span reducer core has an incompatible layout",
+        ));
+    }
     let mut assembler = X86Assembler::new();
     let register_outcome = entry_contract.register_outcome();
     let fixed_candidate = entry_contract.fixed_candidate();
@@ -45059,6 +45889,30 @@ fn lower_x86_64_dfa_with_entry_contract(
     let reverse_continue = assembler.label()?;
     let reverse_finish = assembler.label()?;
     let exact_start_probe_failed = assembler.label()?;
+    let complete_restart = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_loop_head = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_nonempty = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_accepted = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_publish = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_invalid_result = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
 
     let instruction_filter = layout
         .start_filter
@@ -45176,6 +46030,23 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x41, 0x57])?; // push r15
     }
 
+    if entry_contract.complete_span_reduce() {
+        // Private result pointer, Count, SpanSum, last empty endpoint,
+        // iterator flags, and the immutable full-haystack end. Reverse DFA
+        // lowering uses RCX for its selected-start scratch, so every restart
+        // must restore the caller's end before entering the forward graph.
+        // The core makes no calls, so the route-dependent callee-save prefix
+        // above is the only additional stack topology.
+        assembler.instruction(&[0x48, 0x83, 0xec, 48])?;
+        assembler.instruction(&[0x4c, 0x89, 0x04, 0x24])?;
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 8])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 16])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 24])?;
+        assembler.instruction(&[0x89, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 40])?;
+    }
+
     if entry_contract.validates_public_args() {
         // Validate start <= end <= length before touching public result
         // memory. The prepared partial core receives the same facts from its
@@ -45202,6 +46073,10 @@ fn lower_x86_64_dfa_with_entry_contract(
         && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         x86_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
+    }
+    if let Some(restart) = complete_restart {
+        assembler.bind(restart)?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 40])?;
     }
     assembler.instruction(&[0x48, 0x89, 0xd6])?; // mov rsi, rdx (window start)
 
@@ -45983,17 +46858,99 @@ fn lower_x86_64_dfa_with_entry_contract(
             assembler.bind(reverse_finish)?;
             assembler.instruction(&[0x48, 0x83, 0xf9, 0xff])?;
             assembler.branch(&[0x0f, 0x84], invalid)?;
-            assembler.instruction(&[0x49, 0x89, 0x08])?;
+            if register_outcome {
+                assembler.instruction(&[0x49, 0x89, 0xca])?; // r10 = selected start
+            } else {
+                assembler.instruction(&[0x49, 0x89, 0x08])?;
+            }
             assembler.branch(&[0xe9], matched)?;
         }
     }
 
     assembler.bind(no_match)?;
-    assembler.instruction(&[0x31, 0xc0])?;
-    assembler.branch(&[0xe9], done)?;
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(&[0x4c, 0x8b, 0x04, 0x24])?; // result pair
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 8])?; // Count
+        assembler.instruction(&[0x49, 0x89, 0x00])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 16])?; // SpanSum
+        assembler.instruction(&[0x49, 0x89, 0x40, 8])?;
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.branch(&[0xe9], done)?;
+    } else {
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.branch(&[0xe9], done)?;
+    }
     assembler.bind(matched)?;
-    assembler.instruction(&[0xb8, 0x01, 0x00, 0x00, 0x00])?;
-    assembler.branch(&[0xe9], done)?;
+    if let (
+        Some(restart),
+        Some(loop_head),
+        Some(nonempty),
+        Some(accepted),
+        Some(publish),
+        Some(invalid_result),
+    ) = (
+        complete_restart,
+        complete_loop_head,
+        complete_nonempty,
+        complete_accepted,
+        complete_publish,
+        complete_invalid_result,
+    ) {
+        // Reverse DFA lowering owns RCX as selected-start scratch. Recover
+        // the semantic full-haystack end before validating or advancing the
+        // iterator, including the first match before any restart.
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 40])?;
+        assembler.instruction(&[0x49, 0x39, 0xf2])?; // start >= requested start
+        assembler.branch(&[0x0f, 0x82], invalid_result)?;
+        assembler.instruction(&[0x4d, 0x39, 0xd3])?; // end >= start
+        assembler.branch(&[0x0f, 0x82], invalid_result)?;
+        assembler.instruction(&[0x49, 0x39, 0xcb])?; // end <= full length
+        assembler.branch(&[0x0f, 0x87], invalid_result)?;
+        assembler.instruction(&[0x4d, 0x39, 0xda])?; // start != end
+        assembler.branch(&[0x0f, 0x85], nonempty)?;
+        assembler.instruction(&[0x8b, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0xa8, 0x01])?;
+        assembler.branch(&[0x0f, 0x84], accepted)?;
+        assembler.instruction(&[0x4c, 0x3b, 0x5c, 0x24, 24])?;
+        assembler.branch(&[0x0f, 0x85], accepted)?;
+        assembler.instruction(&[0x48, 0x39, 0xce])?; // requested start == end
+        assembler.branch(&[0x0f, 0x84], no_match)?;
+        assembler.instruction(&[0x48, 0x8d, 0x56, 1])?;
+        assembler.branch(&[0xe9], restart)?;
+
+        assembler.bind(nonempty)?;
+        assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+        assembler.branch(&[0xe9], publish)?;
+        assembler.bind(accepted)?;
+        assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+        assembler.bind(publish)?;
+        assembler.instruction(&[0x89, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 24])?;
+        assembler.instruction(&[0x48, 0x83, 0x44, 0x24, 8, 1])?;
+        assembler.instruction(&[0x4c, 0x89, 0xd8])?;
+        assembler.instruction(&[0x49, 0x2b, 0xc2])?;
+        assembler.instruction(&[0x48, 0x01, 0x44, 0x24, 16])?;
+        assembler.instruction(&[0x4c, 0x89, 0xda])?;
+        assembler.branch(&[0xe9], loop_head)?;
+
+        assembler.bind(loop_head)?;
+        assembler.instruction(&[0x8b, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0xa8, 0x02])?;
+        assembler.branch(&[0x0f, 0x84], restart)?;
+        assembler.instruction(&[0x83, 0xe0, 0xfd])?;
+        assembler.instruction(&[0x89, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0x48, 0x39, 0xca])?;
+        assembler.branch(&[0x0f, 0x84], no_match)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, 1])?;
+        assembler.branch(&[0xe9], restart)?;
+
+        assembler.bind(invalid_result)?;
+        assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+        assembler.branch(&[0xe9], done)?;
+    } else {
+        assembler.instruction(&[0xb8, 0x01, 0x00, 0x00, 0x00])?;
+        assembler.branch(&[0xe9], done)?;
+    }
     assembler.bind(selected_end)?;
     if layout.partial.is_some() {
         let mut status = vec![0xb8];
@@ -46004,6 +46961,9 @@ fn lower_x86_64_dfa_with_entry_contract(
     assembler.bind(invalid)?;
     assembler.instruction(&[0xb8, 0x02, 0x00, 0x00, 0x00])?;
     assembler.bind(done)?;
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(&[0x48, 0x83, 0xc4, 48])?;
+    }
     if uses_seeded_reverse {
         assembler.instruction(&[0x41, 0x5f])?; // pop r15
         assembler.instruction(&[0x41, 0x5e])?; // pop r14
@@ -47533,6 +48493,132 @@ fn lower_x86_64_prepared_span_fill_impl(
 /// call is an artifact-specific prepared target or self-contained ordinary Span
 /// entry. The outer wrapper authenticates the complete immutable artifact
 /// identity before that target can inspect source bytes.
+fn lower_x86_64_complete_span_reduce_export(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if matches!(sink, PreparedSpanSink::Fill { .. }) {
+        return Err(ObjectError::InvalidModule(
+            "x86 complete Span reducer received the Fill sink",
+        ));
+    }
+    let mut assembler = X86Assembler::new();
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    assembler.instruction(&[0x48, 0x8d, 0x05])?;
+    let identity_displacement = assembler.label()?;
+    assembler.bind(identity_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 complete Span reducer identity word",
+            ))?;
+        if word_offset == 0 {
+            assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+        } else {
+            assembler.instruction(&[
+                0x4c,
+                0x8b,
+                0x50,
+                u8::try_from(word_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "x86 complete Span reducer linked identity offset",
+                    )
+                })?,
+            ])?;
+        }
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 complete Span reducer header identity offset",
+            ))?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "x86 complete Span reducer header identity displacement",
+                )
+            })?,
+        ])?;
+        assembler.branch(&[0x0f, 0x85], wrong_identity)?;
+    }
+
+    // One callee-save plus a two-word private result preserves the SysV call
+    // alignment and keeps the public output transactional.
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, 32])?;
+    assembler.instruction(&[0x48, 0x89, 0xcb])?;
+    assembler.instruction(&[0x48, 0x89, 0xf7])?;
+    assembler.instruction(&[0x48, 0x89, 0xd6])?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x48, 0x89, 0xf1])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let prepared_call = assembler.label()?;
+    assembler.bind(prepared_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], returned)?;
+    match sink {
+        PreparedSpanSink::Count => {
+            assembler.instruction(&[0x48, 0x8b, 0x14, 0x24])?;
+        }
+        PreparedSpanSink::SpanSum => {
+            assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 8])?;
+        }
+        PreparedSpanSink::Fill { .. } => unreachable!(),
+    }
+    assembler.instruction(&[0x48, 0x89, 0x13])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, 32])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 0x05, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let prepared_call_offset = finished.label_offset(prepared_call)?;
+    let identity_relocation_offset = finished.label_offset(identity_displacement)?;
+    Ok(NativePreparedBulkWrapper {
+        code: finished.code,
+        prepared_call_offset,
+        ordered_nfa_gate_call_offset: None,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(NativePreparedIdentityRelocation::X86PcRelative32(
+            identity_relocation_offset,
+        )),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "raw ABI validation, exact nullable progress, and transactional scalar publication form one generated leaf"
@@ -50545,6 +51631,87 @@ fn aarch64_emit_prepared_artifact_identity_validation(
         assembler.branch_cond(AARCH64_NE, wrong_identity)?;
     }
     Ok([identity_page, identity_page_offset])
+}
+
+fn lower_aarch64_complete_span_reduce_export(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if matches!(sink, PreparedSpanSink::Fill { .. }) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete Span reducer received the Fill sink",
+        ));
+    }
+    const FRAME_BYTES: u16 = 32;
+    let mut assembler = Aarch64Assembler::new();
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_handle)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    aarch64_emit_prepared_scalar_output_validation(&mut assembler, invalid)?;
+    let [identity_page, identity_page_offset] =
+        aarch64_emit_prepared_artifact_identity_validation(
+            &mut assembler,
+            wrong_identity,
+        )?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 30, 31, 16)?)?;
+    assembler.instruction(aarch64_mov_x(19, 3)?)?;
+    assembler.instruction(aarch64_mov_x(0, 1)?)?;
+    assembler.instruction(aarch64_mov_x(1, 2)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 1)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+    let prepared_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+    assembler.instruction(aarch64_load_x_imm(
+        8,
+        31,
+        match sink {
+            PreparedSpanSink::Count => 0,
+            PreparedSpanSink::SpanSum => 8,
+            PreparedSpanSink::Fill { .. } => unreachable!(),
+        },
+    )?)?;
+    assembler.instruction(aarch64_store_x(8, 19, 0)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 30, 31, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [prepared_call, identity_page, identity_page_offset];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativePreparedBulkWrapper {
+        code,
+        prepared_call_offset: offsets[0],
+        ordered_nfa_gate_call_offset: None,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(
+            NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                page: offsets[1],
+                page_offset: offsets[2],
+            },
+        ),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
+    })
 }
 
 fn lower_aarch64_direct_count_cold_long(
@@ -68794,6 +69961,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             "AArch64 fixed candidate retained a moving Teddy scanner",
         ));
     }
+    if entry_contract.complete_span_reduce()
+        && (layout.output != OutputContract::Span || layout.partial.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete Span reducer core has an incompatible layout",
+        ));
+    }
     if sve_suffix_kind.is_some()
         && layout
             .suffix_filter
@@ -68847,6 +70021,43 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let reverse_continue = assembler.label()?;
     let reverse_finish = assembler.label()?;
     let exact_start_probe_failed = assembler.label()?;
+    let complete_restart = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_loop_head = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_nonempty = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_accepted = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_publish = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_invalid_result = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(aarch64_sub_x_imm(31, 31, 48)?)?;
+        assembler.instruction(aarch64_store_x(4, 31, 0)?)?;
+        assembler.instruction(aarch64_movz_x(8, 0, 0)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 8)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 16)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 24)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
+        // Keep the semantic full-haystack end independent of every scanner
+        // scratch register and reload it at restart and result validation.
+        assembler.instruction(aarch64_store_x(3, 31, 40)?)?;
+    }
 
     if entry_contract.validates_public_args() {
         assembler.instruction(0xf100_003f)?; // cmp length, #0
@@ -68871,6 +70082,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         aarch64_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
+    }
+    if let Some(restart) = complete_restart {
+        assembler.bind(restart)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
     }
     assembler.instruction(aarch64_mov_x(9, 2)?)?;
 
@@ -70016,17 +71231,100 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             assembler.bind(reverse_finish)?;
             assembler.instruction(aarch64_cmp_x(10, 13)?)?;
             assembler.branch_cond(AARCH64_EQ, invalid)?;
-            assembler.instruction(aarch64_store_x(10, 4, 0)?)?;
+            if register_outcome {
+                assembler.instruction(aarch64_mov_x(6, 10)?)?;
+            } else {
+                assembler.instruction(aarch64_store_x(10, 4, 0)?)?;
+            }
             assembler.branch(matched)?;
         }
     }
 
     assembler.bind(no_match)?;
-    assembler.instruction(aarch64_movz_w(0, 0)?)?;
-    assembler.branch(done)?;
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(10, 31, 8)?)?;
+        assembler.instruction(aarch64_store_x(10, 8, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(10, 31, 16)?)?;
+        assembler.instruction(aarch64_store_x(10, 8, 8)?)?;
+        assembler.instruction(aarch64_movz_w(0, 0)?)?;
+        assembler.branch(done)?;
+    } else {
+        assembler.instruction(aarch64_movz_w(0, 0)?)?;
+        assembler.branch(done)?;
+    }
     assembler.bind(matched)?;
-    assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.branch(done)?;
+    if let (
+        Some(restart),
+        Some(loop_head),
+        Some(nonempty),
+        Some(accepted),
+        Some(publish),
+        Some(invalid_result),
+    ) = (
+        complete_restart,
+        complete_loop_head,
+        complete_nonempty,
+        complete_accepted,
+        complete_publish,
+        complete_invalid_result,
+    ) {
+        // Keep the validation/result ABI independent of future scanner
+        // scratch-register changes and symmetric with the x86 core.
+        assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
+        assembler.instruction(aarch64_cmp_x(6, 9)?)?;
+        assembler.branch_cond(AARCH64_LO, invalid_result)?;
+        assembler.instruction(aarch64_cmp_x(7, 6)?)?;
+        assembler.branch_cond(AARCH64_LO, invalid_result)?;
+        assembler.instruction(aarch64_cmp_x(7, 3)?)?;
+        assembler.branch_cond(AARCH64_HI, invalid_result)?;
+        assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+        assembler.branch_cond(AARCH64_NE, nonempty)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+        assembler.branch_bit_clear_w(8, 0, accepted)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 24)?)?;
+        assembler.instruction(aarch64_cmp_x(8, 7)?)?;
+        assembler.branch_cond(AARCH64_NE, accepted)?;
+        assembler.instruction(aarch64_cmp_x(9, 3)?)?;
+        assembler.branch_cond(AARCH64_EQ, no_match)?;
+        assembler.instruction(aarch64_add_x_imm(2, 9, 1)?)?;
+        assembler.branch(restart)?;
+
+        assembler.bind(nonempty)?;
+        assembler.instruction(aarch64_movz_w(8, 1)?)?;
+        assembler.branch(publish)?;
+        assembler.bind(accepted)?;
+        assembler.instruction(aarch64_movz_w(8, 3)?)?;
+        assembler.bind(publish)?;
+        assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
+        assembler.instruction(aarch64_store_x(7, 31, 24)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 8)?)?;
+        assembler.instruction(aarch64_add_x_imm(8, 8, 1)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 8)?)?;
+        assembler.instruction(aarch64_sub_x_reg(10, 7, 6)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 16)?)?;
+        assembler.instruction(aarch64_add_x_reg(8, 8, 10)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 16)?)?;
+        assembler.instruction(aarch64_mov_x(2, 7)?)?;
+        assembler.branch(loop_head)?;
+
+        assembler.bind(loop_head)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+        assembler.branch_bit_clear_w(8, 1, restart)?;
+        assembler.instruction(aarch64_and_low_w(8, 8, 1)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(AARCH64_EQ, no_match)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(restart)?;
+
+        assembler.bind(invalid_result)?;
+        assembler.instruction(aarch64_movz_w(0, 3)?)?;
+        assembler.branch(done)?;
+    } else {
+        assembler.instruction(aarch64_movz_w(0, 1)?)?;
+        assembler.branch(done)?;
+    }
     assembler.bind(selected_end)?;
     if layout.partial.is_some() {
         assembler.instruction(aarch64_movz_w(
@@ -70039,6 +71337,9 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.bind(done)?;
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(aarch64_add_x_imm(31, 31, 48)?)?;
+    }
     assembler.instruction(0xd65f_03c0)?;
 
     let mut relocation_offsets = [table_page, table_page_offset];
@@ -83936,6 +85237,7 @@ mod tests {
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         })
     }
 
@@ -84331,6 +85633,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -84583,6 +85886,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             },
             LinkedHybridSparseNativeFixture {
                 byte_cells,
@@ -84754,6 +86058,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -84909,6 +86214,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -105743,6 +107049,7 @@ int main(void){{
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             };
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
@@ -105774,6 +107081,266 @@ int main(void){{
             emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
                 .unwrap_or_else(|error| panic!("large slow object {target:?}: {error}"));
         }
+    }
+
+    #[test]
+    fn complete_span_recipe_scope_is_nested_unwind_safe_and_thread_local() {
+        assert!(!complete_span_reduce_recipe_enabled());
+        with_complete_span_reduce_recipe(|| {
+            assert!(complete_span_reduce_recipe_enabled());
+            with_complete_span_reduce_recipe(|| {
+                assert!(complete_span_reduce_recipe_enabled());
+            });
+            assert!(complete_span_reduce_recipe_enabled());
+            without_complete_span_reduce_recipe(|| {
+                assert!(!complete_span_reduce_recipe_enabled());
+                with_complete_span_reduce_recipe(|| {
+                    assert!(complete_span_reduce_recipe_enabled());
+                });
+                assert!(!complete_span_reduce_recipe_enabled());
+            });
+            assert!(complete_span_reduce_recipe_enabled());
+            let other = std::thread::spawn(complete_span_reduce_recipe_enabled)
+                .join()
+                .expect("recipe policy isolation thread");
+            assert!(!other);
+        });
+        assert!(!complete_span_reduce_recipe_enabled());
+
+        let unwind = std::panic::catch_unwind(|| {
+            with_complete_span_reduce_recipe(|| {
+                assert!(complete_span_reduce_recipe_enabled());
+                panic!("synthetic recipe scope unwind");
+            });
+        });
+        assert!(unwind.is_err());
+        assert!(!complete_span_reduce_recipe_enabled());
+    }
+
+    #[test]
+    fn complete_span_recipe_allocation_is_terminal_end_to_end_and_across_classifiers() {
+        let target = Target::x86_64_linux();
+        let request = || {
+            CompileRequest::new("[ab]+z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let fixture = without_complete_span_reduce_source_allocation_attempt(|| {
+            compile(request())
+        })
+        .expect("ordinary public Span allocation fixture");
+        assert!(!fixture.module().has_complete_span_reduce_source_for_test());
+        let program = fixture.program();
+        let view = program
+            .native_dfa_view()
+            .expect("complete public Span allocation view");
+        assert_eq!(view.output, OutputContract::Span);
+        assert!(view.partial_discovered_states.is_none());
+
+        // The actual public Count entry enables the recipe for the full
+        // compile-and-append transaction. The fail-once seam must escape
+        // exactly, without a second recipe attempt or a later fallback.
+        let public_count = with_complete_span_reduce_source_allocation_failure(|| {
+            crate::compile_with_prepared_aggregate_exports(
+                request(),
+                PreparedAggregateExports::COUNT,
+            )
+        });
+        assert!(matches!(
+            public_count,
+            Err(CompileError::Object(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            ))),
+        ));
+
+        // Every excluded public operation retains ce964 allocation behavior.
+        for exports in [
+            PreparedAggregateExports::SPAN_SUM,
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM),
+        ] {
+            let excluded = without_complete_span_reduce_source_allocation_attempt(|| {
+                crate::compile_with_prepared_aggregate_exports(request(), exports)
+            })
+            .expect("excluded aggregate must not allocate a complete recipe");
+            assert!(!excluded.module().uses_complete_span_reduce_aggregate());
+            assert!(!excluded.module().has_complete_span_reduce_source_for_test());
+        }
+        let exact_singleton = without_complete_span_reduce_source_allocation_attempt(|| {
+            crate::compile_with_prepared_aggregate_exports(
+                CompileRequest::new("abc", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::COUNT,
+            )
+        })
+        .expect("exact singleton must retain its incumbent allocation behavior");
+        assert!(!exact_singleton
+            .module()
+            .has_complete_span_reduce_source_for_test());
+
+        let low_level = without_complete_span_reduce_source_allocation_attempt(|| {
+            CompiledModule::lower_optimizing(program, target)
+        })
+        .expect("unscoped low-level lowering");
+        assert_eq!(&low_level, fixture.module());
+        assert!(!low_level.has_complete_span_reduce_source_for_test());
+
+        let ordinary = with_complete_span_reduce_source_allocation_failure(|| {
+            with_complete_span_reduce_recipe(|| CompiledModule::lower(program, target))
+        });
+        assert!(matches!(
+            ordinary,
+            Err(CompileError::Object(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            ))),
+        ));
+
+        let optimizing = with_complete_span_reduce_source_allocation_failure(|| {
+            with_complete_span_reduce_recipe(|| {
+                CompiledModule::lower_optimizing(program, target)
+            })
+        });
+        assert!(matches!(
+            optimizing,
+            Err(CompileError::Object(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            ))),
+        ));
+
+        let optional = with_complete_span_reduce_source_allocation_failure(|| {
+            with_complete_span_reduce_recipe(|| {
+                lower_optional_native_dfa_with_data_limit(view, target, usize::MAX)
+            })
+        });
+        assert!(matches!(
+            optional,
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+
+        // This is the former `unwrap_or(None)` path. If it swallowed the
+        // injected selected-recipe failure, the native owner would be removed
+        // and the generic fallback transaction below would allocate and
+        // succeed. It must instead return the exact failure immediately.
+        let serialized = program.serialize().expect("serialize allocation fixture");
+        let materialized = with_complete_span_reduce_source_allocation_failure(|| {
+            with_complete_span_reduce_recipe(|| {
+                CompiledModule::lower_serialized(
+                    serialized,
+                    Some(view),
+                    true,
+                    program.native_context_program_view(),
+                    program.native_bit_parallel_exists_view(),
+                    program.native_bit_parallel_endpoint_oracle_view(),
+                    program.native_partial_dfa_view(),
+                    program.native_dynamic_rows_view(),
+                    None,
+                    target,
+                )
+            })
+        });
+        assert!(matches!(
+            materialized,
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+
+        let source_failure = || {
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE,
+            ))
+        };
+        assert!(matches!(
+            optional_native_lowering_outcome(source_failure()),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            measured_native_dfa_outcome(source_failure(), false, usize::MAX),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            legacy_fixed_k0_lowering_outcome(source_failure()),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            compiler_k0_lowering_error(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE,
+            )),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            materialized_native_fallback_outcome(source_failure()),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            exact_finite_teddy_incumbent_outcome(source_failure(), usize::MAX),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            slow_partial_prepared_outcome(Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE,
+            ))),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+
+        // Preserve the established optional policy for every older allocation
+        // site; only the newly required selected-layout receipt is terminal.
+        assert!(matches!(
+            optional_native_lowering_outcome(Err(ObjectError::Allocation(
+                "synthetic optional native allocation",
+            ))),
+            Ok(None),
+        ));
+        assert!(matches!(
+            materialized_native_fallback_outcome(Err(ObjectError::Allocation(
+                "synthetic materialized fallback allocation",
+            ))),
+            Ok(None),
+        ));
+        assert!(matches!(
+            measured_native_dfa_outcome(
+                Err(ObjectError::Allocation(
+                    "synthetic measured native allocation",
+                )),
+                false,
+                usize::MAX,
+            ),
+            Ok(MeasuredNativeDfaOutcome::AllocationFailure),
+        ));
+        let legacy = legacy_fixed_k0_lowering_outcome(Err(ObjectError::Allocation(
+            "synthetic legacy K0 allocation",
+        )))
+        .expect("legacy K0 allocation classification");
+        assert!(legacy.lowering.is_none());
+        assert!(!legacy.may_continue_compilation);
+        let compiler = compiler_k0_lowering_error(ObjectError::Allocation(
+            "synthetic compiler K0 allocation",
+        ))
+        .expect("compiler K0 allocation classification");
+        assert!(compiler.lowering.is_none());
+        assert!(!compiler.may_continue_compilation);
+        assert!(matches!(
+            slow_partial_prepared_outcome(Err(ObjectError::Allocation(
+                "synthetic prepared native allocation",
+            ))),
+            Ok(SlowPartialPreparedOutcome::AllocationFailure),
+        ));
     }
 
     #[test]
@@ -122678,6 +124245,8 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_exists_batch_symbol_index: None,
                 direct_exists_batch_symbol_index: None,
                 native_direct_search_trusted_core: None,
+                native_complete_span_reduce_source: None,
+                native_complete_span_reduce_core: None,
                 prepared_count_symbol_index: None,
                 prepared_span_sum_symbol_index: None,
                 prepared_grep_count_symbol_index: None,
@@ -123014,6 +124583,8 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_exists_batch_symbol_index: None,
             direct_exists_batch_symbol_index: None,
             native_direct_search_trusted_core: None,
+            native_complete_span_reduce_source: None,
+            native_complete_span_reduce_core: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -135249,6 +136820,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         };
         let base = native_module_digest(program, target, &lowering, None).unwrap();
         let mut legacy = Sha256::new();

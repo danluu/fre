@@ -352,6 +352,7 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         report,
     )))

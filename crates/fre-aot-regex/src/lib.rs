@@ -1311,6 +1311,14 @@ pub fn compile_with_independent_exists_batch(
 /// the same exclusive prepared handle. Requesting no exports is exactly
 /// equivalent to [`compile`].
 ///
+/// In optimizing mode, an exact sole `Count` request may reuse an
+/// independently authenticated complete public Span DFA as one closed native
+/// iteration core. The private regeneration recipe is enabled only for that
+/// compile-and-append transaction, and only after the semantic program proves
+/// that the exact-singleton portfolio does not apply. `SpanSum`, mixed/Grep
+/// exports, contextual and partial routes, and exact singletons retain the
+/// ordinary compiler's module, object, allocation, and fallback behavior.
+///
 /// An optimizing `AArch64` target that explicitly enables
 /// [`CpuFeature::Aarch64Asimd`] may implement a sole `Count` or `SpanSum`
 /// export with the audited `Count-v3` core when source-independent
@@ -1368,6 +1376,9 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     let target = request.target;
     let mode = request.mode;
     let max_object_bytes = request.limits.max_object_bytes;
+    let _complete_span_reduce_recipe = module::complete_span_reduce_recipe_scope(
+        exports == PreparedAggregateExports::COUNT,
+    );
     let compiled = compile_with_slow_aot_limits(request, slow_aot_limits)?;
     append_prepared_aggregate_exports_to_compiled(
         compiled,
@@ -1439,11 +1450,13 @@ fn append_prepared_aggregate_exports_to_compiled(
     let exact_teddy_incumbent = module
         .exact_finite_selected_end_teddy_aot_report()
         .copied();
-    // The AArch64 exact-singleton Count-v3/SpanSum pass authenticates and
-    // rewrites the established DirectOrdinary wrapper byte for byte. Keep
-    // that incumbent unchanged when the existing structural follow-on is
-    // eligible; the generic trusted-core re-entry remains available to every
-    // other complete public Span DFA.
+    // Exact singletons already own a later, independently authenticated
+    // Count-v3/SpanSum portfolio. Suppress this generic complete-reducer
+    // recipe for every exact singleton so both that portfolio's selections
+    // and all of its target/resource declines retain the pre-feature
+    // incumbent. When the AArch64 follow-on is eligible, also suppress the
+    // ce964 trusted-core wrapper so it can authenticate and rewrite the exact
+    // DirectOrdinary bytes it was designed against.
     let preserve_direct_singleton_followon = mode == CompileMode::Optimizing
         && target.architecture == Architecture::Aarch64
         && target.abi == CallAbi::Aapcs64
@@ -1460,8 +1473,13 @@ fn append_prepared_aggregate_exports_to_compiled(
                 (1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
             });
     let append_exports = |module: CompiledModule| -> Result<CompiledModule, CompileError> {
-        let module = if preserve_direct_singleton_followon {
-            module.without_direct_span_trusted_core_for_aggregate()?
+        let module = if program.native_exact_singleton_count_literal().is_some() {
+            let module = module.without_complete_span_reduce_for_aggregate()?;
+            if preserve_direct_singleton_followon {
+                module.without_direct_span_trusted_core_for_aggregate()?
+            } else {
+                module
+            }
         } else {
             module
         };
@@ -1548,6 +1566,92 @@ fn append_prepared_aggregate_exports_to_compiled(
         FinalObjectAttempt::ObjectBytes {
             module,
             first_error: _,
+        } if module.uses_complete_span_reduce_aggregate() => {
+            // The one-shot complete reducer is optional additive text. A
+            // proven final ObjectBytes decline first restores the exact ce964
+            // trusted-core incumbent. If that incumbent also exceeds the
+            // ceiling, preserve its established DirectOrdinary retry and its
+            // exact final error. Every non-ObjectBytes failure is terminal.
+            let expected_entry_sha256 = module.direct_span_trusted_core_entry_sha256().ok_or(
+                CompileError::InternalInvariant(
+                    "complete Span reducer aggregate lost its public entry identity",
+                ),
+            )?;
+            let selected_reverse = module.has_synchronizing_accept_reverse();
+            let selected_exact_pair = module.has_exact_pair_suffix();
+            let selected_start = module.start_accelerator();
+            let may_continue = module.optimizing_fallbacks_may_continue();
+            let rebuilt = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                &program,
+                target,
+                effective_native_data_limit_bytes,
+                selected_reverse,
+                selected_exact_pair,
+            )?
+            .with_optimizing_fallbacks_may_continue(may_continue);
+            if rebuilt.direct_span_trusted_core_entry_sha256()
+                != Some(expected_entry_sha256)
+                || rebuilt.has_synchronizing_accept_reverse() != selected_reverse
+                || rebuilt.has_exact_pair_suffix() != selected_exact_pair
+                || rebuilt.start_accelerator() != selected_start
+                || rebuilt.required_runtime_symbols().next().is_some()
+                || rebuilt.required_prepare_capabilities() != 0
+            {
+                return Err(CompileError::InternalInvariant(
+                    "complete Span reducer ObjectBytes retry changed its complete-DFA route",
+                ));
+            }
+            let incumbent = rebuilt
+                .clone()
+                .without_complete_span_reduce_for_aggregate()?
+                .append_prepared_aggregate_exports(
+                    exports,
+                    artifact_identity,
+                    &serialized_program,
+                )?;
+            if incumbent.uses_complete_span_reduce_aggregate()
+                || !incumbent.uses_direct_span_trusted_core_aggregate()
+                || incumbent.prepared_aggregate_strategy()
+                    != Some(PreparedAggregateStrategy::NativeFused)
+            {
+                return Err(CompileError::InternalInvariant(
+                    "complete Span reducer ObjectBytes retry did not restore the trusted-core incumbent",
+                ));
+            }
+            match emit_object(&incumbent, format, max_object_bytes) {
+                Ok(object) => (incumbent, object),
+                Err(error) if is_proven_object_byte_limit(&error) => {
+                    let ordinary = rebuilt
+                        .without_complete_span_reduce_for_aggregate()?
+                        .without_direct_span_trusted_core_for_aggregate()?
+                        .append_prepared_aggregate_exports(
+                            exports,
+                            artifact_identity,
+                            &serialized_program,
+                        )?;
+                    if ordinary.uses_complete_span_reduce_aggregate()
+                        || ordinary.uses_direct_span_trusted_core_aggregate()
+                        || ordinary.prepared_aggregate_strategy()
+                            != Some(PreparedAggregateStrategy::NativeFused)
+                    {
+                        return Err(CompileError::InternalInvariant(
+                            "complete Span reducer second ObjectBytes retry did not restore DirectOrdinary",
+                        ));
+                    }
+                    match emit_object(&ordinary, format, max_object_bytes) {
+                        Ok(object) => (ordinary, object),
+                        Err(error) if is_proven_object_byte_limit(&error) => {
+                            return Err(error.into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error: _,
         } if module.uses_direct_span_trusted_core_aggregate() => {
             // The trusted-core trampoline is optional additive text. Only a
             // proven final ObjectBytes decline may remove it. Rebuild the
@@ -1585,6 +1689,7 @@ fn append_prepared_aggregate_exports_to_compiled(
                 ));
             }
             let fallback = fallback
+                .without_complete_span_reduce_for_aggregate()?
                 .without_direct_span_trusted_core_for_aggregate()?
                 .append_prepared_aggregate_exports(
                     exports,
@@ -2808,6 +2913,9 @@ pub(crate) fn compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
     }
     validate_prepared_aggregate_exports(output, exports)?;
     let max_object_bytes = limits.max_object_bytes;
+    let _complete_span_reduce_recipe = module::complete_span_reduce_recipe_scope(
+        exports == PreparedAggregateExports::COUNT,
+    );
     let compiled = compile_raw_with_line_terminator_and_slow_aot_limits(
         source_bytes,
         raw,
@@ -3463,6 +3571,10 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     let program_bytes = program.serialized_len()?;
     let program_sha256 = program.artifact_identity();
     let format = ObjectFormat::for_target(target);
+    let _complete_span_reduce_singleton_suppression = program
+        .native_exact_singleton_count_literal()
+        .is_some()
+        .then(|| module::complete_span_reduce_recipe_scope(false));
     let (module, object) = match mode {
         CompileMode::Fast => lower_ordinary_with_endpoint_oracle_object_retry(
             &program,
