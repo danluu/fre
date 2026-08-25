@@ -1,12 +1,11 @@
-//! Helper-free whole-operation lowering for Rebar's multi-pattern `grep`.
+//! Whole-operation lowering for Rebar's independent native row closures.
 //!
-//! This reducer deliberately consumes only independently authenticated,
-//! ordinary `SpanSearchV1` artifacts. It owns `bstr::ByteSlice::lines` byte
-//! traversal, invokes every distinct row for every line, validates every
-//! returned status and span, and publishes the final `u64` line count only
-//! after the complete operation succeeds. Prepared rows retain the exact
-//! pre-existing adapter route; this compiler never fabricates handles or a
-//! runtime semantic edge.
+//! These reducers consume independently authenticated ordinary `SpanSearchV1`
+//! artifacts and, for scalar operations, prepared Ordered-NFA V15 artifacts.
+//! They own the operation traversal, validate every returned status and span,
+//! and publish the final `u64` only after the complete operation succeeds.
+//! Prepared rows retain their authenticated semantic-runtime route, while the
+//! caller prepares and owns their opaque handles.
 
 use core::fmt;
 
@@ -1705,8 +1704,8 @@ fn authenticate_mixed_scalar_artifact(
     Ok(())
 }
 
-/// Compile one helper-free Count or SpanSum transaction over a statically
-/// authenticated ordinary/prepared row closure.
+/// Compile one Count or SpanSum transaction over a statically authenticated
+/// ordinary/prepared row closure.
 ///
 /// The caller prepares and owns one opaque handle-table slot per row. The
 /// generated operation validates its exact table shape once, passes null

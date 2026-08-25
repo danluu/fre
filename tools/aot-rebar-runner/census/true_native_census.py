@@ -6637,19 +6637,56 @@ def identity_defined_symbols_from_provenance(
             raise CensusError("multi-Grep reducer row identity symbols are malformed")
         return sorted(symbols)
     if provenance.get("composite_kind") == "native-row-scalar-reducer-v1":
-        validate_normalized_row_scalar_reducer(
+        components = provenance.get("components")
+        if (
+            not isinstance(components, list)
+            or not all(isinstance(component, dict) for component in components)
+        ):
+            raise CensusError("row-scalar reducer row identities are malformed")
+        proof = validate_normalized_row_scalar_reducer(
             provenance.get("row_scalar_reducer"), provenance,
             "normalized row-scalar reducer provenance",
         )
-        symbols = [component.get("entry_symbol") for component in provenance["components"]]
-        if (
-            len(symbols) != len(set(symbols))
-            or not all(
-                isinstance(symbol, str) and NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(symbol)
-                for symbol in symbols
-            )
+        symbols: list[object] = []
+        for component, route in zip(components, proof["row_routes"]):
+            symbols.append(component.get("entry_symbol"))
+            prepared = component.get("prepared_v15")
+            if route == 1 and isinstance(prepared, dict):
+                symbols.extend((
+                    prepared.get("span_fill_symbol"),
+                    prepared.get("runtime_program_symbol"),
+                ))
+        if not all(isinstance(symbol, str) for symbol in symbols):
+            raise CensusError("row-scalar reducer linked identity symbols are malformed")
+        if len(symbols) != len(set(symbols)):
+            raise CensusError("row-scalar reducer repeats a linked identity symbol")
+        for index, (component, route) in enumerate(
+            zip(components, proof["row_routes"])
         ):
-            raise CensusError("row-scalar reducer row identity symbols are malformed")
+            entry = component["entry_symbol"]
+            prepared = component.get("prepared_v15")
+            if route == 0:
+                if (
+                    prepared is not None
+                    or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(entry) is None
+                ):
+                    raise CensusError(
+                        "row-scalar reducer ordinary row identity route is malformed"
+                    )
+            elif route == 1:
+                if (
+                    not isinstance(prepared, dict)
+                    or NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL.fullmatch(entry) is None
+                ):
+                    raise CensusError(
+                        "row-scalar reducer prepared row identity route is malformed"
+                    )
+                validate_normalized_prepared_v15_component(
+                    prepared, component,
+                    f"normalized row-scalar reducer component {index}",
+                )
+            else:
+                raise CensusError("row-scalar reducer row identity route is malformed")
         return sorted(symbols)
     if provenance.get("kind") == "single-capture-reducer-v5":
         validate_normalized_single_capture_reducer(

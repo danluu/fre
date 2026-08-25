@@ -3822,8 +3822,8 @@ pub fn try_compile_native_multi_grep_reducer(
     Ok(NativeMultiGrepReducerDisposition::Selected(selected))
 }
 
-/// Build-time selection for a helper-free whole-operation Count or SpanSum
-/// reducer over the independently authenticated ordinary row closure.
+/// Build-time selection for a whole-operation Count or SpanSum reducer over
+/// the independently authenticated ordinary/prepared row closure.
 #[derive(Clone, Debug)]
 pub enum NativeRowScalarReducerDisposition {
     Selected(fre_aot_regex::RebarNativeRowScalarReducerAotArtifactV1),

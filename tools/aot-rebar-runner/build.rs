@@ -531,7 +531,7 @@ fn main() {
             shared::Model::Count | shared::Model::SpanSum
         ) {
             match shared::try_compile_native_row_scalar_reducer(&benchmark, &bridge)
-                .expect("compile helper-free native row-scalar reducer")
+                .expect("compile native row-scalar reducer")
             {
                 shared::NativeRowScalarReducerDisposition::Selected(artifact) => Some(artifact),
                 shared::NativeRowScalarReducerDisposition::DeclinedObjectBytes { .. } => None,

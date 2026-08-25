@@ -3490,6 +3490,71 @@ class TrueNativeCensusTests(unittest.TestCase):
             CENSUS.operation_route_from_provenance_record(mixed_receipt),
             ([mixed_symbol], "linked-native-row-scalar-helper-backed-reducer"),
         )
+        prepared_identity_symbols = [
+            mixed["component_1_entry_symbol"],
+            mixed["component_1_span_fill_symbol"],
+            mixed["component_1_runtime_program_symbol"],
+        ]
+        identity_symbols = sorted([
+            mixed["component_0_entry_symbol"],
+            *prepared_identity_symbols,
+        ])
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(mixed_receipt),
+            identity_symbols,
+        )
+        self.assertEqual(
+            CENSUS.authenticate_identity_defined_symbol_inventory(
+                mixed_receipt, set(identity_symbols), set(identity_symbols)
+            ),
+            identity_symbols,
+        )
+        for missing_symbol in prepared_identity_symbols:
+            for missing_from_replica in (False, True):
+                with self.subTest(
+                    identity=missing_symbol,
+                    binary="replica" if missing_from_replica else "primary",
+                ):
+                    primary = set(identity_symbols)
+                    replica = set(identity_symbols)
+                    (replica if missing_from_replica else primary).remove(
+                        missing_symbol
+                    )
+                    with self.assertRaisesRegex(
+                        CENSUS.CensusError, "identity symbols are absent"
+                    ):
+                        CENSUS.authenticate_identity_defined_symbol_inventory(
+                            mixed_receipt, primary, replica
+                        )
+
+        missing_identity = copy.deepcopy(mixed_receipt)
+        del missing_identity["components"][1]["prepared_v15"][
+            "runtime_program_symbol"
+        ]
+        with self.assertRaisesRegex(CENSUS.CensusError, "identit.*malformed"):
+            CENSUS.identity_defined_symbols_from_provenance(missing_identity)
+
+        wrong_identity = copy.deepcopy(mixed_receipt)
+        wrong_identity["components"][1]["prepared_v15"][
+            "runtime_program_symbol"
+        ] = f"fre_aot_regex_runtime_program_v1_{'9' * 64}"
+        with self.assertRaisesRegex(CENSUS.CensusError, "component identity differs"):
+            CENSUS.identity_defined_symbols_from_provenance(wrong_identity)
+
+        duplicate_identity = copy.deepcopy(mixed_receipt)
+        duplicate_prepared = duplicate_identity["components"][1]["prepared_v15"]
+        duplicate_prepared["runtime_program_symbol"] = duplicate_prepared[
+            "span_fill_symbol"
+        ]
+        with self.assertRaisesRegex(CENSUS.CensusError, "repeats a linked identity"):
+            CENSUS.identity_defined_symbols_from_provenance(duplicate_identity)
+
+        wrong_route = copy.deepcopy(mixed_receipt)
+        wrong_route["components"][1]["entry_symbol"] = (
+            f"fre_aot_regex_search_v1_{prepared_identity}"
+        )
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.identity_defined_symbols_from_provenance(wrong_route)
 
         poisoned_grep = dict(grep_fields)
         poisoned_grep["aggregate_strategy"] = "native-independent-span-row-selector-v1"

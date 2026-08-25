@@ -756,7 +756,7 @@ fn strict_linked_native_multi_grep_reduce(haystack: &[u8]) -> Result<u64, String
 
 #[allow(
     unsafe_code,
-    reason = "route authentication binds the statically linked helper-free row-scalar ABI"
+    reason = "route authentication binds the statically linked native row-scalar ABI"
 )]
 fn strict_linked_native_row_scalar_reduce(
     haystack: &[u8],
@@ -771,8 +771,9 @@ fn strict_linked_native_row_scalar_reduce(
         (core::ptr::null(), 0)
     };
     // SAFETY: route authentication binds the exact operation, ordered source
-    // topology, ordinary-row closure, relocations, and reducer symbol to this
-    // ABI. The complete haystack and aligned output remain live and disjoint.
+    // topology, ordinary/prepared row closure, relocations, and reducer symbol
+    // to this ABI. The handle table, complete haystack, and aligned output
+    // remain live and disjoint.
     let status = unsafe {
         linked::reduce_native_rows(
             handles,
