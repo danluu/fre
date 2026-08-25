@@ -25,7 +25,8 @@ use super::{
 use crate::{
     ordered_nfa_native::{
         NativeOrderedNfaObjectImage, NativeOrderedNfaObjectLayout,
-        NativeOrderedNfaStartPrefixPlan, WholeWindowWidthBounds,
+        NativeOrderedNfaStartPrefixPlan, NativeOrderedNfaTerminalRangeV1,
+        WholeWindowWidthBounds,
         ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
         ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
         ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
@@ -2007,6 +2008,65 @@ fn exact_start_prefix_vector_filter(
     )
 }
 
+/// Select the ASIMD reverse scanner only when the authenticated terminal
+/// range is sparse enough that a long miss can amortize its bounded constants.
+/// Common and wide ranges retain the established scalar reverse walk, and
+/// short windows bypass vector setup in the emitted control flow.
+fn sparse_terminal_range_vector_filter(
+    range: NativeOrderedNfaTerminalRangeV1,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    if range.start > range.end || range.reverse_depth != 0 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 Ordered-NFA terminal-range vector proof",
+        ));
+    }
+    let mut filter = EMPTY_NATIVE_START_FILTER;
+    filter.ranges[0] = NativeByteRange {
+        start: range.start,
+        end: range.end,
+    };
+    filter.range_count = 1;
+    filter.candidate_bytes = u16::from(range.end)
+        .checked_sub(u16::from(range.start))
+        .and_then(|width| width.checked_add(1))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 Ordered-NFA terminal-range candidate bytes",
+        ))?;
+    Ok(
+        (estimated_filter_frequency_units(filter) <= MAX_SCALAR_REFINEMENT_PRIMARY_FREQUENCY_UNITS)
+            .then_some(filter),
+    )
+}
+
+/// Recover the last set byte from V24 and publish its exclusive semantic end.
+/// Candidate masks contain exact `0xff`/`0x00` bytes. CLZ therefore converts
+/// the highest set bit in either 64-bit half into the highest selected lane
+/// without rereading the haystack.
+fn emit_terminal_range_last_lane(
+    a: &mut A<'_>,
+    search_entry: usize,
+) -> Result<(), ObjectError> {
+    let low_half = a.asm.label()?;
+    let lane_selected = a.asm.label()?;
+    a.raw(0x4e18_3f0c)?; // umov x12, v24.d[1]
+    a.cbz_x(12, low_half)?;
+    a.raw(0xdac0_118c)?; // clz x12, x12
+    a.i(aarch64_lsr_x_imm(12, 12, 3))?;
+    a.constant32(13, 15)?;
+    a.sub_x(12, 13, 12)?;
+    a.branch(lane_selected)?;
+    a.asm.bind(low_half)?;
+    a.raw(0x4e08_3f0c)?; // umov x12, v24.d[0]
+    a.raw(0xdac0_118c)?; // clz x12, x12
+    a.i(aarch64_lsr_x_imm(12, 12, 3))?;
+    a.constant32(13, 7)?;
+    a.sub_x(12, 13, 12)?;
+    a.asm.bind(lane_selected)?;
+    a.add_x(8, 8, 12)?;
+    a.add_x_imm(22, 8, 1)?;
+    a.branch(search_entry)
+}
+
 fn start_closure_labels(
     asm: &mut Aarch64Assembler,
     program: NativeEpsilonClosureProgramView<'_>,
@@ -2847,9 +2907,10 @@ fn emit_semantic_body(
 pub(super) fn lower_aarch64(
     image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
-    lower_aarch64_with_surface_and_start_prefix_vector_policy(
+    lower_aarch64_with_surface_and_vector_policies(
         image,
         OrderedNfaEntrySurface::Compatibility,
+        true,
         true,
     )
 }
@@ -2861,10 +2922,24 @@ pub(super) fn lower_aarch64_with_start_prefix_vector_policy(
     image: &NativeOrderedNfaObjectImage<'_>,
     allow_start_prefix_vector: bool,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
-    lower_aarch64_with_surface_and_start_prefix_vector_policy(
+    lower_aarch64_with_surface_and_vector_policies(
         image,
         OrderedNfaEntrySurface::Compatibility,
         allow_start_prefix_vector,
+        true,
+    )
+}
+
+#[cfg(test)]
+fn lower_aarch64_with_terminal_range_vector_policy(
+    image: &NativeOrderedNfaObjectImage<'_>,
+    allow_terminal_range_vector: bool,
+) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    lower_aarch64_with_surface_and_vector_policies(
+        image,
+        OrderedNfaEntrySurface::Compatibility,
+        true,
+        allow_terminal_range_vector,
     )
 }
 
@@ -2875,9 +2950,10 @@ pub(super) fn lower_aarch64_with_start_prefix_vector_policy(
 pub(super) fn lower_aarch64_operation_only(
     image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
-    lower_aarch64_with_surface_and_start_prefix_vector_policy(
+    lower_aarch64_with_surface_and_vector_policies(
         image,
         OrderedNfaEntrySurface::OperationOnly,
+        true,
         true,
     )
 }
@@ -2888,10 +2964,11 @@ pub(super) fn lower_aarch64_operation_only_with_start_prefix_vector_policy(
     image: &NativeOrderedNfaObjectImage<'_>,
     allow_start_prefix_vector: bool,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
-    lower_aarch64_with_surface_and_start_prefix_vector_policy(
+    lower_aarch64_with_surface_and_vector_policies(
         image,
         OrderedNfaEntrySurface::OperationOnly,
         allow_start_prefix_vector,
+        true,
     )
 }
 
@@ -2902,23 +2979,31 @@ pub(super) fn lower_aarch64_row_search_only_with_start_prefix_vector_policy(
     image: &NativeOrderedNfaObjectImage<'_>,
     allow_start_prefix_vector: bool,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
-    lower_aarch64_with_surface_and_start_prefix_vector_policy(
+    lower_aarch64_with_surface_and_vector_policies(
         image,
         OrderedNfaEntrySurface::RowSearchOnly,
         allow_start_prefix_vector,
+        true,
     )
 }
 
-fn lower_aarch64_with_surface_and_start_prefix_vector_policy(
+fn lower_aarch64_with_surface_and_vector_policies(
     image: &NativeOrderedNfaObjectImage<'_>,
     surface: OrderedNfaEntrySurface,
     allow_start_prefix_vector: bool,
+    allow_terminal_range_vector: bool,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
     // The fragmented terminal proof is aggregate-only. Revalidate it here so
     // a forged compiler-only receipt still fails closed, but do not let it
     // change the shared/public/private one-Span entry.
     let _ = image.terminal_exact_set_plan()?;
     let layout = image.layout;
+    let terminal_range_vector_filter = allow_terminal_range_vector
+        .then_some(layout.terminal_range)
+        .flatten()
+        .map(sparse_terminal_range_vector_filter)
+        .transpose()?
+        .flatten();
     let expected_scratch_bytes = scratch_bytes(layout)?;
     let mut asm = Aarch64Assembler::new();
     let invalid_argument = asm.label()?;
@@ -3096,16 +3181,132 @@ fn lower_aarch64_with_surface_and_start_prefix_vector_policy(
         asm.bind(scan)?;
         let mut a = A { asm: &mut asm };
         a.load_x(9, 31, usize::from(L_POSITION))?;
-        a.cmp_x(8, 9)?;
-        a.branch_cond(AARCH64_LS, no_match)?;
-        a.sub_x_imm(8, 8, 1)?;
-        a.i(aarch64_load_byte_reg(10, 20, 8))?;
-        a.cmp_w_imm(10, u16::from(range.start))?;
-        a.branch_cond(AARCH64_LO, scan)?;
-        a.cmp_w_imm(10, u16::from(range.end))?;
-        a.branch_cond(AARCH64_HI, scan)?;
-        a.add_x_imm(22, 8, 1)?;
-        a.branch(search_entry)?;
+        if let Some(filter) = terminal_range_vector_filter {
+            let vector = a.asm.label()?;
+            let single = a.asm.label()?;
+            let scalar = a.asm.label()?;
+            let batch_hit = a.asm.label()?;
+            let batch_block0 = a.asm.label()?;
+            let batch_block1 = a.asm.label()?;
+            let batch_block2 = a.asm.label()?;
+            let batch_block3 = a.asm.label()?;
+            let vector_hit = a.asm.label()?;
+
+            // Short inputs retain the incumbent byte loop without paying for
+            // vector constants. A complete vector installs the immutable
+            // compiler-proved range once for the whole reverse scan.
+            a.cmp_x(8, 9)?;
+            a.branch_cond(AARCH64_LS, no_match)?;
+            a.sub_x(10, 8, 9)?;
+            a.i(aarch64_cmp_x_imm(10, 16))?;
+            a.branch_cond(AARCH64_LO, scalar)?;
+            aarch64_emit_start_filter_constants(
+                a.asm,
+                filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            a.branch(vector)?;
+
+            a.asm.bind(vector)?;
+            a.sub_x(10, 8, 9)?;
+            a.i(aarch64_cmp_x_imm(10, 64))?;
+            a.branch_cond(AARCH64_LO, single)?;
+            a.sub_x_imm(8, 8, 64)?;
+            a.add_x(12, 20, 8)?;
+            a.i(aarch64_ld1_four_16b(24, 12))?;
+            for block in 0_u8..4 {
+                let candidates = 24_u8.checked_add(block).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "AArch64 Ordered-NFA terminal-range batch candidates",
+                    ),
+                )?;
+                aarch64_emit_start_filter_vector_candidates(
+                    a.asm,
+                    filter,
+                    candidates,
+                    candidates,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            }
+            aarch64_emit_candidate_batch_any(a.asm, 24)?;
+            a.branch_cond(AARCH64_NE, batch_hit)?;
+            a.branch(vector)?;
+
+            // Probe retained masks from the end of the batch. The aggregate
+            // test guarantees one succeeds; the final recovery edge remains
+            // scalar-correct if that internal invariant is ever violated.
+            a.asm.bind(batch_hit)?;
+            for (candidates, hit) in [
+                (27_u8, batch_block3),
+                (26, batch_block2),
+                (25, batch_block1),
+                (24, batch_block0),
+            ] {
+                aarch64_emit_candidate_any(a.asm, candidates)?;
+                a.branch_cond(AARCH64_NE, hit)?;
+            }
+            a.add_x_imm(8, 8, 64)?;
+            a.branch(scalar)?;
+
+            for (label, candidates, offset) in [
+                (batch_block0, 24_u8, 0_u16),
+                (batch_block1, 25, 16),
+                (batch_block2, 26, 32),
+                (batch_block3, 27, 48),
+            ] {
+                a.asm.bind(label)?;
+                if candidates != 24 {
+                    a.i(aarch64_orr_16b(24, candidates, candidates))?;
+                }
+                if offset != 0 {
+                    a.add_x_imm(8, 8, offset)?;
+                }
+                a.branch(vector_hit)?;
+            }
+
+            a.asm.bind(single)?;
+            a.i(aarch64_cmp_x_imm(10, 16))?;
+            a.branch_cond(AARCH64_LO, scalar)?;
+            a.sub_x_imm(8, 8, 16)?;
+            a.add_x(12, 20, 8)?;
+            a.i(aarch64_load_q(24, 12))?;
+            aarch64_emit_start_filter_vector_candidates(
+                a.asm,
+                filter,
+                24,
+                24,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_any(a.asm, 24)?;
+            a.branch_cond(AARCH64_NE, vector_hit)?;
+            a.branch(vector)?;
+
+            a.asm.bind(vector_hit)?;
+            emit_terminal_range_last_lane(&mut a, search_entry)?;
+
+            a.asm.bind(scalar)?;
+            a.cmp_x(8, 9)?;
+            a.branch_cond(AARCH64_LS, no_match)?;
+            a.sub_x_imm(8, 8, 1)?;
+            a.i(aarch64_load_byte_reg(10, 20, 8))?;
+            a.cmp_w_imm(10, u16::from(range.start))?;
+            a.branch_cond(AARCH64_LO, scalar)?;
+            a.cmp_w_imm(10, u16::from(range.end))?;
+            a.branch_cond(AARCH64_HI, scalar)?;
+            a.add_x_imm(22, 8, 1)?;
+            a.branch(search_entry)?;
+        } else {
+            a.cmp_x(8, 9)?;
+            a.branch_cond(AARCH64_LS, no_match)?;
+            a.sub_x_imm(8, 8, 1)?;
+            a.i(aarch64_load_byte_reg(10, 20, 8))?;
+            a.cmp_w_imm(10, u16::from(range.start))?;
+            a.branch_cond(AARCH64_LO, scan)?;
+            a.cmp_w_imm(10, u16::from(range.end))?;
+            a.branch_cond(AARCH64_HI, scan)?;
+            a.add_x_imm(22, 8, 1)?;
+            a.branch(search_entry)?;
+        }
     }
 
     asm.bind(search_entry)?;
@@ -3354,6 +3555,18 @@ mod tests {
             crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
                 start: 0x80,
                 end: 0xff,
+                reverse_depth: 0,
+            },
+        );
+        image
+    }
+
+    fn sparse_terminal_range_image() -> NativeOrderedNfaObjectImage<'static> {
+        let mut image = minimal_image();
+        image.layout.terminal_range = Some(
+            crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
+                start: 0x01,
+                end: 0x08,
                 reverse_depth: 0,
             },
         );
@@ -3861,6 +4074,17 @@ mod tests {
                 .any(|word| word == compare));
         }
         assert_eq!(
+            filtered,
+            lower_aarch64_with_terminal_range_vector_policy(&terminal_range_image(), false)
+                .unwrap(),
+            "the common high-byte range must retain the incumbent scalar walk",
+        );
+        assert!(!filtered
+            .code
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .any(|word| word == aarch64_ld1_four_16b(24, 12).unwrap()));
+        assert_eq!(
             filtered
                 .relocations
                 .iter()
@@ -3872,6 +4096,162 @@ mod tests {
                 .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_batches_only_sparse_terminal_ranges() {
+        let sparse_range = sparse_terminal_range_image().layout.terminal_range.unwrap();
+        let sparse_filter = sparse_terminal_range_vector_filter(sparse_range)
+            .unwrap()
+            .expect("eight rare bytes must admit the vector reverse scanner");
+        assert_eq!(
+            sparse_filter
+                .ranges()
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            [(0x01, 0x08)],
+        );
+        assert!(sparse_terminal_range_vector_filter(
+            terminal_range_image().layout.terminal_range.unwrap()
+        )
+        .unwrap()
+        .is_none());
+        assert!(sparse_terminal_range_vector_filter(NativeOrderedNfaTerminalRangeV1 {
+            start: b'a',
+            end: b'z',
+            reverse_depth: 0,
+        })
+        .unwrap()
+        .is_none());
+        assert!(matches!(
+            sparse_terminal_range_vector_filter(NativeOrderedNfaTerminalRangeV1 {
+                start: 0x08,
+                end: 0x01,
+                reverse_depth: 0,
+            }),
+            Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA terminal-range vector proof"
+            ))
+        ));
+        assert!(matches!(
+            sparse_terminal_range_vector_filter(NativeOrderedNfaTerminalRangeV1 {
+                start: 0x01,
+                end: 0x08,
+                reverse_depth: 1,
+            }),
+            Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA terminal-range vector proof"
+            ))
+        ));
+
+        let image = sparse_terminal_range_image();
+        let selected = lower_aarch64(&image).unwrap();
+        let scalar = lower_aarch64_with_terminal_range_vector_policy(&image, false).unwrap();
+        let selected_words = selected
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let scalar_words = scalar
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(selected_words.contains(&aarch64_ld1_four_16b(24, 12).unwrap()));
+        assert!(selected_words.contains(&aarch64_load_q(24, 12).unwrap()));
+        assert!(selected_words.contains(&aarch64_sub_x_imm(8, 8, 64).unwrap()));
+        assert!(selected_words.contains(&aarch64_sub_x_imm(8, 8, 16).unwrap()));
+        for offset in [16_u16, 32, 48] {
+            assert!(selected_words.contains(&aarch64_add_x_imm(8, 8, offset).unwrap()));
+        }
+        for source in [25_u8, 26, 27] {
+            assert!(selected_words.contains(&aarch64_orr_16b(24, source, source).unwrap()));
+        }
+        for word in [0x4e18_3f0c, 0x4e08_3f0c, 0xdac0_118c] {
+            assert!(selected_words.contains(&word));
+        }
+        for immediate in [0x01_u16, 0x08] {
+            assert!(selected_words.contains(&aarch64_cmp_w_imm(10, immediate).unwrap()));
+        }
+        assert!(selected_words.contains(&aarch64_load_byte_reg(10, 20, 8).unwrap()));
+        assert!(!scalar_words.contains(&aarch64_ld1_four_16b(24, 12).unwrap()));
+        assert!(!scalar_words.contains(&aarch64_load_q(24, 12).unwrap()));
+        assert!(selected.code.len() > scalar.code.len());
+        assert_eq!(selected.relocations, scalar.relocations);
+
+        fn oracle(haystack: &[u8], start: usize, end: usize) -> Option<usize> {
+            haystack[start..end]
+                .iter()
+                .rposition(|byte| (0x01..=0x08).contains(byte))
+                .map(|offset| start + offset + 1)
+        }
+
+        fn batched(haystack: &[u8], start: usize, end: usize) -> Option<usize> {
+            let mut cursor = end;
+            while cursor - start >= 64 {
+                let base = cursor - 64;
+                if let Some(offset) = haystack[base..cursor]
+                    .iter()
+                    .rposition(|byte| (0x01..=0x08).contains(byte))
+                {
+                    return Some(base + offset + 1);
+                }
+                cursor = base;
+            }
+            while cursor - start >= 16 {
+                let base = cursor - 16;
+                if let Some(offset) = haystack[base..cursor]
+                    .iter()
+                    .rposition(|byte| (0x01..=0x08).contains(byte))
+                {
+                    return Some(base + offset + 1);
+                }
+                cursor = base;
+            }
+            while cursor > start {
+                cursor -= 1;
+                if (0x01..=0x08).contains(&haystack[cursor]) {
+                    return Some(cursor + 1);
+                }
+            }
+            None
+        }
+
+        for window_len in 0_usize..=160 {
+            for prefix in [0_usize, 1, 7] {
+                let start = prefix;
+                let end = start + window_len;
+                let mut haystack = vec![0x40; end + 7];
+                if start > 0 {
+                    haystack[start - 1] = 0x01;
+                }
+                if end < haystack.len() {
+                    haystack[end] = 0x08;
+                }
+                assert_eq!(batched(&haystack, start, end), oracle(&haystack, start, end));
+                for hit in start..end {
+                    for byte in [0x01_u8, 0x08] {
+                        haystack[hit] = byte;
+                        assert_eq!(
+                            batched(&haystack, start, end),
+                            oracle(&haystack, start, end),
+                            "window={start}..{end}, hit={hit:#x}, byte={byte:#x}",
+                        );
+                        if hit > start {
+                            haystack[start] = 0x04;
+                            assert_eq!(
+                                batched(&haystack, start, end),
+                                oracle(&haystack, start, end),
+                                "multiple hits in window={start}..{end}, latest={hit:#x}",
+                            );
+                            haystack[start] = 0x40;
+                        }
+                        haystack[hit] = 0x40;
+                    }
+                }
+            }
+        }
     }
 
     #[test]
