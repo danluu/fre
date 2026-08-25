@@ -27,6 +27,12 @@ const FOLDED_SHORT_MIN_CLASSIFIER_BLOCKS: usize = 1;
 // Shorter tails remain in the already-hot DFA loop.
 const ORDINARY_ROOT_RANGE_MIN_BYTES: usize = BYTE_SET_BLOCK_BYTES * 2;
 
+// Direct existence keeps its native classifier for a short accepting prefix.
+// Past that prefix, four straight transitions amortize cursor and loop control
+// while the outlined tail preserves the short-hit entry layout.
+const ORDINARY_DIRECT_DFA_NATIVE_BYTES: usize = 32;
+const ORDINARY_DIRECT_DFA_BULK_BYTES: usize = 4;
+
 pub(super) const ALPHABET_LEN: usize = 256;
 pub(super) const BYTES_PER_DFA_CELL_ENVELOPE: usize = 16;
 pub(super) const BYTES_PER_TRIE_STATE_ENVELOPE: usize = 256;
@@ -1700,6 +1706,71 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     }
 }
 
+/// Continue a direct existence scan after its native-classification prefix.
+///
+/// Four straight transitions share one cursor advance and loop edge. The
+/// caller supplies the exact state and relative endpoint reached by the
+/// prefix, so every accepting lane still returns an endpoint relative to the
+/// original window.
+#[inline(never)]
+fn ordinary_direct_dfa_first_acceptance_tail(
+    automaton: &DFA,
+    start_state: StateID,
+    mut state: StateID,
+    haystack: &[u8],
+    base_at: usize,
+) -> Option<usize> {
+    debug_assert!(automaton.prefilter().is_none());
+    debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
+    debug_assert!(!automaton.is_special(start_state));
+    debug_assert!(!automaton.is_match(start_state));
+
+    let anchored = Anchored::No;
+    let mut at = 0_usize;
+    macro_rules! stop_at_direct_special {
+        ($lane:expr) => {{
+            // The exactly pinned aho-corasick 1.1.4 concrete DFA orders dead
+            // and match states before its unanchored start, followed by
+            // ordinary states. The reachable-state closure test is the
+            // upgrade tripwire for this concrete dependency invariant.
+            debug_assert_eq!(
+                automaton.is_special(state),
+                state < start_state,
+                "Aho's concrete DFA special-state ordering changed",
+            );
+            if state < start_state {
+                if automaton.is_dead(state) {
+                    return None;
+                }
+                debug_assert!(
+                    automaton.is_match(state),
+                    "a DFA without a prefilter has no other special states",
+                );
+                return Some(base_at + at + $lane);
+            }
+        }};
+    }
+
+    let mut chunks = haystack.chunks_exact(ORDINARY_DIRECT_DFA_BULK_BYTES);
+    for chunk in chunks.by_ref() {
+        state = automaton.next_state(anchored, state, chunk[0]);
+        stop_at_direct_special!(1);
+        state = automaton.next_state(anchored, state, chunk[1]);
+        stop_at_direct_special!(2);
+        state = automaton.next_state(anchored, state, chunk[2]);
+        stop_at_direct_special!(3);
+        state = automaton.next_state(anchored, state, chunk[3]);
+        stop_at_direct_special!(4);
+        at += ORDINARY_DIRECT_DFA_BULK_BYTES;
+    }
+    for &byte in chunks.remainder() {
+        state = automaton.next_state(anchored, state, byte);
+        at += 1;
+        stop_at_direct_special!(0);
+    }
+    None
+}
+
 /// Stop at the first direct-DFA acceptance without selecting a pattern or
 /// reconstructing its start.
 ///
@@ -1722,10 +1793,9 @@ fn ordinary_direct_dfa_first_acceptance_end(
     let mut at = 0;
     // A short accepting prefix is dominated by entry and branch shape rather
     // than the saved metadata load. Preserve Aho's native classification for
-    // that prefix, then use the construction-proved boundary for the part of
-    // the scan where it amortizes. This is one continuous DFA traversal: the
-    // second loop resumes from the exact state reached by the first.
-    let native_end = haystack.len().min(32);
+    // that prefix, then continue from its exact state in the outlined bulk
+    // tail where shared loop control amortizes.
+    let native_end = haystack.len().min(ORDINARY_DIRECT_DFA_NATIVE_BYTES);
     while at < native_end {
         state = automaton.next_state(anchored, state, haystack[at]);
         at += 1;
@@ -1738,29 +1808,13 @@ fn ordinary_direct_dfa_first_acceptance_end(
             }
         }
     }
-    while at < haystack.len() {
-        state = automaton.next_state(anchored, state, haystack[at]);
-        at += 1;
-        // The exactly pinned aho-corasick 1.1.4 concrete DFA orders dead and
-        // match states before its unanchored start, followed by ordinary
-        // states. The reachable-state closure test is the upgrade tripwire.
-        debug_assert_eq!(
-            automaton.is_special(state),
-            state < start_state,
-            "Aho's concrete DFA special-state ordering changed",
-        );
-        if state < start_state {
-            if automaton.is_dead(state) {
-                return None;
-            }
-            debug_assert!(
-                automaton.is_match(state),
-                "a DFA without a prefilter has no other special states",
-            );
-            return Some(at);
-        }
-    }
-    None
+    ordinary_direct_dfa_first_acceptance_tail(
+        automaton,
+        start_state,
+        state,
+        &haystack[at..],
+        at,
+    )
 }
 
 impl<'a> LiteralSetOrdinaryExecutor<'a> {
@@ -5120,10 +5174,13 @@ mod tests {
     use super::{
         LiteralSetBuildLimits, LiteralSetDfaRootRange, LiteralSetError,
         LiteralSetMatchSemantics, LiteralSetOrdinaryExecutor, LiteralSetPlan,
-        LiteralSetSearchLimits, ORDINARY_ROOT_RANGE_MIN_BYTES,
+        LiteralSetSearchLimits, ORDINARY_DIRECT_DFA_BULK_BYTES,
+        ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
         decode_direct_dfa_start_state, encode_direct_dfa_start_state,
         first_acceptance_end_for_count, first_acceptance_end_for_span_visit,
-        first_acceptance_end_without_prefilter, ordinary_direct_probe, preflight,
+        first_acceptance_end_without_prefilter,
+        ordinary_direct_dfa_first_acceptance_end, ordinary_direct_probe,
+        preflight,
     };
     use crate::Window;
 
@@ -6835,6 +6892,96 @@ mod tests {
             ordinary.find_window_value(&delayed, window),
             Ok(Some((47, 51))),
         );
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_exists_tail_preserves_group_and_remainder_endpoints() {
+        let mut patterns = (0_u8..131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        patterns[0] = vec![1; 4];
+        let plan = LiteralSetPlan::new(
+            &patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().unwrap();
+        let start_state = ordinary
+            .direct_dfa_start_state
+            .map(decode_direct_dfa_start_state)
+            .unwrap();
+        let automaton = plan.automaton.as_ref();
+        const BASE: usize = 5;
+        let full_window_bytes = ORDINARY_DIRECT_DFA_NATIVE_BYTES
+            + 2 * ORDINARY_DIRECT_DFA_BULK_BYTES
+            + 3;
+
+        for relative_end in 30..=full_window_bytes {
+            let mut haystack = vec![200_u8; BASE + full_window_bytes + 7];
+            haystack[BASE + relative_end - 3..BASE + relative_end].fill(1);
+            assert_eq!(
+                ordinary_direct_dfa_first_acceptance_end(
+                    automaton,
+                    start_state,
+                    &haystack[BASE..BASE + full_window_bytes],
+                ),
+                Some(relative_end),
+                "relative_end={relative_end}",
+            );
+            assert_eq!(
+                ordinary.first_acceptance_window_value(
+                    &haystack,
+                    Window::new(BASE, BASE + full_window_bytes),
+                ),
+                Ok(Some(BASE + relative_end)),
+                "relative_end={relative_end}",
+            );
+        }
+
+        for remainder in 1..ORDINARY_DIRECT_DFA_BULK_BYTES {
+            let window_bytes = ORDINARY_DIRECT_DFA_NATIVE_BYTES + remainder;
+            let mut haystack = vec![200_u8; BASE + window_bytes + 7];
+            haystack[BASE + window_bytes - 3..BASE + window_bytes].fill(1);
+            assert_eq!(
+                ordinary_direct_dfa_first_acceptance_end(
+                    automaton,
+                    start_state,
+                    &haystack[BASE..BASE + window_bytes],
+                ),
+                Some(window_bytes),
+                "positive remainder={remainder}",
+            );
+            assert_eq!(
+                ordinary.first_acceptance_window_value(
+                    &haystack,
+                    Window::new(BASE, BASE + window_bytes),
+                ),
+                Ok(Some(BASE + window_bytes)),
+                "positive remainder={remainder}",
+            );
+        }
+
+        for window_bytes in 28..=full_window_bytes {
+            let haystack = vec![200_u8; BASE + window_bytes + 7];
+            assert_eq!(
+                ordinary_direct_dfa_first_acceptance_end(
+                    automaton,
+                    start_state,
+                    &haystack[BASE..BASE + window_bytes],
+                ),
+                None,
+                "miss window_bytes={window_bytes}",
+            );
+            assert_eq!(
+                ordinary.first_acceptance_window_value(
+                    &haystack,
+                    Window::new(BASE, BASE + window_bytes),
+                ),
+                Ok(None),
+                "miss window_bytes={window_bytes}",
+            );
+        }
     }
 
     #[test]
