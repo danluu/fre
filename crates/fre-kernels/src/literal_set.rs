@@ -2,14 +2,16 @@
 
 use core::fmt;
 use core::mem;
-use core::num::{NonZeroU16, NonZeroU32};
+use core::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 
 use aho_corasick::automaton::{Automaton, StateID};
 use aho_corasick::dfa::DFA;
 use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind, PatternID, Span};
 use fre_exact_alloc::try_box_preserve;
-use fre_simd_kernels::{BYTE_BUCKET_BLOCK_BYTES, BYTE_SET_BLOCK_BYTES, find_byte_delta};
+use fre_simd_kernels::{
+    BYTE_BUCKET_BLOCK_BYTES, BYTE_SET_BLOCK_BYTES, find_byte_delta, find_byte_set4,
+};
 
 use crate::Window;
 use crate::folded_literal_trie::{
@@ -26,6 +28,17 @@ const FOLDED_SHORT_MIN_CLASSIFIER_BLOCKS: usize = 1;
 // The fixed byte-range leaf amortizes its setup over two complete blocks.
 // Shorter tails remain in the already-hot DFA loop.
 const ORDINARY_ROOT_RANGE_MIN_BYTES: usize = BYTE_SET_BLOCK_BYTES * 2;
+
+// Four exact members pay a wider classifier setup than one bounded delta.
+// Four complete blocks keep that optional leaf behind a conservative,
+// source-independent amortization boundary.
+const ORDINARY_ROOT_SET4_MIN_BYTES: usize = BYTE_SET_BLOCK_BYTES * 4;
+
+// Direct existence keeps its native classifier for a short accepting prefix.
+// Past that prefix, four straight transitions amortize cursor and loop control
+// while the outlined tail preserves the short-hit entry layout.
+const ORDINARY_DIRECT_DFA_NATIVE_BYTES: usize = 32;
+const ORDINARY_DIRECT_DFA_BULK_BYTES: usize = 4;
 
 pub(super) const ALPHABET_LEN: usize = 256;
 pub(super) const BYTES_PER_DFA_CELL_ENVELOPE: usize = 16;
@@ -262,8 +275,7 @@ pub struct LiteralSetPlan {
 #[derive(Clone, Copy, Debug)]
 pub struct LiteralSetOrdinaryExecutor<'a> {
     plan: &'a LiteralSetPlan,
-    direct_dfa_start_state: Option<NonZeroU32>,
-    direct_dfa_root_range: Option<NonZeroU16>,
+    direct_dfa_identity: Option<LiteralSetDirectDfaIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,6 +285,11 @@ struct LiteralSetDfaRootRange {
 }
 
 impl LiteralSetDfaRootRange {
+    #[inline(always)]
+    fn contains(self, byte: u8) -> bool {
+        byte.wrapping_sub(self.origin) <= self.maximum_delta
+    }
+
     fn encode(self) -> NonZeroU16 {
         debug_assert!(self.origin.checked_add(self.maximum_delta).is_some());
         let raw = (u16::from(self.origin) << 8) | u16::from(self.maximum_delta);
@@ -292,6 +309,222 @@ impl LiteralSetDfaRootRange {
     }
 }
 
+/// One necessary-root capability packed above the direct DFA start.
+///
+/// Biased exact ranges occupy the nonzero low-16-bit domain. A non-contiguous
+/// set of at most four exact roots instead records the nonzero mask of their
+/// high-nibble buckets in the high 16 bits, leaving the range half exactly
+/// zero. The selected-span scanner can therefore retain the incumbent
+/// low-half `Option<NonZeroU16>` projection without learning about Set4. Only
+/// the sufficiently-long Exists continuation expands marked buckets back into
+/// exact members from the already-bound DFA.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiteralSetDfaRoot(NonZeroU32);
+
+impl LiteralSetDfaRoot {
+    const SET4_BUCKET_SHIFT: u32 = u16::BITS;
+
+    fn from_range(range: LiteralSetDfaRootRange) -> Self {
+        Self(
+            NonZeroU32::new(u32::from(range.encode().get()))
+                .expect("the biased range payload is nonzero"),
+        )
+    }
+
+    fn from_set4(members: [u8; 4]) -> Self {
+        debug_assert!(members.windows(2).all(|pair| pair[0] <= pair[1]));
+        let mut buckets = 0_u16;
+        for member in members {
+            buckets |= 1_u16 << (member >> 4);
+        }
+        let buckets = NonZeroU16::new(buckets)
+            .expect("a canonical Set4 root marks at least one byte bucket");
+        let encoded = u32::from(buckets.get()) << Self::SET4_BUCKET_SHIFT;
+        Self(
+            NonZeroU32::new(encoded)
+                .expect("a Set4 bucket mask occupies the nonzero high half"),
+        )
+    }
+
+    const fn encode(self) -> NonZeroU32 {
+        self.0
+    }
+
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "the low half deliberately retains only the optional range payload"
+    )]
+    fn as_range(self) -> Option<LiteralSetDfaRootRange> {
+        NonZeroU16::new(self.0.get() as u16).map(LiteralSetDfaRootRange::decode)
+    }
+
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "the high half deliberately retains only the Set4 bucket mask"
+    )]
+    fn set4_bucket_mask(self) -> Option<NonZeroU16> {
+        NonZeroU16::new((self.0.get() >> Self::SET4_BUCKET_SHIFT) as u16)
+    }
+}
+
+#[inline(always)]
+fn direct_dfa_set4_contains(members: [u8; 4], byte: u8) -> bool {
+    // One packed zero lane means that one exact member equals `byte`.
+    let different = u32::from_le_bytes(members) ^ u32::from_le_bytes([byte; 4]);
+    (different.wrapping_sub(0x0101_0101) & !different & 0x8080_8080) != 0
+}
+
+/// One scalar identity for the direct ordinary DFA and its optional root
+/// accelerator.
+///
+/// The nonzero encoded start occupies the low 32 bits, making the complete
+/// value nonzero even when no exact root capability is available. The high
+/// 32-bit payload retains the range's existing low-16-bit encoding or one
+/// high-16-bit Set4 bucket mask. Binding both pieces once keeps the executor at
+/// two machine words, lets every direct operation decode its mandatory start
+/// without a shift, and preserves the incumbent range projection in scanners
+/// that must remain unaware of Set4.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiteralSetDirectDfaIdentity(NonZeroU64);
+
+impl LiteralSetDirectDfaIdentity {
+    const ROOT_SHIFT: u32 = u32::BITS;
+
+    #[inline]
+    fn new(start_state: StateID, root: Option<LiteralSetDfaRoot>) -> Self {
+        let encoded_start = encode_direct_dfa_start_state(start_state);
+        let encoded_root = root.map_or(0, |root| root.encode().get());
+        let raw = u64::from(encoded_start.get())
+            | (u64::from(encoded_root) << Self::ROOT_SHIFT);
+        Self(
+            NonZeroU64::new(raw)
+                .expect("the low direct-DFA start encoding is nonzero"),
+        )
+    }
+
+    #[inline(always)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::inline_always,
+        reason = "the low 32 bits deliberately retain the nonzero biased start and decode on the hot boundary"
+    )]
+    fn start_state(self) -> StateID {
+        let encoded = self.0.get() as u32;
+        debug_assert_ne!(encoded, 0);
+        let raw = encoded - 1;
+        StateID::must(
+            usize::try_from(raw)
+                .expect("a valid encoded StateID always fits in usize"),
+        )
+    }
+
+    #[inline(always)]
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::inline_always,
+        reason = "the shifted optional root payload is confined to 32 bits and decodes on the hot boundary"
+    )]
+    fn root(self) -> Option<LiteralSetDfaRoot> {
+        NonZeroU32::new((self.0.get() >> Self::ROOT_SHIFT) as u32)
+            .map(LiteralSetDfaRoot)
+    }
+
+    #[inline(always)]
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::inline_always,
+        reason = "the shifted optional range payload is deliberately confined to the low 16 root bits"
+    )]
+    fn root_range(self) -> Option<NonZeroU16> {
+        NonZeroU16::new((self.0.get() >> Self::ROOT_SHIFT) as u16)
+    }
+}
+
+/// Find the first exact root after the caller has rejected the current byte.
+///
+/// Both the selected-span scanner and the post-native Exists range continuation
+/// use this leaf, so its probe accounting proves that they share one range
+/// predicate and one first-position implementation.
+#[inline(always)]
+fn find_direct_dfa_root_after_initial_miss(
+    range: LiteralSetDfaRootRange,
+    remaining: &[u8],
+) -> Option<usize> {
+    debug_assert!(remaining.len() >= ORDINARY_ROOT_RANGE_MIN_BYTES);
+    debug_assert!(!range.contains(remaining[0]));
+    let relative = find_byte_delta(range.origin, range.maximum_delta, remaining);
+    #[cfg(test)]
+    ordinary_direct_probe::record_root_range(relative.unwrap_or(remaining.len()));
+    relative
+}
+
+#[inline(never)]
+fn find_direct_dfa_set4_after_initial_miss(
+    members: [u8; 4],
+    remaining: &[u8],
+) -> Option<usize> {
+    let relative = find_byte_set4(members, remaining);
+    #[cfg(test)]
+    ordinary_direct_probe::record_root_set4(relative.unwrap_or(remaining.len()));
+    relative
+}
+
+/// Expand one construction-proved Set4 bucket mask only on the long Exists
+/// branch that can amortize it.
+///
+/// At most four marked high-nibble buckets are possible, so this performs no
+/// more than 64 start-state transitions. Returning `None` preserves a safe
+/// exact-DFA fallback if the private packed capability is ever inconsistent.
+#[cold]
+#[inline(never)]
+fn direct_dfa_set4_members_from_buckets(
+    automaton: &DFA,
+    start_state: StateID,
+    buckets: NonZeroU16,
+) -> Option<[u8; 4]> {
+    debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
+    debug_assert!(automaton.prefilter().is_none());
+    debug_assert!(!automaton.is_special(start_state));
+    let anchored = Anchored::No;
+    let expected_buckets = buckets.get();
+    let mut pending_buckets = expected_buckets;
+    let mut reconstructed_buckets = 0_u16;
+    let mut members = [0_u8; 4];
+    let mut member_count = 0_usize;
+    while pending_buckets != 0 {
+        let bucket = u8::try_from(pending_buckets.trailing_zeros())
+            .expect("a u16 bucket index fits u8");
+        let bucket_bit = 1_u16 << bucket;
+        pending_buckets ^= bucket_bit;
+        let origin = bucket << 4;
+        for delta in 0_u8..16 {
+            let byte = origin | delta;
+            let next = automaton.next_state(anchored, start_state, byte);
+            if automaton.is_start(next) || automaton.is_dead(next) {
+                continue;
+            }
+            let slot = members.get_mut(member_count)?;
+            *slot = byte;
+            member_count = member_count.checked_add(1)?;
+            reconstructed_buckets |= bucket_bit;
+        }
+    }
+    if reconstructed_buckets != expected_buckets {
+        return None;
+    }
+    let last = *members.get(member_count.checked_sub(1)?)?;
+    members[member_count..].fill(last);
+    Some(members)
+}
+
 #[inline]
 fn encode_direct_dfa_start_state(state: StateID) -> NonZeroU32 {
     NonZeroU32::new(
@@ -303,6 +536,7 @@ fn encode_direct_dfa_start_state(state: StateID) -> NonZeroU32 {
     .expect("biasing a StateID excludes zero")
 }
 
+#[cfg(test)]
 #[inline]
 fn decode_direct_dfa_start_state(encoded: NonZeroU32) -> StateID {
     let raw = encoded.get() - 1;
@@ -326,16 +560,33 @@ struct LiteralSetDfaScanner<'a, 'h> {
     end: usize,
 }
 
-/// One selected DFA match before an operation-specific projection.
+/// One selected DFA match in the incumbent generic scanner representation.
 ///
 /// `LiteralSetDfaScanner::next::<false>` never reads an output pattern,
 /// so its count-only instantiation retains the incumbent endpoint loop without
-/// pattern bookkeeping. The span instantiation records output slot zero from
-/// the final delayed LeftmostFirst acceptance and resolves its width once.
+/// pattern bookkeeping. Span selection uses the raw-pattern projection below.
 #[derive(Clone, Copy)]
 struct LiteralSetDfaSelection {
     end: usize,
+    // The span projection below deliberately leaves only the count
+    // monomorphization of the incumbent generic scanner.
+    #[allow(
+        dead_code,
+        reason = "the incumbent generic count representation retains its pattern slot"
+    )]
     pattern: Option<PatternID>,
+}
+
+/// Selected span evidence with presence encoded by its restart-relative end.
+///
+/// Positive width proves that every acceptance ends after the current restart,
+/// so the span-only transition loop can keep a raw pattern ID without carrying
+/// an inner option. Count retains `LiteralSetDfaSelection` and its incumbent
+/// generic loop above unchanged.
+#[derive(Clone, Copy)]
+struct LiteralSetDfaSpanSelection {
+    end: usize,
+    pattern: PatternID,
 }
 
 /// Construction-bound capability for deliberately bypassing the optional
@@ -400,7 +651,10 @@ mod ordinary_direct_probe {
         static ADAPTIVE_REPLAYS: Cell<usize> = const { Cell::new(0) };
         static ROOT_RANGE_BINDINGS: Cell<usize> = const { Cell::new(0) };
         static ROOT_RANGE_CALLS: Cell<usize> = const { Cell::new(0) };
+        static SPAN_ROOT_RANGE_NEAR_HITS: Cell<usize> = const { Cell::new(0) };
         static ROOT_RANGE_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
+        static ROOT_SET4_CALLS: Cell<usize> = const { Cell::new(0) };
+        static ROOT_SET4_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
@@ -409,7 +663,10 @@ mod ordinary_direct_probe {
         ADAPTIVE_REPLAYS.set(0);
         ROOT_RANGE_BINDINGS.set(0);
         ROOT_RANGE_CALLS.set(0);
+        SPAN_ROOT_RANGE_NEAR_HITS.set(0);
         ROOT_RANGE_SKIPPED_BYTES.set(0);
+        ROOT_SET4_CALLS.set(0);
+        ROOT_SET4_SKIPPED_BYTES.set(0);
     }
 
     pub(super) fn record() {
@@ -453,15 +710,40 @@ mod ordinary_direct_probe {
         ROOT_RANGE_CALLS.get()
     }
 
+    pub(super) fn record_span_root_range_near_hit() {
+        SPAN_ROOT_RANGE_NEAR_HITS.set(
+            SPAN_ROOT_RANGE_NEAR_HITS.get().saturating_add(1),
+        );
+    }
+
+    pub(super) fn span_root_range_near_hits() -> usize {
+        SPAN_ROOT_RANGE_NEAR_HITS.get()
+    }
+
     pub(super) fn root_range_skipped_bytes() -> usize {
         ROOT_RANGE_SKIPPED_BYTES.get()
     }
+
+    pub(super) fn record_root_set4(skipped: usize) {
+        ROOT_SET4_CALLS.set(ROOT_SET4_CALLS.get().saturating_add(1));
+        ROOT_SET4_SKIPPED_BYTES.set(ROOT_SET4_SKIPPED_BYTES.get().saturating_add(skipped));
+    }
+
+    pub(super) fn root_set4_calls() -> usize {
+        ROOT_SET4_CALLS.get()
+    }
+
+    pub(super) fn root_set4_skipped_bytes() -> usize {
+        ROOT_SET4_SKIPPED_BYTES.get()
+    }
 }
 
-fn direct_dfa_root_range(
+#[cold]
+#[inline(never)]
+fn direct_dfa_root(
     automaton: &DFA,
     start_state: StateID,
-) -> Option<LiteralSetDfaRootRange> {
+) -> Option<LiteralSetDfaRoot> {
     debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
     debug_assert!(automaton.prefilter().is_none());
     debug_assert!(automaton.min_pattern_len() > 0);
@@ -472,6 +754,7 @@ fn direct_dfa_root_range(
     let mut first = None;
     let mut last = 0_u8;
     let mut members = 0_usize;
+    let mut exact_members = [0_u8; 4];
     for byte in 0_u16..=u16::from(u8::MAX) {
         let byte = u8::try_from(byte).expect("the fixed byte domain fits in u8");
         let next = automaton.next_state(anchored, start_state, byte);
@@ -480,17 +763,25 @@ fn direct_dfa_root_range(
         }
         first.get_or_insert(byte);
         last = byte;
+        if members < exact_members.len() {
+            exact_members[members] = byte;
+        }
         members = members.checked_add(1)?;
     }
     let origin = first?;
     let maximum_delta = last.checked_sub(origin)?;
     let range_members = usize::from(maximum_delta).checked_add(1)?;
-    (members == range_members && range_members < ALPHABET_LEN).then_some(
-        LiteralSetDfaRootRange {
+    if members == range_members && range_members < ALPHABET_LEN {
+        return Some(LiteralSetDfaRoot::from_range(LiteralSetDfaRootRange {
             origin,
             maximum_delta,
-        },
-    )
+        }));
+    }
+    if members > exact_members.len() {
+        return None;
+    }
+    exact_members[members..].fill(last);
+    Some(LiteralSetDfaRoot::from_set4(exact_members))
 }
 
 /// Construction-sealed opportunity to attach one folded accelerator.
@@ -736,14 +1027,13 @@ impl LiteralSetPlan {
         } else {
             None
         };
-        let direct_dfa_root_range = direct_dfa_start_state
-            .and_then(|start_state| direct_dfa_root_range(automaton, start_state))
-            .map(LiteralSetDfaRootRange::encode);
+        let direct_dfa_identity = direct_dfa_start_state.map(|start_state| {
+            let root = direct_dfa_root(automaton, start_state);
+            LiteralSetDirectDfaIdentity::new(start_state, root)
+        });
         Some(LiteralSetOrdinaryExecutor {
             plan: self,
-            direct_dfa_start_state: direct_dfa_start_state
-                .map(encode_direct_dfa_start_state),
-            direct_dfa_root_range,
+            direct_dfa_identity,
         })
     }
 
@@ -1590,9 +1880,8 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     ) -> Option<Self> {
         let plan = executor.plan;
         let automaton = plan.automaton.as_ref();
-        let start_state = executor
-            .direct_dfa_start_state
-            .map(decode_direct_dfa_start_state)?;
+        let identity = executor.direct_dfa_identity?;
+        let start_state = identity.start_state();
         debug_assert!(automaton.prefilter().is_none());
         debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
         // Aho's special-state taxonomy is dead, match or start. Requiring an
@@ -1602,9 +1891,7 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         debug_assert!(!automaton.is_match(start_state));
         Some(Self {
             automaton,
-            root_range: executor
-                .direct_dfa_root_range
-                .map(LiteralSetDfaRootRange::decode),
+            root_range: identity.root_range().map(LiteralSetDfaRootRange::decode),
             haystack,
             start_state,
             restart: window.start(),
@@ -1653,10 +1940,60 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         selected
     }
 
-    /// Seek one exact root only for the bulk span visitor, before entering the
-    /// unchanged shared DFA transition loop.
     #[inline(always)]
-    fn seek_root_range_for_span_visit(&mut self) -> bool {
+    fn next_pattern(&mut self) -> Option<LiteralSetDfaSpanSelection> {
+        let anchored = Anchored::No;
+        let mut state = self.start_state;
+        let restart = self.restart;
+        let mut at = restart;
+        // Positive width makes the search restart an exact no-selection
+        // sentinel: every acceptance ends strictly after it. Keep that proof
+        // in the endpoint instead of carrying and rewriting a separate
+        // `Option<LiteralSetDfaSelection>` tag through the transition loop.
+        let mut selected_end = restart;
+        let mut selected_pattern = PatternID::ZERO;
+        while at < self.end {
+            state = self.automaton.next_state(anchored, state, self.haystack[at]);
+            at += 1;
+            // The exactly pinned aho-corasick 1.1.4 concrete DFA orders dead
+            // and match states before the unanchored start, followed by its
+            // ordinary states. With no prefilter that start is deliberately
+            // non-special, so the bound start is also the exact special-state
+            // boundary. Reusing it avoids loading the DFA's private maximum
+            // on every byte. The reachable-state closure test is the upgrade
+            // tripwire for this concrete dependency invariant.
+            debug_assert_eq!(
+                self.automaton.is_special(state),
+                state < self.start_state,
+                "Aho's concrete DFA special-state ordering changed",
+            );
+            if state < self.start_state {
+                if self.automaton.is_dead(state) {
+                    break;
+                }
+                debug_assert!(
+                    self.automaton.is_match(state),
+                    "a DFA without a prefilter has no other special states",
+                );
+                selected_end = at;
+                selected_pattern = self.automaton.match_pattern(state, 0);
+            }
+        }
+        if selected_end == restart {
+            self.restart = self.end;
+            return None;
+        }
+        self.restart = selected_end;
+        Some(LiteralSetDfaSpanSelection {
+            end: selected_end,
+            pattern: selected_pattern,
+        })
+    }
+
+    /// Seek one exact root before entering the unchanged selected-span DFA
+    /// transition loop.
+    #[inline(always)]
+    fn seek_root_range_for_selected_span(&mut self) -> bool {
         let at = self.restart;
         if self.end - at < ORDINARY_ROOT_RANGE_MIN_BYTES {
             return true;
@@ -1664,18 +2001,22 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         let Some(range) = self.root_range else {
             return true;
         };
-        if self.haystack[at].wrapping_sub(range.origin) <= range.maximum_delta {
+        if range.contains(self.haystack[at]) {
+            return true;
+        }
+        // A single separator is too near to amortize the out-of-line native
+        // range leaf. The minimum extent above makes this lookahead safe.
+        if range.contains(self.haystack[at + 1]) {
+            #[cfg(test)]
+            ordinary_direct_probe::record_span_root_range_near_hit();
+            self.restart = at + 1;
             return true;
         }
         let remaining = &self.haystack[at..self.end];
-        let Some(relative) = find_byte_delta(range.origin, range.maximum_delta, remaining) else {
-            #[cfg(test)]
-            ordinary_direct_probe::record_root_range(remaining.len());
+        let Some(relative) = find_direct_dfa_root_after_initial_miss(range, remaining) else {
             self.restart = self.end;
             return false;
         };
-        #[cfg(test)]
-        ordinary_direct_probe::record_root_range(relative);
         self.restart = at + relative;
         true
     }
@@ -1688,16 +2029,141 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     #[inline(always)]
     fn next_span(&mut self) -> Option<(usize, usize)> {
         let restart = self.restart;
-        let matched = self.next::<true>()?;
+        let matched = self.next_pattern()?;
         let end = matched.end;
-        let pattern = matched
-            .pattern
-            .expect("span-mode DFA scanning records its selected pattern");
-        let pattern_bytes = self.automaton.pattern_len(pattern);
+        let pattern_bytes = self.automaton.pattern_len(matched.pattern);
         debug_assert!(pattern_bytes > 0);
         debug_assert!(pattern_bytes <= end.saturating_sub(restart));
         Some((end - pattern_bytes, end))
     }
+}
+
+/// Continue a direct existence scan after its native-classification prefix.
+///
+/// Four straight transitions share one cursor advance and loop edge. The
+/// caller supplies the exact state and relative endpoint reached by the
+/// prefix, so every accepting lane still returns an endpoint relative to the
+/// original window.
+#[inline(never)]
+fn ordinary_direct_dfa_first_acceptance_tail(
+    automaton: &DFA,
+    start_state: StateID,
+    mut state: StateID,
+    haystack: &[u8],
+    base_at: usize,
+) -> Option<usize> {
+    debug_assert!(automaton.prefilter().is_none());
+    debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
+    debug_assert!(!automaton.is_special(start_state));
+    debug_assert!(!automaton.is_match(start_state));
+
+    let anchored = Anchored::No;
+    let mut at = 0_usize;
+    macro_rules! stop_at_direct_special {
+        ($lane:expr) => {{
+            // The exactly pinned aho-corasick 1.1.4 concrete DFA orders dead
+            // and match states before its unanchored start, followed by
+            // ordinary states. The reachable-state closure test is the
+            // upgrade tripwire for this concrete dependency invariant.
+            debug_assert_eq!(
+                automaton.is_special(state),
+                state < start_state,
+                "Aho's concrete DFA special-state ordering changed",
+            );
+            if state < start_state {
+                if automaton.is_dead(state) {
+                    return None;
+                }
+                debug_assert!(
+                    automaton.is_match(state),
+                    "a DFA without a prefilter has no other special states",
+                );
+                return Some(base_at + at + $lane);
+            }
+        }};
+    }
+
+    let mut chunks = haystack.chunks_exact(ORDINARY_DIRECT_DFA_BULK_BYTES);
+    for chunk in chunks.by_ref() {
+        state = automaton.next_state(anchored, state, chunk[0]);
+        stop_at_direct_special!(1);
+        state = automaton.next_state(anchored, state, chunk[1]);
+        stop_at_direct_special!(2);
+        state = automaton.next_state(anchored, state, chunk[2]);
+        stop_at_direct_special!(3);
+        state = automaton.next_state(anchored, state, chunk[3]);
+        stop_at_direct_special!(4);
+        at += ORDINARY_DIRECT_DFA_BULK_BYTES;
+    }
+    for &byte in chunks.remainder() {
+        state = automaton.next_state(anchored, state, byte);
+        at += 1;
+        stop_at_direct_special!(0);
+    }
+    None
+}
+
+/// Continue Exists only after the native prefix ended at the unanchored start
+/// and its current suffix byte was proved not to be in the exact root range.
+///
+/// Outlining this branch keeps the native entry and early-acceptance loop from
+/// preserving DFA and slice registers across the optional native range leaf.
+#[inline(never)]
+fn ordinary_direct_dfa_first_acceptance_after_root_miss(
+    automaton: &DFA,
+    start_state: StateID,
+    range: LiteralSetDfaRootRange,
+    haystack: &[u8],
+    base_at: usize,
+) -> Option<usize> {
+    let relative = find_direct_dfa_root_after_initial_miss(range, haystack)?;
+    ordinary_direct_dfa_first_acceptance_tail(
+        automaton,
+        start_state,
+        start_state,
+        &haystack[relative..],
+        base_at + relative,
+    )
+}
+
+/// Continue Exists only after its post-native suffix reaches a sufficiently
+/// long Set4-capable window.
+///
+/// Exact members are reconstructed from the packed bucket mask here, keeping
+/// that work and the wider classifier disjoint from the incumbent range
+/// continuation above. A capability mismatch falls back to the exact DFA tail.
+#[cold]
+#[inline(never)]
+fn ordinary_direct_dfa_first_acceptance_after_set4_root(
+    automaton: &DFA,
+    start_state: StateID,
+    buckets: NonZeroU16,
+    haystack: &[u8],
+    base_at: usize,
+) -> Option<usize> {
+    let Some(members) =
+        direct_dfa_set4_members_from_buckets(automaton, start_state, buckets)
+    else {
+        return ordinary_direct_dfa_first_acceptance_tail(
+            automaton,
+            start_state,
+            start_state,
+            haystack,
+            base_at,
+        );
+    };
+    let relative = if direct_dfa_set4_contains(members, haystack[0]) {
+        0
+    } else {
+        find_direct_dfa_set4_after_initial_miss(members, haystack)?
+    };
+    ordinary_direct_dfa_first_acceptance_tail(
+        automaton,
+        start_state,
+        start_state,
+        &haystack[relative..],
+        base_at + relative,
+    )
 }
 
 /// Stop at the first direct-DFA acceptance without selecting a pattern or
@@ -1705,12 +2171,13 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
 ///
 /// This deliberately binds only the state needed by one-shot Exists. Bulk
 /// selected-span operations retain `LiteralSetDfaScanner`, whose restart and
-/// root-range fields amortize across matches.
+/// exact-root fields amortize across matches.
 #[inline(never)]
 fn ordinary_direct_dfa_first_acceptance_end(
     automaton: &DFA,
     start_state: StateID,
     haystack: &[u8],
+    root: Option<LiteralSetDfaRoot>,
 ) -> Option<usize> {
     debug_assert!(automaton.prefilter().is_none());
     debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
@@ -1722,10 +2189,9 @@ fn ordinary_direct_dfa_first_acceptance_end(
     let mut at = 0;
     // A short accepting prefix is dominated by entry and branch shape rather
     // than the saved metadata load. Preserve Aho's native classification for
-    // that prefix, then use the construction-proved boundary for the part of
-    // the scan where it amortizes. This is one continuous DFA traversal: the
-    // second loop resumes from the exact state reached by the first.
-    let native_end = haystack.len().min(32);
+    // that prefix, then continue from its exact state in the outlined bulk
+    // tail where shared loop control amortizes.
+    let native_end = haystack.len().min(ORDINARY_DIRECT_DFA_NATIVE_BYTES);
     while at < native_end {
         state = automaton.next_state(anchored, state, haystack[at]);
         at += 1;
@@ -1738,29 +2204,39 @@ fn ordinary_direct_dfa_first_acceptance_end(
             }
         }
     }
-    while at < haystack.len() {
-        state = automaton.next_state(anchored, state, haystack[at]);
-        at += 1;
-        // The exactly pinned aho-corasick 1.1.4 concrete DFA orders dead and
-        // match states before its unanchored start, followed by ordinary
-        // states. The reachable-state closure test is the upgrade tripwire.
-        debug_assert_eq!(
-            automaton.is_special(state),
-            state < start_state,
-            "Aho's concrete DFA special-state ordering changed",
-        );
-        if state < start_state {
-            if automaton.is_dead(state) {
-                return None;
+    let remaining = &haystack[at..];
+    if remaining.len() >= ORDINARY_ROOT_RANGE_MIN_BYTES && state == start_state {
+        if let Some(root) = root {
+            if let Some(range) = root.as_range() {
+                if !range.contains(remaining[0]) {
+                    return ordinary_direct_dfa_first_acceptance_after_root_miss(
+                        automaton,
+                        start_state,
+                        range,
+                        remaining,
+                        at,
+                    );
+                }
+            } else if remaining.len() >= ORDINARY_ROOT_SET4_MIN_BYTES {
+                if let Some(buckets) = root.set4_bucket_mask() {
+                    return ordinary_direct_dfa_first_acceptance_after_set4_root(
+                        automaton,
+                        start_state,
+                        buckets,
+                        remaining,
+                        at,
+                    );
+                }
             }
-            debug_assert!(
-                automaton.is_match(state),
-                "a DFA without a prefilter has no other special states",
-            );
-            return Some(at);
         }
     }
-    None
+    ordinary_direct_dfa_first_acceptance_tail(
+        automaton,
+        start_state,
+        state,
+        remaining,
+        at,
+    )
 }
 
 impl<'a> LiteralSetOrdinaryExecutor<'a> {
@@ -1806,7 +2282,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     #[must_use]
     #[inline]
     pub fn direct_count_scanner_supported(&self) -> bool {
-        self.direct_dfa_start_state.is_some()
+        self.direct_dfa_identity.is_some()
     }
 
     /// Bind the capability to select first acceptance by scanning this same
@@ -1841,6 +2317,9 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     ) -> Result<Option<(usize, usize)>, LiteralSetError> {
         validate_window(window, haystack.len())?;
         if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
+            if !scanner.seek_root_range_for_selected_span() {
+                return Ok(None);
+            }
             return Ok(scanner.next_span());
         }
         self.plan.try_find_window_value(haystack, window)
@@ -1882,13 +2361,14 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         window: Window,
     ) -> Result<Option<usize>, LiteralSetError> {
         validate_window(window, haystack.len())?;
-        if let Some(encoded) = self.direct_dfa_start_state {
+        if let Some(identity) = self.direct_dfa_identity {
             let base = window.start();
             let window_bytes = window.end() - base;
             let relative_end = ordinary_direct_dfa_first_acceptance_end(
                 self.plan.automaton.as_ref(),
-                decode_direct_dfa_start_state(encoded),
+                identity.start_state(),
                 &haystack[base..window.end()],
+                identity.root(),
             );
             return Ok(relative_end.map(|end| {
                 debug_assert!(end <= window_bytes);
@@ -1981,7 +2461,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         debug_assert!(window.start() <= window.end());
         debug_assert!(window.end() <= haystack.len());
         if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
-            while scanner.seek_root_range_for_span_visit() {
+            while scanner.seek_root_range_for_selected_span() {
                 let Some(matched) = scanner.next_span() else {
                     break;
                 };
@@ -2154,8 +2634,7 @@ impl<'a> LiteralSetUniformStandardOrdinaryExecutor<'a> {
     pub const fn ordinary_executor(self) -> LiteralSetOrdinaryExecutor<'a> {
         LiteralSetOrdinaryExecutor {
             plan: self.plan,
-            direct_dfa_start_state: None,
-            direct_dfa_root_range: None,
+            direct_dfa_identity: None,
         }
     }
 
@@ -5115,15 +5594,21 @@ mod tests {
 
     use aho_corasick::automaton::{Automaton, StateID};
     use aho_corasick::dfa::DFA;
-    use aho_corasick::{Anchored, Input, MatchKind};
+    use aho_corasick::{Anchored, Input, MatchKind, PatternID};
 
     use super::{
-        LiteralSetBuildLimits, LiteralSetDfaRootRange, LiteralSetError,
-        LiteralSetMatchSemantics, LiteralSetOrdinaryExecutor, LiteralSetPlan,
-        LiteralSetSearchLimits, ORDINARY_ROOT_RANGE_MIN_BYTES,
+        LiteralSetBuildLimits, LiteralSetDfaRoot, LiteralSetDfaRootRange,
+        LiteralSetDfaScanner, LiteralSetDfaSpanSelection, LiteralSetDirectDfaIdentity,
+        LiteralSetError, LiteralSetMatchSemantics, LiteralSetOrdinaryExecutor, LiteralSetPlan,
+        LiteralSetSearchLimits, ORDINARY_DIRECT_DFA_BULK_BYTES,
+        ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
+        ORDINARY_ROOT_SET4_MIN_BYTES,
         decode_direct_dfa_start_state, encode_direct_dfa_start_state,
+        direct_dfa_set4_contains, direct_dfa_set4_members_from_buckets,
         first_acceptance_end_for_count, first_acceptance_end_for_span_visit,
-        first_acceptance_end_without_prefilter, ordinary_direct_probe, preflight,
+        first_acceptance_end_without_prefilter,
+        ordinary_direct_dfa_first_acceptance_end, ordinary_direct_probe,
+        preflight,
     };
     use crate::Window;
 
@@ -6334,6 +6819,85 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_direct_dfa_raw_pattern_matches_canonical_all_windows() {
+        // Broad root coverage prevents Aho from retaining a prefilter. Slot
+        // one has priority over its three-byte prefix at slot two, so the raw
+        // pattern ID must survive a delayed acceptance and select width four.
+        let mut patterns = (0_u8..131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        patterns[1] = vec![1; 4];
+        patterns[2] = vec![1; 3];
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+        let haystack = [250, 1, 1, 1, 1, 1, 1, 1, 251];
+
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = Window::new(start, end);
+                let expected = plan
+                    .automaton
+                    .try_find(&Input::new(&haystack[start..end]))
+                    .unwrap();
+                let mut scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+                    .expect("the direct span scanner is bound");
+                let selected = scanner.next_pattern();
+                match (expected, selected) {
+                    (Some(expected), Some(selected)) => {
+                        assert_eq!(selected.end, start + expected.end(), "window={window:?}");
+                        assert_eq!(selected.pattern, expected.pattern(), "window={window:?}");
+                        assert_eq!(scanner.restart, selected.end, "window={window:?}");
+                    }
+                    (None, None) => assert_eq!(scanner.restart, end, "window={window:?}"),
+                    _ => panic!("selection presence mismatch: window={window:?}"),
+                }
+
+                let mut expected_spans = Vec::new();
+                let mut cursor = start;
+                while cursor < end {
+                    let Some(matched) = plan
+                        .automaton
+                        .try_find(&Input::new(&haystack).span(cursor..end))
+                        .unwrap()
+                    else {
+                        break;
+                    };
+                    expected_spans.push((matched.start(), matched.end()));
+                    cursor = matched.end();
+                }
+                let mut scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+                    .expect("the direct span scanner is bound");
+                let mut actual_spans = Vec::new();
+                while let Some(matched) = scanner.next_span() {
+                    actual_spans.push(matched);
+                }
+                assert_eq!(actual_spans, expected_spans, "window={window:?}");
+
+                let mut scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+                    .expect("the direct endpoint scanner is bound");
+                let mut actual_count = 0;
+                while scanner.next_end().is_some() {
+                    actual_count += 1;
+                }
+                assert_eq!(actual_count, expected_spans.len(), "window={window:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_raw_pattern_removes_inner_option_layout() {
+        assert!(
+            core::mem::size_of::<PatternID>()
+                < core::mem::size_of::<Option<PatternID>>()
+        );
+        assert_eq!(
+            core::mem::size_of::<LiteralSetDfaSpanSelection>(),
+            core::mem::size_of::<(usize, PatternID)>(),
+        );
+    }
+
+    #[test]
     fn ordinary_direct_dfa_span_scanner_preserves_priority_windows_and_callbacks() {
         // Broad byte coverage prevents a heuristic prefilter. At byte 1,
         // source slot zero is a four-byte literal, slot one is its three-byte
@@ -6353,6 +6917,29 @@ mod tests {
 
         let haystack = [250, 251, 1, 1, 1, 1, 1, 1, 1, 252];
         let window = Window::new(2, 9);
+        // Pin the restart-relative endpoint sentinel directly. The second
+        // selected match ends exactly at the window boundary, while the
+        // nonzero miss window has no acceptance and must advance to its end.
+        let mut span_scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+            .expect("the direct span scanner is bound");
+        assert_eq!(span_scanner.next_span(), Some((2, 6)));
+        assert_eq!(span_scanner.next_span(), Some((6, 9)));
+        assert_eq!(span_scanner.next_span(), None);
+        assert_eq!(span_scanner.restart, window.end());
+
+        let miss_window = Window::new(8, haystack.len());
+        let mut miss_scanner = LiteralSetDfaScanner::new(ordinary, &haystack, miss_window)
+            .expect("the direct miss scanner is bound");
+        assert_eq!(miss_scanner.next_span(), None);
+        assert_eq!(miss_scanner.restart, miss_window.end());
+
+        // The count-only instantiation retains its incumbent optional
+        // selection loop and never resolves either selected pattern.
+        let mut end_scanner = LiteralSetDfaScanner::new(ordinary, &haystack, window)
+            .expect("the direct endpoint scanner is bound");
+        assert_eq!(end_scanner.next_end(), Some(6));
+        assert_eq!(end_scanner.next_end(), Some(9));
+        assert_eq!(end_scanner.next_end(), None);
         assert_eq!(
             ordinary.find_window_value(&haystack, window),
             Ok(Some((2, 6))),
@@ -6447,14 +7034,32 @@ mod tests {
             .collect()
     }
 
+    fn root_set4_patterns_for_roots(roots: [u8; 4]) -> Vec<Vec<u8>> {
+        // Seventeen distinct widths at each of four starts give 68 patterns:
+        // above Aho 1.1.4's 64-pattern Teddy ceiling, while four start and
+        // rare bytes exceed its three-byte memchr prefilter ceiling. This is
+        // a public, deterministic direct-DFA fixture rather than a private
+        // pattern-derived shape.
+        roots
+            .into_iter()
+            .flat_map(|root| {
+                (4_usize..=20).map(move |pattern_bytes| vec![root; pattern_bytes])
+            })
+            .collect()
+    }
+
+    fn root_set4_patterns() -> Vec<Vec<u8>> {
+        root_set4_patterns_for_roots([b'A', b'Q', b'a', b'q'])
+    }
+
     fn assert_pinned_direct_dfa_special_boundary(plan: &LiteralSetPlan) {
         let automaton = plan.automaton.as_ref();
         assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
         assert!(automaton.prefilter().is_none());
         let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
         let start_state = ordinary
-            .direct_dfa_start_state
-            .map(decode_direct_dfa_start_state)
+            .direct_dfa_identity
+            .map(LiteralSetDirectDfaIdentity::start_state)
             .expect("direct DFA retains its unanchored start");
 
         let mut seen = BTreeSet::from([start_state]);
@@ -6485,7 +7090,8 @@ mod tests {
         assert!(ranged
             .ordinary_executor()
             .unwrap()
-            .direct_dfa_root_range
+            .direct_dfa_identity
+            .and_then(LiteralSetDirectDfaIdentity::root_range)
             .is_some());
         assert_pinned_direct_dfa_special_boundary(&ranged);
 
@@ -6502,7 +7108,8 @@ mod tests {
         assert!(gapped
             .ordinary_executor()
             .unwrap()
-            .direct_dfa_root_range
+            .direct_dfa_identity
+            .and_then(LiteralSetDirectDfaIdentity::root_range)
             .is_none());
         assert_pinned_direct_dfa_special_boundary(&gapped);
     }
@@ -6512,6 +7119,14 @@ mod tests {
         struct IncumbentOrdinaryExecutorLayout<'a> {
             _plan: &'a LiteralSetPlan,
             _direct_dfa_start_state: Option<StateID>,
+        }
+        struct IncumbentDfaScannerLayout<'a, 'h> {
+            _automaton: &'a DFA,
+            _root_range: Option<LiteralSetDfaRootRange>,
+            _haystack: &'h [u8],
+            _start_state: StateID,
+            _restart: usize,
+            _end: usize,
         }
 
         assert_eq!(
@@ -6523,14 +7138,57 @@ mod tests {
             core::mem::size_of::<u32>(),
         );
         assert_eq!(
+            core::mem::size_of::<Option<LiteralSetDfaRoot>>(),
+            core::mem::size_of::<u32>(),
+        );
+        assert_eq!(
+            core::mem::size_of::<LiteralSetDfaScanner<'static, 'static>>(),
+            core::mem::size_of::<IncumbentDfaScannerLayout<'static, 'static>>(),
+        );
+        assert_eq!(
             core::mem::size_of::<Option<core::num::NonZeroU16>>(),
             core::mem::size_of::<u16>(),
+        );
+        assert_eq!(
+            core::mem::size_of::<LiteralSetDirectDfaIdentity>(),
+            core::mem::size_of::<u64>(),
+        );
+        assert_eq!(
+            core::mem::size_of::<Option<LiteralSetDirectDfaIdentity>>(),
+            core::mem::size_of::<u64>(),
         );
         for state in [StateID::ZERO, StateID::MAX] {
             assert_eq!(
                 decode_direct_dfa_start_state(encode_direct_dfa_start_state(state)),
                 state,
             );
+            let roots = [
+                None,
+                Some(LiteralSetDfaRoot::from_range(LiteralSetDfaRootRange {
+                    origin: 0,
+                    maximum_delta: 0,
+                })),
+                Some(LiteralSetDfaRoot::from_range(LiteralSetDfaRootRange {
+                    origin: u8::MAX,
+                    maximum_delta: 0,
+                })),
+                Some(LiteralSetDfaRoot::from_set4([0, 2, 2, 2])),
+                Some(LiteralSetDfaRoot::from_set4([1, 64, 127, 254])),
+            ];
+            for root in roots {
+                let identity = LiteralSetDirectDfaIdentity::new(state, root);
+                let raw = identity.0.get();
+                assert_eq!(
+                    raw & u64::from(u32::MAX),
+                    u64::from(encode_direct_dfa_start_state(state).get()),
+                );
+                assert_eq!(
+                    raw >> LiteralSetDirectDfaIdentity::ROOT_SHIFT,
+                    u64::from(root.map_or(0, |root| root.encode().get())),
+                );
+                assert_eq!(identity.start_state(), state);
+                assert_eq!(identity.root(), root);
+            }
         }
         for origin in 0_u8..=u8::MAX {
             for end in origin..=u8::MAX {
@@ -6558,7 +7216,8 @@ mod tests {
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
         assert_eq!(
             ordinary
-                .direct_dfa_root_range
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root_range)
                 .map(LiteralSetDfaRootRange::decode),
             Some(LiteralSetDfaRootRange {
                 origin: b'A',
@@ -6581,13 +7240,419 @@ mod tests {
         assert!(exact
             .ordinary_executor()
             .unwrap()
-            .direct_dfa_root_range
+            .direct_dfa_identity
+            .and_then(LiteralSetDirectDfaIdentity::root_range)
             .is_some());
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
     }
 
     #[test]
-    fn ordinary_direct_dfa_root_range_is_bulk_span_only_with_exact_fallback() {
+    fn ordinary_direct_dfa_root_set4_packed_membership_is_exhaustive() {
+        for lane in 0..4 {
+            for member in u8::MIN..=u8::MAX {
+                for byte in u8::MIN..=u8::MAX {
+                    let outsider = byte.wrapping_add(1).max(1);
+                    let mut members = [outsider; 4];
+                    members[lane] = member;
+                    assert_eq!(
+                        direct_dfa_set4_contains(members, byte),
+                        member == byte,
+                        "lane={lane} member={member} byte={byte} members={members:?}",
+                    );
+                }
+            }
+        }
+
+        for member in u8::MIN..=u8::MAX {
+            let root = LiteralSetDfaRoot::from_set4([member; 4]);
+            assert_eq!(root.as_range(), None);
+            assert_eq!(
+                root.set4_bucket_mask().map(core::num::NonZeroU16::get),
+                Some(1_u16 << (member >> 4)),
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_root_set4_bucket_reconstruction_is_exact() {
+        for expected in [
+            [0, 1, 2, 4],
+            [0, 15, 16, 255],
+            [1, 64, 127, 254],
+            [15, 16, 31, 32],
+            [15, 16, 239, 240],
+        ] {
+            let patterns = root_set4_patterns_for_roots(expected);
+            let plan = LiteralSetPlan::new_stable(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert!(plan.automaton.prefilter().is_none(), "roots={expected:?}");
+            let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            let identity = ordinary
+                .direct_dfa_identity
+                .expect("the no-prefilter DFA retains its direct identity");
+            assert_eq!(identity.root_range(), None, "roots={expected:?}");
+            let root = identity.root().expect("Set4 root capability");
+            let buckets = root.set4_bucket_mask().expect("Set4 bucket mask");
+            assert_eq!(
+                direct_dfa_set4_members_from_buckets(
+                    plan.automaton.as_ref(),
+                    identity.start_state(),
+                    buckets,
+                ),
+                Some(expected),
+                "roots={expected:?}",
+            );
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    direct_dfa_set4_contains(expected, byte),
+                    expected.contains(&byte),
+                    "roots={expected:?} byte={byte}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_root_set4_packs_without_growing_the_executor() {
+        let patterns = root_set4_patterns();
+        let limits = LiteralSetBuildLimits::default();
+        let base = preflight(&patterns, limits, LiteralSetMatchSemantics::LeftmostFirst).unwrap();
+        let plan = LiteralSetPlan::new_stable(&patterns, limits).unwrap();
+        assert_eq!(plan.automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert!(plan.automaton.prefilter().is_none());
+        let build = plan.build_accounting();
+        assert_eq!(build.build_work_upper_bound, base.build_work_upper_bound);
+        assert_eq!(build.build_bytes_upper_bound, base.build_bytes_upper_bound);
+        assert_eq!(build.persistent_bytes, plan.automaton.memory_usage());
+
+        ordinary_direct_probe::reset();
+        let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+        assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
+        let expected = LiteralSetDfaRoot::from_set4([b'A', b'Q', b'a', b'q']);
+        let identity = ordinary
+            .direct_dfa_identity
+            .expect("the no-prefilter DFA retains its direct identity");
+        assert_eq!(identity.root(), Some(expected));
+        assert_eq!(identity.root_range(), None);
+        assert!(expected.encode().get() > u32::from(u16::MAX));
+
+        let exact_limits = LiteralSetBuildLimits {
+            max_build_work: build.build_work_upper_bound,
+            max_build_bytes: build.build_bytes_upper_bound,
+            max_persistent_bytes: build.persistent_bytes,
+            ..limits
+        };
+        let exact = LiteralSetPlan::new_stable(&patterns, exact_limits).unwrap();
+        assert_eq!(exact.build_accounting(), build);
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            exact
+                .ordinary_executor()
+                .unwrap()
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root),
+            Some(expected),
+        );
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_root_set4_accelerates_exists_outside_span_scanner() {
+        let patterns = root_set4_patterns();
+        let plan = LiteralSetPlan::new_stable(
+            &patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        assert!(
+            ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root)
+                .is_some_and(|root| root.as_range().is_none()),
+        );
+
+        let frame = 3;
+        let gap = ORDINARY_ROOT_SET4_MIN_BYTES + 17;
+        let first_pattern = patterns[0].as_slice();
+        let second_pattern = patterns[51].as_slice();
+        debug_assert_eq!(first_pattern, b"AAAA");
+        debug_assert_eq!(second_pattern, b"qqqq");
+        let mut haystack = vec![b'!'; frame + gap];
+        let first_start = haystack.len();
+        haystack.extend_from_slice(first_pattern);
+        haystack.extend(core::iter::repeat_n(b'!', gap));
+        let second_start = haystack.len();
+        haystack.extend_from_slice(second_pattern);
+        let window_end = haystack.len();
+        haystack.extend_from_slice(first_pattern);
+        let window = Window::new(frame, window_end);
+        let expected = [
+            (first_start, first_start + first_pattern.len()),
+            (second_start, second_start + second_pattern.len()),
+        ];
+        assert_eq!(
+            LiteralSetDfaScanner::new(ordinary, &haystack, window)
+                .expect("the direct DFA retains its selected-span scanner")
+                .root_range,
+            None,
+        );
+
+        ordinary_direct_probe::reset();
+        assert_eq!(ordinary.find_window_value(&haystack, window), Ok(Some(expected[0])));
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
+        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), 0);
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        ordinary_direct_probe::reset();
+        let mut actual = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
+                actual.push(matched);
+                Ok::<bool, ()>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
+        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), 0);
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        // Count deliberately retains the incumbent endpoint loop. This
+        // capability must not broaden the repeated-seek experiment into it.
+        ordinary_direct_probe::reset();
+        assert_eq!(ordinary.count_spans_window_value(&haystack, window), Ok(2));
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
+
+        // A root at every restart stays in the DFA and never pays Set4 setup.
+        let dense_repetitions = 32;
+        let dense = first_pattern.repeat(dense_repetitions);
+        let mut dense_spans = 0_usize;
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                &dense,
+                Window::full(&dense),
+                |_| {
+                    dense_spans += 1;
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(dense_spans, dense_repetitions);
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
+
+        // Selected-span operations retain the incumbent DFA at both sides of
+        // Exists' separate Set4 threshold.
+        ordinary_direct_probe::reset();
+        let short = vec![b'!'; ORDINARY_ROOT_SET4_MIN_BYTES - 1];
+        assert_eq!(ordinary.find_window_value(&short, Window::full(&short)), Ok(None));
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
+        ordinary_direct_probe::reset();
+        let exact = vec![b'!'; ORDINARY_ROOT_SET4_MIN_BYTES];
+        assert_eq!(ordinary.find_window_value(&exact, Window::full(&exact)), Ok(None));
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
+        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), 0);
+
+        for (suffix_bytes, expected_calls) in [
+            (ORDINARY_ROOT_SET4_MIN_BYTES.saturating_sub(1), 0),
+            (ORDINARY_ROOT_SET4_MIN_BYTES, 1),
+        ] {
+            let miss_bytes = ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                .checked_add(suffix_bytes)
+                .expect("the fixed Set4 threshold fits usize");
+            let miss = vec![b'!'; miss_bytes];
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                ordinary.exists_window_value(&miss, Window::full(&miss)),
+                Ok(false),
+            );
+            assert_eq!(ordinary_direct_probe::root_set4_calls(), expected_calls);
+            assert_eq!(
+                ordinary_direct_probe::root_set4_skipped_bytes(),
+                if expected_calls == 0 { 0 } else { suffix_bytes },
+            );
+        }
+
+        // Exists keeps its native 32-byte prefix and seeks only from an idle
+        // start state in the sufficiently long suffix.
+        const EXISTS_WINDOW_BYTES: usize =
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_SET4_MIN_BYTES + 8;
+        for (root_offset, expected_calls, expected_skipped) in [
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES, 0, 0),
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1, 1, 1),
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES + 10, 1, 10),
+        ] {
+            let mut exists_source = vec![b'!'; EXISTS_WINDOW_BYTES];
+            exists_source[root_offset..root_offset + first_pattern.len()]
+                .copy_from_slice(first_pattern);
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                ordinary.exists_window_value(&exists_source, Window::full(&exists_source)),
+                Ok(true),
+            );
+            assert_eq!(ordinary_direct_probe::root_set4_calls(), expected_calls);
+            assert_eq!(
+                ordinary_direct_probe::root_set4_skipped_bytes(),
+                expected_skipped,
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_root_set4_one_byte_separator_keeps_span_range_only() {
+        let patterns = root_set4_patterns();
+        let plan = LiteralSetPlan::new_stable(
+            &patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        let first_pattern = patterns[0].as_slice();
+        let second_pattern = patterns[51].as_slice();
+
+        // Keep a full Set4 extent after the second match. If Set4 leaked into
+        // selected-span seeking, the one-byte separator would invoke its
+        // leaf. The range-only span scanner instead keeps the incumbent DFA.
+        let mut haystack = first_pattern.to_vec();
+        haystack.push(b'!');
+        haystack.extend_from_slice(second_pattern);
+        haystack.extend(core::iter::repeat_n(
+            b'!',
+            ORDINARY_ROOT_SET4_MIN_BYTES,
+        ));
+        let expected = [
+            (0, first_pattern.len()),
+            (
+                first_pattern.len() + 1,
+                first_pattern.len() + 1 + second_pattern.len(),
+            ),
+        ];
+        assert_eq!(
+            LiteralSetDfaScanner::new(
+                ordinary,
+                &haystack,
+                Window::full(&haystack),
+            )
+            .expect("the direct DFA retains its selected-span scanner")
+            .root_range,
+            None,
+        );
+
+        ordinary_direct_probe::reset();
+        let mut actual = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                &haystack,
+                Window::full(&haystack),
+                |matched| {
+                    actual.push(matched);
+                    Ok::<bool, ()>(actual.len() < expected.len())
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
+        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), 0);
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+        assert_eq!(ordinary_direct_probe::span_root_range_near_hits(), 0);
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_root_set4_matches_canonical_in_every_curated_window() {
+        let patterns = root_set4_patterns();
+        let plan = LiteralSetPlan::new_stable(
+            &patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        assert!(
+            ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root)
+                .is_some_and(|root| root.as_range().is_none()),
+        );
+
+        // Short root runs are false candidates and valid runs exercise every
+        // root member across long miss stretches. Enumerating every subwindow
+        // also cuts through candidates and uses every possible nonzero base.
+        let mut haystack = vec![b'!'; 40];
+        haystack.extend_from_slice(b"A!AAA!!!!QQQQ!qqq!aaaaa!qQq!");
+        haystack.extend(core::iter::repeat_n(b'!', 24));
+        haystack.extend_from_slice(b"qqqq!AAAAA!!!!!!");
+
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = Window::new(start, end);
+                let expected_first = plan
+                    .find_window(
+                        &haystack,
+                        window,
+                        LiteralSetSearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    ordinary.find_window_value(&haystack, window),
+                    Ok(expected_first),
+                    "first span window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.exists_window_value(&haystack, window),
+                    Ok(expected_first.is_some()),
+                    "exists window={window:?}",
+                );
+
+                let mut expected_spans = Vec::new();
+                let mut cursor = start;
+                loop {
+                    let Some(matched) = plan
+                        .find_window(
+                            &haystack,
+                            Window::new(cursor, end),
+                            LiteralSetSearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .0
+                    else {
+                        break;
+                    };
+                    assert!(matched.1 > cursor);
+                    cursor = matched.1;
+                    expected_spans.push(matched);
+                }
+
+                let mut actual_spans = Vec::new();
+                assert_eq!(
+                    ordinary.try_visit_spans_window_value(
+                        &haystack,
+                        window,
+                        |matched| {
+                            actual_spans.push(matched);
+                            Ok::<bool, ()>(true)
+                        },
+                    ),
+                    Ok(Ok(())),
+                    "span visit window={window:?}",
+                );
+                assert_eq!(
+                    actual_spans,
+                    expected_spans,
+                    "spans window={window:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_root_range_accelerates_selected_spans_with_exact_fallback() {
         let patterns = root_range_patterns();
         let plan = LiteralSetPlan::new_stable(
             &patterns,
@@ -6620,9 +7685,11 @@ mod tests {
             ordinary.find_window_value(&haystack, window),
             Ok(expected.first().copied()),
         );
-        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_range_skipped_bytes(), gap);
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
 
+        ordinary_direct_probe::reset();
         let mut actual = Vec::new();
         assert_eq!(
             ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
@@ -6637,7 +7704,7 @@ mod tests {
             ordinary_direct_probe::root_range_skipped_bytes(),
             gap * 2,
         );
-        assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
+        assert_eq!(ordinary_direct_probe::root_range_bindings(), 0);
 
         // Adjacent root starts do not pay the range leaf: the current-byte
         // guard recognizes membership with one wrapping-sub comparison.
@@ -6654,6 +7721,11 @@ mod tests {
             .collect::<Vec<_>>();
         let mut dense_spans = Vec::new();
         assert_eq!(
+            ordinary.find_window_value(&dense, Window::new(0, dense.len())),
+            Ok(dense_expected.first().copied()),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+        assert_eq!(
             ordinary.try_visit_spans_window_value(
                 &dense,
                 Window::new(0, dense.len()),
@@ -6666,6 +7738,67 @@ mod tests {
         );
         assert_eq!(dense_spans, dense_expected);
         assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        // A one-byte separator is also cheaper to cross in the span scanner
+        // than in the native range leaf. Long restarts take that near path;
+        // the short terminal tail stays in the scalar DFA.
+        ordinary_direct_probe::reset();
+        let mut separated = Vec::new();
+        let mut separated_expected = Vec::new();
+        for index in 0..dense_repetitions {
+            if index > 0 {
+                separated.push(b'|');
+            }
+            let start = separated.len();
+            separated.extend_from_slice(matched_pattern);
+            separated_expected.push((start, separated.len()));
+        }
+        let expected_near_hits = separated_expected
+            .iter()
+            .take(separated_expected.len() - 1)
+            .filter(|&&(_, end)| {
+                separated.len() - end >= ORDINARY_ROOT_RANGE_MIN_BYTES
+            })
+            .count();
+        let mut separated_spans = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                &separated,
+                Window::full(&separated),
+                |matched| {
+                    separated_spans.push(matched);
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(separated_spans, separated_expected);
+        assert_eq!(
+            ordinary_direct_probe::span_root_range_near_hits(),
+            expected_near_hits,
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        // The exact short-window boundary retains the scalar DFA without
+        // invoking the native range leaf.
+        ordinary_direct_probe::reset();
+        let short = vec![b'z'; ORDINARY_ROOT_RANGE_MIN_BYTES - 1];
+        assert_eq!(
+            ordinary.find_window_value(&short, Window::full(&short)),
+            Ok(None),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+        ordinary_direct_probe::reset();
+        let exact = vec![b'z'; ORDINARY_ROOT_RANGE_MIN_BYTES];
+        assert_eq!(
+            ordinary.find_window_value(&exact, Window::full(&exact)),
+            Ok(None),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 1);
+        assert_eq!(
+            ordinary_direct_probe::root_range_skipped_bytes(),
+            exact.len(),
+        );
 
         ordinary_direct_probe::reset();
         assert_eq!(
@@ -6687,8 +7820,49 @@ mod tests {
         ordinary_direct_probe::reset();
         let fallback = fallback.ordinary_executor().unwrap();
         assert!(fallback.direct_count_scanner_supported());
-        assert!(fallback.direct_dfa_root_range.is_none());
+        assert!(
+            fallback
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root_range)
+                .is_none(),
+        );
         assert_eq!(ordinary_direct_probe::root_range_bindings(), 1);
+        let fallback_miss = vec![200_u8; ORDINARY_ROOT_RANGE_MIN_BYTES + 7];
+        assert_eq!(
+            fallback.find_window_value(&fallback_miss, Window::full(&fallback_miss)),
+            Ok(None),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        // Selected starts, truncated candidates and nonzero windows retain the
+        // complete canonical LeftmostFirst result around both sparse hits.
+        let starts = [0, frame, first_start - 1, first_start, first_start + 1];
+        let ends = [
+            first_start,
+            first_start + matched_pattern.len() - 1,
+            first_start + matched_pattern.len(),
+            second_start + matched_pattern.len(),
+            window_end,
+            haystack.len(),
+        ];
+        for start in starts {
+            for end in ends.into_iter().filter(|&end| end >= start) {
+                let differential_window = Window::new(start, end);
+                let expected = plan
+                    .find_window(
+                        &haystack,
+                        differential_window,
+                        LiteralSetSearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    ordinary.find_window_value(&haystack, differential_window),
+                    Ok(expected),
+                    "window={differential_window:?}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -6831,10 +8005,374 @@ mod tests {
             ordinary.selected_end_window_value(&delayed, window),
             Ok(Some(51)),
         );
+        ordinary_direct_probe::reset();
         assert_eq!(
             ordinary.find_window_value(&delayed, window),
             Ok(Some((47, 51))),
         );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_range_skipped_bytes(), 42);
+
+        // Truncating the higher-priority four-byte candidate at the window
+        // end still selects the complete three-byte alternative.
+        ordinary_direct_probe::reset();
+        let truncated = Window::new(5, 50);
+        assert_eq!(
+            ordinary.find_window_value(&delayed, truncated),
+            Ok(Some((47, 50))),
+        );
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_range_skipped_bytes(), 42);
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_exists_tail_preserves_group_and_remainder_endpoints() {
+        let mut patterns = (0_u8..131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        patterns[0] = vec![1; 4];
+        let plan = LiteralSetPlan::new(
+            &patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().unwrap();
+        let start_state = ordinary
+            .direct_dfa_identity
+            .map(LiteralSetDirectDfaIdentity::start_state)
+            .unwrap();
+        let automaton = plan.automaton.as_ref();
+        const BASE: usize = 5;
+        let full_window_bytes = ORDINARY_DIRECT_DFA_NATIVE_BYTES
+            + 2 * ORDINARY_DIRECT_DFA_BULK_BYTES
+            + 3;
+
+        for relative_end in 30..=full_window_bytes {
+            let mut haystack = vec![200_u8; BASE + full_window_bytes + 7];
+            haystack[BASE + relative_end - 3..BASE + relative_end].fill(1);
+            assert_eq!(
+                ordinary_direct_dfa_first_acceptance_end(
+                    automaton,
+                    start_state,
+                    &haystack[BASE..BASE + full_window_bytes],
+                    None,
+                ),
+                Some(relative_end),
+                "relative_end={relative_end}",
+            );
+            assert_eq!(
+                ordinary.first_acceptance_window_value(
+                    &haystack,
+                    Window::new(BASE, BASE + full_window_bytes),
+                ),
+                Ok(Some(BASE + relative_end)),
+                "relative_end={relative_end}",
+            );
+        }
+
+        for remainder in 1..ORDINARY_DIRECT_DFA_BULK_BYTES {
+            let window_bytes = ORDINARY_DIRECT_DFA_NATIVE_BYTES + remainder;
+            let mut haystack = vec![200_u8; BASE + window_bytes + 7];
+            haystack[BASE + window_bytes - 3..BASE + window_bytes].fill(1);
+            assert_eq!(
+                ordinary_direct_dfa_first_acceptance_end(
+                    automaton,
+                    start_state,
+                    &haystack[BASE..BASE + window_bytes],
+                    None,
+                ),
+                Some(window_bytes),
+                "positive remainder={remainder}",
+            );
+            assert_eq!(
+                ordinary.first_acceptance_window_value(
+                    &haystack,
+                    Window::new(BASE, BASE + window_bytes),
+                ),
+                Ok(Some(BASE + window_bytes)),
+                "positive remainder={remainder}",
+            );
+        }
+
+        for window_bytes in 28..=full_window_bytes {
+            let haystack = vec![200_u8; BASE + window_bytes + 7];
+            assert_eq!(
+                ordinary_direct_dfa_first_acceptance_end(
+                    automaton,
+                    start_state,
+                    &haystack[BASE..BASE + window_bytes],
+                    None,
+                ),
+                None,
+                "miss window_bytes={window_bytes}",
+            );
+            assert_eq!(
+                ordinary.first_acceptance_window_value(
+                    &haystack,
+                    Window::new(BASE, BASE + window_bytes),
+                ),
+                Ok(None),
+                "miss window_bytes={window_bytes}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_post_native_root_seek_preserves_edges_and_counters() {
+        fn assert_first_and_exists(
+            ordinary: LiteralSetOrdinaryExecutor<'_>,
+            haystack: &[u8],
+            window: Window,
+            expected: Option<usize>,
+            expected_calls: usize,
+            expected_skipped: usize,
+            context: &str,
+        ) {
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                ordinary.first_acceptance_window_value(haystack, window),
+                Ok(expected),
+                "first acceptance: {context}",
+            );
+            assert_eq!(
+                ordinary_direct_probe::root_range_calls(),
+                expected_calls,
+                "first-acceptance calls: {context}",
+            );
+            assert_eq!(
+                ordinary_direct_probe::root_range_skipped_bytes(),
+                expected_skipped,
+                "first-acceptance skipped bytes: {context}",
+            );
+
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                ordinary.exists_window_value(haystack, window),
+                Ok(expected.is_some()),
+                "exists: {context}",
+            );
+            assert_eq!(
+                ordinary_direct_probe::root_range_calls(),
+                expected_calls,
+                "exists calls: {context}",
+            );
+            assert_eq!(
+                ordinary_direct_probe::root_range_skipped_bytes(),
+                expected_skipped,
+                "exists skipped bytes: {context}",
+            );
+        }
+
+        const BASE: usize = 5;
+        const PATTERN_BYTES: usize = 3;
+        const LONG_WINDOW_BYTES: usize =
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_RANGE_MIN_BYTES + 8;
+
+        let patterns = (1_u8..=131)
+            .map(|byte| vec![byte; PATTERN_BYTES])
+            .collect::<Vec<_>>();
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        assert_eq!(
+            ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root_range)
+                .map(LiteralSetDfaRootRange::decode),
+            Some(LiteralSetDfaRootRange {
+                origin: 1,
+                maximum_delta: 130,
+            }),
+        );
+
+        // Exact native window lengths stay in the incumbent prefix/tail path.
+        for window_bytes in [
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES - 1,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1,
+        ] {
+            let haystack = vec![200_u8; BASE + window_bytes + 7];
+            assert_first_and_exists(
+                ordinary,
+                &haystack,
+                Window::new(BASE, BASE + window_bytes),
+                None,
+                0,
+                0,
+                "native window boundary miss",
+            );
+        }
+
+        // Accept immediately before and at the native boundary, then complete
+        // one in-flight candidate on the first tail byte. Even with a long
+        // terminal window, none may enter the root leaf.
+        for relative_end in [
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES - 1,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1,
+        ] {
+            let mut haystack = vec![200_u8; BASE + LONG_WINDOW_BYTES + 7];
+            let start = BASE + relative_end - PATTERN_BYTES;
+            haystack[start..start + PATTERN_BYTES].fill(1);
+            assert_first_and_exists(
+                ordinary,
+                &haystack,
+                Window::new(BASE, BASE + LONG_WINDOW_BYTES),
+                Some(BASE + relative_end),
+                0,
+                0,
+                "native endpoint boundary hit",
+            );
+        }
+
+        let mut dense = vec![200_u8; BASE + LONG_WINDOW_BYTES + 7];
+        dense[BASE..BASE + LONG_WINDOW_BYTES].fill(1);
+        assert_first_and_exists(
+            ordinary,
+            &dense,
+            Window::new(BASE, BASE + LONG_WINDOW_BYTES),
+            Some(BASE + PATTERN_BYTES),
+            0,
+            0,
+            "early dense hit",
+        );
+
+        // A root exactly at the tail boundary is retained by the scalar guard.
+        // Moving it one byte later enters the shared range leaf exactly once.
+        for (root_offset, expected_calls, expected_skipped) in [
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES, 0, 0),
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1, 1, 1),
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES + 10, 1, 10),
+        ] {
+            let mut haystack = vec![200_u8; BASE + LONG_WINDOW_BYTES + 7];
+            let root = BASE + root_offset;
+            haystack[root..root + PATTERN_BYTES].fill(1);
+            assert_first_and_exists(
+                ordinary,
+                &haystack,
+                Window::new(BASE, BASE + LONG_WINDOW_BYTES),
+                Some(root + PATTERN_BYTES),
+                expected_calls,
+                expected_skipped,
+                "post-native delayed root",
+            );
+        }
+
+        // The leaf's recorded displacement is relative to the post-native
+        // suffix. A clipped pattern cannot read its final byte beyond `end`.
+        let root_offset = ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_RANGE_MIN_BYTES;
+        let mut truncated = vec![200_u8; BASE + LONG_WINDOW_BYTES + 7];
+        let root = BASE + root_offset;
+        truncated[root..root + PATTERN_BYTES].fill(1);
+        assert_first_and_exists(
+            ordinary,
+            &truncated,
+            Window::new(BASE, root + PATTERN_BYTES - 1),
+            None,
+            1,
+            ORDINARY_ROOT_RANGE_MIN_BYTES,
+            "nonzero truncated window",
+        );
+
+        // Activation is based on the suffix remaining after the exact native
+        // prefix, not on the complete input length.
+        for (window_bytes, expected_calls, expected_skipped) in [
+            (
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_RANGE_MIN_BYTES - 1,
+                0,
+                0,
+            ),
+            (
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_RANGE_MIN_BYTES,
+                1,
+                ORDINARY_ROOT_RANGE_MIN_BYTES,
+            ),
+        ] {
+            let haystack = vec![200_u8; BASE + window_bytes + 7];
+            assert_first_and_exists(
+                ordinary,
+                &haystack,
+                Window::new(BASE, BASE + window_bytes),
+                None,
+                expected_calls,
+                expected_skipped,
+                "post-native activation boundary miss",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_post_native_root_seek_matches_earliest_dfa_in_every_window() {
+        let patterns = (1_u8..=131)
+            .map(|byte| vec![byte; 3])
+            .collect::<Vec<_>>();
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert!(plan.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        let start_state = ordinary
+            .direct_dfa_identity
+            .map(LiteralSetDirectDfaIdentity::start_state)
+            .unwrap();
+        assert!(
+            ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root_range)
+                .is_some(),
+        );
+
+        let miss = vec![200_u8; 72];
+        let mut boundary_hits = vec![200_u8; 72];
+        for start in [0, 28, 30, 32, 33, 63, 69] {
+            if start + 3 <= boundary_hits.len() {
+                boundary_hits[start..start + 3].fill(1);
+            }
+        }
+        let mut decoys = (0_u8..72)
+            .map(|index| if index % 5 == 0 { 57 } else { 200 })
+            .collect::<Vec<_>>();
+        for start in [29, 31, 34, 62] {
+            decoys[start..start + 2].fill(1);
+        }
+        decoys[66..69].fill(57);
+
+        for haystack in [&miss[..], &boundary_hits[..], &decoys[..]] {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = Window::new(start, end);
+                    let input = Input::new(haystack)
+                        .span(start..end)
+                        .earliest(true);
+                    let expected = plan
+                        .automaton
+                        .as_ref()
+                        .try_find(&input)
+                        .expect("the direct DFA supports earliest unanchored input")
+                        .map(|matched| matched.end());
+                    let incumbent = ordinary_direct_dfa_first_acceptance_end(
+                        plan.automaton.as_ref(),
+                        start_state,
+                        &haystack[start..end],
+                        None,
+                    )
+                    .map(|relative_end| start + relative_end);
+                    assert_eq!(
+                        incumbent, expected,
+                        "incumbent haystack={haystack:?}, window={window:?}",
+                    );
+                    assert_eq!(
+                        ordinary.first_acceptance_window_value(haystack, window),
+                        Ok(expected),
+                        "first acceptance haystack={haystack:?}, window={window:?}",
+                    );
+                    assert_eq!(
+                        ordinary.exists_window_value(haystack, window),
+                        Ok(expected.is_some()),
+                        "exists haystack={haystack:?}, window={window:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
