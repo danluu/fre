@@ -487,6 +487,7 @@ mod ordinary_direct_probe {
         static ADAPTIVE_REPLAYS: Cell<usize> = const { Cell::new(0) };
         static ROOT_RANGE_BINDINGS: Cell<usize> = const { Cell::new(0) };
         static ROOT_RANGE_CALLS: Cell<usize> = const { Cell::new(0) };
+        static SPAN_ROOT_RANGE_NEAR_HITS: Cell<usize> = const { Cell::new(0) };
         static ROOT_RANGE_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -496,6 +497,7 @@ mod ordinary_direct_probe {
         ADAPTIVE_REPLAYS.set(0);
         ROOT_RANGE_BINDINGS.set(0);
         ROOT_RANGE_CALLS.set(0);
+        SPAN_ROOT_RANGE_NEAR_HITS.set(0);
         ROOT_RANGE_SKIPPED_BYTES.set(0);
     }
 
@@ -538,6 +540,16 @@ mod ordinary_direct_probe {
 
     pub(super) fn root_range_calls() -> usize {
         ROOT_RANGE_CALLS.get()
+    }
+
+    pub(super) fn record_span_root_range_near_hit() {
+        SPAN_ROOT_RANGE_NEAR_HITS.set(
+            SPAN_ROOT_RANGE_NEAR_HITS.get().saturating_add(1),
+        );
+    }
+
+    pub(super) fn span_root_range_near_hits() -> usize {
+        SPAN_ROOT_RANGE_NEAR_HITS.get()
     }
 
     pub(super) fn root_range_skipped_bytes() -> usize {
@@ -1749,6 +1761,14 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
             return true;
         };
         if range.contains(self.haystack[at]) {
+            return true;
+        }
+        // A single separator is too near to amortize the out-of-line native
+        // range leaf. The minimum extent above makes this lookahead safe.
+        if range.contains(self.haystack[at + 1]) {
+            #[cfg(test)]
+            ordinary_direct_probe::record_span_root_range_near_hit();
+            self.restart = at + 1;
             return true;
         }
         let remaining = &self.haystack[at..self.end];
@@ -6872,6 +6892,46 @@ mod tests {
             Ok(Ok(())),
         );
         assert_eq!(dense_spans, dense_expected);
+        assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        // A one-byte separator is also cheaper to cross in the span scanner
+        // than in the native range leaf. Long restarts take that near path;
+        // the short terminal tail stays in the scalar DFA.
+        ordinary_direct_probe::reset();
+        let mut separated = Vec::new();
+        let mut separated_expected = Vec::new();
+        for index in 0..dense_repetitions {
+            if index > 0 {
+                separated.push(b'|');
+            }
+            let start = separated.len();
+            separated.extend_from_slice(matched_pattern);
+            separated_expected.push((start, separated.len()));
+        }
+        let expected_near_hits = separated_expected
+            .iter()
+            .take(separated_expected.len() - 1)
+            .filter(|&&(_, end)| {
+                separated.len() - end >= ORDINARY_ROOT_RANGE_MIN_BYTES
+            })
+            .count();
+        let mut separated_spans = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(
+                &separated,
+                Window::full(&separated),
+                |matched| {
+                    separated_spans.push(matched);
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(separated_spans, separated_expected);
+        assert_eq!(
+            ordinary_direct_probe::span_root_range_near_hits(),
+            expected_near_hits,
+        );
         assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
 
         // The exact short-window boundary retains the scalar DFA without
