@@ -9,9 +9,10 @@ use crate::{
     BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanKind, PlanSelection,
     PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
     PortableFindIterRunLimits, PortableK0StartFilterSetupAccounting, PortableMatches,
-    PortableRegex, PortableSearchSession, PortableSessionMatches, RustProfile, SearchAccounting,
-    SearchError, SearchLimits, SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow,
-    charge_planner, finite, reserve_planner, rust_profile_size_limit, set_rust_profile_size_limit,
+    PortableOrdinaryCanonical, PortableRegex, PortableSearchSession, PortableSessionMatches,
+    RustProfile, SearchAccounting, SearchError, SearchLimits, SearchSessionLimits,
+    SearchSessionSetupAccounting, SearchWindow, charge_planner, finite, reserve_planner,
+    rust_profile_size_limit, set_rust_profile_size_limit,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -1075,6 +1076,10 @@ impl PortableTextRegex {
             inner: self.inner.fixed_endpoint_search_session(limits)?,
             shortest_value_eligible: self.report.portable.plan == PlanKind::K0,
         })
+    }
+
+    pub(crate) fn ordinary_canonical(&self) -> Result<PortableOrdinaryCanonical<'_>, SearchError> {
+        PortableOrdinaryCanonical::try_new(&self.inner)
     }
 
     /// Iterate over every non-overlapping match with Rust text empty-match

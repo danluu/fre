@@ -3,7 +3,7 @@
 use fre::{
     PlanKind, PortableRegexSetExecutionError, PortableRegexSetRunLimits,
     PortableRegexSetSessionLimits, PortableTextProof, PortableTextRegexSet,
-    PortableTextRegexSetSearchSession, SearchLimits,
+    PortableTextRegexSetBuilder, PortableTextRegexSetSearchSession, SearchLimits,
 };
 
 fn session(set: &PortableTextRegexSet) -> PortableTextRegexSetSearchSession<'_> {
@@ -186,4 +186,99 @@ fn value_existence_preserves_source_order_assertions_and_session_reuse() {
             .is_match("a7", one_search)
             .expect_err("accounted pattern-search refusal"),
     );
+}
+
+#[test]
+fn compact_text_routes_preserve_every_interior_utf8_offset() {
+    let patterns = [
+        "東京",
+        "é",
+        r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
+        r"\A[ab]+Z",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let set = PortableTextRegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .build()
+        .expect("all-non-K0 text set");
+    let plans = (0..set.len())
+        .map(|index| {
+            set.pattern_build_report(index)
+                .expect("text plan")
+                .portable
+                .plan
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        plans.iter().all(|plan| *plan != PlanKind::K0),
+        "unexpected text compact plans: {plans:?}"
+    );
+    assert!(plans.contains(&PlanKind::ExactLiteral));
+    assert!(plans.contains(&PlanKind::FixedPredicateWord64));
+    assert!(plans.contains(&PlanKind::ForwardAnchored));
+    let upstream = regex::RegexSetBuilder::new(&patterns)
+        .unicode(false)
+        .build()
+        .expect("upstream text set");
+    let mut session = session(&set);
+    assert!(session.setup_report().session_capacity_bytes > 0);
+    assert_eq!(
+        session.setup_report().charged_retained_bytes,
+        session.setup_report().session_capacity_bytes
+    );
+    let unlimited = PortableRegexSetRunLimits::unlimited();
+    let finite = PortableRegexSetRunLimits {
+        max_total_work: u64::MAX - 1,
+        ..unlimited
+    };
+    let haystack = "ababZxé\n東京y--Qacegikmortvx0--";
+
+    for start in 0..=haystack.len() {
+        let expected_ids = upstream
+            .matches_at(haystack, start)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let actual = session
+            .matches_at(haystack, start, unlimited)
+            .unwrap_or_else(|error| panic!("matches offset {start}: {error}"));
+        assert_eq!(
+            actual.iter().collect::<Vec<_>>(),
+            expected_ids,
+            "start {start}"
+        );
+        assert_eq!(actual.report().start, start);
+
+        let expected = upstream.is_match_at(haystack, start);
+        let (accounted, report) = session
+            .is_match_at(haystack, start, unlimited)
+            .unwrap_or_else(|error| panic!("accounted offset {start}: {error}"));
+        assert_eq!(accounted, expected, "start {start}");
+        assert_eq!(report.start, start);
+        assert_eq!(
+            session
+                .is_match_value_at(haystack, start, unlimited)
+                .unwrap_or_else(|error| panic!("value offset {start}: {error}")),
+            expected,
+            "start {start}",
+        );
+        assert_eq!(
+            session.is_match_value_at(haystack, start, finite),
+            set.is_match_at(haystack, start, finite)
+                .map(|(matched, _report)| matched),
+            "finite start {start}",
+        );
+
+        let mut flags = vec![false; patterns.len() + 1];
+        flags[patterns.len()] = true;
+        let any = session
+            .matches_read_at_value_unlimited(&mut flags, haystack, start)
+            .unwrap_or_else(|error| panic!("caller flags offset {start}: {error}"));
+        assert_eq!(any, !expected_ids.is_empty(), "start {start}");
+        for index in 0..patterns.len() {
+            assert_eq!(flags[index], expected_ids.contains(&index), "start {start}");
+        }
+        assert!(flags[patterns.len()]);
+    }
 }

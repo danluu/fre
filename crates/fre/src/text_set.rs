@@ -4,13 +4,14 @@ use core::{fmt, mem::size_of};
 
 use fre_syntax::RustProfile;
 
-use crate::set::build_set_session_vector;
+use crate::set::{build_set_session_vector, validate_set_session_count_and_work};
 use crate::{
-    PortableRegexSetBuildLimits, PortableRegexSetExecutionError, PortableRegexSetExecutionReport,
-    PortableRegexSetRunLimits, PortableRegexSetSessionError, PortableRegexSetSessionLimits,
-    PortableRegexSetSessionSetupReport, PortableSetMatches, PortableTextBuildError,
-    PortableTextBuildReport, PortableTextBuilder, PortableTextRegex, PortableTextSearchSession,
-    SearchLimits, rust_profile_size_limit, set_rust_profile_size_limit,
+    PortableOrdinaryCanonical, PortableRegexSetBuildLimits, PortableRegexSetExecutionError,
+    PortableRegexSetExecutionReport, PortableRegexSetRunLimits, PortableRegexSetSessionError,
+    PortableRegexSetSessionLimits, PortableRegexSetSessionSetupReport, PortableSetMatches,
+    PortableTextBuildError, PortableTextBuildReport, PortableTextBuilder, PortableTextRegex,
+    PortableTextSearchSession, SearchLimits, SearchWindow, rust_profile_size_limit,
+    set_rust_profile_size_limit,
 };
 
 /// Stable schema for portable Rust-text regex-set construction reports.
@@ -531,14 +532,14 @@ impl PortableTextRegexSet {
         &self.report
     }
 
-    /// Construct one reusable Exists-only session for every proved text
-    /// constituent.
+    /// Construct reusable Exists-only state for every proved text constituent.
     ///
-    /// The session vector and all fixed-capacity endpoint-capable K0 payloads
-    /// are charged as one transaction before publication. Their cache capacity
-    /// cannot grow during later searches. A failure drops every already-made
-    /// private constituent session. No source positions or results are
-    /// retained between calls.
+    /// A set with no K0 constituent retains one compact immutable binding per
+    /// pattern. Any set containing K0 charges its session vector and all
+    /// fixed-capacity endpoint-capable payloads as one transaction before
+    /// publication. Their cache capacity cannot grow during later searches.
+    /// A failure drops every already-made private binding or constituent
+    /// session. No source positions or results are retained between calls.
     ///
     /// # Errors
     ///
@@ -548,18 +549,35 @@ impl PortableTextRegexSet {
         &self,
         limits: PortableRegexSetSessionLimits,
     ) -> Result<PortableTextRegexSetSearchSession<'_>, PortableRegexSetSessionError> {
+        validate_set_session_count_and_work(self.regexes.len(), limits)?;
+        if self
+            .regexes
+            .iter()
+            .all(|regex| regex.build_report().portable.plan != crate::PlanKind::K0)
+        {
+            let (bindings, setup) = build_set_session_vector(
+                self.regexes.len(),
+                limits,
+                "text-set compact session bindings",
+                |index, _residual| self.regexes[index].ordinary_canonical(),
+                |_| None,
+            )?;
+            return Ok(PortableTextRegexSetSearchSession {
+                owner: self,
+                sessions: PortableTextRegexSetSessionStorage::Compact(bindings),
+                setup,
+            });
+        }
         let (sessions, setup) = build_set_session_vector(
             self.regexes.len(),
             limits,
             "text-set session vector",
-            |index, residual| {
-                self.regexes[index].fixed_endpoint_search_session(residual)
-            },
+            |index, residual| self.regexes[index].fixed_endpoint_search_session(residual),
             PortableTextSearchSession::workspace_setup_accounting,
         )?;
         Ok(PortableTextRegexSetSearchSession {
             owner: self,
-            sessions,
+            sessions: PortableTextRegexSetSessionStorage::Stateful(sessions),
             setup,
         })
     }
@@ -847,12 +865,22 @@ impl Default for PortableTextRegexSet {
     }
 }
 
-/// Reusable Exists-only sessions for every constituent of one text regex set.
+/// Reusable Exists-only state for every constituent of one text regex set.
+///
+/// An all-non-K0 set retains compact immutable plan bindings. A set containing
+/// K0 retains the established mutable constituent-session vector. No source
+/// positions or results are retained between calls.
 #[derive(Debug)]
 pub struct PortableTextRegexSetSearchSession<'r> {
     owner: &'r PortableTextRegexSet,
-    sessions: Vec<PortableTextSearchSession<'r>>,
+    sessions: PortableTextRegexSetSessionStorage<'r>,
     setup: PortableRegexSetSessionSetupReport,
+}
+
+#[derive(Debug)]
+enum PortableTextRegexSetSessionStorage<'r> {
+    Compact(Vec<PortableOrdinaryCanonical<'r>>),
+    Stateful(Vec<PortableTextSearchSession<'r>>),
 }
 
 impl PortableTextRegexSetSearchSession<'_> {
@@ -865,13 +893,13 @@ impl PortableTextRegexSetSearchSession<'_> {
     /// Number of constituent sessions in stable pattern-ID order.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.sessions.len()
+        self.owner.len()
     }
 
     /// Whether the originating set was empty.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
+        self.owner.is_empty()
     }
 
     /// Original pattern sources in stable ID order.
@@ -916,18 +944,34 @@ impl PortableTextRegexSetSearchSession<'_> {
         limits: PortableRegexSetRunLimits,
     ) -> Result<(bool, PortableRegexSetExecutionReport), PortableRegexSetExecutionError> {
         let search_start = validate_text_start(haystack, start)?;
+        let haystack_bytes = haystack.as_bytes();
+        let window = SearchWindow::new(search_start, haystack_bytes.len());
         let mut total_work = 0_u64;
         let mut searched = 0_usize;
-        for (index, session) in self.sessions.iter_mut().enumerate() {
+        for index in 0..self.owner.len() {
             let search_count = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) = search_one_session_normalized(
-                session,
-                index,
-                haystack,
-                search_start,
-                limits,
-                total_work,
-            )?;
+            let (matched, work) = match &mut self.sessions {
+                PortableTextRegexSetSessionStorage::Compact(bindings) => {
+                    search_one_compact_session_normalized(
+                        &bindings[index],
+                        index,
+                        haystack_bytes,
+                        window,
+                        limits,
+                        total_work,
+                    )?
+                }
+                PortableTextRegexSetSessionStorage::Stateful(sessions) => {
+                    search_one_session_normalized(
+                        &mut sessions[index],
+                        index,
+                        haystack,
+                        search_start,
+                        limits,
+                        total_work,
+                    )?
+                }
+            };
             total_work = work;
             searched = search_count;
             if matched {
@@ -978,24 +1022,51 @@ impl PortableTextRegexSetSearchSession<'_> {
             return self.is_match_value_at_accounted_normalized(haystack, search_start, limits);
         }
 
-        for (index, session) in self.sessions.iter_mut().enumerate() {
-            let _ = enforce_search_count(index, limits.max_pattern_searches)?;
-            let regex = &self.owner.regexes[index];
-            let matched = if text_set_constituent_value_route_is_direct(regex) {
-                session.is_match_value_at_normalized(haystack, search_start, limits.pattern)
-            } else {
-                session
-                    .is_match_accounted_at_normalized(haystack, search_start, limits.pattern)
-                    .map(|(matched, _)| matched)
+        let haystack_bytes = haystack.as_bytes();
+        let window = SearchWindow::new(search_start, haystack_bytes.len());
+        match &mut self.sessions {
+            PortableTextRegexSetSessionStorage::Compact(bindings) => {
+                for (index, binding) in bindings.iter().enumerate() {
+                    let _ = enforce_search_count(index, limits.max_pattern_searches)?;
+                    let matched = binding
+                        .is_match_window_value(haystack_bytes, window, limits.pattern)
+                        .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                            index,
+                            total_work_before: 0,
+                            remaining_total_work: u64::MAX,
+                            source,
+                        })?;
+                    if matched {
+                        return Ok(true);
+                    }
+                }
             }
-            .map_err(|source| PortableRegexSetExecutionError::Pattern {
-                index,
-                total_work_before: 0,
-                remaining_total_work: u64::MAX,
-                source,
-            })?;
-            if matched {
-                return Ok(true);
+            PortableTextRegexSetSessionStorage::Stateful(sessions) => {
+                for (index, session) in sessions.iter_mut().enumerate() {
+                    let _ = enforce_search_count(index, limits.max_pattern_searches)?;
+                    let regex = &self.owner.regexes[index];
+                    let matched = if text_set_constituent_value_route_is_direct(regex) {
+                        session.is_match_value_at_normalized(haystack, search_start, limits.pattern)
+                    } else {
+                        session
+                            .is_match_accounted_at_normalized(
+                                haystack,
+                                search_start,
+                                limits.pattern,
+                            )
+                            .map(|(matched, _)| matched)
+                    };
+                    let matched =
+                        matched.map_err(|source| PortableRegexSetExecutionError::Pattern {
+                            index,
+                            total_work_before: 0,
+                            remaining_total_work: u64::MAX,
+                            source,
+                        })?;
+                    if matched {
+                        return Ok(true);
+                    }
+                }
             }
         }
         Ok(false)
@@ -1007,17 +1078,33 @@ impl PortableTextRegexSetSearchSession<'_> {
         search_start: usize,
         limits: PortableRegexSetRunLimits,
     ) -> Result<bool, PortableRegexSetExecutionError> {
+        let haystack_bytes = haystack.as_bytes();
+        let window = SearchWindow::new(search_start, haystack_bytes.len());
         let mut total_work = 0_u64;
-        for (index, session) in self.sessions.iter_mut().enumerate() {
+        for index in 0..self.owner.len() {
             let _ = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) = search_one_session_normalized(
-                session,
-                index,
-                haystack,
-                search_start,
-                limits,
-                total_work,
-            )?;
+            let (matched, work) = match &mut self.sessions {
+                PortableTextRegexSetSessionStorage::Compact(bindings) => {
+                    search_one_compact_session_normalized(
+                        &bindings[index],
+                        index,
+                        haystack_bytes,
+                        window,
+                        limits,
+                        total_work,
+                    )?
+                }
+                PortableTextRegexSetSessionStorage::Stateful(sessions) => {
+                    search_one_session_normalized(
+                        &mut sessions[index],
+                        index,
+                        haystack,
+                        search_start,
+                        limits,
+                        total_work,
+                    )?
+                }
+            };
             total_work = work;
             if matched {
                 return Ok(true);
@@ -1044,30 +1131,47 @@ impl PortableTextRegexSetSearchSession<'_> {
         start: usize,
         limits: PortableRegexSetRunLimits,
     ) -> Result<PortableSetMatches, PortableRegexSetExecutionError> {
+        let pattern_count = self.owner.len();
         let search_start = validate_text_start(haystack, start)?;
-        enforce_output_bytes(self.len(), limits.max_output_bytes)?;
+        enforce_output_bytes(pattern_count, limits.max_output_bytes)?;
         let mut flags = Vec::new();
-        flags.try_reserve_exact(self.len()).map_err(|_| {
+        flags.try_reserve_exact(pattern_count).map_err(|_| {
             PortableRegexSetExecutionError::AllocationFailed {
                 structure: "text session set match flags",
-                additional: self.len(),
+                additional: pattern_count,
             }
         })?;
         enforce_output_bytes(flags.capacity(), limits.max_output_bytes)?;
-        flags.resize(self.len(), 0_u8);
+        flags.resize(pattern_count, 0_u8);
 
+        let haystack_bytes = haystack.as_bytes();
+        let window = SearchWindow::new(search_start, haystack_bytes.len());
         let mut total_work = 0_u64;
         let mut matched_patterns = 0_usize;
-        for (index, session) in self.sessions.iter_mut().enumerate() {
+        for index in 0..pattern_count {
             let _ = enforce_search_count(index, limits.max_pattern_searches)?;
-            let (matched, work) = search_one_session_normalized(
-                session,
-                index,
-                haystack,
-                search_start,
-                limits,
-                total_work,
-            )?;
+            let (matched, work) = match &mut self.sessions {
+                PortableTextRegexSetSessionStorage::Compact(bindings) => {
+                    search_one_compact_session_normalized(
+                        &bindings[index],
+                        index,
+                        haystack_bytes,
+                        window,
+                        limits,
+                        total_work,
+                    )?
+                }
+                PortableTextRegexSetSessionStorage::Stateful(sessions) => {
+                    search_one_session_normalized(
+                        &mut sessions[index],
+                        index,
+                        haystack,
+                        search_start,
+                        limits,
+                        total_work,
+                    )?
+                }
+            };
             total_work = work;
             if matched {
                 let needed = matched_patterns.checked_add(1).ok_or(
@@ -1087,7 +1191,7 @@ impl PortableTextRegexSetSearchSession<'_> {
         }
         let report = PortableRegexSetExecutionReport {
             start,
-            patterns_searched: self.len(),
+            patterns_searched: pattern_count,
             matched_patterns,
             work: total_work,
             output_capacity_bytes: flags.capacity(),
@@ -1140,32 +1244,41 @@ impl PortableTextRegexSetSearchSession<'_> {
         start: usize,
     ) -> Result<bool, PortableRegexSetExecutionError> {
         let search_start = validate_text_start(haystack, start)?;
-        if match_flags.len() < self.len() {
+        let pattern_count = self.owner.len();
+        if match_flags.len() < pattern_count {
             return Err(PortableRegexSetExecutionError::MatchBufferTooSmall {
-                needed: self.len(),
+                needed: pattern_count,
                 available: match_flags.len(),
             });
         }
-        if self.is_empty() {
+        if pattern_count == 0 {
             return Ok(false);
         }
+        let haystack_bytes = haystack.as_bytes();
+        let window = SearchWindow::new(search_start, haystack_bytes.len());
         let mut any = false;
-        for (index, session) in self.sessions.iter_mut().enumerate() {
+        for index in 0..pattern_count {
             let regex = &self.owner.regexes[index];
-            let matched = if text_set_constituent_value_route_is_direct(regex) {
-                session.is_match_value_at_normalized(
-                    haystack,
-                    search_start,
-                    SearchLimits::unlimited(),
-                )
-            } else {
-                session
-                    .is_match_accounted_at_normalized(
-                        haystack,
-                        search_start,
-                        SearchLimits::unlimited(),
-                    )
-                    .map(|(matched, _report)| matched)
+            let matched = match &mut self.sessions {
+                PortableTextRegexSetSessionStorage::Compact(bindings) => bindings[index]
+                    .is_match_window_value(haystack_bytes, window, SearchLimits::unlimited()),
+                PortableTextRegexSetSessionStorage::Stateful(sessions) => {
+                    if text_set_constituent_value_route_is_direct(regex) {
+                        sessions[index].is_match_value_at_normalized(
+                            haystack,
+                            search_start,
+                            SearchLimits::unlimited(),
+                        )
+                    } else {
+                        sessions[index]
+                            .is_match_accounted_at_normalized(
+                                haystack,
+                                search_start,
+                                SearchLimits::unlimited(),
+                            )
+                            .map(|(matched, _report)| matched)
+                    }
+                }
             }
             .map_err(|source| PortableRegexSetExecutionError::Pattern {
                 index,
@@ -1241,6 +1354,45 @@ fn search_one_session_normalized(
     };
     let (matched, accounting) = session
         .is_match_accounted_at_normalized(haystack, start, pattern_limits)
+        .map_err(|source| PortableRegexSetExecutionError::Pattern {
+            index,
+            total_work_before,
+            remaining_total_work,
+            source,
+        })?;
+    let work = accounting.work_or_linear_terms();
+    let total_work = total_work_before.checked_add(work).ok_or(
+        PortableRegexSetExecutionError::ArithmeticOverflow {
+            computation: "total text-session execution work",
+        },
+    )?;
+    if total_work > limits.max_total_work {
+        return Err(PortableRegexSetExecutionError::ArithmeticOverflow {
+            computation: "text session matcher exceeded delegated work limit",
+        });
+    }
+    Ok((matched, total_work))
+}
+
+fn search_one_compact_session_normalized(
+    binding: &PortableOrdinaryCanonical<'_>,
+    index: usize,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: PortableRegexSetRunLimits,
+    total_work_before: u64,
+) -> Result<(bool, u64), PortableRegexSetExecutionError> {
+    let remaining_total_work = limits.max_total_work.checked_sub(total_work_before).ok_or(
+        PortableRegexSetExecutionError::ArithmeticOverflow {
+            computation: "remaining total text-session execution work",
+        },
+    )?;
+    let pattern_limits = SearchLimits {
+        max_work: limits.pattern.max_work.min(remaining_total_work),
+        max_scratch_bytes: limits.pattern.max_scratch_bytes,
+    };
+    let (matched, accounting) = binding
+        .is_match_window(haystack, window, pattern_limits)
         .map_err(|source| PortableRegexSetExecutionError::Pattern {
             index,
             total_work_before,

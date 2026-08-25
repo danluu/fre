@@ -18544,14 +18544,14 @@ enum PortableOrdinarySessionPlan<'a> {
 /// already required by the outer K0 variant, so canonical construction needs
 /// no separate allocation and does not enlarge the ordinary session.
 #[derive(Debug)]
-enum PortableOrdinaryCanonical<'a> {
+pub(crate) enum PortableOrdinaryCanonical<'a> {
     Native(&'a PortableRegex),
     ExactLiteral(&'a LiteralPlan),
     FixedPredicateWord64(&'a FixedPredicateWord64Plan),
 }
 
 impl<'a> PortableOrdinaryCanonical<'a> {
-    fn try_new(regex: &'a PortableRegex) -> Result<Self, SearchError> {
+    pub(crate) fn try_new(regex: &'a PortableRegex) -> Result<Self, SearchError> {
         match &regex.plan {
             PortablePlan::K0(_) => Err(SearchError::K0(K0SearchError::InternalInvariant {
                 detail: "ordinary canonical binding unexpectedly selected K0",
@@ -18559,6 +18559,72 @@ impl<'a> PortableOrdinaryCanonical<'a> {
             PortablePlan::ExactLiteral(plan) => Ok(Self::ExactLiteral(plan)),
             PortablePlan::FixedPredicateWord64(plan) => Ok(Self::FixedPredicateWord64(plan)),
             _ => Ok(Self::Native(regex)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_match_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(bool, SearchAccounting), SearchError> {
+        match self {
+            Self::ExactLiteral(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::ExactLiteral(accounting),
+                ))
+            }
+            Self::FixedPredicateWord64(plan) => {
+                let (matched, accounting) = plan.is_match_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(limits),
+                )?;
+                Ok((
+                    matched,
+                    SearchAccounting::FixedPredicateWord64(accounting),
+                ))
+            }
+            Self::Native(regex) => regex.is_match_window(haystack, window, limits),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        match self {
+            Self::ExactLiteral(plan) => {
+                let window = LiteralWindow::new(window.start(), window.end());
+                if limits == SearchLimits::unlimited()
+                    && let Some(executor) = plan.ordinary_executor()
+                {
+                    return executor
+                        .exists_window_value(haystack, window)
+                        .map_err(SearchError::from);
+                }
+                plan.find_window(haystack, window, literal_limits(limits))
+                    .map(|(matched, _)| matched.is_some())
+                    .map_err(SearchError::from)
+            }
+            Self::FixedPredicateWord64(plan) => plan
+                .is_match_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(limits),
+                )
+                .map_err(SearchError::from),
+            Self::Native(regex) => regex.is_match_window_value(haystack, window, limits),
         }
     }
 
