@@ -3244,7 +3244,7 @@ mod tests {
             program.native_dynamic_rows_view(),
             program
                 .native_ordered_nfa_view()
-                .map(|view| (view, usize::MAX)),
+                .map(|view| (view, usize::MAX, true)),
             target,
         )
         .unwrap()
