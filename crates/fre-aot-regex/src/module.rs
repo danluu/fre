@@ -77809,7 +77809,7 @@ mod tests {
         clippy::arithmetic_side_effects,
         reason = "the test decoder checks already-bounded generated branch immediates",
     )]
-    fn x86_test_branch_target(
+    fn x86_required_reducer_branch_target(
         code: &[u8],
         instruction: usize,
     ) -> (Option<u8>, usize, usize) {
@@ -77876,7 +77876,7 @@ mod tests {
                 Some([0x83, 0xf8, 0x01].as_slice()),
             );
             cursor += 3;
-            let (condition, _, end) = x86_test_branch_target(&wrapper.code, cursor);
+            let (condition, _, end) = x86_required_reducer_branch_target(&wrapper.code, cursor);
             assert_eq!(condition, Some(4), "status one must enter matched-line");
             cursor = end;
             assert_eq!(
@@ -77884,9 +77884,9 @@ mod tests {
                 Some([0x85, 0xc0].as_slice()),
             );
             cursor += 2;
-            let (condition, _, end) = x86_test_branch_target(&wrapper.code, cursor);
+            let (condition, _, end) = x86_required_reducer_branch_target(&wrapper.code, cursor);
             assert_eq!(condition, Some(4), "status zero must complete the line");
-            let (condition, target, _) = x86_test_branch_target(&wrapper.code, end);
+            let (condition, target, _) = x86_required_reducer_branch_target(&wrapper.code, end);
             assert_eq!(condition, None, "every other private status is terminal");
             target
         } else {
@@ -77895,7 +77895,7 @@ mod tests {
                 Some([0x85, 0xc0].as_slice()),
             );
             cursor += 2;
-            let (condition, _, end) = x86_test_branch_target(&wrapper.code, cursor);
+            let (condition, _, end) = x86_required_reducer_branch_target(&wrapper.code, cursor);
             assert_eq!(condition, Some(4), "status zero must finish the reduction");
             cursor = end;
             assert_eq!(
@@ -77903,13 +77903,14 @@ mod tests {
                 Some([0x83, 0xf8, 0x01].as_slice()),
             );
             cursor += 3;
-            let (condition, target, end) = x86_test_branch_target(&wrapper.code, cursor);
+            let (condition, target, end) =
+                x86_required_reducer_branch_target(&wrapper.code, cursor);
             match condition {
                 // The assembler may retain JE matched + JMP error or invert
                 // the pair to JNE error with matched as fallthrough.
                 Some(4) => {
                     let (jump_condition, error, _) =
-                        x86_test_branch_target(&wrapper.code, end);
+                        x86_required_reducer_branch_target(&wrapper.code, end);
                     assert_eq!(jump_condition, None);
                     error
                 }
