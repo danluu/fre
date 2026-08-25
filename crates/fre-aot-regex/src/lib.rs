@@ -47,6 +47,7 @@ mod regex_set_exact64;
 mod regex_set_exact64_aot;
 mod regex_set_exact64_first_any_aot;
 mod regex_set_finite64;
+mod regex_set_finite64_aot;
 mod regex_redux_aot;
 mod rebar_multi_grep;
 mod rebar_single_capture;
@@ -375,6 +376,19 @@ pub use regex_set_finite64::{
     RegexSetFinite64Limits, RegexSetFinite64Program, RegexSetFinite64Receipt,
     RegexSetFinite64Resource, RegexSetFinite64RunError, RegexSetFinite64Session,
     compile_regex_set_finite64_reported,
+};
+pub use regex_set_finite64_aot::{
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_ABI_VERSION,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_ALPHABET_LEN,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_DATA_SCHEMA_VERSION,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_IDENTITY_DOMAIN,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_MAX_ADDRESSABLE_DATA_BYTES,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_STATUS_INVALID_ARGUMENT,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_STATUS_SUCCESS, RegexSetFinite64AotArtifactV1,
+    RegexSetFinite64AotCompileDispositionV1, RegexSetFinite64AotDeclineV1,
+    RegexSetFinite64AotErrorV1, RegexSetFinite64AotLimitsV1,
+    RegexSetFinite64AotResourceV1, RegexSetGraphExistsAotReceiptV1,
+    compile_regex_set_finite64_aot_v1,
 };
 pub use regex_redux_aot::{
     NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION, NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS,

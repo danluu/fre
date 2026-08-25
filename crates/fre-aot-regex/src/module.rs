@@ -31093,6 +31093,342 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
     })
 }
 
+const REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION: usize = 0;
+const REGEX_SET_GRAPH_EXISTS_AOT_DATA_SECTION: usize = 1;
+const REGEX_SET_GRAPH_EXISTS_AOT_ENTRY_SYMBOL: usize = 0;
+const REGEX_SET_GRAPH_EXISTS_AOT_TRANSITIONS_SYMBOL: usize = 2;
+const REGEX_SET_GRAPH_EXISTS_AOT_OUTPUTS_SYMBOL: usize = 3;
+
+struct NativeRegexSetGraphExistsAarch64LoweringV1 {
+    code: Vec<u8>,
+    transition_page: usize,
+    transition_page_offset: usize,
+    output_page: usize,
+    output_page_offset: usize,
+}
+
+/// Lower the generic graph Exists ABI independently of the frozen Exact64 V1
+/// object family. The loop consumes one byte per transition and ORs the
+/// authenticated owner mask for the resulting state into the transactional
+/// result word.
+fn lower_aarch64_regex_set_graph_exists_scan_v1(
+    all_pattern_mask: u64,
+) -> Result<NativeRegexSetGraphExistsAarch64LoweringV1, ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let addressable_haystack = assembler.label()?;
+    let scan = assembler.label()?;
+    let publish = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // Raw ABI: u32 entry(const u8 *haystack, usize haystack_len,
+    //                    usize start, usize end, u64 *output).
+    // The output remains untouched until every pointer/window check succeeds.
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_adds_x_imm(5, 4, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(1, addressable_haystack)?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_adds_x_reg(5, 0, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+
+    assembler.bind(addressable_haystack)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 2)?)?;
+    assembler.instruction(aarch64_add_x_reg(13, 0, 3)?)?;
+    assembler.instruction(aarch64_movz_w(6, 0)?)?;
+    assembler.instruction(aarch64_movz_x(7, 0, 0)?)?;
+    aarch64_load_u64_constant(&mut assembler, 12, all_pattern_mask)?;
+
+    let transition_page = assembler.instruction(0x9000_0008)?; // ADRP X8, transitions
+    let transition_page_offset = assembler.instruction(aarch64_add_x_imm(8, 8, 0)?)?;
+    let output_page = assembler.instruction(0x9000_000b)?; // ADRP X11, outputs
+    let output_page_offset = assembler.instruction(aarch64_add_x_imm(11, 11, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    assembler.branch_cond(AARCH64_HS, publish)?;
+
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_load_byte_post_imm(9, 5, 1)?)?;
+    // A complete row is 256 u32 cells, hence state * 1024 + byte * 4.
+    // State tokens load through W6 and are therefore zero-extended before
+    // participating in the full-width address computation.
+    assembler.instruction(aarch64_add_x_lsl(10, 8, 6, 10)?)?;
+    assembler.instruction(aarch64_add_x_lsl(10, 10, 9, 2)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 10, 0)?)?;
+    assembler.instruction(aarch64_load_x_lsl3(10, 11, 6)?)?;
+    assembler.instruction(aarch64_orr_x(7, 7, 10)?)?;
+    assembler.instruction(aarch64_cmp_x(7, 12)?)?;
+    assembler.branch_cond(AARCH64_EQ, publish)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, scan)?;
+
+    assembler.bind(publish)?;
+    assembler.instruction(aarch64_store_x(7, 4, 0)?)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_GRAPH_EXISTS_AOT_V1_STATUS_SUCCESS).map_err(|_| {
+            ObjectError::ArithmeticOverflow("generic graph Exists success status")
+        })?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_GRAPH_EXISTS_AOT_V1_STATUS_INVALID_ARGUMENT).map_err(
+            |_| ObjectError::ArithmeticOverflow("generic graph Exists invalid status"),
+        )?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        transition_page,
+        transition_page_offset,
+        output_page,
+        output_page_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(NativeRegexSetGraphExistsAarch64LoweringV1 {
+        code,
+        transition_page: relocation_offsets[0],
+        transition_page_offset: relocation_offsets[1],
+        output_page: relocation_offsets[2],
+        output_page_offset: relocation_offsets[3],
+    })
+}
+
+/// Lower an independently authenticated generic finite-set graph into one
+/// helper-free AArch64 Exists scan. This is a distinct object ABI and symbol
+/// family; the frozen Exact64 V1 lowering and bytes are not consulted.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one standalone text/data object with four internal relocations is a single fail-closed artifact boundary"
+)]
+pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
+    target: Target,
+    operation_identity: [u8; 32],
+    source_graph_schema_version: u32,
+    source_graph_identity: [u8; 32],
+    source_artifact_identity: [u8; 32],
+    pattern_count: u8,
+    all_pattern_mask: u64,
+    image: crate::regex_set_finite64_aot::RegexSetGraphDenseImageV1,
+    max_code_bytes: usize,
+) -> Result<CompiledModule, ObjectError> {
+    target.validate()?;
+    if target.architecture != Architecture::Aarch64 || target.abi != CallAbi::Aapcs64 {
+        return Err(ObjectError::InvalidModule(
+            "generic graph Exists lowering requires a valid AArch64 target",
+        ));
+    }
+    crate::regex_set_finite64_aot::authenticate_dense_image_for_lowering(
+        source_graph_identity,
+        source_artifact_identity,
+        pattern_count,
+        all_pattern_mask,
+        &image,
+    )?;
+    crate::regex_set_finite64_aot::authenticate_operation_identity_for_lowering(
+        target,
+        operation_identity,
+        source_graph_schema_version,
+        source_artifact_identity,
+        source_graph_identity,
+        pattern_count,
+        all_pattern_mask,
+        &image,
+    )?;
+    if u64::try_from(image.data.len()).map_or(true, |bytes| {
+        bytes > crate::REGEX_SET_GRAPH_EXISTS_AOT_V1_MAX_ADDRESSABLE_DATA_BYTES
+    }) {
+        return Err(ObjectError::InvalidModule(
+            "generic graph Exists data exceeds its addressing model",
+        ));
+    }
+    let lowered = lower_aarch64_regex_set_graph_exists_scan_v1(all_pattern_mask)?;
+    if lowered.code.len() > max_code_bytes {
+        return Err(ObjectError::Resource {
+            resource: CompileResource::CodeBytes,
+            limit: max_code_bytes,
+            required: lowered.code.len(),
+        });
+    }
+    let transition_bytes = image
+        .transition_cells
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "generic graph Exists transition symbol size",
+        ))?;
+    let output_bytes = image
+        .state_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "generic graph Exists output symbol size",
+        ))?;
+    let symbols = vec![
+        ModuleSymbol {
+            name: identity_symbol(
+                "fre_aot_regex_set_graph_exists_v1_",
+                &operation_identity,
+            )?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION),
+            offset: 0,
+            size: u64::try_from(lowered.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("generic graph Exists text symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_graph_exists_header_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_GRAPH_EXISTS_AOT_DATA_SECTION),
+            offset: 0,
+            size: u64::try_from(
+                crate::regex_set_finite64_aot::REGEX_SET_GRAPH_EXISTS_AOT_V1_HEADER_BYTES,
+            )
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow("generic graph Exists header symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_graph_exists_transitions_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_GRAPH_EXISTS_AOT_DATA_SECTION),
+            offset: offset_u64(
+                image.transition_offset,
+                "generic graph Exists transition symbol offset",
+            )?,
+            size: u64::try_from(transition_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("generic graph Exists transition symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_graph_exists_outputs_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_GRAPH_EXISTS_AOT_DATA_SECTION),
+            offset: offset_u64(
+                image.output_offset,
+                "generic graph Exists output symbol offset",
+            )?,
+            size: u64::try_from(output_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("generic graph Exists output symbol size")
+            })?,
+        },
+    ];
+    let relocations = vec![
+        ModuleRelocation {
+            section: REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page,
+                "generic graph Exists transition page relocation",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_GRAPH_EXISTS_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page_offset,
+                "generic graph Exists transition page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_GRAPH_EXISTS_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.output_page,
+                "generic graph Exists output page relocation",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_GRAPH_EXISTS_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.output_page_offset,
+                "generic graph Exists output page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_GRAPH_EXISTS_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+    ];
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: lowered.code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.regex-set-graph-exists",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 64,
+                data: image.data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REGEX_SET_GRAPH_EXISTS_AOT_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_exists_trusted_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
 const REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION: usize = 0;
 const REGEX_SET_EXACT64_FIRST_ANY_AOT_DATA_SECTION: usize = 1;
 const REGEX_SET_EXACT64_FIRST_ANY_AOT_ENTRY_SYMBOL: usize = 0;

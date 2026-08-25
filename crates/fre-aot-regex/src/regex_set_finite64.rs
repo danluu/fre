@@ -473,6 +473,48 @@ pub struct RegexSetFinite64Program {
     edges: Vec<Finite64Edge>,
 }
 
+/// Borrowed authenticated graph surface for optional target backends.
+///
+/// The concrete Rust records remain private so a backend cannot accidentally
+/// turn their in-memory layout into an object ABI.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegexSetFinite64GraphView<'a> {
+    program: &'a RegexSetFinite64Program,
+}
+
+impl RegexSetFinite64GraphView<'_> {
+    pub(crate) fn state_count(self) -> usize {
+        self.program.states.len()
+    }
+
+    pub(crate) const fn receipt(self) -> RegexSetFinite64Receipt {
+        self.program.receipt
+    }
+
+    pub(crate) fn state_depth(self, state: usize) -> Option<u32> {
+        self.program.states.get(state).map(|state| state.depth)
+    }
+
+    pub(crate) fn failure_state(self, state: usize) -> Option<u32> {
+        self.program.states.get(state).map(|state| state.failure)
+    }
+
+    pub(crate) fn output_mask(self, state: usize) -> Option<u64> {
+        self.program.states.get(state).map(|state| state.output_mask)
+    }
+
+    pub(crate) fn direct_transition(self, state: usize, byte: u8) -> Option<u32> {
+        let state = self.program.states.get(state)?;
+        let start = usize::try_from(state.edge_start).ok()?;
+        let end = start.checked_add(usize::from(state.edge_count))?;
+        let edges = self.program.edges.get(start..end)?;
+        edges
+            .binary_search_by_key(&byte, |edge| edge.byte)
+            .ok()
+            .map(|edge| edges[edge].target)
+    }
+}
+
 /// Reusable authentication receipt for allocation-free warm scans.
 #[derive(Clone, Copy, Debug)]
 pub struct RegexSetFinite64Session {
@@ -717,6 +759,15 @@ impl RegexSetFinite64Program {
     #[must_use]
     pub const fn receipt(&self) -> RegexSetFinite64Receipt {
         self.receipt
+    }
+
+    /// Authenticate the complete graph before lending only its abstract
+    /// topology to an optional target backend.
+    pub(crate) fn authenticated_graph(
+        &self,
+    ) -> Result<RegexSetFinite64GraphView<'_>, RegexSetFinite64AuthenticationError> {
+        self.authenticate()?;
+        Ok(RegexSetFinite64GraphView { program: self })
     }
 
     /// Authenticate once and create an allocation-free reusable scan session.

@@ -121,6 +121,50 @@ geometry, generated code, relocation-closed object, and every ceiling. This
 entry remains opt-in; `compile_regex_set`, `compile_regex_set_exact64_reported`,
 and all of their defaults are unchanged.
 
+### General finite-language shared scan and AArch64 lowering
+
+`compile_regex_set_finite64_reported` is a separate Optimizing-only Exists
+entry for 2 through 64 source rows. Unlike the exact64 substrate, each row may
+be any independently authenticated nonempty, assertion-free finite byte
+language within the caller's witness limits. It still builds the complete
+independent-row regex-set incumbent first. A selected target-neutral graph
+maps every retained finite string to its source bit; duplicate strings can own
+multiple bits, and failure outputs inherit every matching suffix owner. One
+scan therefore publishes the same `u64` source mask as all independent rows.
+Its normal compiler entry and defaults remain unchanged.
+
+`compile_regex_set_finite64_aot_v1` is an additional explicit AArch64 step. It
+consumes an already-selected `RegexSetFinite64Program`, reauthenticates the
+source graph, and constructs a stable generic graph image with a versioned
+128-byte header, a complete 256-way `u32` transition row per state, and one
+inherited `u64` owner mask per state. Immediately before code generation, the
+lowerer independently rehashes the complete image and verifies that its exact
+target, source identities, geometry, and bytes reproduce the operation
+identity. The helper-free entry ABI is:
+
+```text
+u32 entry(const u8 *haystack, usize len, usize start, usize end, u64 *mask)
+```
+
+Status zero transactionally publishes the complete matching-source mask for
+the requested `SearchWindow`. An invalid pointer, alignment, extent, or window
+returns status two without touching the caller word. The object has one global
+identity-suffixed function, only internal data relocations, and no required
+runtime symbol or runtime program.
+
+Dense transition cells, authenticated construction work, dense data bytes,
+code bytes, and final object bytes have independent numeric caps. Those five
+caps are the only safe declines, and a decline returns the exact portable
+owner supplied by the caller. Source or wire authentication failure, target
+incoherence or unsupported architecture, allocation refusal, arithmetic
+overflow, invariant failure, and object failure are terminal. The effective
+data cap is also bounded by the published AArch64 addressing ceiling.
+
+The generic graph ABI, identity domain, symbols, data schema, and receipt are
+distinct from Exact64 V1. This additive lowering neither reuses nor changes
+the frozen Exact64 V1 object format or its byte identities. No default route
+selects the generic graph object implicitly.
+
 ### Additive first-any-position lowering
 
 `compile_regex_set_exact64_first_any_aot_v1` is a separate opt-in consumer of
