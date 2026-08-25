@@ -43,6 +43,7 @@ mod prefix_predicate;
 mod prefix_relation;
 mod program;
 mod regex_set;
+mod regex_set_exact64;
 mod regex_redux_aot;
 mod rebar_multi_grep;
 mod rebar_single_capture;
@@ -333,6 +334,14 @@ pub use regex_set::{
     RegexSetCompileRequest, RegexSetFillReport, RegexSetOutputError, RegexSetPatternIds,
     RegexSetPrepareError, RegexSetProgram, RegexSetProgramShapeError, RegexSetProgramStats,
     RegexSetRunError, RegexSetSession, RegexSetSessionLimits, compile_regex_set,
+};
+pub use regex_set_exact64::{
+    REGEX_SET_EXACT64_MAX_PATTERNS, REGEX_SET_EXACT64_MIN_PATTERNS,
+    REGEX_SET_EXACT64_SCHEMA_VERSION, RegexSetExact64ArtifactIdentity,
+    RegexSetExact64AuthenticationError, RegexSetExact64CompileDisposition,
+    RegexSetExact64CompileError, RegexSetExact64Decline, RegexSetExact64FillReport,
+    RegexSetExact64Limits, RegexSetExact64Program, RegexSetExact64Receipt, RegexSetExact64Resource,
+    RegexSetExact64RunError, compile_regex_set_exact64_reported,
 };
 pub use regex_redux_aot::{
     NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION, NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS,

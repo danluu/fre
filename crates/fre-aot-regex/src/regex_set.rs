@@ -19,7 +19,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileError, CompileMode, DeterminizeLimits, MatchResult, OutputContract, ProgramWorkspace,
-    SearchWindow, program::CompiledProgram,
+    SearchWindow,
+    finite_language::{NativeExactSingletonAnalysis, NativeFiniteLanguageCandidate},
+    program::CompiledProgram,
 };
 
 const REGEX_SET_IDENTITY_DOMAIN: &[u8] = b"FRE-AOT-REGEX-SET\0";
@@ -990,13 +992,57 @@ impl std::error::Error for RegexSetProgramShapeError {}
 ///
 /// Syntax is parsed once per source row and the aggregate size limit is
 /// applied directly to FRE's stable compiled programs.
-#[allow(
-    clippy::too_many_lines,
-    reason = "aggregate admission, exact row allocation, indexed compilation, and identity publication form one transaction"
-)]
 pub fn compile_regex_set(
     request: RegexSetCompileRequest,
 ) -> Result<RegexSetProgram, RegexSetCompileError> {
+    Ok(compile_regex_set_internal(request, None)?.program)
+}
+
+pub(crate) struct RegexSetExact64CompileParts {
+    pub(crate) program: RegexSetProgram,
+    pub(crate) witnesses: Vec<Option<Vec<u8>>>,
+    pub(crate) witness_decline: Option<RegexSetExact64WitnessDecline>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegexSetExact64WitnessDecline {
+    RowNotExactSingleton { pattern: usize },
+    LiteralBytes { needed: u64, limit: u64 },
+}
+
+pub(crate) fn compile_regex_set_with_exact64_witnesses(
+    request: RegexSetCompileRequest,
+    max_literal_bytes: usize,
+) -> Result<RegexSetExact64CompileParts, RegexSetCompileError> {
+    let RegexSetCompileParts {
+        program,
+        witnesses,
+        witness_decline,
+    } = compile_regex_set_internal(request, Some(max_literal_bytes))?;
+    let witnesses = witnesses.ok_or(RegexSetCompileError::InternalInvariant(
+        "exact64 regex-set compilation omitted its witness table",
+    ))?;
+    Ok(RegexSetExact64CompileParts {
+        program,
+        witnesses,
+        witness_decline,
+    })
+}
+
+struct RegexSetCompileParts {
+    program: RegexSetProgram,
+    witnesses: Option<Vec<Option<Vec<u8>>>>,
+    witness_decline: Option<RegexSetExact64WitnessDecline>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "aggregate admission, exact row allocation, optional authenticated witness capture, indexed compilation, and identity publication form one transaction"
+)]
+fn compile_regex_set_internal(
+    request: RegexSetCompileRequest,
+    exact64_max_literal_bytes: Option<usize>,
+) -> Result<RegexSetCompileParts, RegexSetCompileError> {
     let RegexSetCompileRequest {
         patterns,
         profile,
@@ -1037,6 +1083,11 @@ pub fn compile_regex_set(
     let compatibility = CompatibilityProfile::RustBytes(profile.clone());
 
     let mut rows = reserve_exact_compile(pattern_count, "compiled rows")?;
+    let mut witnesses = exact64_max_literal_bytes
+        .map(|_| reserve_exact_compile(pattern_count, "exact64 literal witnesses"))
+        .transpose()?;
+    let mut witness_decline = None;
+    let mut exact64_literal_bytes = 0usize;
     let line_terminator = profile.options.line_terminator;
     let mut total_program_bytes = 0usize;
     for (pattern, source) in patterns.into_iter().enumerate() {
@@ -1084,6 +1135,120 @@ pub fn compile_regex_set(
                 limit: limits.max_total_program_bytes,
             });
         }
+        if let Some(witnesses) = &mut witnesses {
+            let witness = if matches!(
+                witness_decline,
+                Some(RegexSetExact64WitnessDecline::RowNotExactSingleton { .. })
+            ) {
+                None
+            } else if matches!(
+                witness_decline,
+                Some(RegexSetExact64WitnessDecline::LiteralBytes { .. })
+            ) {
+                let exact = NativeFiniteLanguageCandidate::preflight_exact_singleton_checked(
+                    &parsed,
+                    OutputContract::Exists,
+                )
+                .map_err(CompileError::from)
+                .map_err(|source| RegexSetCompileError::Pattern { pattern, source })?;
+                if !exact {
+                    witness_decline =
+                        Some(RegexSetExact64WitnessDecline::RowNotExactSingleton { pattern });
+                }
+                None
+            } else {
+                let limit =
+                    exact64_max_literal_bytes.ok_or(RegexSetCompileError::InternalInvariant(
+                        "exact64 witness table lacked its literal-byte ceiling",
+                    ))?;
+                let remaining = limit.checked_sub(exact64_literal_bytes).ok_or(
+                    RegexSetCompileError::InternalInvariant(
+                        "exact64 literal-byte census exceeded its ceiling",
+                    ),
+                )?;
+                let witness = match NativeFiniteLanguageCandidate::analyze_exact_singleton_checked(
+                    &parsed,
+                    OutputContract::Exists,
+                    remaining,
+                ) {
+                    Ok(result) => result,
+                    Err(source) => {
+                        return Err(RegexSetCompileError::Pattern {
+                            pattern,
+                            source: CompileError::from(source),
+                        });
+                    }
+                };
+                match witness {
+                    NativeExactSingletonAnalysis::Proven(literal) => {
+                        let needed = exact64_literal_bytes.checked_add(literal.len()).ok_or(
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 literal byte sum",
+                            },
+                        )?;
+                        if needed > limit {
+                            let needed = u64::try_from(needed).map_err(|_| {
+                                RegexSetCompileError::ArithmeticOverflow {
+                                    computation: "exact64 literal byte requirement",
+                                }
+                            })?;
+                            let limit = u64::try_from(limit).map_err(|_| {
+                                RegexSetCompileError::ArithmeticOverflow {
+                                    computation: "exact64 literal byte limit",
+                                }
+                            })?;
+                            witness_decline =
+                                Some(RegexSetExact64WitnessDecline::LiteralBytes { needed, limit });
+                            None
+                        } else {
+                            exact64_literal_bytes = needed;
+                            Some(literal)
+                        }
+                    }
+                    NativeExactSingletonAnalysis::Declined => {
+                        witness_decline =
+                            Some(RegexSetExact64WitnessDecline::RowNotExactSingleton { pattern });
+                        None
+                    }
+                    NativeExactSingletonAnalysis::LiteralBytesLimit {
+                        needed,
+                        limit: proof_limit,
+                    } => {
+                        let expected_limit = u64::try_from(remaining).map_err(|_| {
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 remaining literal byte limit",
+                            }
+                        })?;
+                        if proof_limit != expected_limit || needed <= proof_limit {
+                            return Err(RegexSetCompileError::InternalInvariant(
+                                "exact64 fact refusal did not authenticate its byte ceiling",
+                            ));
+                        }
+                        let retained = u64::try_from(exact64_literal_bytes).map_err(|_| {
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 retained literal bytes",
+                            }
+                        })?;
+                        let aggregate_needed = retained.checked_add(needed).ok_or(
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 refused literal byte sum",
+                            },
+                        )?;
+                        let aggregate_limit = u64::try_from(limit).map_err(|_| {
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 aggregate literal byte limit",
+                            }
+                        })?;
+                        witness_decline = Some(RegexSetExact64WitnessDecline::LiteralBytes {
+                            needed: aggregate_needed,
+                            limit: aggregate_limit,
+                        });
+                        None
+                    }
+                }
+            };
+            witnesses.push(witness);
+        }
         rows.push(program);
     }
     if rows.len() != pattern_count {
@@ -1092,19 +1257,35 @@ pub fn compile_regex_set(
         ));
     }
     validate_exact_capacity_compile(rows.capacity(), pattern_count, "compiled rows")?;
+    if let Some(witnesses) = &witnesses {
+        if witnesses.len() != pattern_count {
+            return Err(RegexSetCompileError::InternalInvariant(
+                "exact64 witness table lost source order",
+            ));
+        }
+        validate_exact_capacity_compile(
+            witnesses.capacity(),
+            pattern_count,
+            "exact64 literal witnesses",
+        )?;
+    }
     let artifact = semantic_identity(&rows)?;
     let instance = next_instance()?;
-    Ok(RegexSetProgram {
-        rows,
-        identity: RegexSetIdentity { artifact, instance },
-        profile,
-        mode,
-        stats: RegexSetProgramStats {
-            patterns: pattern_count,
-            pattern_bytes,
-            serialized_program_bytes: total_program_bytes,
-            required_words,
+    Ok(RegexSetCompileParts {
+        program: RegexSetProgram {
+            rows,
+            identity: RegexSetIdentity { artifact, instance },
+            profile,
+            mode,
+            stats: RegexSetProgramStats {
+                patterns: pattern_count,
+                pattern_bytes,
+                serialized_program_bytes: total_program_bytes,
+                required_words,
+            },
         },
+        witnesses,
+        witness_decline,
     })
 }
 

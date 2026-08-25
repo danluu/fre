@@ -56,6 +56,47 @@ Search windows retain surrounding haystack context. In particular, callers
 must pass a `SearchWindow` over the original bytes instead of slicing when
 anchors or word boundaries can observe bytes outside the window.
 
+## Opt-in exact64 shared-scan substrate
+
+`compile_regex_set_exact64_reported` is a separate experimental entry; the
+existing compiler and its defaults do not request this optimization. It first
+builds the same complete independent-row incumbent. An Optimizing request with
+2 through 64 rows can then select a target-neutral shared Aho-Corasick graph
+only when current authenticated HIR facts independently prove that every row
+is one nonempty, assertion-free exact byte string. Semantic proof refusal,
+including nullable, assertive, and multi-string rows, returns the incumbent
+with an indexed decline.
+
+Before applying the caller's literal-byte ceiling, an allocation-free
+canonical-HIR exact-literal proof establishes singleton shape and exact width.
+The bounded finite-language facts then independently authenticate the same
+assertion-free bytes; the two proofs' materializations must agree. This keeps
+semantic row declines ahead of literal/state/transition resource declines
+without retaining an over-limit witness.
+
+The shared graph assigns one `u64` bit to every source ordinal. Terminal masks
+retain duplicate rows, and failure-link masks inherit suffix matches, so
+prefix, suffix, and overlapping literals are all reported by one scan. Its
+receipt binds the ordered incumbent artifact, exact literal-to-source mapping,
+current canonical exact-literal and HIR-fact algorithm/accounting identities,
+graph dimensions, transitions, failure links, and output masks. Before
+publication, construction replays every independently digested proof byte
+through direct trie edges to its exact source terminal. The portable oracle
+reauthenticates the retained receipt and graph before reading the haystack,
+scans exactly the requested window, and publishes the caller word only after
+success.
+
+Explicit literal-byte, state, transition, and failure-work ceilings are the
+only resource declines after proof. Allocation, arithmetic, construction
+invariant, and authentication failures are terminal. This substrate does not
+yet claim a generated entry point or native object route. The aggregate
+literal-byte ceiling is charged while witnesses are captured: its first
+crossing stops later optional fact work, and each finite-language proof is
+bounded by the remaining allowance after the allocation-free exact-width
+proof, so an oversized literal is not first retained as an optional witness. A
+decline does not bypass completion of the authoritative incumbent or any later
+indexed semantic error.
+
 ## Next layer
 
 This foundation deliberately adds no combined stable wire format, object
