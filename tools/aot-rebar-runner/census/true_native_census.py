@@ -142,6 +142,9 @@ NATIVE_MULTI_GREP_REDUCER_SYMBOL = re.compile(
 NATIVE_ROW_SCALAR_REDUCER_SYMBOL = re.compile(
     r"^fre_aot_regex_rebar_row_scalar_v1_[0-9a-f]{64}$"
 )
+NATIVE_MIXED_ROW_SCALAR_REDUCER_SYMBOL = re.compile(
+    r"^fre_aot_regex_rebar_mixed_row_scalar_v1_[0-9a-f]{64}$"
+)
 NATIVE_COUNT_CAPTURES_ENTRY_SYMBOL = re.compile(
     r"^fre_aot_regex_count_captures_exclusive_v1_[0-9a-f]{64}$"
 )
@@ -304,6 +307,10 @@ OPERATION_ROUTE_POLICIES = {
     "linked-native-row-scalar-reducer": OperationRoutePolicy(
         OperationBoundary.WHOLE_OPERATION,
         "whole-operation-native-authenticated",
+    ),
+    "linked-native-row-scalar-helper-backed-reducer": OperationRoutePolicy(
+        OperationBoundary.SEMANTIC_HELPER_BACKED,
+        "single-call-native-reducer-retains-semantic-runtime-helpers",
     ),
     "linked-uniform-capture-row-adapter-loop": OperationRoutePolicy(
         OperationBoundary.RUST_ADAPTER_LOOP,
@@ -3183,23 +3190,43 @@ def row_scalar_reducer_proof_from_provenance(
     row_object_bytes: int,
     source_to_artifact: list[int],
 ) -> dict[str, object]:
-    """Authenticate the helper-free Count/SpanSum ordinary-row wrapper."""
+    """Authenticate the single-call Count/SpanSum row wrapper."""
     model = fields.get("model")
     operation = {"count": "count", "count-spans": "span-sum"}.get(model)
-    adapter = {
+    mixed_text = fields.get("row_scalar_reducer_mixed_handle_table")
+    if mixed_text not in {"true", "false"}:
+        raise CensusError("row-scalar mixed-handle receipt is not canonical")
+    mixed_handle_table = mixed_text == "true"
+    has_prepared = any(component.get("prepared_v15") is not None
+                       for component in components)
+    adapter = ({
+        "count": "general-aot-native-row-count-mixed-prepared-whole-operation-reducer-v1",
+        "count-spans": (
+            "general-aot-native-row-span-sum-mixed-prepared-whole-operation-reducer-v1"
+        ),
+    } if mixed_handle_table else {
         "count": "general-aot-native-row-count-whole-operation-reducer-v1",
         "count-spans": (
             "general-aot-native-row-span-sum-whole-operation-reducer-v1"
         ),
-    }.get(model)
+    }).get(model)
+    aggregate_strategy = (
+        "native-independent-mixed-span-row-whole-scalar-reducer-v1"
+        if mixed_handle_table else
+        "native-independent-span-row-whole-scalar-reducer-v1"
+    )
+    boundary = (
+        "single-call-native-mixed-row-scalar-reducer"
+        if mixed_handle_table else
+        "single-call-helper-free-native-row-scalar-reducer"
+    )
     if (
         operation is None
+        or mixed_handle_table != has_prepared
         or fields.get("native_row_scalar_reducer") != "true"
         or fields.get("adapter") != adapter
-        or fields.get("aggregate_strategy")
-        != "native-independent-span-row-whole-scalar-reducer-v1"
-        or fields.get("boundary")
-        != "single-call-helper-free-native-row-scalar-reducer"
+        or fields.get("aggregate_strategy") != aggregate_strategy
+        or fields.get("boundary") != boundary
         or fields.get("row_scalar_reducer_operation") != operation
     ):
         raise CensusError("row-scalar reducer has a noncanonical typed route")
@@ -3211,6 +3238,22 @@ def row_scalar_reducer_proof_from_provenance(
         fields.get("row_scalar_reducer_source_cardinality"),
         "row-scalar reducer source cardinality", source_count, source_count,
     )
+    required_handle_count = parse_canonical_decimal(
+        fields.get("row_scalar_reducer_required_handle_count"),
+        "row-scalar reducer required handle count",
+        len(components) if mixed_handle_table else 0,
+        len(components) if mixed_handle_table else 0,
+    )
+    row_routes = parse_canonical_decimal_list(
+        fields.get("row_scalar_reducer_row_routes"),
+        "row-scalar reducer row routes", len(components), 0, 1,
+    )
+    expected_routes = [
+        1 if component.get("prepared_v15") is not None else 0
+        for component in components
+    ]
+    if row_routes != expected_routes:
+        raise CensusError("row-scalar reducer route vector differs from its components")
     source_bytes = parse_canonical_decimal(
         fields.get("row_scalar_reducer_source_bytes"),
         "row-scalar reducer source bytes", 0, MAX_PUBLIC_KLV_BYTES,
@@ -3257,7 +3300,9 @@ def row_scalar_reducer_proof_from_provenance(
     if not isinstance(reducer_symbol, str):
         raise CensusError("row-scalar reducer symbol is absent")
     symbol_identity = symbol_identity_suffix(
-        reducer_symbol, NATIVE_ROW_SCALAR_REDUCER_SYMBOL,
+        reducer_symbol,
+        (NATIVE_MIXED_ROW_SCALAR_REDUCER_SYMBOL if mixed_handle_table
+         else NATIVE_ROW_SCALAR_REDUCER_SYMBOL),
         "row-scalar reducer symbol",
     )
 
@@ -3312,7 +3357,11 @@ def row_scalar_reducer_proof_from_provenance(
         {"x86_64": 0, "aarch64": 1}[architecture],
     ))
     operation_digest = hashlib.sha256()
-    operation_digest.update(b"fre-aot-regex/rebar-native-row-scalar-reducer/v1\0")
+    operation_digest.update(
+        b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer/v1\0"
+        if mixed_handle_table else
+        b"fre-aot-regex/rebar-native-row-scalar-reducer/v1\0"
+    )
     operation_digest.update(abi_version.to_bytes(4, "little"))
     operation_digest.update(bytes((1 if operation == "count" else 2,)))
     operation_digest.update(target_bytes)
@@ -3324,12 +3373,14 @@ def row_scalar_reducer_proof_from_provenance(
     for row in source_to_artifact:
         operation_digest.update(row.to_bytes(8, "little"))
     operation_digest.update(len(components).to_bytes(8, "little"))
-    for component in components:
+    for row, component in enumerate(components):
         first_source = component.get("source_ordinal")
         entry_symbol = component.get("entry_symbol")
         if not isinstance(first_source, int) or not isinstance(entry_symbol, str):
             raise CensusError("row-scalar reducer row identity is malformed")
         operation_digest.update(first_source.to_bytes(8, "little"))
+        if mixed_handle_table:
+            operation_digest.update(bytes((row_routes[row],)))
         entry_bytes = entry_symbol.encode("ascii", "strict")
         operation_digest.update(len(entry_bytes).to_bytes(8, "little"))
         operation_digest.update(entry_bytes)
@@ -3345,7 +3396,11 @@ def row_scalar_reducer_proof_from_provenance(
         raise CensusError("row-scalar reducer symbol does not bind operation identity")
 
     artifact = hashlib.sha256()
-    artifact.update(b"fre-aot-regex/rebar-native-row-scalar-reducer-artifact/v1\0")
+    artifact.update(
+        b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer-artifact/v1\0"
+        if mixed_handle_table else
+        b"fre-aot-regex/rebar-native-row-scalar-reducer-artifact/v1\0"
+    )
     artifact.update(bytes.fromhex(operation_identity_sha256))
     symbol_bytes = reducer_symbol.encode("ascii", "strict")
     artifact.update(len(symbol_bytes).to_bytes(8, "little"))
@@ -3364,11 +3419,17 @@ def row_scalar_reducer_proof_from_provenance(
         artifact.update(addend.to_bytes(8, "little", signed=True))
     artifact.update(object_bytes.to_bytes(8, "little"))
     artifact.update(max_object_bytes.to_bytes(8, "little"))
+    if mixed_handle_table:
+        artifact.update(len(row_routes).to_bytes(8, "little"))
+        artifact.update(bytes(row_routes))
     if artifact_identity_sha256 != artifact.hexdigest():
         raise CensusError("row-scalar artifact identity does not authenticate its receipt")
     return {
         "abi_version": abi_version,
         "operation": operation,
+        "mixed_handle_table": mixed_handle_table,
+        "required_handle_count": required_handle_count,
+        "row_routes": row_routes,
         "source_cardinality": source_cardinality,
         "source_bytes": source_bytes,
         "ordered_sources_sha256": ordered_sources_sha256,
@@ -3396,7 +3457,8 @@ def validate_normalized_row_scalar_reducer(
     if not isinstance(proof, dict):
         raise CensusError(f"{context} proof is not an object")
     require_exact_keys(proof, {
-        "abi_version", "operation", "source_cardinality", "source_bytes",
+        "abi_version", "operation", "mixed_handle_table",
+        "required_handle_count", "row_routes", "source_cardinality", "source_bytes",
         "ordered_sources_sha256", "operation_identity_sha256",
         "reducer_symbol", "code_sha256", "object_sha256", "relocation_count",
         "relocation_sections", "relocation_offsets", "relocation_kinds",
@@ -3431,6 +3493,15 @@ def validate_normalized_row_scalar_reducer(
         "feature_bits": str(provenance.get("feature_bits", "")),
         "row_scalar_reducer_abi_version": str(proof["abi_version"]),
         "row_scalar_reducer_operation": str(proof["operation"]),
+        "row_scalar_reducer_mixed_handle_table": (
+            "true" if proof["mixed_handle_table"] else "false"
+        ),
+        "row_scalar_reducer_required_handle_count": str(
+            proof["required_handle_count"]
+        ),
+        "row_scalar_reducer_row_routes": ",".join(
+            str(value) for value in proof["row_routes"]
+        ),
         "row_scalar_reducer_source_cardinality": str(proof["source_cardinality"]),
         "row_scalar_reducer_source_bytes": str(proof["source_bytes"]),
         "row_scalar_reducer_ordered_sources_sha256": str(
@@ -4808,6 +4879,9 @@ def validate_v3_provenance(
             reducer_fields = {
                 "native_row_scalar_reducer", "row_scalar_reducer_abi_version",
                 "row_scalar_reducer_operation",
+                "row_scalar_reducer_mixed_handle_table",
+                "row_scalar_reducer_required_handle_count",
+                "row_scalar_reducer_row_routes",
                 "row_scalar_reducer_source_cardinality",
                 "row_scalar_reducer_source_bytes",
                 "row_scalar_reducer_ordered_sources_sha256",
@@ -4827,7 +4901,7 @@ def validate_v3_provenance(
                 "row_scalar_reducer_artifact_identity_sha256",
             }
             expected |= reducer_fields
-            if uniform_capture != "false" or has_prepared or native_multi_grep:
+            if uniform_capture != "false" or native_multi_grep:
                 raise CensusError("row-scalar reducer overlaps another row route")
             source_count, row_bytes, source_map = native_row_topology(
                 fields, components, 2
@@ -5804,7 +5878,12 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
             proof = row_scalar_reducer_proof_from_provenance(
                 provenance, components, source_count, row_bytes, source_map
             )
-            return [str(proof["reducer_symbol"])], "linked-native-row-scalar-reducer"
+            route = (
+                "linked-native-row-scalar-helper-backed-reducer"
+                if proof["mixed_handle_table"] else
+                "linked-native-row-scalar-reducer"
+            )
+            return [str(proof["reducer_symbol"])], route
         if provenance.get("native_multi_grep_reducer") == "true":
             source_count, row_bytes, source_map = native_row_topology(
                 provenance, components, 2
@@ -6256,8 +6335,8 @@ def provenance_receipt(fields: dict[str, str]) -> dict[str, object]:
         "kind": "composite-v3",
         "composite_kind": (
             "uniform-capture-row-bridge-v1" if uniform_capture else
-            "mixed-prepared-native-row-bridge-v15" if mixed_prepared_v15 else
             "native-row-scalar-reducer-v1" if native_row_scalar else
+            "mixed-prepared-native-row-bridge-v15" if mixed_prepared_v15 else
             "native-multi-grep-reducer-v1" if native_multi_grep else
             "native-row-bridge-v1" if native_row else
             "regex-redux-fixed-v1"
@@ -6366,7 +6445,12 @@ def operation_route_from_provenance_record(
                 provenance.get("row_scalar_reducer"), provenance,
                 "normalized row-scalar reducer provenance",
             )
-            return [proof["reducer_symbol"]], "linked-native-row-scalar-reducer"
+            route = (
+                "linked-native-row-scalar-helper-backed-reducer"
+                if proof["mixed_handle_table"] else
+                "linked-native-row-scalar-reducer"
+            )
+            return [proof["reducer_symbol"]], route
         if provenance["composite_kind"] == "strict-capture-next-v1":
             strict_capture = provenance.get("strict_capture")
             if (
@@ -8851,6 +8935,9 @@ def validate_provenance_record(provenance: object, context: str) -> None:
         expected_keys.add("multi_grep_reducer")
     if provenance.get("composite_kind") == "native-row-scalar-reducer-v1":
         expected_keys.add("row_scalar_reducer")
+        proof = provenance.get("row_scalar_reducer")
+        if isinstance(proof, dict) and proof.get("mixed_handle_table") is True:
+            expected_keys.add("prepared_v15_limits")
     if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
         expected_keys.add("prepared_v15_limits")
     require_exact_keys(provenance, expected_keys, context)
@@ -8898,7 +8985,15 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             "required_runtime_symbols", "automaton_sha256",
             "program_sha256", "object_sha256",
         }
-        if provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15":
+        scalar_proof = provenance.get("row_scalar_reducer")
+        if (
+            provenance.get("composite_kind") == "mixed-prepared-native-row-bridge-v15"
+            or (
+                provenance.get("composite_kind") == "native-row-scalar-reducer-v1"
+                and isinstance(scalar_proof, dict)
+                and scalar_proof.get("mixed_handle_table") is True
+            )
+        ):
             component_keys.add("prepared_v15")
         require_exact_keys(component, component_keys, f"{context} component {index}")
         if component["ordinal"] != index or component["native"] is not True:
@@ -9048,19 +9143,40 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             )
         elif provenance["composite_kind"] == "native-row-scalar-reducer-v1":
             components = provenance["components"]
-            expected_adapter = {
+            proof = validate_normalized_row_scalar_reducer(
+                provenance["row_scalar_reducer"], provenance, context
+            )
+            mixed_handle_table = proof["mixed_handle_table"]
+            expected_adapter = ({
+                "count": (
+                    "general-aot-native-row-count-mixed-prepared-"
+                    "whole-operation-reducer-v1"
+                ),
+                "count-spans": (
+                    "general-aot-native-row-span-sum-mixed-prepared-"
+                    "whole-operation-reducer-v1"
+                ),
+            } if mixed_handle_table else {
                 "count": "general-aot-native-row-count-whole-operation-reducer-v1",
                 "count-spans": (
                     "general-aot-native-row-span-sum-whole-operation-reducer-v1"
                 ),
-            }.get(provenance["model"])
+            }).get(provenance["model"])
+            expected_boundary = (
+                "single-call-native-mixed-row-scalar-reducer"
+                if mixed_handle_table else
+                "single-call-helper-free-native-row-scalar-reducer"
+            )
+            expected_strategy = (
+                "native-independent-mixed-span-row-whole-scalar-reducer-v1"
+                if mixed_handle_table else
+                "native-independent-span-row-whole-scalar-reducer-v1"
+            )
             if (
                 expected_adapter is None
                 or provenance["adapter"] != expected_adapter
-                or provenance["boundary"]
-                != "single-call-helper-free-native-row-scalar-reducer"
-                or provenance["aggregate_strategy"]
-                != "native-independent-span-row-whole-scalar-reducer-v1"
+                or provenance["boundary"] != expected_boundary
+                or provenance["aggregate_strategy"] != expected_strategy
                 or provenance["uniform_capture"] is not None
                 or provenance["required_runtime_symbols"] != []
                 or provenance["program_sha256"] is not None
@@ -9072,11 +9188,26 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                 or provenance["grep_iteration_strategy"] is not None
                 or any(
                     component["automaton_sha256"] is None
-                    or component["required_runtime_symbols"] != []
                     or not isinstance(component["entry_symbol"], str)
-                    or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(
-                        component["entry_symbol"]
-                    ) is None
+                    or (
+                        component.get("prepared_v15") is None
+                        and (
+                            component["required_runtime_symbols"] != []
+                            or NATIVE_SEARCH_ENTRY_SYMBOL.fullmatch(
+                                component["entry_symbol"]
+                            ) is None
+                        )
+                    )
+                    or (
+                        component.get("prepared_v15") is not None
+                        and (
+                            component["required_runtime_symbols"]
+                            != sorted(PREPARED_V15_RUNTIME_SYMBOLS)
+                            or NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL.fullmatch(
+                                component["entry_symbol"]
+                            ) is None
+                        )
+                    )
                     for component in components
                 )
             ):
@@ -9084,9 +9215,10 @@ def validate_provenance_record(provenance: object, context: str) -> None:
                     f"{context} row-scalar reducer topology is not canonical"
                 )
             validate_native_row_engine_routes(provenance, components)
-            proof = validate_normalized_row_scalar_reducer(
-                provenance["row_scalar_reducer"], provenance, context
-            )
+            if mixed_handle_table:
+                validate_normalized_prepared_v15_limits(
+                    provenance["prepared_v15_limits"], context
+                )
             if (
                 provenance["object_sha256"] != proof["object_sha256"]
                 or provenance["reducer_symbol"] != proof["reducer_symbol"]

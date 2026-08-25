@@ -419,6 +419,10 @@ impl PreparedRowSessions {
         }
     }
 
+    fn handle_table(&self) -> (*const FreAotRegexExclusiveHandleV1, usize) {
+        (self.handles.as_ptr(), self.handles.len())
+    }
+
     #[allow(
         unsafe_code,
         reason = "per-row explicit destruction is the audited exclusive-handle C ABI boundary"
@@ -754,13 +758,29 @@ fn strict_linked_native_multi_grep_reduce(haystack: &[u8]) -> Result<u64, String
     unsafe_code,
     reason = "route authentication binds the statically linked helper-free row-scalar ABI"
 )]
-fn strict_linked_native_row_scalar_reduce(haystack: &[u8]) -> Result<u64, String> {
+fn strict_linked_native_row_scalar_reduce(
+    haystack: &[u8],
+    sessions: Option<&PreparedRowSessions>,
+) -> Result<u64, String> {
     let mut value = u64::MAX;
+    let (handles, handle_count) = if linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE {
+        sessions
+            .ok_or_else(|| "mixed native row-scalar reducer omitted its prepared handle table".to_owned())?
+            .handle_table()
+    } else {
+        (core::ptr::null(), 0)
+    };
     // SAFETY: route authentication binds the exact operation, ordered source
     // topology, ordinary-row closure, relocations, and reducer symbol to this
     // ABI. The complete haystack and aligned output remain live and disjoint.
     let status = unsafe {
-        linked::reduce_native_rows(haystack.as_ptr(), haystack.len(), &mut value)
+        linked::reduce_native_rows(
+            handles,
+            handle_count,
+            haystack.as_ptr(),
+            haystack.len(),
+            &mut value,
+        )
     };
     match status {
         fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_SUCCESS
@@ -2051,11 +2071,19 @@ fn print_provenance() {
                 .map(i64::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
+            let row_routes = linked::ROW_SCALAR_REDUCER_ROW_ROUTES
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
             write!(
                 &mut provenance,
-                " native_row_scalar_reducer=true row_scalar_reducer_abi_version={} row_scalar_reducer_operation={} row_scalar_reducer_source_cardinality={} row_scalar_reducer_source_bytes={} row_scalar_reducer_ordered_sources_sha256={} row_scalar_reducer_symbol={} row_scalar_reducer_operation_identity_sha256={} row_scalar_reducer_code_sha256={} row_scalar_reducer_object_sha256={} row_scalar_reducer_relocation_count={} row_scalar_reducer_relocation_sections={} row_scalar_reducer_relocation_offsets={} row_scalar_reducer_relocation_kinds={} row_scalar_reducer_relocation_symbols={} row_scalar_reducer_relocation_addends={} row_scalar_reducer_semantic_runtime_calls={} row_scalar_reducer_object_bytes={} row_scalar_reducer_max_object_bytes={} row_scalar_reducer_artifact_identity_sha256={}",
+                " native_row_scalar_reducer=true row_scalar_reducer_abi_version={} row_scalar_reducer_operation={} row_scalar_reducer_mixed_handle_table={} row_scalar_reducer_required_handle_count={} row_scalar_reducer_row_routes={} row_scalar_reducer_source_cardinality={} row_scalar_reducer_source_bytes={} row_scalar_reducer_ordered_sources_sha256={} row_scalar_reducer_symbol={} row_scalar_reducer_operation_identity_sha256={} row_scalar_reducer_code_sha256={} row_scalar_reducer_object_sha256={} row_scalar_reducer_relocation_count={} row_scalar_reducer_relocation_sections={} row_scalar_reducer_relocation_offsets={} row_scalar_reducer_relocation_kinds={} row_scalar_reducer_relocation_symbols={} row_scalar_reducer_relocation_addends={} row_scalar_reducer_semantic_runtime_calls={} row_scalar_reducer_object_bytes={} row_scalar_reducer_max_object_bytes={} row_scalar_reducer_artifact_identity_sha256={}",
                 linked::ROW_SCALAR_REDUCER_ABI_VERSION,
                 linked::ROW_SCALAR_REDUCER_OPERATION,
+                linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE,
+                linked::ROW_SCALAR_REDUCER_REQUIRED_HANDLE_COUNT,
+                row_routes,
                 linked::ROW_SCALAR_REDUCER_SOURCE_CARDINALITY,
                 linked::ROW_SCALAR_REDUCER_SOURCE_BYTES,
                 hex(&linked::ROW_SCALAR_REDUCER_ORDERED_SOURCES_SHA256),
@@ -2153,7 +2181,11 @@ fn print_provenance() {
             )
             .expect("format uniform-capture proof provenance");
         }
-        let boundary = if linked::NATIVE_ROW_SCALAR_REDUCER {
+        let boundary = if linked::NATIVE_ROW_SCALAR_REDUCER
+            && linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE
+        {
+            "single-call-native-mixed-row-scalar-reducer"
+        } else if linked::NATIVE_ROW_SCALAR_REDUCER {
             "single-call-helper-free-native-row-scalar-reducer"
         } else if linked::NATIVE_MULTI_GREP_REDUCER {
             "single-call-helper-free-native-multi-grep-reducer"
@@ -2432,10 +2464,19 @@ fn expected_native_row_scalar_operation_identity(
         .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
         .ok_or_else(|| "row-scalar runtime source byte sum overflowed".to_owned())?;
     let mut digest = Sha256::new();
-    digest.update(fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_IDENTITY_DOMAIN);
-    digest.update(
-        fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes(),
-    );
+    if linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE {
+        digest.update(
+            fre_aot_regex::REBAR_MIXED_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+        );
+        digest.update(
+            fre_aot_regex::REBAR_MIXED_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes(),
+        );
+    } else {
+        digest.update(fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_IDENTITY_DOMAIN);
+        digest.update(
+            fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION.to_le_bytes(),
+        );
+    }
     digest.update([operation_tag]);
     digest.update([
         target.architecture as u8,
@@ -2450,9 +2491,17 @@ fn expected_native_row_scalar_operation_identity(
     for &row in linked::SOURCE_TO_ARTIFACT {
         update_multi_grep_identity_usize(&mut digest, row)?;
     }
+    if linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE
+        && linked::ROW_SCALAR_REDUCER_ROW_ROUTES.len() != linked::ROW_ARTIFACT_COUNT
+    {
+        return Err("mixed row-scalar route cardinality disagrees with its rows".to_owned());
+    }
     update_multi_grep_identity_usize(&mut digest, linked::ROW_ARTIFACT_COUNT)?;
     for row in 0..linked::ROW_ARTIFACT_COUNT {
         update_multi_grep_identity_usize(&mut digest, linked::ROW_FIRST_SOURCE_ORDINALS[row])?;
+        if linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE {
+            digest.update([linked::ROW_SCALAR_REDUCER_ROW_ROUTES[row]]);
+        }
         update_multi_grep_identity_field(&mut digest, linked::ROW_ENTRY_SYMBOLS[row].as_bytes())?;
         digest.update(linked::ROW_AUTOMATON_SHA256[row]);
         digest.update(linked::ROW_PROGRAM_SHA256[row]);
@@ -2473,7 +2522,11 @@ fn expected_native_row_scalar_artifact_identity(
         return Err("row-scalar relocation receipt cardinalities disagree".to_owned());
     }
     let mut digest = Sha256::new();
-    digest.update(b"fre-aot-regex/rebar-native-row-scalar-reducer-artifact/v1\0");
+    if linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE {
+        digest.update(b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer-artifact/v1\0");
+    } else {
+        digest.update(b"fre-aot-regex/rebar-native-row-scalar-reducer-artifact/v1\0");
+    }
     digest.update(operation_identity);
     update_multi_grep_identity_field(&mut digest, linked::ROW_SCALAR_REDUCER_SYMBOL.as_bytes())?;
     digest.update(linked::ROW_SCALAR_REDUCER_CODE_SHA256);
@@ -2497,12 +2550,22 @@ fn expected_native_row_scalar_artifact_identity(
         &mut digest,
         linked::ROW_SCALAR_REDUCER_MAX_OBJECT_BYTES,
     )?;
+    if linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE {
+        update_multi_grep_identity_usize(
+            &mut digest,
+            linked::ROW_SCALAR_REDUCER_ROW_ROUTES.len(),
+        )?;
+        digest.update(linked::ROW_SCALAR_REDUCER_ROW_ROUTES);
+    }
     Ok(digest.finalize().into())
 }
 
 fn native_row_scalar_reducer_receipt_is_empty() -> bool {
     linked::ROW_SCALAR_REDUCER_ABI_VERSION == 0
         && linked::ROW_SCALAR_REDUCER_OPERATION.is_empty()
+        && !linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE
+        && linked::ROW_SCALAR_REDUCER_REQUIRED_HANDLE_COUNT == 0
+        && linked::ROW_SCALAR_REDUCER_ROW_ROUTES.is_empty()
         && linked::ROW_SCALAR_REDUCER_SOURCE_CARDINALITY == 0
         && linked::ROW_SCALAR_REDUCER_SOURCE_BYTES == 0
         && linked::ROW_SCALAR_REDUCER_SEMANTIC_RUNTIME_CALLS == 0
@@ -4200,9 +4263,14 @@ fn authenticate_native_row_scalar_reducer(
     let operation_identity = expected_native_row_scalar_operation_identity(benchmark)?;
     let artifact_identity = expected_native_row_scalar_artifact_identity(operation_identity)?;
     let operation_identity_hex = hex(&operation_identity);
+    let mixed_handle_table = linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE;
     let symbol_identity = native_symbol_identity(
         linked::ROW_SCALAR_REDUCER_SYMBOL,
-        "fre_aot_regex_rebar_row_scalar_v1_",
+        if mixed_handle_table {
+            "fre_aot_regex_rebar_mixed_row_scalar_v1_"
+        } else {
+            "fre_aot_regex_rebar_row_scalar_v1_"
+        },
     );
     let reducer_limit = shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
         .checked_sub(linked::ROW_TOTAL_OBJECT_BYTES)
@@ -4228,15 +4296,37 @@ fn authenticate_native_row_scalar_reducer(
         linked::ROW_SCALAR_REDUCER_OBJECT_SHA256,
         linked::ROW_SCALAR_REDUCER_ARTIFACT_IDENTITY_SHA256,
     ];
+    let routes_match = linked::ROW_SCALAR_REDUCER_ROW_ROUTES.len()
+        == linked::ROW_ARTIFACT_COUNT
+        && linked::ROW_SCALAR_REDUCER_ROW_ROUTES
+            .iter()
+            .copied()
+            .zip(linked::ROW_REQUIRED_PREPARE_CAPABILITIES.iter().copied())
+            .all(|(route, capabilities)| {
+                (route == 0 && capabilities == 0)
+                    || (route == 1
+                        && capabilities == PREPARE_CAPABILITY_ORDERED_NFA_V15)
+            });
+    let expected_abi_version = if mixed_handle_table {
+        fre_aot_regex::REBAR_MIXED_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION
+    } else {
+        fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION
+    };
     if benchmark.patterns.len() < 2
-        || has_prepared_v15
+        || mixed_handle_table != has_prepared_v15
+        || linked::ROW_SCALAR_REDUCER_REQUIRED_HANDLE_COUNT
+            != if mixed_handle_table {
+                linked::ROW_ARTIFACT_COUNT
+            } else {
+                0
+            }
+        || !routes_match
         || linked::NATIVE_MULTI_GREP_REDUCER
         || linked::UNIFORM_CAPTURE_BRIDGE
         || linked::STRICT_CAPTURE_BRIDGE
         || linked::PARTICIPATION_CAPTURE_BRIDGE
         || linked::SELECTOR_CAPTURE_FALLBACK_BRIDGE
-        || linked::ROW_SCALAR_REDUCER_ABI_VERSION
-            != fre_aot_regex::REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION
+        || linked::ROW_SCALAR_REDUCER_ABI_VERSION != expected_abi_version
         || linked::ROW_SCALAR_REDUCER_OPERATION != expected_operation
         || linked::ROW_SCALAR_REDUCER_SOURCE_CARDINALITY != benchmark.patterns.len()
         || linked::ROW_SCALAR_REDUCER_SOURCE_BYTES != source_bytes
@@ -4358,6 +4448,8 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         "per-line-native-independent-span-row-exists-mixed-prepared-v15-v1";
     const NATIVE_ROW_SCALAR_STRATEGY: &str =
         "native-independent-span-row-whole-scalar-reducer-v1";
+    const MIXED_NATIVE_ROW_SCALAR_STRATEGY: &str =
+        "native-independent-mixed-span-row-whole-scalar-reducer-v1";
     const NATIVE_MULTI_GREP_STRATEGY: &str =
         "native-independent-span-row-whole-grep-reducer-v1";
     const LINKED_NATIVE_MULTI_GREP_STRATEGY: &str =
@@ -4468,7 +4560,9 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     {
         return Err("linked native-row table exposes a forbidden global prepared route".to_owned());
     }
-    let expected_aggregate_strategy = if linked::NATIVE_ROW_SCALAR_REDUCER {
+    let expected_aggregate_strategy = if linked::NATIVE_ROW_SCALAR_REDUCER && has_prepared_v15 {
+        MIXED_NATIVE_ROW_SCALAR_STRATEGY
+    } else if linked::NATIVE_ROW_SCALAR_REDUCER {
         NATIVE_ROW_SCALAR_STRATEGY
     } else if linked::NATIVE_MULTI_GREP_REDUCER {
         NATIVE_MULTI_GREP_STRATEGY
@@ -4495,7 +4589,11 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
     };
     let expected_span_strategy = if benchmark.model == shared::Model::SpanSum {
         if linked::NATIVE_ROW_SCALAR_REDUCER {
-            NATIVE_ROW_SCALAR_STRATEGY
+            if has_prepared_v15 {
+                MIXED_NATIVE_ROW_SCALAR_STRATEGY
+            } else {
+                NATIVE_ROW_SCALAR_STRATEGY
+            }
         } else if has_prepared_v15 {
             MIXED_ROW_STRATEGY
         } else {
@@ -4535,9 +4633,17 @@ fn authenticate_native_row_route(benchmark: &shared::Benchmark) -> Result<(), St
         return Err("linked native-row table has the wrong scalar iteration route".to_owned());
     }
     let expected_adapter = if linked::NATIVE_ROW_SCALAR_REDUCER {
-        match benchmark.model {
-            shared::Model::Count => "general-aot-native-row-count-whole-operation-reducer-v1",
-            shared::Model::SpanSum => {
+        match (benchmark.model, has_prepared_v15) {
+            (shared::Model::Count, true) => {
+                "general-aot-native-row-count-mixed-prepared-whole-operation-reducer-v1"
+            }
+            (shared::Model::SpanSum, true) => {
+                "general-aot-native-row-span-sum-mixed-prepared-whole-operation-reducer-v1"
+            }
+            (shared::Model::Count, false) => {
+                "general-aot-native-row-count-whole-operation-reducer-v1"
+            }
+            (shared::Model::SpanSum, false) => {
                 "general-aot-native-row-span-sum-whole-operation-reducer-v1"
             }
             _ => return Err("row-scalar bridge has a non-scalar adapter".to_owned()),
@@ -5410,7 +5516,8 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         || linked::PARTICIPATION_CAPTURE_BRIDGE
         || linked::STRICT_CAPTURE_BRIDGE
         || linked::UNIFORM_CAPTURE_BRIDGE
-        || linked::NATIVE_ROW_SCALAR_REDUCER
+        || (linked::NATIVE_ROW_SCALAR_REDUCER
+            && !linked::ROW_SCALAR_REDUCER_MIXED_HANDLE_TABLE)
         || linked::NATIVE_MULTI_GREP_REDUCER
     {
         None
@@ -5432,7 +5539,7 @@ fn run_native_row_operation(benchmark: &shared::Benchmark) -> Result<Vec<Sample>
         } else if linked::UNIFORM_CAPTURE_BRIDGE {
             strict_uniform_capture_reduce(benchmark.model, haystack)
         } else if linked::NATIVE_ROW_SCALAR_REDUCER {
-            strict_linked_native_row_scalar_reduce(haystack)
+            strict_linked_native_row_scalar_reduce(haystack, prepared_rows.as_ref())
         } else if linked::NATIVE_MULTI_GREP_REDUCER {
             strict_linked_native_multi_grep_reduce(haystack)
         } else {

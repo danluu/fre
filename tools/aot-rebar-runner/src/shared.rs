@@ -3827,13 +3827,13 @@ pub fn try_compile_native_multi_grep_reducer(
 #[derive(Clone, Debug)]
 pub enum NativeRowScalarReducerDisposition {
     Selected(fre_aot_regex::RebarNativeRowScalarReducerAotArtifactV1),
-    DeclinedPreparedRow { artifact: usize },
     DeclinedObjectBytes { limit: usize, required: usize },
 }
 
 /// Attempt to replace the Rust ordered-row iterator with one native scalar
-/// transaction. Prepared rows retain the exact incumbent handle-taking route;
-/// only the final numeric object cap can decline after ordinary rows exist.
+/// transaction. A mixed closure passes the already-prepared opaque handle
+/// table once and seals the ordinary/prepared call route for every row. Only
+/// the final numeric object cap can decline after authenticated rows exist.
 pub fn try_compile_native_row_scalar_reducer(
     benchmark: &Benchmark,
     bridge: &NativeRowBridge,
@@ -3870,44 +3870,98 @@ pub fn try_compile_native_row_scalar_reducer(
     if exact_row_bytes != bridge.total_object_bytes {
         return Err("native row-scalar row object-byte receipt mismatch".to_owned());
     }
-    if let Some((artifact, _)) = bridge
+    let has_prepared = bridge
         .artifacts
         .iter()
-        .enumerate()
-        .find(|(_, artifact)| artifact.route.is_prepared())
-    {
-        return Ok(NativeRowScalarReducerDisposition::DeclinedPreparedRow {
-            artifact,
-        });
-    }
+        .any(|artifact| artifact.route.is_prepared());
     let source_bytes = benchmark
         .patterns
         .iter()
         .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
         .ok_or_else(|| "native row-scalar source byte sum overflowed".to_owned())?;
     let ordered_sources_sha256 = ordered_many_source_sha256(&benchmark.patterns)?;
-    let mut rows = Vec::new();
-    rows.try_reserve_exact(bridge.artifacts.len())
-        .map_err(|_| "native row-scalar descriptor allocation failed".to_owned())?;
-    rows.extend(bridge.artifacts.iter().map(|artifact| {
-        fre_aot_regex::RebarMultiGrepReducerRowV1::new(
-            &artifact.compiled,
-            artifact.first_source_ordinal,
-        )
-    }));
     let reducer_limit = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
         .checked_sub(bridge.total_object_bytes)
         .ok_or_else(|| "native row-scalar object-byte remainder underflowed".to_owned())?;
-    let disposition = fre_aot_regex::compile_rebar_native_row_scalar_reducer_aot_v1(
-        operation,
-        ordered_sources_sha256,
-        benchmark.patterns.len(),
-        source_bytes,
-        &bridge.source_to_artifact,
-        &rows,
-        reducer_limit,
-    )
-    .map_err(|error| format!("native row-scalar reducer compilation failed: {error}"))?;
+    let disposition = if has_prepared {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(bridge.artifacts.len())
+            .map_err(|_| "mixed native row-scalar descriptor allocation failed".to_owned())?;
+        rows.extend(bridge.artifacts.iter().map(|artifact| {
+            fre_aot_regex::RebarMixedNativeRowScalarReducerRowV1::new(
+                &artifact.compiled,
+                artifact.first_source_ordinal,
+                match artifact.route {
+                    NativeRowRoute::Ordinary => {
+                        fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary
+                    }
+                    NativeRowRoute::PreparedOrderedNfaV15 => {
+                        fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15
+                    }
+                },
+            )
+        }));
+        let disposition = fre_aot_regex::compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
+            operation,
+            ordered_sources_sha256,
+            benchmark.patterns.len(),
+            source_bytes,
+            &bridge.source_to_artifact,
+            &rows,
+            reducer_limit,
+        )
+        .map_err(|error| format!("mixed native row-scalar reducer compilation failed: {error}"))?;
+        if let fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(
+            selected,
+        ) = &disposition
+            && !selected.authenticates_mixed_rows(
+                operation,
+                ordered_sources_sha256,
+                benchmark.patterns.len(),
+                source_bytes,
+                &bridge.source_to_artifact,
+                &rows,
+            )
+        {
+            return Err("mixed native row-scalar reducer row authentication failed".to_owned());
+        }
+        disposition
+    } else {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(bridge.artifacts.len())
+            .map_err(|_| "native row-scalar descriptor allocation failed".to_owned())?;
+        rows.extend(bridge.artifacts.iter().map(|artifact| {
+            fre_aot_regex::RebarMultiGrepReducerRowV1::new(
+                &artifact.compiled,
+                artifact.first_source_ordinal,
+            )
+        }));
+        let disposition = fre_aot_regex::compile_rebar_native_row_scalar_reducer_aot_v1(
+            operation,
+            ordered_sources_sha256,
+            benchmark.patterns.len(),
+            source_bytes,
+            &bridge.source_to_artifact,
+            &rows,
+            reducer_limit,
+        )
+        .map_err(|error| format!("native row-scalar reducer compilation failed: {error}"))?;
+        if let fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(
+            selected,
+        ) = &disposition
+            && !selected.authenticates_rows(
+                operation,
+                ordered_sources_sha256,
+                benchmark.patterns.len(),
+                source_bytes,
+                &bridge.source_to_artifact,
+                &rows,
+            )
+        {
+            return Err("native row-scalar reducer row authentication failed".to_owned());
+        }
+        disposition
+    };
     let selected = match disposition {
         fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(selected) => {
             selected
@@ -3929,14 +3983,20 @@ pub fn try_compile_native_row_scalar_reducer(
         .total_object_bytes
         .checked_add(selected.object().len())
         .ok_or_else(|| "native row-scalar total linked object bytes overflowed".to_owned())?;
-    if !selected.authenticates_rows(
-        operation,
-        ordered_sources_sha256,
-        benchmark.patterns.len(),
-        source_bytes,
-        &bridge.source_to_artifact,
-        &rows,
-    ) || receipt.max_object_bytes() != reducer_limit
+    let routes_match = receipt.row_routes().iter().copied().eq(bridge.artifacts.iter().map(
+        |artifact| match artifact.route {
+            NativeRowRoute::Ordinary => {
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary
+            }
+            NativeRowRoute::PreparedOrderedNfaV15 => {
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15
+            }
+        },
+    ));
+    if receipt.uses_mixed_handle_table() != has_prepared
+        || receipt.required_handle_count() != usize::from(has_prepared) * bridge.artifacts.len()
+        || !routes_match
+        || receipt.max_object_bytes() != reducer_limit
         || receipt.object_bytes() != selected.object().len()
         || receipt.reducer_relocations() != selected.module().relocations()
         || receipt.reducer_relocations().len() != bridge.artifacts.len()
@@ -5549,7 +5609,7 @@ mod tests {
     }
 
     #[test]
-    fn native_row_scalar_reducer_declines_prepared_rows_without_changing_adapter() {
+    fn native_row_scalar_reducer_seals_mixed_prepared_row_routes() {
         let target = target_from_parts(
             std::env::consts::ARCH,
             std::env::consts::OS,
@@ -5571,11 +5631,21 @@ mod tests {
             bridge.artifacts[1].route,
             NativeRowRoute::PreparedOrderedNfaV15,
         );
-        assert!(matches!(
+        let NativeRowScalarReducerDisposition::Selected(selected) =
             try_compile_native_row_scalar_reducer(&benchmark, &bridge)
-                .expect("prepared row is a typed scalar-wrapper decline"),
-            NativeRowScalarReducerDisposition::DeclinedPreparedRow { artifact: 1 },
-        ));
+                .expect("compile mixed prepared scalar wrapper")
+        else {
+            panic!("mixed prepared scalar wrapper unexpectedly hit its numeric object cap");
+        };
+        assert!(selected.receipt().uses_mixed_handle_table());
+        assert_eq!(selected.receipt().required_handle_count(), 2);
+        assert_eq!(
+            selected.receipt().row_routes(),
+            [
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary,
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15,
+            ]
+        );
     }
 
     #[test]

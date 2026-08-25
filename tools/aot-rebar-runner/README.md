@@ -427,14 +427,19 @@ table; it is not recognized by benchmark name.
 
 Multi-pattern `count` and `count-spans` first attempt the genuine shared
 ordered-many compiler. If that compiler returns one of its typed declines, an
-all-ordinary independent Span-row table may be sealed into one helper-free
-native row-scalar wrapper. The wrapper owns the complete ordered match loop,
-keeps the lowest source row on equal starts, performs Rebar's byte-wise empty
-match progress, and transactionally publishes either a checked match count or
-checked matched-byte sum. Prepared rows and the wrapper's final numeric object
-cap retain the prior checked Rust row adapter; allocation, lowering, emission,
-and authentication failures remain terminal. The retained Rust adapter is also
-the differential semantic oracle for the native wrapper.
+independent Span-row table may be sealed into one native row-scalar wrapper.
+An all-ordinary table keeps the original three-argument ABI. A table containing
+authenticated Ordered-NFA V15 rows uses the additive mixed ABI: it receives an
+exact handle slot for every row once, requires ordinary slots to be null and
+prepared slots to be non-null, and statically seals which child call ABI owns
+each slot. Handle preparation and destruction remain outside warmup and timed
+samples. The wrapper owns the complete ordered match loop, keeps the lowest
+source row on equal starts, performs Rebar's byte-wise empty-match progress,
+and transactionally publishes either a checked match count or checked
+matched-byte sum. Only the wrapper's final numeric object cap retains the prior
+checked Rust row adapter; allocation, lowering, emission, and authentication
+failures remain terminal. The retained Rust adapter is also the differential
+semantic oracle for the native wrapper.
 
 Multi-pattern `grep` uses the same authenticated direct/prepared native rows,
 restarts every selector for each Rebar byte-line, and reduces only whether any
@@ -460,11 +465,16 @@ report extents, scratch formula, and report/receipt schemas. The census counts
 this route as whole-operation native only when the one reducer entry and all
 of those closures authenticate.
 For `native-row-scalar-reducer-v1`, v3 additionally seals the Count/SpanSum
-operation, ordered-source digest and source-to-row map, every ordinary-row
-receipt and entry, the final wrapper symbol/code/object identities, its exact
+operation, ordered-source digest and source-to-row map, every row receipt and
+entry, the final wrapper symbol/code/object identities, its exact
 architecture-specific call relocations, zero semantic runtime calls, and the
-row-plus-wrapper object envelope. The census admits only the final wrapper as
-the operation entry; child row entries remain identity-defined link targets.
+row-plus-wrapper object envelope. Mixed receipts additionally seal the exact
+handle count and ordinary/prepared route vector under distinct operation,
+artifact, and symbol domains. The census admits only the final wrapper as the
+operation entry; child row entries remain identity-defined link targets. A
+mixed wrapper is still classified as semantic-helper-backed because each V15
+child retains its authenticated runtime-symbol surface, rather than being
+misreported in the helper-free whole-operation numerator.
 Uniform-capture v3 row-adapter routes additionally publish `capture_resolution` as
 `static-uniform-multiplier`, both proof-identity versions, every source's
 multiplier/minimum/census/accounting, and the selector digests that bind it to

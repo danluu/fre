@@ -385,9 +385,12 @@ pub use rebar_multi_grep::{
     REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_INVALID_ARGUMENT,
     REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_RUNTIME_FAILURE,
     REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_SUCCESS,
+    REBAR_MIXED_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION,
+    REBAR_MIXED_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_IDENTITY_DOMAIN,
     RebarMultiGrepReducerAotArtifactV1, RebarMultiGrepReducerAotCompileDeclineV1,
     RebarMultiGrepReducerAotCompileDispositionV1, RebarMultiGrepReducerAotErrorV1,
     RebarMultiGrepReducerAotReceiptV1, RebarMultiGrepReducerRowV1,
+    RebarMixedNativeRowScalarReducerRowV1, RebarMixedNativeRowScalarRouteV1,
     RebarNativeRowScalarOperationV1, RebarNativeRowScalarReducerAotArtifactV1,
     RebarNativeRowScalarReducerAotCompileDeclineV1,
     RebarNativeRowScalarReducerAotCompileDispositionV1,
@@ -398,6 +401,7 @@ pub use rebar_multi_grep::{
     REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_RUNTIME_FAILURE,
     REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_SUCCESS,
     compile_rebar_multi_grep_reducer_aot_v1,
+    compile_rebar_mixed_native_row_scalar_reducer_aot_v1,
     compile_rebar_native_row_scalar_reducer_aot_v1,
 };
 pub use rebar_single_capture::{
