@@ -1439,8 +1439,39 @@ fn append_prepared_aggregate_exports_to_compiled(
     let exact_teddy_incumbent = module
         .exact_finite_selected_end_teddy_aot_report()
         .copied();
-    let module =
-        module.append_prepared_aggregate_exports(exports, artifact_identity, &serialized_program)?;
+    // The AArch64 exact-singleton Count-v3/SpanSum pass authenticates and
+    // rewrites the established DirectOrdinary wrapper byte for byte. Keep
+    // that incumbent unchanged when the existing structural follow-on is
+    // eligible; the generic trusted-core re-entry remains available to every
+    // other complete public Span DFA.
+    let preserve_direct_singleton_followon = mode == CompileMode::Optimizing
+        && target.architecture == Architecture::Aarch64
+        && target.abi == CallAbi::Aapcs64
+        && target
+            .features
+            .contains(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        && matches!(
+            exports,
+            PreparedAggregateExports::COUNT | PreparedAggregateExports::SPAN_SUM
+        )
+        && program
+            .native_exact_singleton_count_literal()
+            .is_some_and(|literal| {
+                (1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+            });
+    let append_exports = |module: CompiledModule| -> Result<CompiledModule, CompileError> {
+        let module = if preserve_direct_singleton_followon {
+            module.without_direct_span_trusted_core_for_aggregate()?
+        } else {
+            module
+        };
+        Ok(module.append_prepared_aggregate_exports(
+            exports,
+            artifact_identity,
+            &serialized_program,
+        )?)
+    };
+    let module = append_exports(module)?;
     let ordered_nfa_selected = module.required_prepare_capabilities()
         & PREPARED_CAPABILITY_ORDERED_NFA_V15
         != 0;
@@ -1458,33 +1489,21 @@ fn append_prepared_aggregate_exports_to_compiled(
                 allow_synchronizing_accept_reverse,
                 allow_exact_pair,
             )?;
-            Ok(without_reverse.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_reverse)
         },
         || {
             let without_exact_set = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, true, true, true, true, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(without_exact_set.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_exact_set)
         },
         || {
             let without_width = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, true, true, true, false, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(without_width.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_width)
         },
         |retain_scalar_prefix| {
             let prefix_candidate = if retain_scalar_prefix {
@@ -1501,47 +1520,93 @@ fn append_prepared_aggregate_exports_to_compiled(
                     effective_native_data_limit_bytes,
                 )?
             };
-            Ok(prefix_candidate.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(prefix_candidate)
         },
         || {
             let without_start = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, true, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(without_start.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_start)
         },
         || {
             let without_terminal = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, false, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(without_terminal.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_terminal)
         },
         || {
             let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, false, false, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(scalar_base.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(scalar_base)
         },
     )? {
         FinalObjectAttempt::Fit { module, object } => (module, object),
+        FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error: _,
+        } if module.uses_direct_span_trusted_core_aggregate() => {
+            // The trusted-core trampoline is optional additive text. Only a
+            // proven final ObjectBytes decline may remove it. Rebuild the
+            // exact selected complete-DFA route, authenticate the ordinary
+            // entry identity, then suppress only the compiler-private core
+            // receipt so Count/SpanSum regain their pre-feature local call.
+            // Allocation, lowering, authentication, and object-backend
+            // failures during this retry remain terminal.
+            let expected_entry_sha256 = module.direct_span_trusted_core_entry_sha256().ok_or(
+                CompileError::InternalInvariant(
+                    "direct Span trusted-core aggregate lost its entry identity",
+                ),
+            )?;
+            let selected_reverse = module.has_synchronizing_accept_reverse();
+            let selected_exact_pair = module.has_exact_pair_suffix();
+            let selected_start = module.start_accelerator();
+            let may_continue = module.optimizing_fallbacks_may_continue();
+            let fallback = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                &program,
+                target,
+                effective_native_data_limit_bytes,
+                selected_reverse,
+                selected_exact_pair,
+            )?
+            .with_optimizing_fallbacks_may_continue(may_continue);
+            if fallback.direct_span_trusted_core_entry_sha256() != Some(expected_entry_sha256)
+                || fallback.has_synchronizing_accept_reverse() != selected_reverse
+                || fallback.has_exact_pair_suffix() != selected_exact_pair
+                || fallback.start_accelerator() != selected_start
+                || fallback.required_runtime_symbols().next().is_some()
+                || fallback.required_prepare_capabilities() != 0
+            {
+                return Err(CompileError::InternalInvariant(
+                    "direct Span trusted-core ObjectBytes retry changed its complete-DFA route",
+                ));
+            }
+            let fallback = fallback
+                .without_direct_span_trusted_core_for_aggregate()?
+                .append_prepared_aggregate_exports(
+                    exports,
+                    artifact_identity,
+                    &serialized_program,
+                )?;
+            if fallback.uses_direct_span_trusted_core_aggregate()
+                || fallback.prepared_aggregate_strategy()
+                    != Some(PreparedAggregateStrategy::NativeFused)
+            {
+                return Err(CompileError::InternalInvariant(
+                    "direct Span trusted-core ObjectBytes retry did not restore the ordinary aggregate",
+                ));
+            }
+            match emit_object(&fallback, format, max_object_bytes) {
+                Ok(object) => (fallback, object),
+                Err(error) if is_proven_object_byte_limit(&error) => {
+                    return Err(error.into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         FinalObjectAttempt::ObjectBytes {
             first_error: first,
             ..

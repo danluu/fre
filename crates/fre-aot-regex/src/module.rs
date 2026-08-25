@@ -1139,21 +1139,47 @@ struct NativeDfaEmission {
     scanner: Option<NativeScannerEmission>,
     suffix_scanner: Option<NativeScannerEmission>,
     conjunction: Option<NativeVectorConjunctionEmission>,
-    direct_exists_trusted_core: Option<NativeDirectExistsTrustedCore>,
+    direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
 }
 
-/// Local entry into an ordinary direct-DFA Exists machine after its public
-/// raw-argument checks and result initialization. The additive batch wrapper
-/// proves those facts once per descriptor and reproduces this entry's exact
+/// Local entry into an ordinary direct DFA after its public raw-argument
+/// checks and result initialization. An additive wrapper may enter this body
+/// only after proving the same facts and authenticating the exact output
+/// contract. On x86-64, the wrapper must also reproduce this entry's precise
 /// callee-save prologue before entering the shared body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NativeDirectExistsTrustedCore {
+struct NativeDirectSearchTrustedCore {
     code_offset: usize,
-    prologue: NativeDirectExistsTrustedCorePrologue,
+    output: OutputContract,
+    entry_contract: NativeDirectSearchEntryContract,
+    result_abi: NativeDirectSearchResultAbi,
+    entry_code_sha256: [u8; 32],
+    prologue: NativeDirectSearchTrustedCorePrologue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativeDirectExistsTrustedCorePrologue {
+enum NativeDirectSearchEntryContract {
+    PublicCompleteV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDirectSearchResultAbi {
+    ExistsStatusOnlyV1,
+    SpanMatchedWritesBothV1,
+}
+
+impl NativeDirectSearchResultAbi {
+    const fn for_output(output: OutputContract) -> Option<Self> {
+        match output {
+            OutputContract::Exists => Some(Self::ExistsStatusOnlyV1),
+            OutputContract::Span => Some(Self::SpanMatchedWritesBothV1),
+            OutputContract::SelectedEnd => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDirectSearchTrustedCorePrologue {
     X86_64 {
         save_rbx: bool,
         save_r12_r13: bool,
@@ -1162,7 +1188,7 @@ enum NativeDirectExistsTrustedCorePrologue {
     Aarch64,
 }
 
-impl NativeDirectExistsTrustedCorePrologue {
+impl NativeDirectSearchTrustedCorePrologue {
     fn identity_tag(self) -> u8 {
         match self {
             Self::X86_64 {
@@ -1177,6 +1203,82 @@ impl NativeDirectExistsTrustedCorePrologue {
             Self::Aarch64 => 1,
         }
     }
+}
+
+fn authenticate_native_direct_search_trusted_core(
+    architecture: Architecture,
+    text: &[u8],
+    entry_start: usize,
+    entry_end: usize,
+    core: NativeDirectSearchTrustedCore,
+    expected_output: OutputContract,
+) -> Result<(), ObjectError> {
+    if core.output != expected_output
+        || core.entry_contract != NativeDirectSearchEntryContract::PublicCompleteV1
+        || Some(core.result_abi) != NativeDirectSearchResultAbi::for_output(expected_output)
+        || !(entry_start..entry_end).contains(&core.code_offset)
+        || !core.code_offset.is_multiple_of(match architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 4,
+        })
+        || !matches!(
+            (architecture, core.prologue),
+            (
+                Architecture::X86_64,
+                NativeDirectSearchTrustedCorePrologue::X86_64 { .. }
+            ) | (
+                Architecture::Aarch64,
+                NativeDirectSearchTrustedCorePrologue::Aarch64
+            )
+        )
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core contract is inconsistent",
+        ));
+    }
+    let entry = text
+        .get(entry_start..entry_end)
+        .ok_or(ObjectError::InvalidModule(
+            "direct search trusted core entry is outside text",
+        ))?;
+    let entry_sha256: [u8; 32] = Sha256::digest(entry).into();
+    if entry_sha256 != core.entry_code_sha256 {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core entry identity is inconsistent",
+        ));
+    }
+    if let NativeDirectSearchTrustedCorePrologue::X86_64 {
+        save_r12_r13,
+        save_r14_r15,
+        ..
+    } = core.prologue
+        && save_r14_r15
+        && !save_r12_r13
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core has an impossible x86 save mask",
+        ));
+    }
+    let landmark_matches = match architecture {
+        Architecture::X86_64 => {
+            text.get(core.code_offset..core.code_offset.saturating_add(6))
+                == Some([0x48, 0x89, 0xd6, 0x4c, 0x8d, 0x0d].as_slice())
+        }
+        Architecture::Aarch64 => {
+            let end = core.code_offset.saturating_add(12);
+            let mut landmark = [0_u8; 12];
+            landmark[..4].copy_from_slice(&aarch64_mov_x(9, 2)?.to_le_bytes());
+            landmark[4..8].copy_from_slice(&0x9000_0005_u32.to_le_bytes());
+            landmark[8..].copy_from_slice(&aarch64_add_x_imm(5, 5, 0)?.to_le_bytes());
+            text.get(core.code_offset..end) == Some(landmark.as_slice())
+        }
+    };
+    if !landmark_matches {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core landmark is malformed",
+        ));
+    }
+    Ok(())
 }
 
 struct NativeDynamicRowsEmission {
@@ -1756,7 +1858,7 @@ pub struct CompiledModule {
     prepared_span_fill_symbol_index: Option<usize>,
     prepared_exists_batch_symbol_index: Option<usize>,
     direct_exists_batch_symbol_index: Option<usize>,
-    native_direct_exists_trusted_core: Option<NativeDirectExistsTrustedCore>,
+    native_direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
     prepared_count_symbol_index: Option<usize>,
     prepared_span_sum_symbol_index: Option<usize>,
     prepared_grep_count_symbol_index: Option<usize>,
@@ -2089,7 +2191,7 @@ struct NativeLowering {
     /// This drives a final-object retry to the exact pre-feature complete-DFA
     /// portfolio and never enters frozen data.
     exact_pair_suffix_lowered: bool,
-    direct_exists_trusted_core: Option<NativeDirectExistsTrustedCore>,
+    direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6515,7 +6617,7 @@ impl CompiledModule {
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
             direct_exists_batch_symbol_index: None,
-            native_direct_exists_trusted_core: lowering.direct_exists_trusted_core,
+            native_direct_search_trusted_core: lowering.direct_search_trusted_core,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -7005,6 +7107,66 @@ impl CompiledModule {
     #[must_use]
     pub const fn prepared_aggregate_strategy(&self) -> Option<PreparedAggregateStrategy> {
         self.prepared_aggregate_strategy
+    }
+
+    /// Whether this completed helper-free aggregate contains a Count or
+    /// SpanSum wrapper whose local call was retargeted to the authenticated
+    /// post-init body of its public complete Span entry.
+    pub(crate) fn uses_direct_span_trusted_core_aggregate(&self) -> bool {
+        self.prepared_aggregate_strategy == Some(PreparedAggregateStrategy::NativeFused)
+            && (self
+                .prepared_aggregate_exports
+                .contains(PreparedAggregateExports::COUNT)
+                || self
+                    .prepared_aggregate_exports
+                    .contains(PreparedAggregateExports::SPAN_SUM))
+            && self.native_direct_search_trusted_core.is_some_and(|core| {
+                core.output == OutputContract::Span
+                    && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+                    && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
+            })
+            && self.prepared_entry_symbol_index.is_none()
+            && self.required_runtime_symbols().next().is_none()
+    }
+
+    pub(crate) fn direct_span_trusted_core_entry_sha256(&self) -> Option<[u8; 32]> {
+        let core = self.native_direct_search_trusted_core?;
+        (core.output == OutputContract::Span
+            && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+            && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1)
+            .then_some(core.entry_code_sha256)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_span_trusted_core_offset(&self) -> Option<usize> {
+        let core = self.native_direct_search_trusted_core?;
+        (core.output == OutputContract::Span
+            && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+            && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1)
+            .then_some(core.code_offset)
+    }
+
+    /// Remove only the compiler-private Span core receipt. This is used after
+    /// a proven final ObjectBytes decline to reconstruct the byte-identical
+    /// pre-feature DirectOrdinary aggregate wrapper. Every allocator or
+    /// authentication failure during that retry remains terminal.
+    pub(crate) fn without_direct_span_trusted_core_for_aggregate(
+        mut self,
+    ) -> Result<Self, ObjectError> {
+        match self.native_direct_search_trusted_core {
+            Some(core)
+                if core.output == OutputContract::Span
+                    && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+                    && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1 =>
+            {
+                self.native_direct_search_trusted_core = None;
+                Ok(self)
+            }
+            None => Ok(self),
+            Some(_) => Err(ObjectError::InvalidModule(
+                "aggregate Span trusted-core fallback has an inconsistent receipt",
+            )),
+        }
     }
 
     /// Return the authenticated direct Count-v3 selection, when the explicit
@@ -7749,7 +7911,7 @@ impl CompiledModule {
         if has_unresolved_function_dependency {
             return Ok(None);
         }
-        let Some(trusted_core) = self.native_direct_exists_trusted_core else {
+        let Some(trusted_core) = self.native_direct_search_trusted_core else {
             return Ok(None);
         };
 
@@ -7785,26 +7947,14 @@ impl CompiledModule {
                 "direct Exists batch target is not a complete text function",
             ));
         }
-        if !(entry_start..entry_end).contains(&trusted_core.code_offset)
-            || !trusted_core.code_offset.is_multiple_of(match self.target.architecture {
-                Architecture::X86_64 => 1,
-                Architecture::Aarch64 => 4,
-            })
-            || !matches!(
-                (self.target.architecture, trusted_core.prologue),
-                (
-                    Architecture::X86_64,
-                    NativeDirectExistsTrustedCorePrologue::X86_64 { .. }
-                ) | (
-                    Architecture::Aarch64,
-                    NativeDirectExistsTrustedCorePrologue::Aarch64
-                )
-            )
-        {
-            return Err(ObjectError::InvalidModule(
-                "direct Exists trusted core is outside its ordinary entry",
-            ));
-        }
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &self.sections[TEXT_SECTION].data,
+            entry_start,
+            entry_end,
+            trusted_core,
+            OutputContract::Exists,
+        )?;
         let entry_name_digest: [u8; 32] = Sha256::digest(entry.name.as_bytes()).into();
         let wrapper = match self.target.architecture {
             Architecture::X86_64 => {
@@ -8134,6 +8284,36 @@ impl CompiledModule {
         } else {
             None
         };
+        let direct_span_trusted_core = if span_reducers_requested {
+            match (direct_search_target, self.native_direct_search_trusted_core) {
+                (Some(NativeSpanReducerTarget::DirectOrdinary(entry_start)), Some(core)) => {
+                    let entry = &self.symbols[self.entry_symbol_index];
+                    let entry_size = usize::try_from(entry.size).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("direct Span trusted core entry size")
+                    })?;
+                    let entry_end = entry_start.checked_add(entry_size).ok_or(
+                        ObjectError::ArithmeticOverflow("direct Span trusted core entry extent"),
+                    )?;
+                    authenticate_native_direct_search_trusted_core(
+                        self.target.architecture,
+                        &self.sections[TEXT_SECTION].data,
+                        entry_start,
+                        entry_end,
+                        core,
+                        OutputContract::Span,
+                    )?;
+                    Some(core)
+                }
+                (Some(NativeSpanReducerTarget::DirectOrdinary(_)), None) | (None, _) => None,
+                (Some(NativeSpanReducerTarget::PreparedPrivate(_)), _) => {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Span trusted core selected a prepared target",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let (
             direct_search_target,
             direct_count_wrapper,
@@ -8141,36 +8321,48 @@ impl CompiledModule {
             direct_grep_count_wrapper,
         ) =
             if let Some(target) = direct_search_target {
+                let direct_span_call_kind = direct_span_trusted_core.map_or(
+                    NativeSpanReducerCallKind::DirectOrdinary,
+                    |core| NativeSpanReducerCallKind::DirectTrustedCore(core.prologue),
+                );
                 let count_wrapper = exports
                     .contains(PreparedAggregateExports::COUNT)
                     .then(|| match self.target.architecture {
                         Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
                             PreparedSpanSink::Count,
-                            NativeSpanReducerCallKind::DirectOrdinary,
+                            direct_span_call_kind,
                             false,
                         ),
                         Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
                             PreparedSpanSink::Count,
-                            NativeSpanReducerCallKind::DirectOrdinary,
+                            direct_span_call_kind,
                             false,
                         ),
                     })
-                    .transpose()?;
+                    .transpose()?
+                    .map(|mut wrapper| {
+                        wrapper.trusted_core = direct_span_trusted_core;
+                        wrapper
+                    });
                 let span_sum_wrapper = exports
                     .contains(PreparedAggregateExports::SPAN_SUM)
                     .then(|| match self.target.architecture {
                         Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
                             PreparedSpanSink::SpanSum,
-                            NativeSpanReducerCallKind::DirectOrdinary,
+                            direct_span_call_kind,
                             false,
                         ),
                         Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
                             PreparedSpanSink::SpanSum,
-                            NativeSpanReducerCallKind::DirectOrdinary,
+                            direct_span_call_kind,
                             false,
                         ),
                     })
-                    .transpose()?;
+                    .transpose()?
+                    .map(|mut wrapper| {
+                        wrapper.trusted_core = direct_span_trusted_core;
+                        wrapper
+                    });
                 let grep_count_wrapper = grep_reducer_requested
                     .then(|| match self.target.architecture {
                         Architecture::X86_64 => lower_x86_64_prepared_grep_count(
@@ -8324,6 +8516,11 @@ impl CompiledModule {
                         }
                     }
                 }
+                NativeSpanReducerCallKind::DirectTrustedCore(_) => {
+                    return Err(ObjectError::InvalidModule(
+                        "native Count target unexpectedly retained a wrapper-only call kind",
+                    ));
+                }
             })
         } else {
             None
@@ -8391,6 +8588,11 @@ impl CompiledModule {
                         }
                     }
                 }
+                NativeSpanReducerCallKind::DirectTrustedCore(_) => {
+                    return Err(ObjectError::InvalidModule(
+                        "native SpanSum target unexpectedly retained a wrapper-only call kind",
+                    ));
+                }
             })
         } else {
             None
@@ -8423,6 +8625,11 @@ impl CompiledModule {
                             true,
                         )?,
                     }
+                }
+                NativeSpanReducerCallKind::DirectTrustedCore(_) => {
+                    return Err(ObjectError::InvalidModule(
+                        "GrepCount cannot target a direct-search trusted core",
+                    ));
                 }
             })
         } else {
@@ -8829,6 +9036,23 @@ impl CompiledModule {
             let search_target = native_search_target.ok_or(ObjectError::InvalidModule(
                 "native prepared scalar reducer has no local search target",
             ))?;
+            let trusted_core = match (
+                wrapper.trusted_core,
+                wrapper.trusted_core_trampoline_offset,
+                wrapper.trusted_core_jump_offset,
+            ) {
+                (Some(core), Some(trampoline), Some(jump))
+                    if matches!(search_target, NativeSpanReducerTarget::DirectOrdinary(_)) =>
+                {
+                    Some((core, trampoline, jump))
+                }
+                (None, None, None) => None,
+                _ => {
+                    return Err(ObjectError::InvalidModule(
+                        "native prepared scalar reducer trusted-core topology is inconsistent",
+                    ));
+                }
+            };
             let alignment_mask = match architecture {
                 Architecture::X86_64 => 15,
                 Architecture::Aarch64 => 3,
@@ -8853,6 +9077,24 @@ impl CompiledModule {
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "native prepared aggregate local call offset",
                 ))?;
+            let trusted_core_trampoline_offset = trusted_core
+                .map(|(_, trampoline, _)| {
+                    code_offset.checked_add(trampoline).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "native prepared scalar reducer trusted-core trampoline offset",
+                        ),
+                    )
+                })
+                .transpose()?;
+            let trusted_core_jump_offset = trusted_core
+                .map(|(_, _, jump)| {
+                    code_offset.checked_add(jump).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "native prepared scalar reducer trusted-core jump offset",
+                        ),
+                    )
+                })
+                .transpose()?;
             let ordered_gate_call_offset = ordered_gate_call
                 .map(|call| {
                     code_offset.checked_add(call).ok_or(
@@ -8908,7 +9150,16 @@ impl CompiledModule {
                         symbol: identity_symbol_index,
                         addend: -4,
                     });
-                    patch_x86_64_local_call(text, call_offset, search_target.offset())?;
+                    patch_x86_64_local_call(
+                        text,
+                        call_offset,
+                        trusted_core_trampoline_offset.unwrap_or(search_target.offset()),
+                    )?;
+                    if let (Some((core, _, _)), Some(jump_offset)) =
+                        (trusted_core, trusted_core_jump_offset)
+                    {
+                        patch_x86_64_local_jump(text, jump_offset, core.code_offset)?;
+                    }
                 }
                 Architecture::Aarch64 => {
                     let NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
@@ -8959,7 +9210,16 @@ impl CompiledModule {
                             addend: 0,
                         },
                     ]);
-                    patch_aarch64_local_call(text, call_offset, search_target.offset())?;
+                    patch_aarch64_local_call(
+                        text,
+                        call_offset,
+                        trusted_core_trampoline_offset.unwrap_or(search_target.offset()),
+                    )?;
+                    if let (Some((core, _, _)), Some(jump_offset)) =
+                        (trusted_core, trusted_core_jump_offset)
+                    {
+                        patch_aarch64_local_branch(text, jump_offset, core.code_offset)?;
+                    }
                 }
             }
             if let Some((_, identity_relocation, _)) = ordered_compatibility {
@@ -12558,6 +12818,9 @@ struct NativePreparedBulkWrapper {
     compatibility_identity_relocation: Option<NativePreparedIdentityRelocation>,
     identity_relocation: Option<NativePreparedIdentityRelocation>,
     authenticated_body_offset: Option<usize>,
+    trusted_core: Option<NativeDirectSearchTrustedCore>,
+    trusted_core_trampoline_offset: Option<usize>,
+    trusted_core_jump_offset: Option<usize>,
 }
 
 struct NativeDirectExistsBatchWrapper {
@@ -12736,6 +12999,7 @@ impl NativeSpanReducerTarget {
 enum NativeSpanReducerCallKind {
     PreparedPrivate,
     DirectOrdinary,
+    DirectTrustedCore(NativeDirectSearchTrustedCorePrologue),
 }
 
 /// Check the exact local-call sites that `append_native` will produce before
@@ -12766,6 +13030,47 @@ fn native_aggregate_wrappers_fit(
             .ok_or(ObjectError::ArithmeticOverflow(
                 "direct aggregate call offset",
             ))?;
+        let trusted_core = match (
+            wrapper.trusted_core,
+            wrapper.trusted_core_trampoline_offset,
+            wrapper.trusted_core_jump_offset,
+        ) {
+            (Some(core), Some(trampoline), Some(jump)) => {
+                if !matches!(
+                    (architecture, core.prologue),
+                    (
+                        Architecture::X86_64,
+                        NativeDirectSearchTrustedCorePrologue::X86_64 { .. }
+                    ) | (
+                        Architecture::Aarch64,
+                        NativeDirectSearchTrustedCorePrologue::Aarch64
+                    )
+                ) || trampoline >= wrapper.code.len()
+                    || jump >= wrapper.code.len()
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "direct aggregate trusted-core trampoline is inconsistent",
+                    ));
+                }
+                Some((core, trampoline, jump))
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "direct aggregate trusted-core topology is incomplete",
+                ));
+            }
+        };
+        let local_call_target = trusted_core
+            .map(|(_, trampoline, _)| {
+                code_offset
+                    .checked_add(trampoline)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "direct aggregate trusted-core trampoline offset",
+                    ))
+            })
+            .transpose()?
+            .unwrap_or(target);
         match architecture {
             Architecture::X86_64 => {
                 let instruction_end = call_offset.checked_add(4).ok_or(
@@ -12786,16 +13091,48 @@ fn native_aggregate_wrappers_fit(
                         "direct aggregate x86 call placeholder is malformed",
                     ));
                 }
-                let (Ok(target), Ok(instruction_end)) =
-                    (i64::try_from(target), i64::try_from(instruction_end))
+                let (Ok(local_call_target), Ok(instruction_end)) =
+                    (i64::try_from(local_call_target), i64::try_from(instruction_end))
                 else {
                     return Ok(false);
                 };
-                let Some(displacement) = target.checked_sub(instruction_end) else {
+                let Some(displacement) = local_call_target.checked_sub(instruction_end) else {
                     return Ok(false);
                 };
                 if i32::try_from(displacement).is_err() {
                     return Ok(false);
+                }
+                if let Some((core, _, jump)) = trusted_core {
+                    let jump_end = code_offset
+                        .checked_add(jump)
+                        .and_then(|offset| offset.checked_add(4))
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "direct aggregate x86 trusted-core jump end",
+                        ))?;
+                    if jump
+                        .checked_sub(1)
+                        .and_then(|offset| wrapper.code.get(offset))
+                        != Some(&0xe9)
+                        || jump
+                            .checked_add(4)
+                            .and_then(|end| wrapper.code.get(jump..end))
+                            != Some(&[0, 0, 0, 0])
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "direct aggregate x86 trusted-core jump placeholder is malformed",
+                        ));
+                    }
+                    let (Ok(core), Ok(jump_end)) =
+                        (i64::try_from(core.code_offset), i64::try_from(jump_end))
+                    else {
+                        return Ok(false);
+                    };
+                    let Some(displacement) = core.checked_sub(jump_end) else {
+                        return Ok(false);
+                    };
+                    if i32::try_from(displacement).is_err() {
+                        return Ok(false);
+                    }
                 }
             }
             Architecture::Aarch64 => {
@@ -12816,17 +13153,17 @@ fn native_aggregate_wrappers_fit(
                         "direct aggregate AArch64 call placeholder is malformed",
                     ));
                 }
-                if !call_offset.is_multiple_of(4) || !target.is_multiple_of(4) {
+                if !call_offset.is_multiple_of(4) || !local_call_target.is_multiple_of(4) {
                     return Err(ObjectError::InvalidModule(
                         "direct aggregate AArch64 call is unaligned",
                     ));
                 }
-                let (Ok(target), Ok(call_offset)) =
-                    (i64::try_from(target), i64::try_from(call_offset))
+                let (Ok(local_call_target), Ok(call_offset)) =
+                    (i64::try_from(local_call_target), i64::try_from(call_offset))
                 else {
                     return Ok(false);
                 };
-                let Some(displacement) = target.checked_sub(call_offset) else {
+                let Some(displacement) = local_call_target.checked_sub(call_offset) else {
                     return Ok(false);
                 };
                 let Some(words) = displacement.checked_div(4) else {
@@ -12834,6 +13171,41 @@ fn native_aggregate_wrappers_fit(
                 };
                 if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
                     return Ok(false);
+                }
+                if let Some((core, trampoline, jump)) = trusted_core {
+                    let jump_end = jump.checked_add(4).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "direct aggregate AArch64 trusted-core branch extent",
+                        ),
+                    )?;
+                    if trampoline.checked_add(4) != Some(jump)
+                        || wrapper.code.get(jump..jump_end)
+                            != Some(0x1400_0000_u32.to_le_bytes().as_slice())
+                        || !core.code_offset.is_multiple_of(4)
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "direct aggregate AArch64 trusted-core branch is malformed",
+                        ));
+                    }
+                    let branch_offset = code_offset.checked_add(jump).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "direct aggregate AArch64 trusted-core branch offset",
+                        ),
+                    )?;
+                    let (Ok(core), Ok(branch_offset)) =
+                        (i64::try_from(core.code_offset), i64::try_from(branch_offset))
+                    else {
+                        return Ok(false);
+                    };
+                    let Some(displacement) = core.checked_sub(branch_offset) else {
+                        return Ok(false);
+                    };
+                    let Some(words) = displacement.checked_div(4) else {
+                        return Ok(false);
+                    };
+                    if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -13008,6 +13380,9 @@ fn append_prepared_bulk_entry(
                 compatibility_identity_relocation: None,
                 identity_relocation: None,
                 authenticated_body_offset: None,
+                trusted_core: None,
+                trusted_core_trampoline_offset: None,
+                trusted_core_jump_offset: None,
             },
             output == OutputContract::Span,
         )),
@@ -13021,6 +13396,9 @@ fn append_prepared_bulk_entry(
                 compatibility_identity_relocation: None,
                 identity_relocation: None,
                 authenticated_body_offset: None,
+                trusted_core: None,
+                trusted_core_trampoline_offset: None,
+                trusted_core_jump_offset: None,
             },
             output == OutputContract::Span,
         )),
@@ -13242,7 +13620,7 @@ fn lower_runtime_adapter(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -13491,7 +13869,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -13923,7 +14301,7 @@ fn lower_native_endpoint_oracle_prepared(
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         },
         composed_prepared,
         Some(mode),
@@ -14270,7 +14648,7 @@ fn lower_native_dynamic_rows_prepared(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -14492,7 +14870,7 @@ fn lower_native_slow_partial_with_data_limit(
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
-        direct_exists_trusted_core: None,
+        direct_search_trusted_core: None,
     }))
 }
 
@@ -15786,7 +16164,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -16541,7 +16919,7 @@ fn lower_native_partial_prepared(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -23991,7 +24369,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         },
         report,
     )))
@@ -24064,7 +24442,7 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         },
         report,
     )))
@@ -24620,7 +24998,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             .map_or(0, |filter| filter.guaranteed_bytes),
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
-        direct_exists_trusted_core: emission.direct_exists_trusted_core,
+        direct_search_trusted_core: emission.direct_search_trusted_core,
     }))
 }
 
@@ -31053,7 +31431,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
-        native_direct_exists_trusted_core: None,
+        native_direct_search_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -31389,7 +31767,7 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
-        native_direct_exists_trusted_core: None,
+        native_direct_search_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -31907,7 +32285,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
-        native_direct_exists_trusted_core: None,
+        native_direct_search_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -32065,7 +32443,7 @@ fn native_regex_redux_module(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
-        native_direct_exists_trusted_core: None,
+        native_direct_search_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -32416,7 +32794,7 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
-        native_direct_exists_trusted_core: None,
+        native_direct_search_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -32528,7 +32906,7 @@ fn native_weighted_capture_module(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
-        native_direct_exists_trusted_core: None,
+        native_direct_search_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -32983,7 +33361,7 @@ fn native_rebar_multi_grep_module_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
-        native_direct_exists_trusted_core: None,
+        native_direct_search_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -33228,7 +33606,7 @@ fn native_rebar_row_scalar_module_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
-        native_direct_exists_trusted_core: None,
+        native_direct_search_trusted_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -44820,8 +45198,8 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x49, 0x89, 0x00])?;
         assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
     }
-    let has_direct_exists_trusted_core = entry_contract == NativeDfaEntryContract::Public
-        && layout.output == OutputContract::Exists;
+    let has_direct_search_trusted_core = entry_contract == NativeDfaEntryContract::Public
+        && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         x86_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
     }
@@ -45655,17 +46033,17 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     let mut finished = assembler.finish_with_label_offsets()?;
     let table_displacement = finished.label_offset(table_displacement_label)?;
-    let direct_exists_trusted_core_offset = if has_direct_exists_trusted_core {
+    let direct_search_trusted_core_offset = if has_direct_search_trusted_core {
         let code_offset = table_displacement
             .checked_sub(6)
             .ok_or(ObjectError::InvalidModule(
-                "x86 direct Exists trusted core landmark",
+                "x86 direct search trusted core landmark",
             ))?;
         if finished.code.get(code_offset..table_displacement)
             != Some([0x48, 0x89, 0xd6, 0x4c, 0x8d, 0x0d].as_slice())
         {
             return Err(ObjectError::InvalidModule(
-                "x86 direct Exists trusted core landmark",
+                "x86 direct search trusted core landmark",
             ));
         }
         Some(code_offset)
@@ -45701,6 +46079,7 @@ fn lower_x86_64_dfa_with_entry_contract(
     }
 
     let code = finished.code;
+    let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
     let relocations = vec![ModuleRelocation {
             section: TEXT_SECTION,
             offset: offset_u64(table_displacement, "x86 DFA table relocation offset")?,
@@ -45749,10 +46128,20 @@ fn lower_x86_64_dfa_with_entry_contract(
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
-        direct_exists_trusted_core: direct_exists_trusted_core_offset.map(|code_offset| {
-            NativeDirectExistsTrustedCore {
+        direct_search_trusted_core: direct_search_trusted_core_offset.map(|code_offset| {
+            NativeDirectSearchTrustedCore {
                 code_offset,
-                prologue: NativeDirectExistsTrustedCorePrologue::X86_64 {
+                output: layout.output,
+                entry_contract: NativeDirectSearchEntryContract::PublicCompleteV1,
+                result_abi: match layout.output {
+                    OutputContract::Exists => NativeDirectSearchResultAbi::ExistsStatusOnlyV1,
+                    OutputContract::Span => NativeDirectSearchResultAbi::SpanMatchedWritesBothV1,
+                    OutputContract::SelectedEnd => {
+                        unreachable!("SelectedEnd cannot publish a direct-search trusted core")
+                    }
+                },
+                entry_code_sha256,
+                prologue: NativeDirectSearchTrustedCorePrologue::X86_64 {
                     save_rbx: uses_exact_pair_phase_register,
                     save_r12_r13: retain_vector_candidates
                         || uses_seeded_reverse
@@ -47130,6 +47519,9 @@ fn lower_x86_64_prepared_span_fill_impl(
             .transpose()?,
         identity_relocation: None,
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
         code: finished.code,
     })
 }
@@ -47213,6 +47605,27 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
     let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
     let wrong_identity = assembler.label()?;
+    let trusted_core_prologue = match call_kind {
+        NativeSpanReducerCallKind::DirectTrustedCore(
+            prologue @ NativeDirectSearchTrustedCorePrologue::X86_64 { .. },
+        ) => Some(prologue),
+        NativeSpanReducerCallKind::DirectTrustedCore(
+            NativeDirectSearchTrustedCorePrologue::Aarch64,
+        ) => {
+            return Err(ObjectError::InvalidModule(
+                "x86 Span reducer received an AArch64 trusted core",
+            ));
+        }
+        NativeSpanReducerCallKind::PreparedPrivate | NativeSpanReducerCallKind::DirectOrdinary => {
+            None
+        }
+    };
+    let trusted_core_trampoline = trusted_core_prologue
+        .map(|_| assembler.label())
+        .transpose()?;
+    let trusted_core_jump = trusted_core_prologue
+        .map(|_| assembler.label())
+        .transpose()?;
     let terminal_scan = assembler.label()?;
     let terminal_word0 = assembler.label()?;
     let terminal_word1 = assembler.label()?;
@@ -47405,7 +47818,8 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
             assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // private result
             assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, SESSION_OFFSET])?;
         }
-        NativeSpanReducerCallKind::DirectOrdinary => {
+        NativeSpanReducerCallKind::DirectOrdinary
+        | NativeSpanReducerCallKind::DirectTrustedCore(_) => {
             assembler.instruction(&[0x4c, 0x89, 0xe7])?; // haystack
             assembler.instruction(&[0x4c, 0x89, 0xee])?; // length
             assembler.instruction(&[0x4c, 0x89, 0xf2])?; // window start
@@ -47516,6 +47930,40 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
     assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
 
+    if let (
+        Some(trampoline),
+        Some(core_jump),
+        Some(NativeDirectSearchTrustedCorePrologue::X86_64 {
+            save_rbx,
+            save_r12_r13,
+            save_r14_r15,
+        }),
+    ) = (
+        trusted_core_trampoline,
+        trusted_core_jump,
+        trusted_core_prologue,
+    ) {
+        assembler.bind(trampoline)?;
+        if save_rbx {
+            assembler.instruction(&[0x53])?;
+        }
+        if save_r12_r13 {
+            assembler.instruction(&[0x41, 0x54])?;
+            assembler.instruction(&[0x41, 0x55])?;
+        }
+        if save_r14_r15 {
+            assembler.instruction(&[0x41, 0x56])?;
+            assembler.instruction(&[0x41, 0x57])?;
+        }
+        // The public prologue reaches the post-init landmark with RAX zero
+        // and integer flags produced by that zeroing instruction. Preserve
+        // that complete machine-state contract before sharing the body.
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.instruction(&[0xe9])?;
+        assembler.bind(core_jump)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+    }
+
     let finished = assembler.finish_with_label_offsets()?;
     Ok(NativePreparedBulkWrapper {
         prepared_call_offset: finished.label_offset(prepared_call)?,
@@ -47540,6 +47988,13 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
             finished.label_offset(identity_displacement)?,
         )),
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: trusted_core_trampoline
+            .map(|label| finished.label_offset(label))
+            .transpose()?,
+        trusted_core_jump_offset: trusted_core_jump
+            .map(|label| finished.label_offset(label))
+            .transpose()?,
         code: finished.code,
     })
 }
@@ -47794,6 +48249,9 @@ fn lower_x86_64_prepared_grep_count(
         compatibility_identity_relocation: None,
         identity_relocation: Some(identity_relocation),
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
 
@@ -48510,6 +48968,9 @@ fn lower_x86_64_exact_finite_selected_end_grep_count()
         compatibility_identity_relocation: None,
         identity_relocation: Some(identity_relocation),
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
 
@@ -49481,15 +49942,18 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
         compatibility_identity_relocation: None,
         identity_relocation: None,
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
         code: finished.code,
     })
 }
 
 fn lower_x86_64_direct_exists_batch(
-    prologue: NativeDirectExistsTrustedCorePrologue,
+    prologue: NativeDirectSearchTrustedCorePrologue,
 ) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 32;
-    let NativeDirectExistsTrustedCorePrologue::X86_64 {
+    let NativeDirectSearchTrustedCorePrologue::X86_64 {
         save_rbx,
         save_r12_r13,
         save_r14_r15,
@@ -49605,6 +50069,7 @@ fn lower_x86_64_direct_exists_batch(
         assembler.instruction(&[0x41, 0x56])?;
         assembler.instruction(&[0x41, 0x57])?;
     }
+    assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0xe9])?;
     let core_jump = assembler.label()?;
     assembler.bind(core_jump)?;
@@ -50007,6 +50472,9 @@ fn lower_aarch64_prepared_span_fill_impl(
             }),
         identity_relocation: None,
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
 
@@ -50303,6 +50771,21 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
             "AArch64 prepared scalar reducer received the Fill sink",
         ));
     }
+    let trusted_core = match call_kind {
+        NativeSpanReducerCallKind::DirectTrustedCore(
+            NativeDirectSearchTrustedCorePrologue::Aarch64,
+        ) => true,
+        NativeSpanReducerCallKind::DirectTrustedCore(
+            NativeDirectSearchTrustedCorePrologue::X86_64 { .. },
+        ) => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 Span reducer received an x86 trusted core",
+            ));
+        }
+        NativeSpanReducerCallKind::PreparedPrivate | NativeSpanReducerCallKind::DirectOrdinary => {
+            false
+        }
+    };
     let frame_bytes = if terminal_exact_set.is_some() {
         TERMINAL_FRAME_BYTES
     } else {
@@ -50447,7 +50930,8 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
             assembler.instruction(aarch64_add_x_imm(5, 31, 0)?)?;
             assembler.instruction(aarch64_add_x_imm(6, 31, SESSION_OFFSET)?)?;
         }
-        NativeSpanReducerCallKind::DirectOrdinary => {
+        NativeSpanReducerCallKind::DirectOrdinary
+        | NativeSpanReducerCallKind::DirectTrustedCore(_) => {
             assembler.instruction(aarch64_mov_x(0, 20)?)?; // haystack
             assembler.instruction(aarch64_mov_x(1, 21)?)?; // length
             assembler.instruction(aarch64_mov_x(2, 23)?)?; // window start
@@ -50536,7 +51020,25 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
     assembler.instruction(aarch64_movz_w(0, 3)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let trusted_core_trampoline = if trusted_core {
+        // The public prologue's last flag-setting instruction before the
+        // post-init landmark is its successful non-null haystack check.
+        // Result stores do not alter NZCV, so recreate those flags exactly.
+        let trampoline = assembler.instruction(0xf100_001f)?; // cmp x0, #0
+        let branch = assembler.instruction(0x1400_0000)?;
+        Some((trampoline, branch))
+    } else {
+        None
+    };
+
     let mut offsets = vec![prepared_call, identity_page, identity_page_offset];
+    let trusted_core_indices = trusted_core_trampoline.map(|(trampoline, branch)| {
+        let trampoline_index = offsets.len();
+        offsets.push(trampoline);
+        let branch_index = offsets.len();
+        offsets.push(branch);
+        (trampoline_index, branch_index)
+    });
     let ordered_gate_indices = ordered_gate_sites.map(|(call, fallback, identity)| {
         let call_index = offsets.len();
         offsets.push(call);
@@ -50583,6 +51085,14 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
             },
         ),
         authenticated_body_offset,
+        // The follow-on exact-singleton Count-v3/SpanSum installers
+        // authenticate and rewrite the legacy DirectOrdinary wrapper byte for
+        // byte. A trusted-core trampoline is a different incumbent shape, so
+        // decline those optional follow-ons by withholding their body seam.
+        trusted_core: None,
+        trusted_core_trampoline_offset: trusted_core_indices
+            .map(|(trampoline, _)| offsets[trampoline]),
+        trusted_core_jump_offset: trusted_core_indices.map(|(_, branch)| offsets[branch]),
     })
 }
 
@@ -50777,6 +51287,11 @@ fn lower_aarch64_prepared_grep_count(
             assembler.instruction(aarch64_mov_x(3, 26)?)?;
             assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
         }
+        NativeSpanReducerCallKind::DirectTrustedCore(_) => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 GrepCount cannot target a direct-search trusted core",
+            ));
+        }
     }
     let prepared_call = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
@@ -50838,6 +51353,9 @@ fn lower_aarch64_prepared_grep_count(
             },
         ),
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
 
@@ -51437,6 +51955,9 @@ fn lower_aarch64_exact_finite_selected_end_grep_count()
             page_offset: offsets[2],
         }),
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
 
@@ -52336,14 +52857,17 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
         compatibility_identity_relocation: None,
         identity_relocation: None,
         authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
 
 fn lower_aarch64_direct_exists_batch(
-    prologue: NativeDirectExistsTrustedCorePrologue,
+    prologue: NativeDirectSearchTrustedCorePrologue,
 ) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 96;
-    if prologue != NativeDirectExistsTrustedCorePrologue::Aarch64 {
+    if prologue != NativeDirectSearchTrustedCorePrologue::Aarch64 {
         return Err(ObjectError::InvalidModule(
             "AArch64 direct Exists batch has a non-AArch64 trusted core",
         ));
@@ -52434,22 +52958,31 @@ fn lower_aarch64_direct_exists_batch(
     assembler.instruction(0xd65f_03c0)?;
 
     let trampoline_offset = assembler.code.len();
+    assembler.instruction(0xf100_001f)?; // cmp x0, #0
     let core_jump = assembler.instruction(0x1400_0000)?;
-    if core_jump != trampoline_offset {
+    if core_jump != trampoline_offset.saturating_add(4) {
         return Err(ObjectError::InvalidModule(
-            "AArch64 direct Exists trampoline is not one branch",
+            "AArch64 direct Exists trampoline is not cmp-and-branch",
         ));
     }
 
     let mut offsets = [search_call];
     let code = assembler.finish_with_offsets(&mut offsets)?;
-    let trampoline_offset = code
+    let core_jump_offset = code
         .len()
         .checked_sub(4)
         .ok_or(ObjectError::InvalidModule(
             "AArch64 direct Exists trampoline is absent",
         ))?;
-    if code.get(trampoline_offset..) != Some(0x1400_0000_u32.to_le_bytes().as_slice()) {
+    let trampoline_offset = core_jump_offset
+        .checked_sub(4)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 direct Exists trampoline cmp is absent",
+        ))?;
+    if code.get(trampoline_offset..core_jump_offset)
+        != Some(0xf100_001f_u32.to_le_bytes().as_slice())
+        || code.get(core_jump_offset..) != Some(0x1400_0000_u32.to_le_bytes().as_slice())
+    {
         return Err(ObjectError::InvalidModule(
             "AArch64 direct Exists trampoline was rewritten",
         ));
@@ -52458,7 +52991,7 @@ fn lower_aarch64_direct_exists_batch(
         code,
         search_call_offset: offsets[0],
         trampoline_offset,
-        core_jump_offset: trampoline_offset,
+        core_jump_offset,
     })
 }
 
@@ -68334,8 +68867,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
         assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
     }
-    let has_direct_exists_trusted_core = entry_contract == NativeDfaEntryContract::Public
-        && layout.output == OutputContract::Exists;
+    let has_direct_search_trusted_core = entry_contract == NativeDfaEntryContract::Public
+        && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         aarch64_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
     }
@@ -69510,17 +70043,18 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
 
     let mut relocation_offsets = [table_page, table_page_offset];
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
-    let direct_exists_trusted_core_offset = if has_direct_exists_trusted_core {
+    let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
+    let direct_search_trusted_core_offset = if has_direct_search_trusted_core {
         let code_offset = relocation_offsets[0]
             .checked_sub(4)
             .ok_or(ObjectError::InvalidModule(
-                "AArch64 direct Exists trusted core landmark",
+                "AArch64 direct search trusted core landmark",
             ))?;
         if code.get(code_offset..relocation_offsets[0])
             != Some(aarch64_mov_x(9, 2)?.to_le_bytes().as_slice())
         {
             return Err(ObjectError::InvalidModule(
-                "AArch64 direct Exists trusted core landmark",
+                "AArch64 direct search trusted core landmark",
             ));
         }
         Some(code_offset)
@@ -69598,10 +70132,20 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
-        direct_exists_trusted_core: direct_exists_trusted_core_offset.map(|code_offset| {
-            NativeDirectExistsTrustedCore {
+        direct_search_trusted_core: direct_search_trusted_core_offset.map(|code_offset| {
+            NativeDirectSearchTrustedCore {
                 code_offset,
-                prologue: NativeDirectExistsTrustedCorePrologue::Aarch64,
+                output: layout.output,
+                entry_contract: NativeDirectSearchEntryContract::PublicCompleteV1,
+                result_abi: match layout.output {
+                    OutputContract::Exists => NativeDirectSearchResultAbi::ExistsStatusOnlyV1,
+                    OutputContract::Span => NativeDirectSearchResultAbi::SpanMatchedWritesBothV1,
+                    OutputContract::SelectedEnd => {
+                        unreachable!("SelectedEnd cannot publish a direct-search trusted core")
+                    }
+                },
+                entry_code_sha256,
+                prologue: NativeDirectSearchTrustedCorePrologue::Aarch64,
             }
         }),
     })
@@ -78692,7 +79236,7 @@ mod tests {
             .expect("ordinary direct Exists fixture");
             let trusted_core = ordinary
                 .module()
-                .native_direct_exists_trusted_core
+                .native_direct_search_trusted_core
                 .expect("compiler-authenticated direct Exists core");
             let entry = &ordinary.module().symbols[ordinary.module().entry_symbol_index];
             let entry_start = usize::try_from(entry.offset).expect("ordinary entry start");
@@ -78782,46 +79326,208 @@ mod tests {
                     assert_eq!(aarch64_direct_branch_target(text, call), trampoline);
                     assert_ne!(trampoline, entry_start);
                     let jump = batch_start + wrapper.core_jump_offset;
-                    assert_eq!(jump, trampoline);
+                    assert_eq!(jump, trampoline + 4);
+                    assert_eq!(
+                        text.get(trampoline..jump),
+                        Some(0xf100_001f_u32.to_le_bytes().as_slice()),
+                    );
                     assert_eq!(aarch64_direct_branch_target(text, jump), trusted_core.code_offset);
                 }
             }
 
             let mut forged = ordinary.module().clone();
-            forged.native_direct_exists_trusted_core = Some(NativeDirectExistsTrustedCore {
-                code_offset: entry_end,
-                prologue: trusted_core.prologue,
-            });
+            let mut forged_core = trusted_core;
+            forged_core.code_offset = entry_end;
+            forged.native_direct_search_trusted_core = Some(forged_core);
             assert!(matches!(
                 forged.append_direct_exists_batch(OutputContract::Exists),
                 Err(ObjectError::InvalidModule(
-                    "direct Exists trusted core is outside its ordinary entry"
+                    "direct search trusted core contract is inconsistent"
                 ))
             ));
 
             let mut wrong_architecture = ordinary.module().clone();
-            wrong_architecture.native_direct_exists_trusted_core = Some(
-                NativeDirectExistsTrustedCore {
-                    code_offset: trusted_core.code_offset,
-                    prologue: match target.architecture {
-                        Architecture::X86_64 => NativeDirectExistsTrustedCorePrologue::Aarch64,
-                        Architecture::Aarch64 => {
-                            NativeDirectExistsTrustedCorePrologue::X86_64 {
-                                save_rbx: false,
-                                save_r12_r13: false,
-                                save_r14_r15: false,
-                            }
-                        }
-                    },
+            let mut wrong_core = trusted_core;
+            wrong_core.prologue = match target.architecture {
+                Architecture::X86_64 => NativeDirectSearchTrustedCorePrologue::Aarch64,
+                Architecture::Aarch64 => NativeDirectSearchTrustedCorePrologue::X86_64 {
+                    save_rbx: false,
+                    save_r12_r13: false,
+                    save_r14_r15: false,
                 },
-            );
+            };
+            wrong_architecture.native_direct_search_trusted_core = Some(wrong_core);
             assert!(matches!(
                 wrong_architecture.append_direct_exists_batch(OutputContract::Exists),
                 Err(ObjectError::InvalidModule(
-                    "direct Exists trusted core is outside its ordinary entry"
+                    "direct search trusted core contract is inconsistent"
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn direct_span_aggregate_trusted_core_receipt_is_output_bound_and_tamper_evident() {
+        let exports = PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM);
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let ordinary = compile(
+                CompileRequest::new("[ab]+z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("ordinary direct Span fixture");
+            let serialized = ordinary
+                .program()
+                .serialize()
+                .expect("serialize Span fixture");
+            let identity = ordinary.program().artifact_identity();
+            let core = ordinary
+                .module()
+                .native_direct_search_trusted_core
+                .expect("authenticated direct Span core");
+            assert_eq!(core.output, OutputContract::Span);
+            assert_eq!(
+                core.entry_contract,
+                NativeDirectSearchEntryContract::PublicCompleteV1,
+            );
+            assert_eq!(
+                core.result_abi,
+                NativeDirectSearchResultAbi::SpanMatchedWritesBothV1,
+            );
+
+            let aggregate = ordinary
+                .module()
+                .clone()
+                .append_prepared_aggregate_exports(exports, identity, &serialized)
+                .expect("append authenticated direct Span aggregate");
+            assert!(aggregate.uses_direct_span_trusted_core_aggregate());
+
+            for mutation in 0..3 {
+                let mut forged = ordinary.module().clone();
+                let mut forged_core = core;
+                match mutation {
+                    0 => forged_core.output = OutputContract::Exists,
+                    1 => {
+                        forged_core.result_abi = NativeDirectSearchResultAbi::ExistsStatusOnlyV1;
+                    }
+                    2 => forged_core.entry_code_sha256[0] ^= 1,
+                    _ => unreachable!(),
+                }
+                forged.native_direct_search_trusted_core = Some(forged_core);
+                assert!(matches!(
+                    forged.append_prepared_aggregate_exports(exports, identity, &serialized),
+                    Err(ObjectError::InvalidModule(
+                        "direct search trusted core contract is inconsistent"
+                            | "direct search trusted core entry identity is inconsistent"
+                    ))
+                ));
+            }
+
+            let mut forged_landmark = ordinary.module().clone();
+            let entry = &forged_landmark.symbols[forged_landmark.entry_symbol_index];
+            let entry_start = usize::try_from(entry.offset).expect("Span entry start");
+            let entry_size = usize::try_from(entry.size).expect("Span entry size");
+            let entry_end = entry_start.checked_add(entry_size).expect("Span entry end");
+            forged_landmark.sections[TEXT_SECTION].data[core.code_offset] ^= 1;
+            let mut forged_core = core;
+            forged_core.entry_code_sha256 = Sha256::digest(
+                &forged_landmark.sections[TEXT_SECTION].data[entry_start..entry_end],
+            )
+            .into();
+            forged_landmark.native_direct_search_trusted_core = Some(forged_core);
+            assert!(matches!(
+                forged_landmark.append_prepared_aggregate_exports(exports, identity, &serialized,),
+                Err(ObjectError::InvalidModule(
+                    "direct search trusted core landmark is malformed"
+                ))
+            ));
+
+            let ordinary_aggregate = ordinary
+                .module()
+                .clone()
+                .without_direct_span_trusted_core_for_aggregate()
+                .expect("remove only Span core metadata")
+                .append_prepared_aggregate_exports(exports, identity, &serialized)
+                .expect("append legacy DirectOrdinary aggregate");
+            assert!(!ordinary_aggregate.uses_direct_span_trusted_core_aggregate());
+            assert_eq!(
+                ordinary_aggregate.prepared_aggregate_strategy(),
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+        }
+    }
+
+    #[test]
+    fn direct_span_aggregate_trampolines_reproduce_core_entry_machine_state() {
+        for save_rbx in [false, true] {
+            for save_r12_r13 in [false, true] {
+                for save_r14_r15 in [false, true] {
+                    if save_r14_r15 && !save_r12_r13 {
+                        continue;
+                    }
+                    let wrapper = lower_x86_64_prepared_span_reduce(
+                        PreparedSpanSink::Count,
+                        NativeSpanReducerCallKind::DirectTrustedCore(
+                            NativeDirectSearchTrustedCorePrologue::X86_64 {
+                                save_rbx,
+                                save_r12_r13,
+                                save_r14_r15,
+                            },
+                        ),
+                        false,
+                    )
+                    .expect("x86 direct Span trusted-core wrapper");
+                    let trampoline = wrapper
+                        .trusted_core_trampoline_offset
+                        .expect("x86 Span trampoline");
+                    let jump = wrapper.trusted_core_jump_offset.expect("x86 Span jump");
+                    let mut expected = Vec::new();
+                    if save_rbx {
+                        expected.push(0x53);
+                    }
+                    if save_r12_r13 {
+                        expected.extend_from_slice(&[0x41, 0x54, 0x41, 0x55]);
+                    }
+                    if save_r14_r15 {
+                        expected.extend_from_slice(&[0x41, 0x56, 0x41, 0x57]);
+                    }
+                    expected.extend_from_slice(&[0x31, 0xc0, 0xe9]);
+                    assert_eq!(&wrapper.code[trampoline..jump], expected);
+                    assert_eq!(
+                        wrapper.code.get(jump..jump + 4),
+                        Some([0, 0, 0, 0].as_slice()),
+                    );
+                }
+            }
+        }
+
+        let wrapper = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::SpanSum,
+            NativeSpanReducerCallKind::DirectTrustedCore(
+                NativeDirectSearchTrustedCorePrologue::Aarch64,
+            ),
+            false,
+        )
+        .expect("AArch64 direct Span trusted-core wrapper");
+        let trampoline = wrapper
+            .trusted_core_trampoline_offset
+            .expect("AArch64 Span trampoline");
+        let jump = wrapper.trusted_core_jump_offset.expect("AArch64 Span jump");
+        assert_eq!(jump, trampoline + 4);
+        assert_eq!(
+            wrapper.code.get(trampoline..jump),
+            Some(0xf100_001f_u32.to_le_bytes().as_slice()),
+        );
+        assert_eq!(
+            wrapper.code.get(jump..jump + 4),
+            Some(0x1400_0000_u32.to_le_bytes().as_slice()),
+        );
+        assert_eq!(wrapper.authenticated_body_offset, None);
     }
 
     #[test]
@@ -78830,7 +79536,7 @@ mod tests {
             for save_r12_r13 in [false, true] {
                 for save_r14_r15 in [false, true] {
                     let wrapper = lower_x86_64_direct_exists_batch(
-                        NativeDirectExistsTrustedCorePrologue::X86_64 {
+                        NativeDirectSearchTrustedCorePrologue::X86_64 {
                             save_rbx,
                             save_r12_r13,
                             save_r14_r15,
@@ -78847,7 +79553,7 @@ mod tests {
                     if save_r14_r15 {
                         expected.extend_from_slice(&[0x41, 0x56, 0x41, 0x57]);
                     }
-                    expected.push(0xe9);
+                    expected.extend_from_slice(&[0x31, 0xc0, 0xe9]);
                     assert_eq!(
                         &wrapper.code[wrapper.trampoline_offset..wrapper.core_jump_offset],
                         expected,
@@ -78866,7 +79572,7 @@ mod tests {
     #[test]
     fn direct_exists_batch_publishes_only_statuses_proved_boolean() {
         let x86 = lower_x86_64_direct_exists_batch(
-            NativeDirectExistsTrustedCorePrologue::X86_64 {
+            NativeDirectSearchTrustedCorePrologue::X86_64 {
                 save_rbx: false,
                 save_r12_r13: false,
                 save_r14_r15: false,
@@ -78906,7 +79612,7 @@ mod tests {
         }
 
         let aarch64 = lower_aarch64_direct_exists_batch(
-            NativeDirectExistsTrustedCorePrologue::Aarch64,
+            NativeDirectSearchTrustedCorePrologue::Aarch64,
         )
         .expect("AArch64 direct Exists batch");
         let words = aarch64
@@ -83229,7 +83935,7 @@ mod tests {
                 .map_or(0, |filter| filter.guaranteed_bytes),
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         })
     }
 
@@ -83624,7 +84330,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
-                direct_exists_trusted_core: None,
+                direct_search_trusted_core: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -83876,7 +84582,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
-                direct_exists_trusted_core: None,
+                direct_search_trusted_core: None,
             },
             LinkedHybridSparseNativeFixture {
                 byte_cells,
@@ -84047,7 +84753,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
-                direct_exists_trusted_core: None,
+                direct_search_trusted_core: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -84202,7 +84908,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
-                direct_exists_trusted_core: None,
+                direct_search_trusted_core: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -105036,7 +105742,7 @@ int main(void){{
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
-                direct_exists_trusted_core: None,
+                direct_search_trusted_core: None,
             };
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
@@ -121971,7 +122677,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
                 direct_exists_batch_symbol_index: None,
-                native_direct_exists_trusted_core: None,
+                native_direct_search_trusted_core: None,
                 prepared_count_symbol_index: None,
                 prepared_span_sum_symbol_index: None,
                 prepared_grep_count_symbol_index: None,
@@ -122307,7 +123013,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_span_fill_symbol_index: None,
             prepared_exists_batch_symbol_index: None,
             direct_exists_batch_symbol_index: None,
-            native_direct_exists_trusted_core: None,
+            native_direct_search_trusted_core: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -134542,7 +135248,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_exists_trusted_core: None,
+            direct_search_trusted_core: None,
         };
         let base = native_module_digest(program, target, &lowering, None).unwrap();
         let mut legacy = Sha256::new();
