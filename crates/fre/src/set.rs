@@ -1026,10 +1026,13 @@ impl PortableRegexSet {
     /// accounted implementation, including cumulative work, partial flag
     /// mutation, and refusal precedence. The value route is selected only
     /// when every field equals [`PortableRegexSetRunLimits::unlimited`]. An
-    /// eligible exact-literal set on a long complete-haystack search executes
-    /// ID zero once, then uses its fused suffix only as a negative certificate.
-    /// A certified miss avoids all remaining constituent searches; a possible
-    /// suffix match retains the source-ID loop.
+    /// Every positive exact-literal constituent uses its retained ordinary
+    /// existence capability on the unlimited path. Empty literals and all
+    /// other plans retain the general value facade. An eligible exact-literal
+    /// set on a long complete-haystack search executes ID zero once, then uses
+    /// its fused suffix only as a negative certificate. A certified miss
+    /// avoids all remaining constituent searches; a possible suffix match
+    /// retains the source-ID loop.
     ///
     /// # Errors
     ///
@@ -1077,8 +1080,7 @@ impl PortableRegexSet {
         }
         let mut any = false;
         for (index, regex) in self.regexes.iter().enumerate() {
-            let matched = regex
-                .is_match_window_value(haystack, window, SearchLimits::unlimited())
+            let matched = is_match_window_value_unlimited(regex, haystack, window)
                 .map_err(|source| PortableRegexSetExecutionError::Pattern {
                     index,
                     total_work_before: 0,
@@ -2432,7 +2434,8 @@ fn capacity_bytes<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        PortableRegexSet, PortableRegexSetRunLimits, fused_exact_ordinary_probe,
+        PortablePlan, PortableRegexSet, PortableRegexSetRunLimits,
+        fused_exact_ordinary_probe,
     };
 
     const PATTERNS: [&str; 8] = [
@@ -2447,7 +2450,7 @@ mod tests {
     ];
 
     #[test]
-    fn fused_all_id_route_uses_ordinary_exact_constituents_only_on_its_gate() {
+    fn unlimited_all_id_routes_use_ordinary_exact_and_contain_fallbacks() {
         let set = PortableRegexSet::new(PATTERNS).expect("fused exact-literal set");
         assert!(set.fused_literal_set.is_some());
 
@@ -2502,7 +2505,7 @@ mod tests {
             )
             .expect("short incumbent all-ID search"),
         );
-        assert_eq!(fused_exact_ordinary_probe::calls(), 0);
+        assert_eq!(fused_exact_ordinary_probe::calls(), PATTERNS.len());
 
         let ineligible = PortableRegexSet::new(&PATTERNS[..7])
             .expect("sidecar-free exact-literal set");
@@ -2519,6 +2522,51 @@ mod tests {
                 )
                 .expect("sidecar-free incumbent all-ID search"),
         );
-        assert_eq!(fused_exact_ordinary_probe::calls(), 0);
+        assert_eq!(fused_exact_ordinary_probe::calls(), ineligible.len());
+
+        let mixed = PortableRegexSet::new(["literal_00", "lit[a-z]+", "", "literal_02"])
+            .expect("mixed ordinary and fallback set");
+        assert!(mixed.fused_literal_set.is_none());
+        assert!(matches!(
+            mixed.regexes[0].plan,
+            PortablePlan::ExactLiteral(_)
+        ));
+        assert!(!matches!(
+            mixed.regexes[1].plan,
+            PortablePlan::ExactLiteral(_)
+        ));
+        assert!(matches!(
+            mixed.regexes[2].plan,
+            PortablePlan::ExactLiteral(_)
+        ));
+        assert!(matches!(
+            mixed.regexes[3].plan,
+            PortablePlan::ExactLiteral(_)
+        ));
+        let mixed_haystack = b"literal_00--litxyz--literal_02";
+        let mut expected = [false; 6];
+        expected[5] = true;
+        let (expected_any, _report) = mixed
+            .matches_read_at(
+                &mut expected,
+                mixed_haystack,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("accounted mixed all-ID oracle");
+        let mut actual = [false; 6];
+        actual[5] = true;
+        fused_exact_ordinary_probe::reset();
+        let actual_any = mixed
+            .matches_read_at_value(
+                &mut actual,
+                mixed_haystack,
+                0,
+                PortableRegexSetRunLimits::unlimited(),
+            )
+            .expect("mixed ordinary and fallback all-ID search");
+        assert_eq!(actual_any, expected_any);
+        assert_eq!(actual, expected);
+        assert_eq!(fused_exact_ordinary_probe::calls(), 2);
     }
 }
