@@ -21,7 +21,33 @@ pub(crate) struct Plan {
 impl Plan {
     #[inline]
     pub(crate) fn is_match_full(&self, haystack: &[u8]) -> bool {
-        self.find_full(haystack).is_some()
+        if self.reject_cr {
+            return self.find_full(haystack).is_some();
+        }
+        self.prefix_exists(haystack)
+    }
+
+    #[inline(never)]
+    fn prefix_exists(&self, haystack: &[u8]) -> bool {
+        let prefix = &self.prefix[..usize::from(self.prefix_len)];
+        let Some(last_start) = haystack.len().checked_sub(prefix.len()) else {
+            return false;
+        };
+        let mut search_start = 0_usize;
+        while search_start <= last_start {
+            let Some(relative) = memchr(prefix[0], &haystack[search_start..=last_start]) else {
+                return false;
+            };
+            let start = search_start + relative;
+            let tail_start = start + prefix.len();
+            if &haystack[start..tail_start] == prefix
+                && (start == 0 || haystack[start - 1] == b'\n')
+            {
+                return true;
+            }
+            search_start = start + 1;
+        }
+        false
     }
 
     #[inline]

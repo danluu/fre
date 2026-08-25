@@ -64,6 +64,33 @@ fn ordinary_line_prefix_tail_is_differential_and_cold_allocation_free() {
 }
 
 #[test]
+fn ordinary_open_line_tail_existence_is_differential_and_cold_allocation_free() {
+    let pattern = r"(?m)^Subject:(?-u:.)*$";
+    let exists_regex = PortableBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .unwrap();
+    assert_eq!(exists_regex.build_report().plan, PlanKind::K0);
+
+    let mut late_with_long_tail = vec![b'x'; 4_093];
+    late_with_long_tail.extend_from_slice(b"\nSubject:");
+    late_with_long_tail.extend(std::iter::repeat_n(b'x', 4_096));
+    late_with_long_tail.push(b'\r');
+    let absent = vec![b'x'; 8_197];
+    let upstream = RegexBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .unwrap();
+    assert!(upstream.is_match(&late_with_long_tail));
+    assert!(!upstream.is_match(&absent));
+
+    let cold = Region::new(GLOBAL);
+    assert!(exists_regex.is_match(&late_with_long_tail));
+    assert!(!exists_regex.is_match(&absent));
+    assert_eq!(cold.change(), Stats::default());
+}
+
+#[test]
 fn ordinary_class_plus_corridor_is_differential_and_cold_allocation_free() {
     let pattern = r"(?-u:[a-z]+MID[0-9]+)";
     let find_regex = PortableBuilder::new(pattern)
