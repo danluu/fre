@@ -200,8 +200,7 @@ pub(super) struct Aarch64OrderedNfaNativeEntry {
 enum OrderedNfaEntrySurface {
     Compatibility,
     OperationOnly,
-    #[cfg(test)]
-    OperationOnlyReauthenticate,
+    RowSearchOnly,
 }
 
 fn scratch_bytes(layout: NativeOrderedNfaObjectLayout) -> Result<usize, ObjectError> {
@@ -2896,6 +2895,20 @@ pub(super) fn lower_aarch64_operation_only_with_start_prefix_vector_policy(
     )
 }
 
+/// Emit one externally callable V15 Span search with no compatibility
+/// fallback. The handle and immutable object are fully reauthenticated on
+/// every call; no enclosing aggregate gate is trusted.
+pub(super) fn lower_aarch64_row_search_only_with_start_prefix_vector_policy(
+    image: &NativeOrderedNfaObjectImage<'_>,
+    allow_start_prefix_vector: bool,
+) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    lower_aarch64_with_surface_and_start_prefix_vector_policy(
+        image,
+        OrderedNfaEntrySurface::RowSearchOnly,
+        allow_start_prefix_vector,
+    )
+}
+
 fn lower_aarch64_with_surface_and_start_prefix_vector_policy(
     image: &NativeOrderedNfaObjectImage<'_>,
     surface: OrderedNfaEntrySurface,
@@ -3766,12 +3779,9 @@ mod tests {
     fn ordered_nfa_aarch64_operation_only_entry_has_closed_local_relocations() {
         let compatibility = lower_aarch64(&minimal_image()).unwrap();
         let operation = lower_aarch64_operation_only(&minimal_image()).unwrap();
-        let reauthenticated = lower_aarch64_with_surface_and_start_prefix_vector_policy(
-            &minimal_image(),
-            OrderedNfaEntrySurface::OperationOnlyReauthenticate,
-            true,
-        )
-        .unwrap();
+        let reauthenticated =
+            lower_aarch64_row_search_only_with_start_prefix_vector_policy(&minimal_image(), true)
+                .unwrap();
 
         assert!(!operation.code.is_empty());
         assert!(operation.code.len() < compatibility.code.len());

@@ -8,9 +8,12 @@ use fre_aot_regex::{
     compile_with_prepared_ordered_nfa_v15_and_native_data_limit,
     compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported,
     compile_with_prepared_ordered_nfa_v15_reported,
+    compile_with_prepared_ordered_nfa_v15_row_search_and_native_data_limit_reported,
+    compile_with_prepared_ordered_nfa_v15_row_search_reported,
     compile_with_prepared_ordered_nfa_v15_scalar_operation_and_native_data_limit_reported,
     compile_with_prepared_ordered_nfa_v15_scalar_operation_reported,
 };
+use sha2::{Digest, Sha256};
 
 const PUBLIC_ORDERED_NFA_FIXTURE: &str = r"(?-u:[\x00-\xFF])\bfoo\b";
 
@@ -278,6 +281,384 @@ fn grep_operation_only_is_one_closed_function_and_reports_numeric_declines() {
             PreparedOrderedNfaV15CompileDecline::ObjectBytes { limit, required },
         )) if limit == object_limit && required > limit
     ));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cross-ISA topology, preparation object, and both numeric ceilings form one strict surface receipt"
+)]
+fn row_search_only_publishes_one_authenticated_span_function_and_exact_program() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let compiled = compile_with_prepared_ordered_nfa_v15_row_search_reported(request(target))
+            .expect("strict RowSearch compilation")
+            .into_compiled()
+            .expect("public Ordered-NFA fixture remains V15 eligible");
+        let module = compiled.module();
+        assert_eq!(compiled.receipt().entry_abi, EntryAbi::PreparedSpanSearchV1);
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+        assert!(!compiled.receipt().runtime_helper_required);
+        assert_eq!(
+            compiled.receipt().required_prepare_capabilities,
+            PREPARED_CAPABILITY_ORDERED_NFA_V15,
+        );
+        assert_eq!(compiled.receipt().prepared_aggregate_exports, PreparedAggregateExports::NONE);
+        assert_eq!(compiled.receipt().prepared_aggregate_strategy, None);
+        assert_eq!(module.prepared_bulk_strategy(), None);
+        assert_eq!(module.prepared_entry_symbol(), Some(module.entry_symbol()));
+        assert_eq!(module.prepared_span_fill_symbol(), None);
+        assert_eq!(module.prepared_count_symbol(), None);
+        assert_eq!(module.prepared_span_sum_symbol(), None);
+        assert_eq!(module.prepared_grep_count_symbol(), None);
+        assert!(module.required_runtime_symbols().next().is_none());
+        let (program_name, program_len) = module
+            .required_runtime_program()
+            .expect("strict RowSearch preparation object");
+        assert_eq!(program_len, compiled.receipt().program_bytes);
+
+        let global_functions = module
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && symbol.section.is_some()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(global_functions.len(), 1);
+        assert_eq!(global_functions[0].name, module.entry_symbol());
+        let global_objects = module
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Object
+                    && symbol.section.is_some()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(global_objects.len(), 1);
+        assert_eq!(global_objects[0].name, program_name);
+        assert_eq!(usize::try_from(global_objects[0].size).unwrap(), program_len);
+        assert!(module.symbols().iter().all(|symbol| symbol.section.is_some()));
+        assert!(module.relocations().iter().all(|relocation| {
+            module
+                .symbols()
+                .get(relocation.symbol)
+                .is_some_and(|symbol| symbol.section.is_some())
+        }));
+    }
+
+    let limited = compile_with_prepared_ordered_nfa_v15_row_search_and_native_data_limit_reported(
+        request(Target::x86_64_linux()),
+        0,
+    )
+    .expect("numeric native-data ceiling is a reported disposition");
+    assert!(matches!(
+        limited,
+        PreparedOrderedNfaV15CompileDisposition::Declined(
+            PreparedOrderedNfaV15CompileDecline::NativeDataBytes { limit: 0, required }
+        ) if required > 0
+    ));
+
+    let unbounded = compile_with_prepared_ordered_nfa_v15_row_search_reported(request(
+        Target::x86_64_linux(),
+    ))
+    .expect("unbounded strict RowSearch")
+    .into_compiled()
+    .expect("public fixture remains eligible");
+    let object_limit = unbounded.object().len() - 1;
+    let limited_request = request(Target::x86_64_linux()).limits(CompileLimitsV1 {
+        max_object_bytes: object_limit,
+        ..CompileLimitsV1::default()
+    });
+    assert!(matches!(
+        compile_with_prepared_ordered_nfa_v15_row_search_reported(limited_request),
+        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(
+            PreparedOrderedNfaV15CompileDecline::ObjectBytes { limit, required }
+        )) if limit == object_limit && required > limit
+    ));
+}
+
+#[test]
+fn legacy_objects_and_receipts_are_byte_identical_to_e7d6b591d() {
+    // These are SHA-256 digests of the complete raw object and the complete,
+    // unnormalized `{:#?}\n` receipt from a detached clean e7d6b591d checkout.
+    // Before freezing them, the baseline and this branch were also compared
+    // byte-for-byte with `diff -r` for all eight files.
+    let fixtures = [
+        (
+            Target::x86_64_linux(),
+            "55a11fc946d0fb58fec48a77b722aac17dcd1a1aaa7cd7f4922b99e0c6e0e181",
+            "8a01a3328ee90ea28b7a7b8d5d2cbd7131a3c24ee67c26047ceef046dd5bb114",
+            "42a3027dfefd3a9be48aa8201e54b15f5ac034fba1aacd4889879d46c5ee3df7",
+            "c3c777273e44a4c01ee3167c9d5f80ab3fdb3625528358bc3259110c8c189bb0",
+        ),
+        (
+            Target::aarch64_linux(),
+            "4fed46c399177d133a9eda27b8790ee60408345f2fda46976b01e8011f60c362",
+            "81637e136a79e141674b46d62292eb2813d507701ce2704a3b2ab52c0da9193b",
+            "506a8677b41376c68b040e0bd9751db1edd1e299e3bef6cfa48eecc08e052588",
+            "cbdcada209e0211d0029e71448afb02fb2838370fa570f4012d4025232300785",
+        ),
+    ];
+    for (
+        target,
+        expected_compatibility_object,
+        expected_compatibility_receipt,
+        expected_scalar_object,
+        expected_scalar_receipt,
+    ) in fixtures
+    {
+        let compatibility = compile_with_prepared_ordered_nfa_v15(
+            request(target),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("legacy compatibility object");
+        let scalar = compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
+            request(target),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("legacy scalar object")
+        .into_compiled()
+        .expect("legacy scalar fixture remains eligible");
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        assert_eq!(digest(compatibility.object()), expected_compatibility_object);
+        assert_eq!(
+            digest(format!("{:#?}\n", compatibility.receipt()).as_bytes()),
+            expected_compatibility_receipt,
+        );
+        assert_eq!(digest(scalar.object()), expected_scalar_object);
+        assert_eq!(
+            digest(format!("{:#?}\n", scalar.receipt()).as_bytes()),
+            expected_scalar_receipt,
+        );
+    }
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links strict and compatibility Span-search objects to the real runtime"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the linked differential owns its objects, authentication failures, windows, and C ABI checks in one bounded transaction"
+)]
+fn linked_host_row_search_matches_compatibility_and_rejects_foreign_handles() {
+    use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+    const PATTERN: &str = r"(?-u:a(?:b|c)*d)";
+    const FOREIGN_PATTERN: &str = r"(?-u:a(?:b|c)*e)";
+    const REPEATS: usize = 8;
+
+    let target = match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "linux") => Target::x86_64_linux(),
+        ("x86_64", "macos") => Target::x86_64_macos(),
+        ("aarch64", "linux") => Target::aarch64_linux(),
+        ("aarch64", "macos") => Target::aarch64_macos(),
+        pair => panic!("unsupported linked-host pair {pair:?}"),
+    };
+    let row_compile = |pattern: &str| {
+        compile_with_prepared_ordered_nfa_v15_row_search_reported(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("strict RowSearch compile")
+        .into_compiled()
+        .expect("linked fixture remains V15 eligible")
+    };
+    let row = row_compile(PATTERN);
+    let foreign = row_compile(FOREIGN_PATTERN);
+    let compatibility = compile_with_prepared_ordered_nfa_v15(
+        CompileRequest::new(PATTERN, target)
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span),
+        PreparedAggregateExports::NONE,
+    )
+    .expect("compatibility Span-search compile");
+    assert_eq!(row.receipt().entry_abi, EntryAbi::PreparedSpanSearchV1);
+    assert_eq!(compatibility.receipt().entry_abi, EntryAbi::SpanSearchV1);
+    assert_eq!(row.receipt().program_sha256, compatibility.receipt().program_sha256);
+
+    let (row_program, row_program_len) = row
+        .module()
+        .required_runtime_program()
+        .expect("strict RowSearch program");
+    let row_entry = row.module().entry_symbol();
+    assert_eq!(row.module().prepared_entry_symbol(), Some(row_entry));
+    let (foreign_program, foreign_program_len) = foreign
+        .module()
+        .required_runtime_program()
+        .expect("foreign strict RowSearch program");
+    let (compatibility_program, compatibility_program_len) = compatibility
+        .module()
+        .required_runtime_program()
+        .expect("compatibility program");
+    let compatibility_entry = compatibility
+        .module()
+        .prepared_entry_symbol()
+        .expect("compatibility prepared entry");
+
+    let cases: Vec<(Vec<u8>, usize, usize, Option<(usize, usize)>)> = vec![
+        (Vec::new(), 0, 0, None),
+        (b"ad".to_vec(), 0, 2, Some((0, 2))),
+        (b"xxabcbcdyy".to_vec(), 0, 10, Some((2, 8))),
+        (b"xxabcbcdyy".to_vec(), 3, 10, None),
+        (b"adad".to_vec(), 1, 4, Some((2, 4))),
+        (b"abce".to_vec(), 0, 4, None),
+        (b"\xffad\0".to_vec(), 0, 4, Some((1, 3))),
+        (b"acccd".to_vec(), 0, 4, None),
+        (b"acccd".to_vec(), 0, 5, Some((0, 5))),
+    ];
+    let mut arrays = String::new();
+    let mut checks = String::new();
+    for (index, (haystack, start, end, expected)) in cases.iter().enumerate() {
+        let initializer = if haystack.is_empty() {
+            "0".to_owned()
+        } else {
+            haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        writeln!(
+            arrays,
+            "static const unsigned char h{index}[]={{{initializer}}};"
+        )
+        .unwrap();
+        let (status, expected_start, expected_end) = expected
+            .map_or((0_u32, 0_usize, 0_usize), |(match_start, match_end)| {
+                (1, match_start, match_end)
+            });
+        writeln!(
+            checks,
+            concat!(
+                "for(unsigned round=0;round<{repeats}U;round++){{",
+                "result_t a={{(size_t)-1,(size_t)-1}},b={{(size_t)-2,(size_t)-2}};",
+                "uint32_t sa={row}(right,h{index},{length}U,{start}U,{end}U,&a);",
+                "uint32_t sb={compat}(legacy,h{index},{length}U,{start}U,{end}U,&b);",
+                "if(sa!={status}U||sb!=sa||a.start!={expected_start}U||a.end!={expected_end}U||",
+                "b.start!=a.start||b.end!=a.end)return {failure};}}"
+            ),
+            repeats = REPEATS,
+            row = row_entry,
+            compat = compatibility_entry,
+            index = index,
+            length = haystack.len(),
+            start = start,
+            end = end,
+            status = status,
+            expected_start = expected_start,
+            expected_end = expected_end,
+            failure = 40 + index,
+        )
+        .unwrap();
+    }
+
+    let source = format!(
+        r"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+typedef void *handle_t;
+typedef struct {{size_t start;size_t end;}} result_t;
+typedef struct {{uint32_t struct_size;uint32_t config_version;uint64_t operation_flags;uint64_t max_start_filter_setup_work;uint64_t max_grep_count_workspace_bytes;uint64_t v2_reserved[4];uint64_t max_handle_bytes;uint64_t max_ordered_nfa_scratch_bytes;uint64_t max_ordered_nfa_setup_work;uint64_t required_capabilities;uint64_t reserved[2];}} prepare_v3_t;
+extern const unsigned char {row_program}[];
+extern const unsigned char {foreign_program}[];
+extern const unsigned char {compatibility_program}[];
+extern uint32_t {row_entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
+extern uint32_t {compatibility_entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v3(const unsigned char*,size_t,const prepare_v3_t*,handle_t*);
+extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);
+{arrays}
+int main(void){{
+  const prepare_v3_t v3={{112U,3U,UINT64_C(2),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C(1),{{0,0}}}};
+  handle_t right=0,wrong=0,legacy=0,compat=0;
+  if(fre_aot_regex_runtime_prepare_exclusive_v3({row_program},{row_program_len}U,&v3,&right)!=0U)return 1;
+  if(fre_aot_regex_runtime_prepare_exclusive_v3({foreign_program},{foreign_program_len}U,&v3,&wrong)!=0U)return 2;
+  if(fre_aot_regex_runtime_prepare_exclusive_v3({compatibility_program},{compatibility_program_len}U,&v3,&legacy)!=0U)return 3;
+  if(fre_aot_regex_runtime_prepare_exclusive_v1({row_program},{row_program_len}U,&compat)!=0U)return 4;
+  result_t out={{UINT64_C(0x1122334455667788),UINT64_C(0x8877665544332211)}};
+  if({row_entry}((handle_t)0,(const unsigned char*)(uintptr_t)1,8U,0U,8U,&out)!=5U||out.start!=UINT64_C(0x1122334455667788)||out.end!=UINT64_C(0x8877665544332211))return 5;
+  if({row_entry}(right,(const unsigned char*)0,1U,0U,1U,&out)!=2U||out.start!=UINT64_C(0x1122334455667788))return 6;
+  if({row_entry}(right,h1,2U,2U,1U,&out)!=2U||out.start!=UINT64_C(0x1122334455667788))return 7;
+  if({row_entry}(right,h1,2U,0U,3U,&out)!=2U||out.start!=UINT64_C(0x1122334455667788))return 8;
+  if({row_entry}(right,h1,2U,0U,2U,(result_t*)0)!=2U||out.start!=UINT64_C(0x1122334455667788))return 9;
+  unsigned char bytes[sizeof(result_t)+1U];memset(bytes,0xa5,sizeof(bytes));
+  if({row_entry}(right,h1,2U,0U,2U,(result_t*)(void*)(bytes+1))!=2U)return 10;
+  for(size_t i=0;i<sizeof(bytes);i++)if(bytes[i]!=0xa5U)return 11;
+  if({row_entry}(wrong,(const unsigned char*)(uintptr_t)1,8U,0U,8U,&out)!=3U||out.start!=UINT64_C(0x1122334455667788))return 12;
+  if({row_entry}(compat,(const unsigned char*)(uintptr_t)1,8U,0U,8U,&out)!=3U||out.start!=UINT64_C(0x1122334455667788))return 13;
+  {checks}
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(right)!=0U)return 20;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(wrong)!=0U)return 21;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(legacy)!=0U)return 22;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(compat)!=0U)return 23;
+  return 0;
+}}
+"
+    );
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-v15-row-search-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create linked RowSearch directory");
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+    let row_object = directory.join("row.o");
+    let foreign_object = directory.join("foreign.o");
+    let compatibility_object = directory.join("compatibility.o");
+    let c_path = directory.join("main.c");
+    let executable = directory.join("row-search");
+    fs::write(&row_object, row.object()).expect("write strict RowSearch object");
+    fs::write(&foreign_object, foreign.object()).expect("write foreign RowSearch object");
+    fs::write(&compatibility_object, compatibility.object())
+        .expect("write compatibility object");
+    fs::write(&c_path, source).expect("write RowSearch C harness");
+    let compiler = if cfg!(target_os = "macos") { "clang" } else { "cc" };
+    let linked = Command::new(compiler)
+        .arg("-O2")
+        .arg(&c_path)
+        .arg(&row_object)
+        .arg(&foreign_object)
+        .arg(&compatibility_object)
+        .arg(&static_runtime)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .expect("link RowSearch harness");
+    assert!(
+        linked.status.success(),
+        "RowSearch link failed: {}",
+        String::from_utf8_lossy(&linked.stderr),
+    );
+    let executed = Command::new(&executable)
+        .output()
+        .expect("run RowSearch harness");
+    assert!(
+        executed.status.success(),
+        "RowSearch harness status={:?}, stderr={}",
+        executed.status.code(),
+        String::from_utf8_lossy(&executed.stderr),
+    );
+    fs::remove_dir_all(&directory).expect("remove linked RowSearch directory");
 }
 
 #[cfg(all(

@@ -542,6 +542,8 @@ pub enum EntryAbi {
     ExistsSearchV1,
     SelectedEndSearchV1,
     SpanSearchV1,
+    /// One fully authenticated exclusive-handle Span search.
+    PreparedSpanSearchV1,
     /// One exclusive-handle full-haystack Count, SpanSum, or GrepCount transaction.
     PreparedScalarReduceV1,
 }
@@ -1836,6 +1838,36 @@ pub fn compile_with_prepared_ordered_nfa_v15_scalar_operation_and_native_data_li
     )
 }
 
+/// Compile one strict prepared Ordered-NFA V15 Span-search operation.
+///
+/// The returned object publishes exactly one global function using the
+/// exclusive-handle Span ABI and one global exact serialized-program object
+/// for preparation. It publishes no ordinary compatibility entry, SpanFill,
+/// bulk entry, aggregate reducer, or unresolved runtime helper. Every call
+/// reauthenticates the immutable object, prepared header, and scratch state.
+pub fn compile_with_prepared_ordered_nfa_v15_row_search_reported(
+    request: CompileRequest,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_row_search_and_native_data_limit_reported(
+        request,
+        SlowAotLimits::default().max_native_data_bytes,
+    )
+}
+
+/// As [`compile_with_prepared_ordered_nfa_v15_row_search_reported`], with an
+/// exact immutable native-data ceiling.
+pub fn compile_with_prepared_ordered_nfa_v15_row_search_and_native_data_limit_reported(
+    request: CompileRequest,
+    max_native_data_bytes: usize,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported_with_surface(
+        request,
+        PreparedAggregateExports::NONE,
+        max_native_data_bytes,
+        module::PreparedOrderedNfaV15Surface::RowSearchOnly,
+    )
+}
+
 /// As [`compile_with_prepared_ordered_nfa_v15`], with an exact ceiling for the
 /// additional immutable Ordered-NFA object data. Sizing precedes image
 /// allocation; a miss is returned as a terminal `ProgramBytes` resource error.
@@ -1879,14 +1911,22 @@ fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported_with_sur
             actual: request.output,
         });
     }
-    if surface == module::PreparedOrderedNfaV15Surface::ScalarOperationOnly
-        && exports != PreparedAggregateExports::COUNT
-        && exports != PreparedAggregateExports::SPAN_SUM
-        && exports != PreparedAggregateExports::GREP_COUNT
-    {
-        return Err(CompileError::PreparedScalarOperationRequiresSingleExport {
-            actual: exports,
-        });
+    match surface {
+        module::PreparedOrderedNfaV15Surface::ScalarOperationOnly
+            if exports != PreparedAggregateExports::COUNT
+                && exports != PreparedAggregateExports::SPAN_SUM
+                && exports != PreparedAggregateExports::GREP_COUNT =>
+        {
+            return Err(CompileError::PreparedScalarOperationRequiresSingleExport {
+                actual: exports,
+            });
+        }
+        module::PreparedOrderedNfaV15Surface::RowSearchOnly if !exports.is_empty() => {
+            return Err(CompileError::InternalInvariant(
+                "prepared Ordered-NFA RowSearch requested aggregate exports",
+            ));
+        }
+        _ => {}
     }
     let CompileRequest {
         pattern,
@@ -2138,6 +2178,19 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
                     max_native_data_bytes,
                 )
             }
+            module::PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                CompiledModule::lower_prepared_ordered_nfa_v15_row_search_reported(
+                    &program,
+                    target,
+                    allow_ordered_edge_dispatch,
+                    allow_ordered_nfa_terminal_range,
+                    allow_ordered_nfa_start_closure_dispatch,
+                    allow_ordered_nfa_start_prefix,
+                    allow_ordered_nfa_whole_window_width_gate,
+                    allow_ordered_nfa_terminal_exact_set,
+                    max_native_data_bytes,
+                )
+            }
         }
     };
     let lower_terminal = |allow_ordered_edge_dispatch,
@@ -2162,6 +2215,19 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
             }
             module::PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
                 CompiledModule::lower_prepared_ordered_nfa_v15_scalar_operation_with_native_data_limit(
+                    &program,
+                    target,
+                    allow_ordered_edge_dispatch,
+                    allow_ordered_nfa_terminal_range,
+                    allow_ordered_nfa_start_closure_dispatch,
+                    allow_ordered_nfa_start_prefix,
+                    allow_ordered_nfa_whole_window_width_gate,
+                    allow_ordered_nfa_terminal_exact_set,
+                    max_native_data_bytes,
+                )
+            }
+            module::PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                CompiledModule::lower_prepared_ordered_nfa_v15_row_search_with_native_data_limit(
                     &program,
                     target,
                     allow_ordered_edge_dispatch,
@@ -2274,6 +2340,40 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
                 && global_functions.next().map(|symbol| symbol.name.as_str()) == reducer
                 && global_functions.next().is_none()
         }
+        module::PreparedOrderedNfaV15Surface::RowSearchOnly => {
+            let prepared = module.prepared_entry_symbol();
+            let runtime_program = module.required_runtime_program();
+            let mut global_functions = module.symbols().iter().filter(|symbol| {
+                symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && symbol.section.is_some()
+            });
+            let mut global_objects = module.symbols().iter().filter(|symbol| {
+                symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Object
+                    && symbol.section.is_some()
+            });
+            let function_is_exact = global_functions.next().map(|symbol| symbol.name.as_str())
+                == prepared
+                && global_functions.next().is_none();
+            let object_is_exact = match (global_objects.next(), runtime_program) {
+                (Some(symbol), Some((name, size))) => {
+                    symbol.name == name
+                        && usize::try_from(symbol.size).ok() == Some(size)
+                        && size == program_bytes
+                }
+                _ => false,
+            } && global_objects.next().is_none();
+            module.prepared_bulk_strategy().is_none()
+                && prepared == Some(module.entry_symbol())
+                && module.prepared_span_fill_symbol().is_none()
+                && module.prepared_aggregate_exports().is_empty()
+                && module.prepared_aggregate_strategy().is_none()
+                && module.required_runtime_symbols().next().is_none()
+                && module.symbols().iter().all(|symbol| symbol.section.is_some())
+                && function_is_exact
+                && object_is_exact
+        }
     };
     if !exact_surface
         || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
@@ -2317,10 +2417,14 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         optimizer_version: OPTIMIZER_VERSION,
         mode,
         output,
-        entry_abi: if surface == module::PreparedOrderedNfaV15Surface::ScalarOperationOnly {
-            EntryAbi::PreparedScalarReduceV1
-        } else {
-            EntryAbi::for_output(output)
+        entry_abi: match surface {
+            module::PreparedOrderedNfaV15Surface::Compatibility => EntryAbi::for_output(output),
+            module::PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
+                EntryAbi::PreparedScalarReduceV1
+            }
+            module::PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                EntryAbi::PreparedSpanSearchV1
+            }
         },
         target,
         line_terminator,

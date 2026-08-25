@@ -127,8 +127,7 @@ pub(super) struct OrderedNfaNativeEntry {
 enum OrderedNfaEntrySurface {
     Compatibility,
     OperationOnly,
-    #[cfg(test)]
-    OperationOnlyReauthenticate,
+    RowSearchOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2862,6 +2861,16 @@ pub(super) fn lower_x86_64_operation_only(
     lower_x86_64_with_surface(image, OrderedNfaEntrySurface::OperationOnly)
 }
 
+/// Emit one externally callable V15 Span search with no compatibility
+/// fallback. Unlike the trusted aggregate-only fragment, every call performs
+/// the complete immutable-object, handle-header, and scratch authentication
+/// sequence before reading source or mutating scratch.
+pub(super) fn lower_x86_64_row_search_only(
+    image: &NativeOrderedNfaObjectImage<'_>,
+) -> Result<OrderedNfaNativeEntry, ObjectError> {
+    lower_x86_64_with_surface(image, OrderedNfaEntrySurface::RowSearchOnly)
+}
+
 fn lower_x86_64_with_surface(
     image: &NativeOrderedNfaObjectImage<'_>,
     surface: OrderedNfaEntrySurface,
@@ -3555,11 +3564,7 @@ mod tests {
     fn ordered_nfa_x86_operation_only_entry_has_closed_local_relocations() {
         let compatibility = lower_x86_64(&minimal_image()).unwrap();
         let operation = lower_x86_64_operation_only(&minimal_image()).unwrap();
-        let reauthenticated = lower_x86_64_with_surface(
-            &minimal_image(),
-            OrderedNfaEntrySurface::OperationOnlyReauthenticate,
-        )
-        .unwrap();
+        let reauthenticated = lower_x86_64_row_search_only(&minimal_image()).unwrap();
 
         assert!(!operation.code.is_empty());
         assert!(operation.code.len() < compatibility.code.len());

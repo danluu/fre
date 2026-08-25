@@ -1741,6 +1741,7 @@ struct AuthenticatedDirectExactSingletonSpanSumIncumbent {
 pub(crate) enum PreparedOrderedNfaV15Surface {
     Compatibility,
     ScalarOperationOnly,
+    RowSearchOnly,
 }
 
 /// Object-format-neutral native module.
@@ -2843,6 +2844,7 @@ enum PreparedEntryKind {
 )]
 struct PreparedOrderedNfaEntryLayout {
     operation_only: bool,
+    row_search_only: bool,
     object_abi_version: u32,
     terminal_exact_set_lowered: Option<[u64; 4]>,
     whole_window_width_gate_lowered: bool,
@@ -4656,6 +4658,36 @@ impl CompiledModule {
         clippy::fn_params_excessive_bools,
         reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
     )]
+    pub(crate) fn lower_prepared_ordered_nfa_v15_row_search_with_native_data_limit(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        Self::lower_prepared_ordered_nfa_v15_with_native_data_limit_and_surface(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+            PreparedOrderedNfaV15Surface::RowSearchOnly,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
     fn lower_prepared_ordered_nfa_v15_with_native_data_limit_and_surface(
         program: &CompiledProgram,
         target: Target,
@@ -4761,6 +4793,37 @@ impl CompiledModule {
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
+    pub(crate) fn lower_prepared_ordered_nfa_v15_row_search_reported(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<PreparedOrderedNfaV15LoweringDisposition, CompileError> {
+        Self::lower_prepared_ordered_nfa_v15_reported_with_surface(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+            PreparedOrderedNfaV15Surface::RowSearchOnly,
+            true,
+        )
+    }
+
     /// Rebuild the exact prepared candidate after terminal-set and width-gate
     /// retries while retaining scalar prefix acceleration and disabling only
     /// the additive AArch64 ASIMD idle scanner.
@@ -4850,7 +4913,7 @@ impl CompiledModule {
                 max_native_data_bytes,
                 FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
                 surface,
-            allow_start_prefix_vector,
+                allow_start_prefix_vector,
             )? {
                 NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => {
                     (lowering, layout)
@@ -4892,6 +4955,15 @@ impl CompiledModule {
                     && module.prepared_entry_symbol().is_some()
                     && module.prepared_span_fill_symbol().is_none()
                     && module.required_runtime_symbols().next().is_none()
+            }
+            PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                module.prepared_bulk_strategy().is_none()
+                    && module.prepared_entry_symbol() == Some(module.entry_symbol())
+                    && module.prepared_span_fill_symbol().is_none()
+                    && module.prepared_aggregate_exports().is_empty()
+                    && module.prepared_aggregate_strategy().is_none()
+                    && module.required_runtime_symbols().next().is_none()
+                    && module.required_runtime_program().is_some()
             }
         };
         if !surface_is_exact
@@ -5441,6 +5513,18 @@ impl CompiledModule {
                 }
             ))
         );
+        let ordered_nfa_row_search_only = matches!(
+            prepared_layout.map(|layout| layout.kind),
+            Some(PreparedEntryKind::OrderedNfa(
+                PreparedOrderedNfaEntryLayout {
+                    operation_only: true,
+                    row_search_only: true,
+                    ..
+                }
+            ))
+        );
+        let ordered_nfa_scalar_operation_only =
+            ordered_nfa_operation_only && !ordered_nfa_row_search_only;
         let prepared_bulk_layout = match prepared_layout {
             Some(prepared) => {
                 let output =
@@ -5449,18 +5533,24 @@ impl CompiledModule {
             }
             None => PreparedBulkEntryLayout::default(),
         };
-        let native_prepared_bulk_search_target = prepared_layout
-            .map(native_prepared_bulk_search_target)
-            .transpose()?
-            .flatten();
-        let ordered_nfa_bulk_gate_target = prepared_layout.and_then(|prepared| {
-            match prepared.kind {
+        let native_prepared_bulk_search_target = if ordered_nfa_row_search_only {
+            None
+        } else {
+            prepared_layout
+                .map(native_prepared_bulk_search_target)
+                .transpose()?
+                .flatten()
+        };
+        let ordered_nfa_bulk_gate_target = if ordered_nfa_row_search_only {
+            None
+        } else {
+            prepared_layout.and_then(|prepared| match prepared.kind {
                 PreparedEntryKind::OrderedNfa(ordered) => {
                     Some(ordered.bulk_gate_entry_offset)
                 }
                 PreparedEntryKind::RuntimeAdapter | PreparedEntryKind::Native(_) => None,
-            }
-        });
+            })
+        };
         // The bulk entry is generated after every possible prepared-entry
         // composition, including endpoint-oracle composites. Recompute the
         // identity over the final text while retaining the exact serialized
@@ -5526,7 +5616,7 @@ impl CompiledModule {
         };
         let prepared_entry_name = prepared_layout
             .map(|_| {
-                if ordered_nfa_operation_only {
+                if ordered_nfa_scalar_operation_only {
                     owned_string(
                         ".Lfre_aot_regex_ordered_nfa_operation_private_v1",
                         "Ordered-NFA operation-only private symbol",
@@ -5544,8 +5634,7 @@ impl CompiledModule {
             .exists_batch
             .map(|_| identity_symbol(PREPARED_EXISTS_BATCH_SYMBOL_PREFIX, &native_digest))
             .transpose()?;
-        let runtime_program_name = lowering
-            .needs_runtime
+        let runtime_program_name = (lowering.needs_runtime || ordered_nfa_row_search_only)
             .then(|| identity_symbol(RUNTIME_PROGRAM_SYMBOL_PREFIX, &native_digest))
             .transpose()?;
 
@@ -5553,7 +5642,7 @@ impl CompiledModule {
             .map_err(|_| ObjectError::ArithmeticOverflow("module code size"))?;
         let data_size = u64::try_from(lowering.data.len())
             .map_err(|_| ObjectError::ArithmeticOverflow("module program size"))?;
-        let program_size = if lowering.needs_runtime {
+        let program_size = if lowering.needs_runtime || ordered_nfa_row_search_only {
             u64::try_from(serialized_program_size)
                 .map_err(|_| ObjectError::ArithmeticOverflow("serialized module program size"))?
         } else {
@@ -5662,10 +5751,40 @@ impl CompiledModule {
                 size: program_size,
             });
             (Some(RUNTIME_SYMBOL), Some(RUNTIME_PROGRAM_SYMBOL))
+        } else if ordered_nfa_row_search_only {
+            if symbols.len() != RUNTIME_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "row-search Ordered-NFA symbol prefix is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_ordered_nfa_row_search_no_runtime_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: 0,
+            });
+            if symbols.len() != RUNTIME_PROGRAM_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "row-search Ordered-NFA program symbol padding is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: runtime_program_name.ok_or(ObjectError::InvalidModule(
+                    "row-search program identity was not constructed",
+                ))?,
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: program_size,
+            });
+            (None, Some(RUNTIME_PROGRAM_SYMBOL))
         } else {
             (None, None)
         };
-        if ordered_nfa_operation_only {
+        if ordered_nfa_scalar_operation_only {
             // Ordered-NFA relocation records and the public compatibility
             // layout deliberately keep their established symbol ordinals.
             // Fill the two runtime-only ordinals with defined local program
@@ -5727,7 +5846,7 @@ impl CompiledModule {
                 name: prepared_entry_name.ok_or(ObjectError::InvalidModule(
                     "prepared entry identity was not constructed",
                 ))?,
-                binding: if ordered_nfa_operation_only {
+                binding: if ordered_nfa_scalar_operation_only {
                     SymbolBinding::Local
                 } else {
                     SymbolBinding::Global
@@ -5839,6 +5958,7 @@ impl CompiledModule {
                             && (lowering.needs_runtime
                                 || prepared_bulk_layout
                                     != PreparedBulkEntryLayout::default()))
+                        || (ordered.row_search_only && !ordered.operation_only)
                     {
                         return Err(ObjectError::InvalidModule(
                             "Ordered-NFA prepared symbol geometry is inconsistent",
@@ -6386,7 +6506,11 @@ impl CompiledModule {
             sections,
             symbols: symbols.into_boxed_slice(),
             relocations: lowering.relocations.into_boxed_slice(),
-            entry_symbol_index: ENTRY_SYMBOL,
+            entry_symbol_index: if ordered_nfa_row_search_only {
+                PREPARED_ENTRY_SYMBOL
+            } else {
+                ENTRY_SYMBOL
+            },
             prepared_entry_symbol_index,
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
@@ -13228,7 +13352,11 @@ fn lower_native_ordered_nfa_prepared_reported(
         (PreparedOrderedNfaV15Surface::Compatibility, Architecture::Aarch64) => {
             lower_aarch64_runtime_adapter()?
         }
-        (PreparedOrderedNfaV15Surface::ScalarOperationOnly, _) => (Vec::new(), Vec::new()),
+        (
+            PreparedOrderedNfaV15Surface::ScalarOperationOnly
+            | PreparedOrderedNfaV15Surface::RowSearchOnly,
+            _,
+        ) => (Vec::new(), Vec::new()),
     };
     let ordinary_code_size = code.len();
     let code_alignment = match target.architecture {
@@ -13266,6 +13394,9 @@ fn lower_native_ordered_nfa_prepared_reported(
                     PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
                         ordered_nfa_codegen::lower_x86_64_operation_only(&image)?
                     }
+                    PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                        ordered_nfa_codegen::lower_x86_64_row_search_only(&image)?
+                    }
                 };
                 (
                     entry.code,
@@ -13286,6 +13417,13 @@ fn lower_native_ordered_nfa_prepared_reported(
                     }
                     PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
                         ordered_nfa_aarch64_codegen::lower_aarch64_operation_only_with_start_prefix_vector_policy(
+                            &image,
+                            allow_start_prefix_vector
+                                && target.features.has(CpuFeature::Aarch64Asimd),
+                        )?
+                    }
+                    PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                        ordered_nfa_aarch64_codegen::lower_aarch64_row_search_only_with_start_prefix_vector_policy(
                             &image,
                             allow_start_prefix_vector
                                 && target.features.has(CpuFeature::Aarch64Asimd),
@@ -13359,8 +13497,8 @@ fn lower_native_ordered_nfa_prepared_reported(
             code_offset: public_entry_offset,
             code_size: public_entry_size,
             kind: PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
-                operation_only: surface
-                    == PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+                operation_only: surface != PreparedOrderedNfaV15Surface::Compatibility,
+                row_search_only: surface == PreparedOrderedNfaV15Surface::RowSearchOnly,
                 object_abi_version: if image.layout.terminal_range.is_some() {
                     ORDERED_NFA_OBJECT_V3_ABI_VERSION
                 } else if image.layout.ordered_edge_dispatch.is_some() {
@@ -16524,6 +16662,7 @@ fn native_module_digest_with_runtime_symbol(
             ))?;
         if ordinary_code_size != code_offset
             || ordered.operation_only == lowering.needs_runtime
+            || (ordered.row_search_only && !ordered.operation_only)
             || ordered.public_entry_offset != code_offset
             || ordered.public_entry_size != code_size
             || ordered.private_entry_offset < code_offset
