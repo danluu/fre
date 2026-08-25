@@ -640,6 +640,177 @@ fn configured_nonuniform_capture_reducers_match_public_oracle_and_v5_receipts(
     }
 }
 
+#[test]
+#[ignore = "recursive Cargo smoke for equal-weight multi-source native capture reducers"]
+fn configured_equal_weight_capture_reducers_are_one_helper_free_native_operation(
+) -> Result<(), DynError> {
+    const INTERNAL_DECLINE_FEATURE: &str =
+        "internal-test-force-shared-capture-native-data-decline";
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = env::temp_dir().join(format!(
+        "fre-aot-rebar-equal-weight-capture-reducers-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root)?;
+
+    let result = (|| {
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let target = root.join("target");
+        for (index, model) in [Model::CountCaptures, Model::GrepCaptures]
+            .into_iter()
+            .enumerate()
+        {
+            let klv_bytes = configured_equal_weight_capture_klv(model);
+            let benchmark = Benchmark::parse(&klv_bytes)?;
+            if !benchmark
+                .patterns
+                .iter()
+                .map(String::as_str)
+                .eq(["(a+)", "(a+)", "(b+)"])
+            {
+                return Err("equal-weight fixture lost its ordered duplicate source map".into());
+            }
+            let expected = capture_oracle(&benchmark)?;
+            if expected != 12 {
+                return Err(format!(
+                    "equal-weight {model:?} fixture oracle returned {expected}, expected 12"
+                )
+                .into());
+            }
+
+            let klv = root.join(format!("equal-weight-{index}.klv"));
+            fs::write(&klv, &klv_bytes)?;
+            let built = Command::new(&cargo)
+                .current_dir(workspace_root())
+                .args([
+                    "build",
+                    "--offline",
+                    "--jobs=1",
+                    "-p",
+                    "fre-aot-rebar-runner",
+                    "--bin",
+                    "fre-aot-rebar-runner",
+                    "--features",
+                    INTERNAL_DECLINE_FEATURE,
+                ])
+                .env("CARGO_TARGET_DIR", &target)
+                .env("FRE_AOT_REBAR_KLV", &klv)
+                .env("FRE_AOT_REBAR_FEATURES", "none")
+                .env("FRE_AOT_REBAR_SOURCE_COMMIT", "equal-weight-capture-smoke")
+                .env("FRE_AOT_REBAR_SOURCE_TREE", "equal-weight-capture-smoke")
+                .output()?;
+            if !built.status.success() {
+                return Err(format!(
+                    "configured equal-weight capture build failed for {model:?}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&built.stdout),
+                    String::from_utf8_lossy(&built.stderr),
+                )
+                .into());
+            }
+
+            let runner = target.join("debug").join(format!(
+                "fre-aot-rebar-runner{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            let executed = Command::new(&runner)
+                .stdin(Stdio::from(fs::File::open(&klv)?))
+                .output()?;
+            if !executed.status.success() {
+                return Err(format!(
+                    "equal-weight capture reducer failed for {model:?}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&executed.stdout),
+                    String::from_utf8_lossy(&executed.stderr),
+                )
+                .into());
+            }
+            let samples = std::str::from_utf8(&executed.stdout)?
+                .lines()
+                .collect::<Vec<_>>();
+            if samples.len() != 1 {
+                return Err(format!(
+                    "equal-weight {model:?} reducer returned {} samples, expected one: {:?}",
+                    samples.len(),
+                    String::from_utf8_lossy(&executed.stdout),
+                )
+                .into());
+            }
+            let (_, actual) = samples[0]
+                .split_once(',')
+                .ok_or("equal-weight capture output is not nanoseconds,value")?;
+            let actual = actual.parse::<u64>()?;
+            if actual != expected {
+                return Err(format!(
+                    "equal-weight {model:?} reducer returned {actual}, oracle returned {expected}"
+                )
+                .into());
+            }
+
+            let provenance = Command::new(&runner).arg("--provenance").output()?;
+            if !provenance.status.success() {
+                return Err(format!(
+                    "equal-weight capture provenance failed for {model:?}: {}",
+                    String::from_utf8_lossy(&provenance.stderr),
+                )
+                .into());
+            }
+            let provenance = std::str::from_utf8(&provenance.stdout)?;
+            let adapter = match model {
+                Model::CountCaptures => {
+                    "adapter=general-aot-native-weighted-capture-count-reducer-v1"
+                }
+                Model::GrepCaptures => {
+                    "adapter=general-aot-native-weighted-capture-grep-reducer-v1"
+                }
+                _ => unreachable!("fixture loop contains only capture models"),
+            };
+            for field in [
+                "schema=fre.aot.rebar-runner.v6",
+                adapter,
+                "aggregate_strategy=native-weighted-capture-row-reducer-v1",
+                "native_row_bridge=true uniform_capture_bridge=true weighted_capture_reducer_bridge=true",
+                "source_pattern_count=3",
+                "component_count=2",
+                "source_to_component=0,0,1",
+                "component_first_source_ordinals=0,2",
+                "component_weights=2,2",
+                "source_participating_groups=2,2,2",
+                "external_relocation_count=2",
+                "semantic_runtime_symbols= boundary=single-call-helper-free-native-multi-component-weighted-row-reducer",
+            ] {
+                if !provenance.contains(field) {
+                    return Err(format!(
+                        "equal-weight {model:?} provenance omitted {field:?}: {provenance}"
+                    )
+                    .into());
+                }
+            }
+            if provenance.contains("grep_iteration_strategy=") {
+                return Err(format!(
+                    "equal-weight {model:?} unexpectedly reported a row-loop grep iteration strategy: {provenance}"
+                )
+                .into());
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "preserving failed equal-weight capture smoke at {}",
+                root.display()
+            );
+            Err(error)
+        }
+    }
+}
+
 fn configured_capture_reducer_klv(model: Model, pattern: &str) -> Vec<u8> {
     let mut output = Vec::new();
     for (key, value) in [
@@ -661,6 +832,41 @@ fn configured_capture_reducer_klv(model: Model, pattern: &str) -> Vec<u8> {
         output.extend_from_slice(value);
         output.push(b'\n');
     }
+    output
+}
+
+fn configured_equal_weight_capture_klv(model: Model) -> Vec<u8> {
+    fn field(output: &mut Vec<u8>, key: &str, value: &[u8]) {
+        output.extend_from_slice(format!("{key}:{}:", value.len()).as_bytes());
+        output.extend_from_slice(value);
+        output.push(b'\n');
+    }
+
+    let name = format!(
+        "synthetic/aot-runner/equal-weight-capture-reducer/{}",
+        model.name()
+    );
+    let mut output = Vec::new();
+    for (key, value) in [
+        ("name", name.as_bytes()),
+        ("model", model.name().as_bytes()),
+        ("case-insensitive", b"false".as_slice()),
+        ("unicode", b"false".as_slice()),
+        ("max-iters", b"1".as_slice()),
+        ("max-warmup-iters", b"0".as_slice()),
+        ("max-time", b"1000000000".as_slice()),
+        ("max-warmup-time", b"0".as_slice()),
+    ] {
+        field(&mut output, key, value);
+    }
+    for pattern in [
+        b"(a+)".as_slice(),
+        b"(a+)".as_slice(),
+        b"(b+)".as_slice(),
+    ] {
+        field(&mut output, "pattern", pattern);
+    }
+    field(&mut output, "haystack", b"aa xx bbb\nb aa\r\nbbb\raaa\n");
     output
 }
 

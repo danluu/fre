@@ -17,6 +17,8 @@ const SOURCE_COMMIT_ENV: &str = "FRE_AOT_REBAR_SOURCE_COMMIT";
 const SOURCE_TREE_ENV: &str = "FRE_AOT_REBAR_SOURCE_TREE";
 const EXPECTED_VALUE_ENV: &str = "FRE_AOT_REBAR_EXPECTED_VALUE";
 const EXPECTED_COMPARATOR_ENV: &str = "FRE_AOT_REBAR_EXPECTED_COMPARATOR";
+const INTERNAL_TEST_SHARED_CAPTURE_DECLINE_FEATURE_ENV: &str =
+    "CARGO_FEATURE_INTERNAL_TEST_FORCE_SHARED_CAPTURE_NATIVE_DATA_DECLINE";
 const GENERATED_FILE: &str = "linked_artifact.rs";
 const OBJECT_FILE: &str = "aot-rebar-artifact.o";
 
@@ -59,6 +61,15 @@ fn main() {
         shared::MAX_KLV_BYTES
     );
     let benchmark = shared::Benchmark::parse(&bytes).expect("parse public Rebar build KLV");
+    let force_shared_capture_native_data_decline =
+        env::var_os(INTERNAL_TEST_SHARED_CAPTURE_DECLINE_FEATURE_ENV).is_some();
+    assert!(
+        !force_shared_capture_native_data_decline
+            || benchmark.uses_uniform_capture_bridge()
+                && benchmark.patterns.len() > 1
+                && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS,
+        "the internal shared-capture decline feature requires a multi-source capture fixture",
+    );
     let expected_binding = expected_binding(&bytes);
     let append_validation_binding = || {
         append_expected_binding(&generated_path, &expected_binding)
@@ -167,9 +178,31 @@ fn main() {
         if benchmark.patterns.len() > 1
             && benchmark.patterns.len() <= fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         {
-            match shared::try_compile_shared_uniform_capture_reducer(&benchmark, target)
-                .expect("attempt shared public Rebar uniform-capture reducer")
-            {
+            let shared_disposition = if force_shared_capture_native_data_decline {
+                let mut limits = fre_aot_regex::SlowAotLimits::default();
+                limits.max_native_data_bytes = 0;
+                shared::try_compile_shared_uniform_capture_reducer_with_slow_aot_limits(
+                    &benchmark, target, limits,
+                )
+            } else {
+                shared::try_compile_shared_uniform_capture_reducer(&benchmark, target)
+            }
+            .expect("attempt shared public Rebar uniform-capture reducer");
+            if force_shared_capture_native_data_decline {
+                assert!(
+                    matches!(
+                        &shared_disposition,
+                        shared::SharedUniformCaptureReducerDisposition::Declined(
+                            fre_aot_regex::SharedUniformCaptureReducerAotCompileDecline::NativeDataBytes {
+                                limit: 0,
+                                required,
+                            }
+                        ) if *required > 0
+                    ),
+                    "the internal recursive-test seam must observe the exact shared NativeDataBytes decline, got {shared_disposition:?}",
+                );
+            }
+            match shared_disposition {
                 shared::SharedUniformCaptureReducerDisposition::Compiled(artifact) => {
                     let compiled = artifact.compiled();
                     let (program_symbol, program_len) =

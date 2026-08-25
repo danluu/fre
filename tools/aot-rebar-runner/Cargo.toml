@@ -8,6 +8,12 @@ description = "Job-specialized static general-AOT runner for public Rebar models
 publish = false
 build = "build.rs"
 
+[features]
+default = []
+# Internal recursive-test seam: production builds must retain the default
+# shared-capture native-data envelope.
+internal-test-force-shared-capture-native-data-decline = []
+
 [[bin]]
 name = "fre-aot-rebar-runner"
 path = "src/main.rs"

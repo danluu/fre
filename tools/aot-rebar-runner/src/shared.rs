@@ -2017,6 +2017,23 @@ pub fn try_compile_shared_uniform_capture_reducer(
     benchmark: &Benchmark,
     target: Target,
 ) -> Result<SharedUniformCaptureReducerDisposition, String> {
+    try_compile_shared_uniform_capture_reducer_with_slow_aot_limits(
+        benchmark,
+        target,
+        SlowAotLimits::default(),
+    )
+}
+
+/// Explicit-limit counterpart used by the recursive build-script regression
+/// to exercise the shared compiler's typed numeric-decline boundary. Normal
+/// adapter builds call [`try_compile_shared_uniform_capture_reducer`] and
+/// therefore retain the compiler's default slow-AOT envelope.
+#[doc(hidden)]
+pub(crate) fn try_compile_shared_uniform_capture_reducer_with_slow_aot_limits(
+    benchmark: &Benchmark,
+    target: Target,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<SharedUniformCaptureReducerDisposition, String> {
     if benchmark.patterns.len() <= 1
         || benchmark.patterns.len() > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
         || !benchmark.model.is_capture()
@@ -2063,7 +2080,7 @@ pub fn try_compile_shared_uniform_capture_reducer(
             .limits(limits),
         operation,
         UniformCaptureParticipationLimits::default(),
-        SlowAotLimits::default(),
+        slow_aot_limits,
     )
     .map_err(|error| format!("shared uniform-capture AOT compilation failed: {error}"))?;
     let artifact = match disposition {

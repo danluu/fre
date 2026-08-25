@@ -2550,9 +2550,6 @@ fn authenticate_linked_weighted_capture_reducer_route(
             != linked::ROW_PROGRAM_SHA256
         || linked::WEIGHTED_CAPTURE_REDUCER_COMPONENT_OBJECT_SHA256 != linked::ROW_OBJECT_SHA256
         || linked::SOURCE_PARTICIPATING_GROUPS.len() != source_count
-        || linked::SOURCE_PARTICIPATING_GROUPS
-            .iter()
-            .all(|weight| *weight == linked::SOURCE_PARTICIPATING_GROUPS[0])
         || linked::WEIGHTED_CAPTURE_REDUCER_OPERATION_IDENTITY_SHA256 == [0; 32]
         || symbol_identity != Some(identity.as_str())
         || linked::WEIGHTED_CAPTURE_REDUCER_SYMBOL != linked::REDUCER_SYMBOL
