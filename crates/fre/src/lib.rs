@@ -14484,12 +14484,13 @@ impl PortableRegex {
     /// source-free executor and settles its immutable start-filter policy
     /// during this call. Unanchored
     /// required-literal matchers bind their value-only projection alongside
-    /// the canonical span session. An attachment-free, positive-width
-    /// leftmost-first literal set binds its immutable direct executor. A
+    /// the already-proven native regex owner for spans. An attachment-free,
+    /// positive-width leftmost-first literal set binds its immutable direct
+    /// executor. A
     /// uniform-standard literal set additionally starts with one cleared
     /// performance-only route bit; near acceptances may spend that bit on one
     /// bounded direct same-DFA probe. Other selected plan families bind
-    /// only the existing canonical session with unlimited setup limits. The
+    /// only the compact canonical non-K0 projection. The
     /// returned owner retains no haystack and may be reused across unrelated
     /// inputs by one mutable worker.
     ///
@@ -14499,17 +14500,17 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] if fallible K0 workspace allocation or
-    /// immutable preparation fails. Canonical fallback construction returns
-    /// the same setup failures as [`Self::search_session`].
+    /// immutable preparation fails, or if an internal route invariant tries
+    /// to place K0 in the compact canonical projection.
     pub fn ordinary_session(&self) -> Result<PortableOrdinarySession<'_>, SearchError> {
         let plan = match &self.plan {
             PortablePlan::ExactLiteral(literal) => {
                 if let Some(executor) = literal.ordinary_executor() {
                     PortableOrdinarySessionPlan::ExactLiteral { executor }
                 } else {
-                    PortableOrdinarySessionPlan::Canonical(Box::new(
-                        self.search_session(SearchSessionLimits::unlimited())?,
-                    ))
+                    PortableOrdinarySessionPlan::Canonical(
+                        PortableOrdinaryCanonical::try_new(self)?,
+                    )
                 }
             }
             PortablePlan::K0(k0) => {
@@ -14532,9 +14533,7 @@ impl PortableRegex {
             {
                 PortableOrdinarySessionPlan::RequiredLiteral {
                     projection: PortableOrdinaryRequiredLiteral::Scalar(required),
-                    canonical: Box::new(
-                        self.search_session(SearchSessionLimits::unlimited())?,
-                    ),
+                    regex: self,
                 }
             }
             PortablePlan::DispatchedRequiredLiteral(required)
@@ -14542,9 +14541,7 @@ impl PortableRegex {
             {
                 PortableOrdinarySessionPlan::RequiredLiteral {
                     projection: PortableOrdinaryRequiredLiteral::Dispatched(required),
-                    canonical: Box::new(
-                        self.search_session(SearchSessionLimits::unlimited())?,
-                    ),
+                    regex: self,
                 }
             }
             PortablePlan::PackedLiteralSet(packed) => {
@@ -14563,9 +14560,9 @@ impl PortableRegex {
                         PortableOrdinarySessionPlan::LiteralSetDfa { executor }
                     }
                 } else {
-                    PortableOrdinarySessionPlan::Canonical(Box::new(
-                        self.search_session(SearchSessionLimits::unlimited())?,
-                    ))
+                    PortableOrdinarySessionPlan::Canonical(
+                        PortableOrdinaryCanonical::try_new(self)?,
+                    )
                 }
             }
             PortablePlan::LiteralSetCompact(literal_set) => {
@@ -14573,9 +14570,9 @@ impl PortableRegex {
                     executor: literal_set.ordinary_executor(),
                 }
             }
-            _ => PortableOrdinarySessionPlan::Canonical(Box::new(
-                self.search_session(SearchSessionLimits::unlimited())?,
-            )),
+            _ => PortableOrdinarySessionPlan::Canonical(
+                PortableOrdinaryCanonical::try_new(self)?,
+            ),
         };
         Ok(PortableOrdinarySession { plan })
     }
@@ -18486,8 +18483,8 @@ pub struct PortableSearchSession<'a> {
 /// allocation. K0 matchers bind one source-free executor, including its
 /// immutable capabilities and reusable workspace, when this session is
 /// constructed. Unanchored required-literal matchers bind their value-only
-/// projection once while retaining the existing canonical search session for
-/// spans. Other matcher families retain only that canonical session. No method
+/// projection once while retaining the native regex owner for spans.
+/// Other matcher families retain only that compact binding. No method
 /// on this type accepts finite limits or publishes accounting; callers that
 /// need either contract should use [`PortableSearchSession`] instead.
 ///
@@ -18513,10 +18510,10 @@ enum PortableOrdinarySessionPlan<'a> {
         executor: K0OrdinaryExecutor<'a>,
         positive: bool,
     },
-    Canonical(Box<PortableSearchSession<'a>>),
+    Canonical(PortableOrdinaryCanonical<'a>),
     RequiredLiteral {
         projection: PortableOrdinaryRequiredLiteral<'a>,
-        canonical: Box<PortableSearchSession<'a>>,
+        regex: &'a PortableRegex,
     },
     PackedLiteralSet {
         executor: PackedLiteralSetOrdinaryExecutor<'a>,
@@ -18537,6 +18534,134 @@ enum PortableOrdinarySessionPlan<'a> {
     LiteralSetCompact {
         executor: LiteralSetCompactOrdinaryExecutor<'a>,
     },
+}
+
+/// Compact binding for ordinary fallbacks that construction has already
+/// proved cannot require mutable K0 workspace.
+///
+/// This mirrors the three source-free variants of [`PortableSearchSessionPlan`]
+/// without inheriting that enum's inline K0 payload. It fits inside the space
+/// already required by the outer K0 variant, so canonical construction needs
+/// no separate allocation and does not enlarge the ordinary session.
+#[derive(Debug)]
+enum PortableOrdinaryCanonical<'a> {
+    Native(&'a PortableRegex),
+    ExactLiteral(&'a LiteralPlan),
+    FixedPredicateWord64(&'a FixedPredicateWord64Plan),
+}
+
+impl<'a> PortableOrdinaryCanonical<'a> {
+    fn try_new(regex: &'a PortableRegex) -> Result<Self, SearchError> {
+        match &regex.plan {
+            PortablePlan::K0(_) => Err(SearchError::K0(K0SearchError::InternalInvariant {
+                detail: "ordinary canonical binding unexpectedly selected K0",
+            })),
+            PortablePlan::ExactLiteral(plan) => Ok(Self::ExactLiteral(plan)),
+            PortablePlan::FixedPredicateWord64(plan) => Ok(Self::FixedPredicateWord64(plan)),
+            _ => Ok(Self::Native(regex)),
+        }
+    }
+
+    #[inline]
+    fn shortest_match_at_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<usize>, SearchError> {
+        let window = SearchWindow::new(start, haystack.len());
+        match self {
+            Self::ExactLiteral(plan) => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(SearchLimits::unlimited()),
+                )
+                .map(|(matched, _)| matched.map(|(_, end)| end))
+                .map_err(SearchError::from),
+            Self::FixedPredicateWord64(plan) => plan
+                .earliest_end_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+                )
+                .map(|(end, _)| end)
+                .map_err(SearchError::from),
+            Self::Native(regex) => regex.shortest_match_window_value(
+                haystack,
+                window,
+                SearchLimits::unlimited(),
+            ),
+        }
+    }
+
+    #[inline]
+    fn find_at_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<Match>, SearchError> {
+        let window = SearchWindow::new(start, haystack.len());
+        match self {
+            Self::ExactLiteral(plan) => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(SearchLimits::unlimited()),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            Self::FixedPredicateWord64(plan) => plan
+                .find_window_value(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+                )
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            Self::Native(regex) => {
+                regex.find_window_value(haystack, window, SearchLimits::unlimited())
+            }
+        }
+    }
+
+    #[inline]
+    fn try_visit_spans_at<F, E>(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        visitor: F,
+    ) -> Result<Result<(), E>, PortableFindIterError>
+    where
+        F: FnMut(Match) -> Result<bool, E>,
+    {
+        // Preserve the construction-selected source cursor when this native
+        // plan exposes one. The cursor is bound only for this call, so the
+        // compact session remains source-free while repeated matches retain
+        // their monotone native traversal.
+        if let Self::Native(regex) = self
+            && let Some(mut cursor) = regex.native_search_cursor(haystack)
+        {
+            return try_visit_ordinary_spans_at(
+                haystack.len(),
+                start,
+                |search_start| {
+                    cursor
+                        .find_at_value(search_start, SearchLimits::unlimited())
+                        .map_err(PortableFindIterError::Search)
+                },
+                visitor,
+            );
+        }
+        try_visit_ordinary_spans_at(
+            haystack.len(),
+            start,
+            |search_start| {
+                self.find_at_value(haystack, search_start)
+                    .map_err(PortableFindIterError::Search)
+            },
+            visitor,
+        )
+    }
 }
 
 // One mistaken density promotion can scan at most one byte alphabet and eight
@@ -24191,7 +24316,7 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map(|endpoint| endpoint.is_some())
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(session) => session
-                .shortest_match_at_value(haystack, start, SearchLimits::unlimited())
+                .shortest_match_at_value(haystack, start)
                 .map(|endpoint| endpoint.is_some()),
             PortableOrdinarySessionPlan::RequiredLiteral { projection, .. } => {
                 #[cfg(test)]
@@ -24250,7 +24375,7 @@ impl<'r> PortableOrdinarySession<'r> {
                 .first_acceptance_at(haystack, start)
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(session) => {
-                session.shortest_match_at_value(haystack, start, SearchLimits::unlimited())
+                session.shortest_match_at_value(haystack, start)
             }
             PortableOrdinarySessionPlan::RequiredLiteral { projection, .. } => {
                 #[cfg(test)]
@@ -24332,11 +24457,14 @@ impl<'r> PortableOrdinarySession<'r> {
                     })
                 })
                 .map_err(SearchError::from),
-            PortableOrdinarySessionPlan::RequiredLiteral {
-                canonical: session, ..
-            }
-            | PortableOrdinarySessionPlan::Canonical(session) => {
-                session.find_at_value(haystack, start, SearchLimits::unlimited())
+            PortableOrdinarySessionPlan::RequiredLiteral { regex, .. } => regex
+                .find_window_value(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                ),
+            PortableOrdinarySessionPlan::Canonical(session) => {
+                session.find_at_value(haystack, start)
             }
             PortableOrdinarySessionPlan::PackedLiteralSet { executor } => executor
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
@@ -24397,8 +24525,8 @@ impl<'r> PortableOrdinarySession<'r> {
     /// retain complete original-haystack context and offsets remain absolute.
     /// Positive exact literals and K0 pass selected items directly to the
     /// callback without an accounting iterator, result buffer, or search-call
-    /// cap. Canonical fallback plans preserve their existing unlimited value
-    /// iterator and any construction-selected native source cursor.
+    /// cap. Canonical fallback plans iterate the compact binding with
+    /// unlimited value searches and the ordinary empty-match progress rule.
     ///
     /// # Errors
     ///
@@ -24452,25 +24580,12 @@ impl<'r> PortableOrdinarySession<'r> {
                     visitor,
                 )
             }
-            PortableOrdinarySessionPlan::RequiredLiteral {
-                canonical: session, ..
+            PortableOrdinarySessionPlan::RequiredLiteral { regex, .. } => {
+                PortableOrdinaryCanonical::Native(regex)
+                    .try_visit_spans_at(haystack, start, visitor)
             }
-            | PortableOrdinarySessionPlan::Canonical(session) => {
-                let matches = session.find_iter_value_at(
-                    haystack,
-                    start,
-                    PortableFindIterRunLimits::unlimited(),
-                );
-                let mut visitor = visitor;
-                for matched in matches {
-                    let matched = matched?;
-                    match visitor(matched) {
-                        Ok(true) => {}
-                        Ok(false) => return Ok(Ok(())),
-                        Err(error) => return Ok(Err(error)),
-                    }
-                }
-                Ok(Ok(()))
+            PortableOrdinarySessionPlan::Canonical(session) => {
+                session.try_visit_spans_at(haystack, start, visitor)
             }
             PortableOrdinarySessionPlan::PackedLiteralSet { executor } => {
                 let mut visitor = visitor;
@@ -47114,6 +47229,93 @@ mod tests {
             ordinary.find_at(&reused, 0),
             Ok(Some(Match { start: 0, end: 2 }))
         );
+    }
+
+    #[test]
+    fn ordinary_compact_canonical_is_small_inline_and_rejects_k0() {
+        let canonical_bytes =
+            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>();
+        let ordinary_plan_bytes =
+            core::mem::size_of::<super::PortableOrdinarySessionPlan<'static>>();
+        let search_plan_bytes =
+            core::mem::size_of::<super::PortableSearchSessionPlan<'static>>();
+        assert!(canonical_bytes <= 2 * core::mem::size_of::<usize>());
+        assert!(ordinary_plan_bytes < search_plan_bytes);
+        assert_eq!(
+            core::mem::size_of::<super::PortableOrdinarySession<'static>>(),
+            ordinary_plan_bytes,
+        );
+
+        let k0 = PortableBuilder::new("ab|a")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            super::PortableOrdinaryCanonical::try_new(&k0),
+            Err(SearchError::K0(
+                fre_automata::SearchError::InternalInvariant {
+                    detail: "ordinary canonical binding unexpectedly selected K0",
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn ordinary_compact_canonical_binds_only_non_k0_direct_routes() {
+        let empty = PortableBuilder::new("")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let empty = empty.ordinary_session().unwrap();
+        assert!(matches!(
+            empty.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::ExactLiteral(_)
+            )
+        ));
+
+        let fixed = PortableBuilder::new(
+            r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
+        )
+        .unicode(false)
+        .build()
+        .unwrap();
+        assert_eq!(fixed.build_report().plan, PlanKind::FixedPredicateWord64);
+        let fixed = fixed.ordinary_session().unwrap();
+        assert!(matches!(
+            fixed.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
+            )
+        ));
+
+        let anchored = PortableBuilder::new(r"(?-u:\A[ab]+Z)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(anchored.build_report().plan, PlanKind::ForwardAnchored);
+        let anchored = anchored.ordinary_session().unwrap();
+        assert!(matches!(
+            anchored.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::Native(_)
+            )
+        ));
+
+        let required = PortableBuilder::new(r"(?-u:[a-z]+ZQ)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        let required_session = required.ordinary_session().unwrap();
+        assert!(matches!(
+            &required_session.plan,
+            super::PortableOrdinarySessionPlan::RequiredLiteral {
+                regex: bound,
+                ..
+            } if core::ptr::eq(*bound, &required)
+        ));
     }
 
     #[test]
