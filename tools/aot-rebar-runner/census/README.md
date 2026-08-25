@@ -142,9 +142,24 @@ Single-source uniform CountCaptures and GrepCaptures use the same distinction.
 Their `PreparedScalarReduceV1` form is strict only when COUNT is the entry, the
 multiplier wrapper is a distinct operation symbol, bulk/SpanFill/prepared entry
 and runtime symbols are absent, and the exact V15 capability and caps are
-sealed. A typed unsupported, native-data, or object-byte decline may retain the
-legacy prepared-SpanFill compatibility form; no compiler or authentication
-error authorizes that fallback.
+sealed. The additive two-object fallback is a separate strict topology. It must
+publish `PreparedSpanSearchV1` / `RowSearchOnly`,
+`Some(LinkedPreparedRowUniformCaptureReducerV1)`, the exact V15 caps, an empty
+bulk/SpanFill/runtime-helper surface, and boundary
+`single-call-native-uniform-capture-row-search-reducer-v1`. Its closed raw and
+normalized receipts independently recompute the uniform-proof binding, local
+Count and public reducer symbols, and final two-object artifact identity. They
+also bind distinct row automaton/program/object and reducer code/object hashes,
+require each object extent to fit the same `max_object_bytes` cap independently,
+and admit exactly one architecture-canonical external relocation to the row
+entry with zero semantic-runtime calls. Qualification requires the object files
+in authenticated row-then-reducer order and checks both hashes and exact byte
+extents. Only then does route
+`linked-native-uniform-capture-row-search-reducer-v1` enter the strict
+whole-operation numerator. Missing, extra, compatibility-surface, relocation,
+digest, cap, or helper fields fail closed. A typed unsupported, native-data, or
+object-byte decline may retain the legacy prepared-SpanFill compatibility form;
+no compiler or authentication error authorizes that fallback.
 
 Shared ordered-many Count and SpanSum use the same ABI distinction. A
 `PreparedScalarReduceV1` receipt is strict only when `bulk=None`, the entry is
@@ -497,6 +512,13 @@ Three fresh processes authenticate each job:
    `native-row-scalar-reducer-v1` follows the same rule: trap its final Count or
    SpanSum wrapper, and inventory each route-specific child identity rather
    than treating the rows as separate operation entries.
+   The scalar two-object uniform-capture RowSearch route similarly traps only
+   its final CountCaptures/GrepCaptures reducer. Its exclusive RowSearch entry,
+   serialized program, and public reducer are authenticated linked identities;
+   the object-local Count name remains receipt/artifact-authenticated rather
+   than becoming a post-link symbol-table requirement. The single external call
+   relocation binds the reducer to that exact row rather than turning the row
+   into a Rust-loop operation entry.
    The variable-width native-row bridge and uniform-capture row bridge receive
    the same independent negative control for every retained row artifact. The
    exact-span participation v4 runs two independent negative controls: one for

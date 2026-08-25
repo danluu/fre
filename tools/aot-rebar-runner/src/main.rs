@@ -2248,7 +2248,9 @@ fn print_provenance() {
                 FROZEN_ORDERED_NFA_V1_MAX_SETUP_WORK,
             )
         };
-    let boundary = if linked::SHARED_ORDERED_MANY_AGGREGATE
+    let boundary = if linked::LINKED_ROW_UNIFORM_CAPTURE {
+        "single-call-native-uniform-capture-row-search-reducer-v1"
+    } else if linked::SHARED_ORDERED_MANY_AGGREGATE
         && linked::UNIFORM_CAPTURE_BRIDGE
         && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
     {
@@ -2269,8 +2271,8 @@ fn print_provenance() {
     } else {
         "runtime-klv-warmup-schedule"
     };
-    println!(
-        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} entry_abi={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} shared_ordered_many={} source_pattern_count={} ordered_many_receipt_schema={} ordered_many_sources_sha256={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={} boundary={} required_comparators={required_comparators} {validation_binding}",
+    let mut provenance = format!(
+        "schema=fre.aot.rebar-runner.v2 disposition=executed configured={} adapter={} model={} benchmark={:?} source_commit={} source_tree={} target={}-{} feature_bits={:016x} compiler_version={} optimizer_version={} engine={} entry_abi={} aggregate_strategy={} prepared_bulk_strategy={} span_iteration_strategy={} grep_iteration_strategy={} shared_ordered_many={} source_pattern_count={} ordered_many_receipt_schema={} ordered_many_sources_sha256={} prepare_config_version={} prepare_operation_flags={:016x} required_prepare_capabilities={:016x} prepare_scope=runtime-handle-state object_descriptor_setup=authenticated-v3-when-required max_start_filter_setup_work={} max_grep_count_workspace_bytes={} max_handle_bytes={} max_ordered_nfa_scratch_bytes={} max_ordered_nfa_setup_work={} program_sha256={} object_sha256={} program_symbol={} program_len={} entry_symbol={} reducer_symbol={} span_fill_symbol={} required_runtime_symbols={}",
         linked::CONFIGURED,
         linked::ADAPTER,
         linked::EXPECTED_MODEL,
@@ -2308,7 +2310,53 @@ fn print_provenance() {
         linked::REDUCER_SYMBOL,
         linked::SPAN_FILL_SYMBOL,
         linked::REQUIRED_RUNTIME_SYMBOLS,
-        boundary,
+    );
+    if linked::LINKED_ROW_UNIFORM_CAPTURE {
+        let (operation, domain) = match linked::EXPECTED_MODEL {
+            "count-captures" => ("count-captures", "whole-haystack"),
+            "grep-captures" => ("grep-captures", "byte-slice-lines-lf-crlf"),
+            _ => ("invalid", "invalid"),
+        };
+        write!(
+            &mut provenance,
+            " prepared_surface=RowSearchOnly uniform_capture_link_receipt_schema={} uniform_capture_operation={} uniform_capture_domain={} uniform_capture_multiplier={} uniform_capture_proof_algorithm_version={} uniform_capture_proof_accounting_version={} uniform_capture_minimum_match_bytes={} uniform_capture_participating_user_captures={} uniform_capture_canonical_capture_annotations={} uniform_capture_proof_work={} uniform_capture_proof_peak_stack_items={} uniform_capture_proof_identity_sha256={} uniform_capture_line_terminator={} uniform_capture_row_automaton_sha256={} uniform_capture_row_program_sha256={} uniform_capture_row_object_sha256={} uniform_capture_row_object_bytes={} uniform_capture_row_entry_symbol={} uniform_capture_count_symbol={} uniform_capture_reducer_symbol={} uniform_capture_reducer_code_sha256={} uniform_capture_reducer_object_sha256={} uniform_capture_reducer_object_bytes={} uniform_capture_max_object_bytes={} uniform_capture_external_relocation_count=1 uniform_capture_external_relocation_symbol={} uniform_capture_external_relocation_offset={} uniform_capture_external_relocation_kind={} uniform_capture_external_relocation_addend={} uniform_capture_semantic_runtime_calls={} uniform_capture_artifact_identity_sha256={}",
+            linked::LINKED_ROW_UNIFORM_CAPTURE_RECEIPT_SCHEMA,
+            operation,
+            domain,
+            linked::SOURCE_PARTICIPATING_GROUPS.first().copied().unwrap_or(0),
+            linked::UNIFORM_CAPTURE_ALGORITHM_VERSION,
+            linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION,
+            linked::SOURCE_MINIMUM_MATCH_BYTES.first().copied().unwrap_or(0),
+            linked::SOURCE_PARTICIPATING_USER_CAPTURES.first().copied().unwrap_or(0),
+            linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS.first().copied().unwrap_or(0),
+            linked::SOURCE_PROOF_WORK.first().copied().unwrap_or(0),
+            linked::SOURCE_PROOF_PEAK_STACK_ITEMS.first().copied().unwrap_or(0),
+            hex(&linked::UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256),
+            b'\n',
+            linked::ROW_AUTOMATON_SHA256
+                .first()
+                .map_or_else(|| hex(&[0; 32]), |digest| hex(digest)),
+            hex(&linked::PROGRAM_SHA256),
+            hex(&linked::OBJECT_SHA256),
+            linked::OBJECT_BYTES.len(),
+            linked::ENTRY_SYMBOL,
+            linked::UNIFORM_CAPTURE_COUNT_SYMBOL,
+            linked::REDUCER_SYMBOL,
+            hex(&linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_CODE_SHA256),
+            hex(&linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_SHA256),
+            linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES,
+            linked::LINKED_ROW_UNIFORM_CAPTURE_MAX_OBJECT_BYTES,
+            linked::ENTRY_SYMBOL,
+            linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_OFFSET,
+            linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_KIND,
+            linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_ADDEND,
+            linked::LINKED_ROW_UNIFORM_CAPTURE_SEMANTIC_RUNTIME_CALLS,
+            hex(&linked::LINKED_ROW_UNIFORM_CAPTURE_ARTIFACT_IDENTITY_SHA256),
+        )
+        .expect("format linked RowSearch uniform-capture provenance");
+    }
+    println!(
+        "{provenance} boundary={boundary} required_comparators={required_comparators} {validation_binding}"
     );
 }
 
@@ -2386,6 +2434,197 @@ fn authenticate_benchmark(
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+fn linked_row_uniform_capture_receipt_is_empty() -> bool {
+    linked::LINKED_ROW_UNIFORM_CAPTURE_RECEIPT_SCHEMA == 0
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_ARTIFACT_IDENTITY_SHA256 == [0; 32]
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_CODE_SHA256 == [0; 32]
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_SHA256 == [0; 32]
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES == 0
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_MAX_OBJECT_BYTES == 0
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_OFFSET == 0
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_KIND.is_empty()
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_ADDEND == 0
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_SEMANTIC_RUNTIME_CALLS == 0
+        && linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES_DATA.is_empty()
+}
+
+fn linked_uniform_capture_target_identity() -> Result<[u8; 4], String> {
+    let target =
+        shared::target_from_parts(linked::TARGET_ARCH, linked::TARGET_OS, linked::FEATURE_BITS)?;
+    Ok([
+        match target.architecture {
+            fre_aot_regex::Architecture::X86_64 => 1,
+            fre_aot_regex::Architecture::Aarch64 => 2,
+        },
+        match target.operating_system {
+            fre_aot_regex::OperatingSystem::Linux => 1,
+            fre_aot_regex::OperatingSystem::Macos => 2,
+        },
+        match target.abi {
+            fre_aot_regex::CallAbi::SystemV => 1,
+            fre_aot_regex::CallAbi::Aapcs64 => 2,
+        },
+        0,
+    ])
+}
+
+fn linked_uniform_capture_operation(
+    model: shared::Model,
+) -> Result<
+    (
+        u8,
+        u8,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    ),
+    String,
+> {
+    match model {
+        shared::Model::CountCaptures => Ok((
+            1,
+            1,
+            "count-captures",
+            "whole-haystack",
+            "general-aot-native-uniform-capture-count-row-search-reducer-v1",
+            "fre_aot_regex_count_captures_exclusive_v1_",
+        )),
+        shared::Model::GrepCaptures => Ok((
+            2,
+            2,
+            "grep-captures",
+            "byte-slice-lines-lf-crlf",
+            "general-aot-native-uniform-capture-grep-row-search-reducer-v1",
+            "fre_aot_regex_grep_captures_exclusive_v1_",
+        )),
+        _ => Err("linked RowSearch uniform-capture route has a non-capture model".to_owned()),
+    }
+}
+
+fn linked_uniform_capture_proof_identity() -> Result<[u8; 32], String> {
+    if linked::SOURCE_MINIMUM_MATCH_BYTES.len() != 1
+        || linked::SOURCE_PARTICIPATING_USER_CAPTURES.len() != 1
+        || linked::SOURCE_PARTICIPATING_GROUPS.len() != 1
+        || linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS.len() != 1
+        || linked::SOURCE_PROOF_WORK.len() != 1
+        || linked::SOURCE_PROOF_PEAK_STACK_ITEMS.len() != 1
+    {
+        return Err("linked RowSearch uniform-capture proof cardinality differs".to_owned());
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/uniform-capture-proof-binding/v1\0");
+    digest.update(linked::UNIFORM_CAPTURE_ALGORITHM_VERSION.to_le_bytes());
+    digest.update(linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION.to_le_bytes());
+    digest.update(linked::PROGRAM_SHA256);
+    for value in [
+        linked::SOURCE_MINIMUM_MATCH_BYTES[0],
+        linked::SOURCE_PARTICIPATING_USER_CAPTURES[0],
+        usize::try_from(linked::SOURCE_PARTICIPATING_GROUPS[0])
+            .map_err(|_| "linked RowSearch capture multiplier does not fit usize".to_owned())?,
+        linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS[0],
+    ] {
+        digest.update(
+            u64::try_from(value)
+                .map_err(|_| "linked RowSearch proof integer does not fit u64".to_owned())?
+                .to_le_bytes(),
+        );
+    }
+    digest.update(linked::SOURCE_PROOF_WORK[0].to_le_bytes());
+    digest.update(
+        u64::try_from(linked::SOURCE_PROOF_PEAK_STACK_ITEMS[0])
+            .map_err(|_| "linked RowSearch proof stack does not fit u64".to_owned())?
+            .to_le_bytes(),
+    );
+    Ok(digest.finalize().into())
+}
+
+fn linked_uniform_capture_symbols(model: shared::Model) -> Result<(String, String), String> {
+    let (_, domain_tag, _, _, _, reducer_prefix) = linked_uniform_capture_operation(model)?;
+    let target_identity = linked_uniform_capture_target_identity()?;
+    let mut count = Sha256::new();
+    count.update(b"fre-aot-regex/linked-row-uniform-count/v1\0");
+    count.update([domain_tag]);
+    count.update(linked::PROGRAM_SHA256);
+    count.update(linked::ENTRY_SYMBOL.as_bytes());
+    count.update(&target_identity[..3]);
+    count.update(linked::FEATURE_BITS.to_le_bytes());
+    let count = format!(
+        "fre_aot_regex_count_exclusive_v1_{}",
+        hex(&count.finalize())
+    );
+
+    let multiplier = linked::SOURCE_PARTICIPATING_GROUPS
+        .first()
+        .copied()
+        .ok_or_else(|| "linked RowSearch capture multiplier is absent".to_owned())?;
+    let mut reducer = Sha256::new();
+    reducer.update(b"fre-aot-regex/linked-row-uniform-reducer/v1\0");
+    reducer.update([domain_tag]);
+    reducer.update(multiplier.to_le_bytes());
+    reducer.update(linked::PROGRAM_SHA256);
+    reducer.update(linked::UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256);
+    reducer.update(count.as_bytes());
+    reducer.update(linked::ENTRY_SYMBOL.as_bytes());
+    reducer.update(&target_identity[..3]);
+    reducer.update(linked::FEATURE_BITS.to_le_bytes());
+    Ok((
+        count,
+        format!("{reducer_prefix}{}", hex(&reducer.finalize())),
+    ))
+}
+
+fn linked_uniform_capture_artifact_identity(model: shared::Model) -> Result<[u8; 32], String> {
+    let (operation_tag, domain_tag, _, _, _, _) = linked_uniform_capture_operation(model)?;
+    let multiplier = linked::SOURCE_PARTICIPATING_GROUPS
+        .first()
+        .copied()
+        .ok_or_else(|| "linked RowSearch capture multiplier is absent".to_owned())?;
+    let row_automaton = linked::ROW_AUTOMATON_SHA256
+        .first()
+        .ok_or_else(|| "linked RowSearch automaton identity is absent".to_owned())?;
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/linked-prepared-row-uniform-capture-artifact/v1\0");
+    digest.update(linked::LINKED_ROW_UNIFORM_CAPTURE_RECEIPT_SCHEMA.to_le_bytes());
+    digest.update([operation_tag, domain_tag]);
+    digest.update(multiplier.to_le_bytes());
+    digest.update(linked::UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256);
+    digest.update(linked_uniform_capture_target_identity()?);
+    digest.update(linked::FEATURE_BITS.to_le_bytes());
+    digest.update([b'\n']);
+    digest.update(row_automaton);
+    digest.update(linked::PROGRAM_SHA256);
+    digest.update(linked::OBJECT_SHA256);
+    update_multi_grep_identity_usize(&mut digest, linked::OBJECT_BYTES.len())?;
+    update_multi_grep_identity_field(&mut digest, linked::ENTRY_SYMBOL.as_bytes())?;
+    update_multi_grep_identity_field(&mut digest, linked::UNIFORM_CAPTURE_COUNT_SYMBOL.as_bytes())?;
+    update_multi_grep_identity_field(&mut digest, linked::REDUCER_SYMBOL.as_bytes())?;
+    digest.update(linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_CODE_SHA256);
+    digest.update(linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_SHA256);
+    update_multi_grep_identity_usize(
+        &mut digest,
+        linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES,
+    )?;
+    update_multi_grep_identity_usize(
+        &mut digest,
+        linked::LINKED_ROW_UNIFORM_CAPTURE_MAX_OBJECT_BYTES,
+    )?;
+    digest.update(linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_OFFSET.to_le_bytes());
+    digest.update([
+        match linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_KIND {
+            "X86PltRelative32" => 2,
+            "Aarch64Branch26" => 5,
+            _ => return Err("linked RowSearch relocation kind is unknown".to_owned()),
+        },
+    ]);
+    digest.update(linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_ADDEND.to_le_bytes());
+    update_multi_grep_identity_usize(
+        &mut digest,
+        linked::LINKED_ROW_UNIFORM_CAPTURE_SEMANTIC_RUNTIME_CALLS,
+    )?;
+    Ok(digest.finalize().into())
 }
 
 fn update_multi_grep_identity_usize(digest: &mut Sha256, value: usize) -> Result<(), String> {
@@ -3223,6 +3462,143 @@ fn authenticate_linked_capture_next_reducer_source() -> Result<(), String> {
     Ok(())
 }
 
+fn authenticate_linked_row_uniform_capture(benchmark: &shared::Benchmark) -> Result<(), String> {
+    let (_, _, _, _, expected_adapter, reducer_prefix) =
+        linked_uniform_capture_operation(benchmark.model)?;
+    let expected_grep_iteration = if benchmark.model == shared::Model::GrepCaptures {
+        "linked-native-uniform-capture-row-search-reducer-v1"
+    } else {
+        "not-applicable"
+    };
+    let expected_relocation = match linked::TARGET_ARCH {
+        "x86_64" => ("X86PltRelative32", -4_i64),
+        "aarch64" => ("Aarch64Branch26", 0_i64),
+        _ => return Err("linked RowSearch target architecture is unknown".to_owned()),
+    };
+    let proof_cardinalities = [
+        linked::ROW_PARTICIPATING_GROUPS.len(),
+        linked::SOURCE_PARTICIPATING_GROUPS.len(),
+        linked::SOURCE_MINIMUM_MATCH_BYTES.len(),
+        linked::SOURCE_PARTICIPATING_USER_CAPTURES.len(),
+        linked::SOURCE_CANONICAL_CAPTURE_ANNOTATIONS.len(),
+        linked::SOURCE_PROOF_WORK.len(),
+        linked::SOURCE_PROOF_PEAK_STACK_ITEMS.len(),
+        linked::SOURCE_SELECTOR_AUTOMATON_SHA256.len(),
+        linked::SOURCE_SELECTOR_PROGRAM_SHA256.len(),
+        linked::SOURCE_SELECTOR_OBJECT_SHA256.len(),
+    ];
+    if proof_cardinalities.into_iter().any(|length| length != 1) {
+        return Err("linked RowSearch uniform-capture proof cardinality differs".to_owned());
+    }
+    let multiplier = linked::SOURCE_PARTICIPATING_GROUPS[0];
+    let expected_multiplier = u64::try_from(linked::SOURCE_PARTICIPATING_USER_CAPTURES[0])
+        .ok()
+        .and_then(|captures| captures.checked_add(1));
+    let entry_identity =
+        native_symbol_identity(linked::ENTRY_SYMBOL, "fre_aot_regex_search_exclusive_v1_");
+    let program_identity =
+        native_symbol_identity(linked::PROGRAM_SYMBOL, "fre_aot_regex_runtime_program_v1_");
+    let count_identity = native_symbol_identity(
+        linked::UNIFORM_CAPTURE_COUNT_SYMBOL,
+        "fre_aot_regex_count_exclusive_v1_",
+    );
+    let reducer_identity = native_symbol_identity(linked::REDUCER_SYMBOL, reducer_prefix);
+    let (expected_count, expected_reducer) = linked_uniform_capture_symbols(benchmark.model)?;
+    let proof_identity = linked_uniform_capture_proof_identity()?;
+    let artifact_identity = linked_uniform_capture_artifact_identity(benchmark.model)?;
+    let object_cap = linked::LINKED_ROW_UNIFORM_CAPTURE_MAX_OBJECT_BYTES;
+    let reducer_object = linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES_DATA;
+    if benchmark.patterns.len() != 1
+        || linked::ADAPTER != expected_adapter
+        || linked::NATIVE_SCALAR_REDUCER
+        || linked::SHARED_ORDERED_MANY_AGGREGATE
+        || linked::ORDERED_MANY_RECEIPT_SCHEMA != 0
+        || linked::ORDERED_MANY_SOURCES_SHA256 != [0; 32]
+        || linked::SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA != 0
+        || linked::SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256 != [0; 32]
+        || !linked::SOURCE_PROOF_BINDINGS_SHA256.is_empty()
+        || linked::ENTRY_ABI != "PreparedSpanSearchV1"
+        || linked::ENGINE != "OrderedNfa"
+        || linked::AGGREGATE_STRATEGY != "Some(LinkedPreparedRowUniformCaptureReducerV1)"
+        || linked::PREPARED_BULK_STRATEGY != "None"
+        || linked::SPAN_ITERATION_STRATEGY != "not-applicable"
+        || linked::GREP_ITERATION_STRATEGY != expected_grep_iteration
+        || linked::HAS_SPAN_FILL
+        || !linked::SPAN_FILL_SYMBOL.is_empty()
+        || !linked::REQUIRED_RUNTIME_SYMBOLS.is_empty()
+        || linked::PREPARE_CONFIG_VERSION != PREPARE_CONFIG_V3_VERSION
+        || linked::PREPARE_OPERATION_FLAGS != shared::Model::Count.prepare_operation_flags()
+        || linked::REQUIRED_PREPARE_CAPABILITIES != PREPARE_CAPABILITY_ORDERED_NFA_V15
+        || linked::SOURCE_PATTERN_COUNT != 1
+        || linked::ROW_ARTIFACT_COUNT != 1
+        || linked::SOURCE_TO_ARTIFACT != [0]
+        || linked::ROW_FIRST_SOURCE_ORDINALS != [0]
+        || linked::ROW_ENTRY_SYMBOLS != [linked::ENTRY_SYMBOL]
+        || linked::ROW_AUTOMATON_SHA256.len() != 1
+        || linked::ROW_PROGRAM_SHA256 != [linked::PROGRAM_SHA256]
+        || linked::ROW_OBJECT_SHA256 != [linked::OBJECT_SHA256]
+        || linked::SOURCE_SELECTOR_AUTOMATON_SHA256 != linked::ROW_AUTOMATON_SHA256
+        || linked::SOURCE_SELECTOR_PROGRAM_SHA256 != linked::ROW_PROGRAM_SHA256
+        || linked::SOURCE_SELECTOR_OBJECT_SHA256 != linked::ROW_OBJECT_SHA256
+        || linked::ROW_TOTAL_OBJECT_BYTES != linked::OBJECT_BYTES.len()
+        || linked::OBJECT_BYTES.is_empty()
+        || linked::PROGRAM_LEN == 0
+        || linked::PROGRAM_SHA256 == [0; 32]
+        || linked::ROW_AUTOMATON_SHA256[0] == [0; 32]
+        || linked::OBJECT_SHA256 == [0; 32]
+        || sha256(linked::OBJECT_BYTES) != linked::OBJECT_SHA256
+        || linked::UNIFORM_CAPTURE_ALGORITHM_VERSION
+            != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION
+        || linked::UNIFORM_CAPTURE_ACCOUNTING_VERSION
+            != fre_lower::UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION
+        || multiplier == 0
+        || linked::ROW_PARTICIPATING_GROUPS != [multiplier]
+        || expected_multiplier != Some(multiplier)
+        || linked::SOURCE_MINIMUM_MATCH_BYTES[0] == 0
+        || linked::SOURCE_PROOF_WORK[0] == 0
+        || linked::SOURCE_PROOF_PEAK_STACK_ITEMS[0] == 0
+        || proof_identity != linked::UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256
+        || entry_identity.is_none()
+        || entry_identity != program_identity
+        || count_identity.is_none()
+        || reducer_identity.is_none()
+        || expected_count != linked::UNIFORM_CAPTURE_COUNT_SYMBOL
+        || expected_reducer != linked::REDUCER_SYMBOL
+        || sha256(linked::UNIFORM_CAPTURE_COUNT_SYMBOL.as_bytes())
+            != linked::UNIFORM_CAPTURE_COUNT_SYMBOL_SHA256
+        || sha256(linked::REDUCER_SYMBOL.as_bytes())
+            != linked::UNIFORM_CAPTURE_REDUCER_SYMBOL_SHA256
+        || [
+            linked::ENTRY_SYMBOL,
+            linked::PROGRAM_SYMBOL,
+            linked::UNIFORM_CAPTURE_COUNT_SYMBOL,
+            linked::REDUCER_SYMBOL,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+            != 4
+        || object_cap != shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        || linked::OBJECT_BYTES.len() > object_cap
+        || reducer_object.is_empty()
+        || reducer_object.len() != linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES
+        || reducer_object.len() > object_cap
+        || sha256(reducer_object) != linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_SHA256
+        || linked::UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256
+            != linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_SHA256
+        || linked::LINKED_ROW_UNIFORM_CAPTURE_REDUCER_CODE_SHA256 == [0; 32]
+        || linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_KIND != expected_relocation.0
+        || linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_ADDEND != expected_relocation.1
+        || usize::try_from(linked::LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_OFFSET)
+            .map_or(true, |offset| offset >= reducer_object.len())
+        || linked::LINKED_ROW_UNIFORM_CAPTURE_SEMANTIC_RUNTIME_CALLS != 0
+        || artifact_identity != linked::LINKED_ROW_UNIFORM_CAPTURE_ARTIFACT_IDENTITY_SHA256
+    {
+        return Err("linked RowSearch uniform-capture identity closure is inconsistent".to_owned());
+    }
+    Ok(())
+}
+
 fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String> {
     if linked::NATIVE_ROW_SCALAR_REDUCER && !linked::NATIVE_ROW_BRIDGE {
         return Err("row-scalar reducer is detached from its native-row closure".to_owned());
@@ -3241,10 +3617,25 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     let scalar_uniform_capture = linked::UNIFORM_CAPTURE_BRIDGE && !linked::NATIVE_ROW_BRIDGE;
     let native_uniform_capture = scalar_uniform_capture && !linked::REDUCER_SYMBOL.is_empty();
     let prepared_uniform_capture = scalar_uniform_capture && linked::REDUCER_SYMBOL.is_empty();
+    let linked_row_uniform_capture = native_uniform_capture && linked::LINKED_ROW_UNIFORM_CAPTURE;
     let shared_uniform_capture = linked::SHARED_ORDERED_MANY_AGGREGATE
         && linked::UNIFORM_CAPTURE_BRIDGE
         && linked::SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA
             == fre_aot_regex::SHARED_UNIFORM_CAPTURE_REDUCER_AOT_RECEIPT_VERSION;
+    if linked::LINKED_ROW_UNIFORM_CAPTURE
+        != (linked::LINKED_ROW_UNIFORM_CAPTURE_RECEIPT_SCHEMA
+            == fre_aot_regex::LINKED_PREPARED_ROW_UNIFORM_CAPTURE_REDUCER_V1_RECEIPT_VERSION)
+    {
+        return Err("linked RowSearch route disagrees with its receipt schema".to_owned());
+    }
+    if !linked::LINKED_ROW_UNIFORM_CAPTURE && !linked_row_uniform_capture_receipt_is_empty() {
+        return Err("non-linked-row route contains a linked RowSearch receipt".to_owned());
+    }
+    if linked::LINKED_ROW_UNIFORM_CAPTURE && !linked_row_uniform_capture {
+        return Err(
+            "linked RowSearch receipt is detached from its uniform-capture route".to_owned(),
+        );
+    }
     if linked::SHARED_ORDERED_MANY_AGGREGATE
         != (linked::ORDERED_MANY_RECEIPT_SCHEMA == fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
             && linked::ORDERED_MANY_SOURCES_SHA256 != [0; 32])
@@ -3270,6 +3661,7 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         return Err("shared uniform-capture route disagrees with its proof receipt".to_owned());
     }
     if !shared_uniform_capture
+        && !linked_row_uniform_capture
         && (linked::SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA != 0
             || linked::UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256 != [0; 32]
             || linked::SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256 != [0; 32]
@@ -3458,7 +3850,9 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
         return Err("linked Span-fill availability disagrees with its bound symbol".to_owned());
     }
     let native_scalar_reducer = authenticate_linked_native_scalar_reducer(benchmark.model)?;
-    if native_uniform_capture && !shared_uniform_capture {
+    if linked_row_uniform_capture {
+        authenticate_linked_row_uniform_capture(benchmark)?;
+    } else if native_uniform_capture && !shared_uniform_capture {
         let reducer_prefix = match benchmark.model {
             shared::Model::CountCaptures => "fre_aot_regex_count_captures_exclusive_v1_",
             shared::Model::GrepCaptures => "fre_aot_regex_grep_captures_exclusive_v1_",
@@ -3712,8 +4106,16 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
             linked::ENTRY_SYMBOL == linked::REDUCER_SYMBOL
         }
         && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty();
+    let ordered_nfa_linked_row_operation = linked_row_uniform_capture
+        && linked::AGGREGATE_STRATEGY == "Some(LinkedPreparedRowUniformCaptureReducerV1)"
+        && linked::ENTRY_ABI == "PreparedSpanSearchV1"
+        && linked::PREPARED_BULK_STRATEGY == "None"
+        && !linked::HAS_SPAN_FILL
+        && linked::SPAN_FILL_SYMBOL.is_empty()
+        && linked::REQUIRED_RUNTIME_SYMBOLS.is_empty();
     if linked::REQUIRED_PREPARE_CAPABILITIES & !PREPARE_CAPABILITY_KNOWN_FLAGS != 0
-        || (ordered_nfa_route || ordered_nfa_scalar_operation) != ordered_nfa_required
+        || (ordered_nfa_route || ordered_nfa_scalar_operation || ordered_nfa_linked_row_operation)
+            != ordered_nfa_required
     {
         return Err(
             "linked Ordered-TNFA route disagrees with its required prepare capability".to_owned(),
@@ -3742,7 +4144,9 @@ fn authenticate_linked_route(benchmark: &shared::Benchmark) -> Result<(), String
     if ordered_nfa_required && !prepared_uniform_capture {
         let native_aggregate = matches!(
             linked::AGGREGATE_STRATEGY,
-            "Some(NativeOrderedNfaFused)" | "Some(NativeOrderedNfaFusedWithRuntimeHelper)"
+            "Some(NativeOrderedNfaFused)"
+                | "Some(NativeOrderedNfaFusedWithRuntimeHelper)"
+                | "Some(LinkedPreparedRowUniformCaptureReducerV1)"
         );
         if !native_aggregate {
             return Err("Ordered-TNFA capability has no native operation route".to_owned());

@@ -32143,6 +32143,320 @@ const WEIGHTED_CAPTURE_DATA_SECTION: usize = 1;
 const WEIGHTED_CAPTURE_ENTRY_SYMBOL: usize = 0;
 const WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE: usize = 2;
 
+const LINKED_ROW_UNIFORM_TEXT_SECTION: usize = 0;
+const LINKED_ROW_UNIFORM_DATA_SECTION: usize = 1;
+const LINKED_ROW_UNIFORM_REDUCER_SYMBOL: usize = 0;
+const LINKED_ROW_UNIFORM_ROW_SYMBOL: usize = 2;
+const LINKED_ROW_UNIFORM_IDENTITY_SYMBOL: usize = 3;
+
+/// Lower a separately linkable uniform-capture reducer over one strict,
+/// externally authenticated `PreparedSpanSearchV1` row.
+///
+/// The generated Count child uses the same six-register prepared-search call
+/// shape as the private aggregate loop, but its sole call is deliberately an
+/// unresolved edge to the *public* RowSearch entry. That entry therefore
+/// reauthenticates the handle and immutable Ordered-NFA object on every call;
+/// this is not the same-object `PreparedPrivate` topology. The outer capture
+/// wrapper is patched locally to Count and remains the only public entry.
+pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
+    target: Target,
+    domain: NativeUniformCaptureReducerDomain,
+    multiplier: u64,
+    artifact_identity: [u8; 32],
+    proof_identity: [u8; 32],
+    row_entry: &str,
+) -> Result<(CompiledModule, String, String), ObjectError> {
+    if multiplier == 0
+        || artifact_identity == [0; 32]
+        || proof_identity == [0; 32]
+        || !row_entry.starts_with(PREPARED_ENTRY_SYMBOL_PREFIX)
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "linked RowSearch uniform-capture input closure",
+        ));
+    }
+
+    let target_identity = [
+        match target.architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        },
+        match target.operating_system {
+            OperatingSystem::Linux => 1,
+            OperatingSystem::Macos => 2,
+        },
+        match target.abi {
+            CallAbi::SystemV => 1,
+            CallAbi::Aapcs64 => 2,
+        },
+    ];
+    let mut count_identity = Sha256::new();
+    count_identity.update(b"fre-aot-regex/linked-row-uniform-count/v1\0");
+    count_identity.update([domain.identity_tag()]);
+    count_identity.update(artifact_identity);
+    count_identity.update(row_entry.as_bytes());
+    count_identity.update(target_identity);
+    count_identity.update(target.features.bits().to_le_bytes());
+    let count_name = identity_symbol(PREPARED_COUNT_SYMBOL_PREFIX, &count_identity.finalize())?;
+
+    let mut reducer_identity = Sha256::new();
+    reducer_identity.update(b"fre-aot-regex/linked-row-uniform-reducer/v1\0");
+    reducer_identity.update([domain.identity_tag()]);
+    reducer_identity.update(multiplier.to_le_bytes());
+    reducer_identity.update(artifact_identity);
+    reducer_identity.update(proof_identity);
+    reducer_identity.update(count_name.as_bytes());
+    reducer_identity.update(row_entry.as_bytes());
+    reducer_identity.update(target_identity);
+    reducer_identity.update(target.features.bits().to_le_bytes());
+    let reducer_name = identity_symbol(domain.symbol_prefix(), &reducer_identity.finalize())?;
+
+    // `PreparedPrivate` names the register call shape here, not the linked
+    // topology. The external relocation below targets the strict public row,
+    // whose full authentication prologue remains intact and authoritative.
+    let count = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
+            PreparedSpanSink::Count,
+            NativeSpanReducerCallKind::PreparedPrivate,
+            false,
+        )?,
+        Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::Count,
+            NativeSpanReducerCallKind::PreparedPrivate,
+            false,
+        )?,
+    };
+    let reducer = match (target.architecture, domain) {
+        (Architecture::X86_64, NativeUniformCaptureReducerDomain::WholeHaystack) => {
+            lower_x86_64_uniform_capture_count(multiplier)?
+        }
+        (Architecture::X86_64, NativeUniformCaptureReducerDomain::ByteSliceLines) => {
+            lower_x86_64_uniform_capture_grep(multiplier)?
+        }
+        (Architecture::Aarch64, NativeUniformCaptureReducerDomain::WholeHaystack) => {
+            lower_aarch64_uniform_capture_count(multiplier)?
+        }
+        (Architecture::Aarch64, NativeUniformCaptureReducerDomain::ByteSliceLines) => {
+            lower_aarch64_uniform_capture_grep(multiplier)?
+        }
+    };
+
+    let alignment_mask = match target.architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let reducer_offset =
+        count
+            .code
+            .len()
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked RowSearch capture reducer alignment",
+            ))?
+            & !alignment_mask;
+    let final_text_len =
+        reducer_offset
+            .checked_add(reducer.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked RowSearch capture reducer extent",
+            ))?;
+    let mut text = Vec::new();
+    text.try_reserve_exact(final_text_len)
+        .map_err(|_| ObjectError::Allocation("linked RowSearch capture reducer text"))?;
+    push_bytes(&mut text, &count.code)?;
+    match target.architecture {
+        Architecture::X86_64 => text.resize(reducer_offset, 0x90),
+        Architecture::Aarch64 => {
+            while text.len() < reducer_offset {
+                push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    push_bytes(&mut text, &reducer.code)?;
+    for &call in &reducer.count_call_offsets {
+        let call = reducer_offset
+            .checked_add(call)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked RowSearch uniform Count call",
+            ))?;
+        match target.architecture {
+            Architecture::X86_64 => patch_x86_64_local_call(&mut text, call, 0)?,
+            Architecture::Aarch64 => patch_aarch64_local_call(&mut text, call, 0)?,
+        }
+    }
+
+    let mut data = Vec::new();
+    data.try_reserve_exact(64)
+        .map_err(|_| ObjectError::Allocation("linked RowSearch capture reducer data"))?;
+    push_bytes(&mut data, &artifact_identity)?;
+    push_bytes(&mut data, &proof_identity)?;
+
+    let symbols = vec![
+        ModuleSymbol {
+            name: reducer_name.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(LINKED_ROW_UNIFORM_TEXT_SECTION),
+            offset: offset_u64(reducer_offset, "linked RowSearch reducer offset")?,
+            size: u64::try_from(reducer.code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("linked RowSearch reducer size"))?,
+        },
+        ModuleSymbol {
+            name: count_name.clone(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Function,
+            section: Some(LINKED_ROW_UNIFORM_TEXT_SECTION),
+            offset: 0,
+            size: u64::try_from(count.code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("linked RowSearch Count size"))?,
+        },
+        ModuleSymbol {
+            name: owned_string(row_entry, "linked RowSearch entry symbol")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_linked_row_uniform_identity_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(LINKED_ROW_UNIFORM_DATA_SECTION),
+            offset: 0,
+            size: 32,
+        },
+    ];
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(match target.architecture {
+            Architecture::X86_64 => 2,
+            Architecture::Aarch64 => 3,
+        })
+        .map_err(|_| ObjectError::Allocation("linked RowSearch capture relocations"))?;
+    match (target.architecture, count.identity_relocation) {
+        (Architecture::X86_64, Some(NativePreparedIdentityRelocation::X86PcRelative32(offset))) => {
+            relocations.push(ModuleRelocation {
+                section: LINKED_ROW_UNIFORM_TEXT_SECTION,
+                offset: offset_u64(offset, "linked RowSearch Count identity relocation")?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: LINKED_ROW_UNIFORM_IDENTITY_SYMBOL,
+                addend: -4,
+            })
+        }
+        (
+            Architecture::Aarch64,
+            Some(NativePreparedIdentityRelocation::Aarch64Page21PageOff12 { page, page_offset }),
+        ) => relocations.extend([
+            ModuleRelocation {
+                section: LINKED_ROW_UNIFORM_TEXT_SECTION,
+                offset: offset_u64(page, "linked RowSearch Count identity ADRP")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: LINKED_ROW_UNIFORM_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: LINKED_ROW_UNIFORM_TEXT_SECTION,
+                offset: offset_u64(page_offset, "linked RowSearch Count identity ADD")?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: LINKED_ROW_UNIFORM_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+        ]),
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "linked RowSearch Count identity relocation",
+            ));
+        }
+    }
+    relocations.push(ModuleRelocation {
+        section: LINKED_ROW_UNIFORM_TEXT_SECTION,
+        offset: offset_u64(
+            count.prepared_call_offset,
+            "linked RowSearch Count external call",
+        )?,
+        kind: match target.architecture {
+            Architecture::X86_64 => RelocationKind::X86PltRelative32,
+            Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+        },
+        symbol: LINKED_ROW_UNIFORM_ROW_SYMBOL,
+        addend: if target.architecture == Architecture::X86_64 {
+            -4
+        } else {
+            0
+        },
+    });
+
+    let module = CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: text.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.linked-row-uniform-capture",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 16,
+                data: data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: LINKED_ROW_UNIFORM_REDUCER_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_exists_trusted_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    };
+    Ok((module, count_name, reducer_name))
+}
+
 fn native_weighted_capture_module(
     target: Target,
     domain: crate::UniformCaptureReducerDomain,

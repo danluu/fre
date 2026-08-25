@@ -74,6 +74,53 @@ PREPARED_V15_COMPATIBILITY_SURFACE = "Compatibility"
 PREPARED_V15_ROW_SEARCH_SURFACE = "RowSearchOnly"
 PREPARED_V15_SPAN_OPERATION_FLAGS = 1 << 1
 PREPARED_V15_SPAN_SUM_OPERATION_FLAGS = 1 << 2
+LINKED_UNIFORM_CAPTURE_ROW_SEARCH_AGGREGATE = (
+    "Some(LinkedPreparedRowUniformCaptureReducerV1)"
+)
+LINKED_UNIFORM_CAPTURE_ROW_SEARCH_BOUNDARY = (
+    "single-call-native-uniform-capture-row-search-reducer-v1"
+)
+LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE = (
+    "linked-native-uniform-capture-row-search-reducer-v1"
+)
+UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION = 1
+UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION = 1
+UNIFORM_CAPTURE_PARTICIPATION_MAX_WORK = 8_000_000
+UNIFORM_CAPTURE_PARTICIPATION_MAX_STACK_ITEMS = 1_000_000
+UNIFORM_CAPTURE_ROW_SEARCH_RAW_FIELDS = {
+    "prepared_surface",
+    "uniform_capture_link_receipt_schema",
+    "uniform_capture_operation",
+    "uniform_capture_domain",
+    "uniform_capture_multiplier",
+    "uniform_capture_proof_algorithm_version",
+    "uniform_capture_proof_accounting_version",
+    "uniform_capture_minimum_match_bytes",
+    "uniform_capture_participating_user_captures",
+    "uniform_capture_canonical_capture_annotations",
+    "uniform_capture_proof_work",
+    "uniform_capture_proof_peak_stack_items",
+    "uniform_capture_proof_identity_sha256",
+    "uniform_capture_line_terminator",
+    "uniform_capture_row_automaton_sha256",
+    "uniform_capture_row_program_sha256",
+    "uniform_capture_row_object_sha256",
+    "uniform_capture_row_object_bytes",
+    "uniform_capture_row_entry_symbol",
+    "uniform_capture_count_symbol",
+    "uniform_capture_reducer_symbol",
+    "uniform_capture_reducer_code_sha256",
+    "uniform_capture_reducer_object_sha256",
+    "uniform_capture_reducer_object_bytes",
+    "uniform_capture_max_object_bytes",
+    "uniform_capture_external_relocation_count",
+    "uniform_capture_external_relocation_symbol",
+    "uniform_capture_external_relocation_offset",
+    "uniform_capture_external_relocation_kind",
+    "uniform_capture_external_relocation_addend",
+    "uniform_capture_semantic_runtime_calls",
+    "uniform_capture_artifact_identity_sha256",
+}
 ORDERED_MANY_RECEIPT_VERSION = 1
 PREPARED_V15_RUNTIME_SYMBOLS = (
     "fre_aot_regex_runtime_fill_spans_exclusive_v1",
@@ -276,6 +323,10 @@ OPERATION_ROUTE_POLICIES = {
         "whole-operation-native-authenticated",
     ),
     "linked-native-uniform-capture-reducer": OperationRoutePolicy(
+        OperationBoundary.WHOLE_OPERATION,
+        "whole-operation-native-authenticated",
+    ),
+    LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE: OperationRoutePolicy(
         OperationBoundary.WHOLE_OPERATION,
         "whole-operation-native-authenticated",
     ),
@@ -2028,11 +2079,18 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         "program_symbol", "program_len", "entry_symbol", "reducer_symbol", "span_fill_symbol",
         "required_runtime_symbols", "entry_abi", "boundary", "required_comparators",
     } | FROZEN_VALIDATION_FIELDS
-    if set(fields) != expected:
+    row_search_receipt = fields.get("boundary") == (
+        LINKED_UNIFORM_CAPTURE_ROW_SEARCH_BOUNDARY
+    )
+    expected_with_route = (
+        expected | UNIFORM_CAPTURE_ROW_SEARCH_RAW_FIELDS
+        if row_search_receipt else expected
+    )
+    if set(fields) != expected_with_route:
         raise CensusError(
             "runner v2 provenance field closure differs: "
-            f"missing={sorted(expected - set(fields))!r} "
-            f"extra={sorted(set(fields) - expected)!r}"
+            f"missing={sorted(expected_with_route - set(fields))!r} "
+            f"extra={sorted(set(fields) - expected_with_route)!r}"
         )
     if fields["disposition"] != "executed":
         raise CensusError("scalar provenance disposition is not executed")
@@ -2040,7 +2098,7 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         raise CensusError("scalar provenance has an invalid shared ordered-many flag")
     if fields["entry_abi"] not in {
         EXISTS_SEARCH_ENTRY_ABI, SPAN_SEARCH_ENTRY_ABI,
-        PREPARED_SCALAR_REDUCE_ENTRY_ABI,
+        PREPARED_SPAN_SEARCH_ENTRY_ABI, PREPARED_SCALAR_REDUCE_ENTRY_ABI,
     }:
         raise CensusError("scalar provenance has an unknown entry ABI")
     if fields["entry_abi"] == EXISTS_SEARCH_ENTRY_ABI and not (
@@ -2048,6 +2106,12 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
         and fields.get("aggregate_strategy") == "Some(NativeFused)"
     ):
         raise CensusError("Exists search ABI is attached to another scalar route")
+    if fields["entry_abi"] == PREPARED_SPAN_SEARCH_ENTRY_ABI and not (
+        fields.get("model") in UNIFORM_CAPTURE_ADAPTER_MODELS
+        and fields.get("boundary")
+        == LINKED_UNIFORM_CAPTURE_ROW_SEARCH_BOUNDARY
+    ):
+        raise CensusError("prepared RowSearch ABI is attached to another scalar route")
     if fields["entry_abi"] == PREPARED_SCALAR_REDUCE_ENTRY_ABI and not (
         fields.get("aggregate_strategy") == "Some(NativeOrderedNfaFused)"
         and fields.get("model") in {
@@ -2124,6 +2188,7 @@ def validate_v2_provenance(fields: dict[str, str]) -> None:
             {
                 "single-call-native-uniform-capture-reducer",
                 "single-call-native-uniform-capture-helper-backed-reducer",
+                LINKED_UNIFORM_CAPTURE_ROW_SEARCH_BOUNDARY,
             }
             if fields["model"] in UNIFORM_CAPTURE_ADAPTER_MODELS
             else {"runtime-klv-warmup-schedule"}
@@ -2413,22 +2478,391 @@ def scalar_direct_native_grep_proof(fields: dict[str, str]) -> None:
         raise CensusError("scalar direct native grep symbol identities disagree")
 
 
+def uniform_capture_target_identity(target: str) -> bytes:
+    """Return the compiler's closed architecture/OS/ABI identity tuple."""
+    architecture = target_architecture(target)
+    if target.endswith("-linux"):
+        operating_system = "linux"
+    elif target.endswith("-macos"):
+        operating_system = "macos"
+    else:
+        raise CensusError(
+            "linked uniform-capture target has an unsupported operating system"
+        )
+    return bytes((
+        {"x86_64": 1, "aarch64": 2}[architecture],
+        {"linux": 1, "macos": 2}[operating_system],
+        {"x86_64": 1, "aarch64": 2}[architecture],
+    ))
+
+
+def linked_uniform_capture_proof_identity(proof: dict[str, object]) -> str:
+    """Recompute the frozen same-HIR uniform-participation proof binding."""
+    digest = hashlib.sha256()
+    digest.update(b"fre-aot-regex/uniform-capture-proof-binding/v1\0")
+    digest.update(int(proof["proof_algorithm_version"]).to_bytes(4, "little"))
+    digest.update(int(proof["proof_accounting_version"]).to_bytes(4, "little"))
+    digest.update(bytes.fromhex(str(proof["row_program_sha256"])))
+    for name in (
+        "minimum_match_bytes", "participating_user_captures", "multiplier",
+        "canonical_capture_annotations",
+    ):
+        digest.update(int(proof[name]).to_bytes(8, "little"))
+    digest.update(int(proof["proof_work"]).to_bytes(8, "little"))
+    digest.update(int(proof["proof_peak_stack_items"]).to_bytes(8, "little"))
+    return digest.hexdigest()
+
+
+def linked_uniform_capture_symbols(
+    proof: dict[str, object], target: str, feature_bits: str,
+) -> tuple[str, str]:
+    """Recompute the internal Count and public reducer symbol identities."""
+    operation = proof["operation"]
+    domain_tag = {"whole-haystack": 1, "byte-slice-lines-lf-crlf": 2}.get(
+        proof["domain"]
+    )
+    reducer_prefix = {
+        "count-captures": "fre_aot_regex_count_captures_exclusive_v1_",
+        "grep-captures": "fre_aot_regex_grep_captures_exclusive_v1_",
+    }.get(operation)
+    if domain_tag is None or reducer_prefix is None:
+        raise CensusError("linked uniform-capture operation/domain is unknown")
+    if re.fullmatch(r"[0-9a-f]{16}", feature_bits) is None:
+        raise CensusError("linked uniform-capture feature bits are not canonical")
+    target_identity = uniform_capture_target_identity(target)
+    row_identity = bytes.fromhex(str(proof["row_program_sha256"]))
+    row_entry = str(proof["row_entry_symbol"])
+
+    count = hashlib.sha256()
+    count.update(b"fre-aot-regex/linked-row-uniform-count/v1\0")
+    count.update(bytes((domain_tag,)))
+    count.update(row_identity)
+    count.update(row_entry.encode("ascii", "strict"))
+    count.update(target_identity)
+    count.update(int(feature_bits, 16).to_bytes(8, "little"))
+    count_symbol = f"fre_aot_regex_count_exclusive_v1_{count.hexdigest()}"
+
+    reducer = hashlib.sha256()
+    reducer.update(b"fre-aot-regex/linked-row-uniform-reducer/v1\0")
+    reducer.update(bytes((domain_tag,)))
+    reducer.update(int(proof["multiplier"]).to_bytes(8, "little"))
+    reducer.update(row_identity)
+    reducer.update(bytes.fromhex(str(proof["proof_identity_sha256"])))
+    reducer.update(count_symbol.encode("ascii", "strict"))
+    reducer.update(row_entry.encode("ascii", "strict"))
+    reducer.update(target_identity)
+    reducer.update(int(feature_bits, 16).to_bytes(8, "little"))
+    return count_symbol, f"{reducer_prefix}{reducer.hexdigest()}"
+
+
+def linked_uniform_capture_artifact_identity(
+    proof: dict[str, object], target: str, feature_bits: str,
+) -> str:
+    """Recompute the census-visible identity of the closed two-object receipt."""
+    operation_tag = {"count-captures": 1, "grep-captures": 2}.get(
+        proof["operation"]
+    )
+    domain_tag = {"whole-haystack": 1, "byte-slice-lines-lf-crlf": 2}.get(
+        proof["domain"]
+    )
+    if operation_tag is None or domain_tag is None:
+        raise CensusError("linked uniform-capture artifact domain is unknown")
+    relocation = proof["external_relocation"]
+    if not isinstance(relocation, dict):
+        raise CensusError("linked uniform-capture relocation is not an object")
+
+    digest = hashlib.sha256()
+    digest.update(
+        b"fre-aot-regex/linked-prepared-row-uniform-capture-artifact/v1\0"
+    )
+    digest.update(int(proof["link_receipt_schema"]).to_bytes(4, "little"))
+    digest.update(bytes((operation_tag, domain_tag)))
+    digest.update(int(proof["multiplier"]).to_bytes(8, "little"))
+    digest.update(bytes.fromhex(str(proof["proof_identity_sha256"])))
+    digest.update(uniform_capture_target_identity(target) + b"\0")
+    digest.update(int(feature_bits, 16).to_bytes(8, "little"))
+    digest.update(bytes((int(proof["line_terminator"]),)))
+    for name in (
+        "row_automaton_sha256", "row_program_sha256", "row_object_sha256",
+    ):
+        digest.update(bytes.fromhex(str(proof[name])))
+    digest.update(int(proof["row_object_bytes"]).to_bytes(8, "little"))
+    for name in ("row_entry_symbol", "count_symbol", "reducer_symbol"):
+        encoded = str(proof[name]).encode("ascii", "strict")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    digest.update(bytes.fromhex(str(proof["reducer_code_sha256"])))
+    digest.update(bytes.fromhex(str(proof["reducer_object_sha256"])))
+    digest.update(int(proof["reducer_object_bytes"]).to_bytes(8, "little"))
+    digest.update(int(proof["max_object_bytes"]).to_bytes(8, "little"))
+    digest.update(int(relocation["offset"]).to_bytes(8, "little"))
+    relocation_kind_tag = {1: 2, 4: 5}.get(int(relocation["kind"]))
+    if relocation_kind_tag is None:
+        raise CensusError("linked uniform-capture relocation kind is unknown")
+    digest.update(bytes((relocation_kind_tag,)))
+    digest.update(int(relocation["addend"]).to_bytes(8, "little", signed=True))
+    digest.update(int(proof["semantic_runtime_calls"]).to_bytes(8, "little"))
+    return digest.hexdigest()
+
+
+def linked_uniform_capture_row_search_proof_from_provenance(
+    fields: dict[str, str],
+) -> dict[str, object]:
+    """Authenticate the raw strict-RowSearch two-object capture receipt."""
+    model = fields.get("model")
+    operation, domain = {
+        "count-captures": ("count-captures", "whole-haystack"),
+        "grep-captures": ("grep-captures", "byte-slice-lines-lf-crlf"),
+    }.get(model, (None, None))
+    if operation is None or fields.get("uniform_capture_operation") != operation or (
+        fields.get("uniform_capture_domain") != domain
+    ):
+        raise CensusError("linked uniform-capture operation/domain differs")
+    if (
+        fields.get("engine") != "OrderedNfa"
+        or fields.get("entry_abi") != PREPARED_SPAN_SEARCH_ENTRY_ABI
+        or fields.get("prepared_surface") != PREPARED_V15_ROW_SEARCH_SURFACE
+        or fields.get("aggregate_strategy")
+        != LINKED_UNIFORM_CAPTURE_ROW_SEARCH_AGGREGATE
+        or fields.get("boundary") != LINKED_UNIFORM_CAPTURE_ROW_SEARCH_BOUNDARY
+        or fields.get("prepare_config_version") != str(PREPARED_V15_CONFIG_VERSION)
+        or fields.get("required_prepare_capabilities")
+        != f"{PREPARED_V15_CAPABILITY:016x}"
+        or fields.get("prepared_bulk_strategy") != "None"
+        or fields.get("span_fill_symbol") != ""
+        or fields.get("required_runtime_symbols") != ""
+        or fields.get("max_handle_bytes") != str(PREPARED_V15_MAX_HANDLE_BYTES)
+        or fields.get("max_ordered_nfa_scratch_bytes")
+        != str(PREPARED_V15_MAX_SCRATCH_BYTES)
+        or fields.get("max_ordered_nfa_setup_work")
+        != str(PREPARED_V15_MAX_SETUP_WORK)
+        or fields.get("max_start_filter_setup_work") != "100000000"
+        or fields.get("max_grep_count_workspace_bytes") != "67108864"
+    ):
+        raise CensusError("linked uniform-capture RowSearch route differs")
+    proof: dict[str, object] = {
+        "route_variant": "ordered-v15-row-search-v1",
+        "required_prepare_capabilities": PREPARED_V15_CAPABILITY,
+        "prepare_config_version": PREPARED_V15_CONFIG_VERSION,
+        "prepare_operation_flags": PREPARED_V15_SPAN_OPERATION_FLAGS,
+        "max_handle_bytes": PREPARED_V15_MAX_HANDLE_BYTES,
+        "max_scratch_bytes": PREPARED_V15_MAX_SCRATCH_BYTES,
+        "max_setup_work": PREPARED_V15_MAX_SETUP_WORK,
+        "runtime_program_len": parse_canonical_decimal(
+            fields.get("program_len"), "linked uniform-capture program length",
+            1, MAX_SERIALIZED_PROGRAM_BYTES,
+        ),
+        "entry_identity_sha256": symbol_identity_suffix(
+            fields["entry_symbol"], NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL,
+            "linked uniform-capture RowSearch entry",
+        ),
+        "program_identity_sha256": symbol_identity_suffix(
+            fields["program_symbol"], NATIVE_RUNTIME_PROGRAM_SYMBOL,
+            "linked uniform-capture runtime program",
+        ),
+        "reducer_identity_sha256": symbol_identity_suffix(
+            fields["reducer_symbol"],
+            (NATIVE_COUNT_CAPTURES_ENTRY_SYMBOL if model == "count-captures"
+             else NATIVE_GREP_CAPTURES_ENTRY_SYMBOL),
+            "linked uniform-capture reducer",
+        ),
+        "span_fill_identity_sha256": None,
+        "prepared_surface": fields.get("prepared_surface"),
+        "link_receipt_schema": parse_canonical_decimal(
+            fields.get("uniform_capture_link_receipt_schema"),
+            "linked uniform-capture receipt schema", 1, 1,
+        ),
+        "operation": operation,
+        "domain": domain,
+        "multiplier": parse_canonical_decimal(
+            fields.get("uniform_capture_multiplier"),
+            "linked uniform-capture multiplier", 1, (1 << 64) - 1,
+        ),
+        "proof_algorithm_version": parse_canonical_decimal(
+            fields.get("uniform_capture_proof_algorithm_version"),
+            "linked uniform-capture proof algorithm version",
+            UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION,
+            UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION,
+        ),
+        "proof_accounting_version": parse_canonical_decimal(
+            fields.get("uniform_capture_proof_accounting_version"),
+            "linked uniform-capture proof accounting version",
+            UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION,
+            UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION,
+        ),
+        "minimum_match_bytes": parse_canonical_decimal(
+            fields.get("uniform_capture_minimum_match_bytes"),
+            "linked uniform-capture minimum match bytes", 1,
+        ),
+        "participating_user_captures": parse_canonical_decimal(
+            fields.get("uniform_capture_participating_user_captures"),
+            "linked uniform-capture participating user captures", 0,
+        ),
+        "canonical_capture_annotations": parse_canonical_decimal(
+            fields.get("uniform_capture_canonical_capture_annotations"),
+            "linked uniform-capture canonical capture annotations", 0,
+        ),
+        "proof_work": parse_canonical_decimal(
+            fields.get("uniform_capture_proof_work"),
+            "linked uniform-capture proof work", 1,
+            UNIFORM_CAPTURE_PARTICIPATION_MAX_WORK,
+        ),
+        "proof_peak_stack_items": parse_canonical_decimal(
+            fields.get("uniform_capture_proof_peak_stack_items"),
+            "linked uniform-capture proof peak stack items", 1,
+            UNIFORM_CAPTURE_PARTICIPATION_MAX_STACK_ITEMS,
+        ),
+        "proof_identity_sha256": require_nonzero_hex64(
+            fields.get("uniform_capture_proof_identity_sha256"),
+            "linked uniform-capture proof identity",
+        ),
+        "line_terminator": parse_canonical_decimal(
+            fields.get("uniform_capture_line_terminator"),
+            "linked uniform-capture line terminator", 10, 10,
+        ),
+        "row_automaton_sha256": require_nonzero_hex64(
+            fields.get("uniform_capture_row_automaton_sha256"),
+            "linked uniform-capture row automaton digest",
+        ),
+        "row_program_sha256": require_nonzero_hex64(
+            fields.get("uniform_capture_row_program_sha256"),
+            "linked uniform-capture row program digest",
+        ),
+        "row_object_sha256": require_nonzero_hex64(
+            fields.get("uniform_capture_row_object_sha256"),
+            "linked uniform-capture row object digest",
+        ),
+        "row_object_bytes": parse_canonical_decimal(
+            fields.get("uniform_capture_row_object_bytes"),
+            "linked uniform-capture row object bytes", 1,
+            MAX_NATIVE_ROW_OBJECT_BYTES,
+        ),
+        "row_entry_symbol": fields.get("uniform_capture_row_entry_symbol"),
+        "count_symbol": fields.get("uniform_capture_count_symbol"),
+        "reducer_symbol": fields.get("uniform_capture_reducer_symbol"),
+        "reducer_code_sha256": require_nonzero_hex64(
+            fields.get("uniform_capture_reducer_code_sha256"),
+            "linked uniform-capture reducer code digest",
+        ),
+        "reducer_object_sha256": require_nonzero_hex64(
+            fields.get("uniform_capture_reducer_object_sha256"),
+            "linked uniform-capture reducer object digest",
+        ),
+        "reducer_object_bytes": parse_canonical_decimal(
+            fields.get("uniform_capture_reducer_object_bytes"),
+            "linked uniform-capture reducer object bytes", 1,
+            MAX_NATIVE_ROW_OBJECT_BYTES,
+        ),
+        "max_object_bytes": parse_canonical_decimal(
+            fields.get("uniform_capture_max_object_bytes"),
+            "linked uniform-capture maximum object bytes", 1,
+            MAX_NATIVE_ROW_OBJECT_BYTES,
+        ),
+        "semantic_runtime_calls": parse_canonical_decimal(
+            fields.get("uniform_capture_semantic_runtime_calls"),
+            "linked uniform-capture semantic runtime calls", 0, 0,
+        ),
+        "artifact_identity_sha256": require_nonzero_hex64(
+            fields.get("uniform_capture_artifact_identity_sha256"),
+            "linked uniform-capture artifact identity",
+        ),
+    }
+    relocation_count = parse_canonical_decimal(
+        fields.get("uniform_capture_external_relocation_count"),
+        "linked uniform-capture external relocation count", 1, 1,
+    )
+    del relocation_count
+    raw_relocation_kind = fields.get("uniform_capture_external_relocation_kind")
+    relocation_kind = {
+        "X86PltRelative32": 1,
+        "Aarch64Branch26": 4,
+    }.get(raw_relocation_kind)
+    if relocation_kind is None:
+        raise CensusError("linked uniform-capture relocation kind is unknown")
+    relocation = {
+        "symbol": fields.get("uniform_capture_external_relocation_symbol"),
+        "offset": parse_canonical_decimal(
+            fields.get("uniform_capture_external_relocation_offset"),
+            "linked uniform-capture external relocation offset", 0,
+            int(proof["reducer_object_bytes"]) - 1,
+        ),
+        "kind": relocation_kind,
+        "addend": parse_canonical_signed_decimal(
+            fields.get("uniform_capture_external_relocation_addend"),
+            "linked uniform-capture external relocation addend",
+        ),
+    }
+    proof["external_relocation"] = relocation
+
+    expected_kind = 1 if target_architecture(fields["target"]) == "x86_64" else 4
+    expected_addend = -4 if expected_kind == 1 else 0
+    expected_raw_kind = (
+        "X86PltRelative32" if expected_kind == 1 else "Aarch64Branch26"
+    )
+    expected_count, expected_reducer = linked_uniform_capture_symbols(
+        proof, fields["target"], fields["feature_bits"]
+    )
+    if (
+        fields.get("prepared_surface") != PREPARED_V15_ROW_SEARCH_SURFACE
+        or proof["multiplier"] != proof["participating_user_captures"] + 1
+        or proof["proof_identity_sha256"]
+        != linked_uniform_capture_proof_identity(proof)
+        or proof["row_program_sha256"] != fields.get("program_sha256")
+        or proof["row_program_sha256"] != proof["entry_identity_sha256"]
+        or proof["row_program_sha256"] != proof["program_identity_sha256"]
+        or proof["row_object_sha256"] != fields.get("object_sha256")
+        or proof["row_entry_symbol"] != fields.get("entry_symbol")
+        or proof["count_symbol"] != expected_count
+        or proof["reducer_symbol"] != expected_reducer
+        or proof["reducer_symbol"] != fields.get("reducer_symbol")
+        or len({
+            fields.get("entry_symbol"), fields.get("program_symbol"),
+            proof["count_symbol"], proof["reducer_symbol"],
+        }) != 4
+        or proof["row_object_bytes"] > proof["max_object_bytes"]
+        or proof["reducer_object_bytes"] > proof["max_object_bytes"]
+        or relocation["symbol"] != proof["row_entry_symbol"]
+        or raw_relocation_kind != expected_raw_kind
+        or relocation["kind"] != expected_kind
+        or relocation["addend"] != expected_addend
+        or proof["artifact_identity_sha256"]
+        != linked_uniform_capture_artifact_identity(
+            proof, fields["target"], fields["feature_bits"]
+        )
+    ):
+        raise CensusError("linked uniform-capture two-object receipt differs")
+    return proof
+
+
 def scalar_native_uniform_capture_proof(
     fields: dict[str, str],
 ) -> dict[str, object]:
     """Authenticate the single-call uniform-capture reducer surface."""
     model = fields.get("model")
+    entry_abi = fields.get("entry_abi")
+    row_search = entry_abi == PREPARED_SPAN_SEARCH_ENTRY_ABI
     if model == "count-captures":
-        adapter = "general-aot-native-uniform-capture-count-reducer-v1"
+        adapter = (
+            "general-aot-native-uniform-capture-count-row-search-reducer-v1"
+            if row_search
+            else "general-aot-native-uniform-capture-count-reducer-v1"
+        )
         reducer_pattern = NATIVE_COUNT_CAPTURES_ENTRY_SYMBOL
         grep_iteration = "not-applicable"
     elif model == "grep-captures":
-        adapter = "general-aot-native-uniform-capture-grep-reducer-v1"
+        adapter = (
+            "general-aot-native-uniform-capture-grep-row-search-reducer-v1"
+            if row_search
+            else "general-aot-native-uniform-capture-grep-reducer-v1"
+        )
         reducer_pattern = NATIVE_GREP_CAPTURES_ENTRY_SYMBOL
-        grep_iteration = "linked-native-uniform-capture-reducer-v1"
+        grep_iteration = (
+            LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE
+            if row_search
+            else "linked-native-uniform-capture-reducer-v1"
+        )
     else:
         raise CensusError("uniform-capture reducer has a non-capture model")
-    entry_abi = fields.get("entry_abi")
     operation_only = entry_abi == PREPARED_SCALAR_REDUCE_ENTRY_ABI
     if (
         fields.get("adapter") != adapter
@@ -2438,6 +2872,8 @@ def scalar_native_uniform_capture_proof(
         != f"{PREPARED_V15_SPAN_OPERATION_FLAGS:016x}"
     ):
         raise CensusError("uniform-capture reducer operation surface differs")
+    if row_search:
+        return linked_uniform_capture_row_search_proof_from_provenance(fields)
     entry = fields["entry_symbol"]
     program = fields["program_symbol"]
     reducer = fields["reducer_symbol"]
@@ -6131,8 +6567,11 @@ def selected_operation_entries(provenance: dict[str, str]) -> tuple[list[str], s
             return entries, "linked-uniform-capture-row-adapter-loop"
         raise CensusError(f"unknown composite operation route for model {model!r}")
     if model in UNIFORM_CAPTURE_ADAPTER_MODELS:
-        scalar_native_uniform_capture_proof(provenance)
+        proof = scalar_native_uniform_capture_proof(provenance)
         route = (
+            LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE
+            if proof["route_variant"] == "ordered-v15-row-search-v1"
+            else
             "linked-native-uniform-capture-reducer"
             if provenance["boundary"] == "single-call-native-uniform-capture-reducer"
             else "linked-native-uniform-capture-helper-backed-reducer"
@@ -6757,7 +7196,7 @@ def operation_route_from_provenance_record(
         route = "linked-native-grep-count-reducer"
         expected_symbol = NATIVE_GREP_COUNT_ENTRY_SYMBOL
     elif model in UNIFORM_CAPTURE_ADAPTER_MODELS:
-        validate_normalized_uniform_capture_reducer(
+        uniform_proof = validate_normalized_uniform_capture_reducer(
             provenance.get("uniform_capture"),
             provenance,
             "normalized uniform-capture provenance",
@@ -6770,6 +7209,9 @@ def operation_route_from_provenance_record(
         )
         entries = [reducer]
         route = (
+            LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE
+            if uniform_proof["route_variant"] == "ordered-v15-row-search-v1"
+            else
             "linked-native-uniform-capture-reducer"
             if provenance["boundary"] == "single-call-native-uniform-capture-reducer"
             else "linked-native-uniform-capture-helper-backed-reducer"
@@ -7013,6 +7455,10 @@ def identity_defined_symbols_from_provenance(
         provenance.get("kind") == "scalar-v2"
         and provenance.get("model") in UNIFORM_CAPTURE_ADAPTER_MODELS
     ):
+        validate_normalized_uniform_capture_reducer(
+            provenance.get("uniform_capture"), provenance,
+            "normalized uniform-capture identity inventory",
+        )
         symbols = [provenance["entry_symbol"], provenance["program_symbol"]]
         if provenance.get("span_fill_symbol"):
             symbols.append(provenance["span_fill_symbol"])
@@ -7282,6 +7728,17 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
         }
         else [component["object_sha256"] for component in normalized_provenance["components"]]
     )
+    linked_uniform_capture = normalized_provenance.get("uniform_capture")
+    if not (
+        isinstance(linked_uniform_capture, dict)
+        and linked_uniform_capture.get("route_variant")
+        == "ordered-v15-row-search-v1"
+    ):
+        linked_uniform_capture = None
+    if linked_uniform_capture is not None:
+        expected_object_hashes.append(
+            linked_uniform_capture["reducer_object_sha256"]
+        )
     if normalized_provenance.get("composite_kind") == "regex-redux-fixed-v1":
         expected_object_hashes.append(normalized_provenance["object_sha256"])
     if normalized_provenance["kind"] == "weighted-capture-reducer-v6":
@@ -7332,6 +7789,21 @@ def qualify_job(args: argparse.Namespace) -> dict[str, object]:
             raise CensusError(
                 "single-capture reducer object file differs from its byte receipt"
             )
+    if linked_uniform_capture is not None and any(
+        len(artifact["objects"]) != 2
+        or artifact["objects"][0]["bytes"]
+        != linked_uniform_capture["row_object_bytes"]
+        or artifact["objects"][1]["bytes"]
+        != linked_uniform_capture["reducer_object_bytes"]
+        or artifact["objects"][0]["bytes"]
+        > linked_uniform_capture["max_object_bytes"]
+        or artifact["objects"][1]["bytes"]
+        > linked_uniform_capture["max_object_bytes"]
+        for artifact in (primary_hashes, replica_hashes)
+    ):
+        raise CensusError(
+            "linked uniform-capture object files differ from byte receipts"
+        )
     if normalized_provenance["kind"] == "weighted-capture-reducer-v6":
         component_count = len(normalized_provenance["components"])
         expected_row_bytes = normalized_provenance["row_total_object_bytes"]
@@ -8193,24 +8665,201 @@ def validate_normalized_prepared_grep_v15(
         raise CensusError(f"{context} scalar prepared V15 topology differs")
 
 
+def validate_normalized_linked_uniform_capture_row_search(
+    proof: dict[str, object], provenance: dict[str, object], context: str,
+) -> None:
+    """Re-authenticate the normalized strict RowSearch two-object receipt."""
+    integer_bounds = {
+        "link_receipt_schema": (1, 1),
+        "multiplier": (1, (1 << 64) - 1),
+        "proof_algorithm_version": (
+            UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION,
+            UNIFORM_CAPTURE_PARTICIPATION_ALGORITHM_VERSION,
+        ),
+        "proof_accounting_version": (
+            UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION,
+            UNIFORM_CAPTURE_PARTICIPATION_ACCOUNTING_VERSION,
+        ),
+        "minimum_match_bytes": (1, (1 << 64) - 1),
+        "participating_user_captures": (0, (1 << 64) - 1),
+        "canonical_capture_annotations": (0, (1 << 64) - 1),
+        "proof_work": (1, UNIFORM_CAPTURE_PARTICIPATION_MAX_WORK),
+        "proof_peak_stack_items": (
+            1, UNIFORM_CAPTURE_PARTICIPATION_MAX_STACK_ITEMS,
+        ),
+        "line_terminator": (10, 10),
+        "row_object_bytes": (1, MAX_NATIVE_ROW_OBJECT_BYTES),
+        "reducer_object_bytes": (1, MAX_NATIVE_ROW_OBJECT_BYTES),
+        "max_object_bytes": (1, MAX_NATIVE_ROW_OBJECT_BYTES),
+        "semantic_runtime_calls": (0, 0),
+    }
+    for name, (minimum, maximum) in integer_bounds.items():
+        value = proof.get(name)
+        if (
+            not isinstance(value, int) or isinstance(value, bool)
+            or not minimum <= value <= maximum
+        ):
+            raise CensusError(f"{context} {name} is outside its closed range")
+    for name in (
+        "proof_identity_sha256", "row_automaton_sha256", "row_program_sha256",
+        "row_object_sha256", "reducer_code_sha256", "reducer_object_sha256",
+        "artifact_identity_sha256",
+    ):
+        require_nonzero_hex64(proof.get(name), f"{context} {name}")
+
+    relocation = proof.get("external_relocation")
+    if not isinstance(relocation, dict):
+        raise CensusError(f"{context} external relocation is not an object")
+    require_exact_keys(
+        relocation, {"symbol", "offset", "kind", "addend"},
+        f"{context} external relocation",
+    )
+    target = provenance.get("target")
+    feature_bits = provenance.get("feature_bits")
+    if not isinstance(target, str) or not isinstance(feature_bits, str):
+        raise CensusError(f"{context} target identity is malformed")
+    expected_kind = 1 if target_architecture(target) == "x86_64" else 4
+    expected_addend = -4 if expected_kind == 1 else 0
+    reducer_object_bytes = proof["reducer_object_bytes"]
+    if (
+        not isinstance(relocation.get("symbol"), str)
+        or not isinstance(relocation.get("offset"), int)
+        or isinstance(relocation.get("offset"), bool)
+        or not 0 <= relocation["offset"] < reducer_object_bytes
+        or not isinstance(relocation.get("kind"), int)
+        or isinstance(relocation.get("kind"), bool)
+        or relocation["kind"] != expected_kind
+        or not isinstance(relocation.get("addend"), int)
+        or isinstance(relocation.get("addend"), bool)
+        or relocation["addend"] != expected_addend
+    ):
+        raise CensusError(f"{context} external RowSearch relocation differs")
+
+    model = provenance.get("model")
+    expected_operation, expected_domain, expected_adapter, reducer_pattern = {
+        "count-captures": (
+            "count-captures", "whole-haystack",
+            "general-aot-native-uniform-capture-count-row-search-reducer-v1",
+            NATIVE_COUNT_CAPTURES_ENTRY_SYMBOL,
+        ),
+        "grep-captures": (
+            "grep-captures", "byte-slice-lines-lf-crlf",
+            "general-aot-native-uniform-capture-grep-row-search-reducer-v1",
+            NATIVE_GREP_CAPTURES_ENTRY_SYMBOL,
+        ),
+    }.get(model, (None, None, None, None))
+    entry = provenance.get("entry_symbol")
+    program = provenance.get("program_symbol")
+    reducer = provenance.get("reducer_symbol")
+    count = proof.get("count_symbol")
+    row_entry = proof.get("row_entry_symbol")
+    if not all(isinstance(value, str) for value in (
+        entry, program, reducer, count, row_entry,
+    )):
+        raise CensusError(f"{context} linked symbols are malformed")
+    entry_identity = symbol_identity_suffix(
+        entry, NATIVE_SEARCH_EXCLUSIVE_ENTRY_SYMBOL, context
+    )
+    program_identity = symbol_identity_suffix(
+        program, NATIVE_RUNTIME_PROGRAM_SYMBOL, context
+    )
+    reducer_identity = symbol_identity_suffix(reducer, reducer_pattern, context)
+    expected_count, expected_reducer = linked_uniform_capture_symbols(
+        proof, target, feature_bits
+    )
+    expected_grep_iteration = (
+        "not-applicable" if model == "count-captures"
+        else LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE
+    )
+    if (
+        expected_operation is None
+        or proof.get("prepared_surface") != PREPARED_V15_ROW_SEARCH_SURFACE
+        or proof.get("operation") != expected_operation
+        or proof.get("domain") != expected_domain
+        or provenance.get("adapter") != expected_adapter
+        or provenance.get("engine") != "OrderedNfa"
+        or provenance.get("entry_abi") != PREPARED_SPAN_SEARCH_ENTRY_ABI
+        or provenance.get("aggregate_strategy")
+        != LINKED_UNIFORM_CAPTURE_ROW_SEARCH_AGGREGATE
+        or provenance.get("boundary")
+        != LINKED_UNIFORM_CAPTURE_ROW_SEARCH_BOUNDARY
+        or provenance.get("prepared_bulk_strategy") != "None"
+        or provenance.get("span_iteration_strategy") != "not-applicable"
+        or provenance.get("grep_iteration_strategy") != expected_grep_iteration
+        or provenance.get("required_runtime_symbols") != []
+        or provenance.get("span_fill_symbol") != ""
+        or proof.get("required_prepare_capabilities") != PREPARED_V15_CAPABILITY
+        or proof.get("prepare_config_version") != PREPARED_V15_CONFIG_VERSION
+        or proof.get("prepare_operation_flags")
+        != PREPARED_V15_SPAN_OPERATION_FLAGS
+        or proof.get("max_handle_bytes") != PREPARED_V15_MAX_HANDLE_BYTES
+        or proof.get("max_scratch_bytes") != PREPARED_V15_MAX_SCRATCH_BYTES
+        or proof.get("max_setup_work") != PREPARED_V15_MAX_SETUP_WORK
+        or not isinstance(proof.get("runtime_program_len"), int)
+        or isinstance(proof.get("runtime_program_len"), bool)
+        or not 1 <= proof["runtime_program_len"] <= MAX_SERIALIZED_PROGRAM_BYTES
+        or proof["multiplier"] != proof["participating_user_captures"] + 1
+        or proof["proof_identity_sha256"]
+        != linked_uniform_capture_proof_identity(proof)
+        or proof.get("row_program_sha256") != provenance.get("program_sha256")
+        or proof.get("row_program_sha256") != entry_identity
+        or proof.get("row_program_sha256") != program_identity
+        or proof.get("row_object_sha256") != provenance.get("object_sha256")
+        or row_entry != entry
+        or relocation["symbol"] != row_entry
+        or count != expected_count
+        or reducer != expected_reducer
+        or proof.get("reducer_symbol") != reducer
+        or proof.get("entry_identity_sha256") != entry_identity
+        or proof.get("program_identity_sha256") != program_identity
+        or proof.get("reducer_identity_sha256") != reducer_identity
+        or proof.get("span_fill_identity_sha256") is not None
+        or len({entry, program, count, reducer}) != 4
+        or proof["row_object_bytes"] > proof["max_object_bytes"]
+        or proof["reducer_object_bytes"] > proof["max_object_bytes"]
+        or proof.get("artifact_identity_sha256")
+        != linked_uniform_capture_artifact_identity(proof, target, feature_bits)
+    ):
+        raise CensusError(f"{context} linked RowSearch route differs")
+
+
 def validate_normalized_uniform_capture_reducer(
     proof: object, provenance: dict[str, object], context: str
-) -> None:
+) -> dict[str, object]:
     """Close the normalized single-call uniform-capture reducer receipt."""
     if not isinstance(proof, dict):
         raise CensusError(f"{context} uniform-capture proof is not an object")
+    base_keys = {
+        "route_variant", "required_prepare_capabilities",
+        "prepare_config_version", "prepare_operation_flags",
+        "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
+        "runtime_program_len", "entry_identity_sha256",
+        "program_identity_sha256", "reducer_identity_sha256",
+        "span_fill_identity_sha256",
+    }
+    row_search_keys = {
+        "prepared_surface", "link_receipt_schema", "operation", "domain",
+        "multiplier", "proof_algorithm_version", "proof_accounting_version",
+        "minimum_match_bytes", "participating_user_captures",
+        "canonical_capture_annotations", "proof_work",
+        "proof_peak_stack_items", "proof_identity_sha256", "line_terminator",
+        "row_automaton_sha256", "row_program_sha256", "row_object_sha256",
+        "row_object_bytes", "row_entry_symbol", "count_symbol",
+        "reducer_symbol", "reducer_code_sha256", "reducer_object_sha256",
+        "reducer_object_bytes", "max_object_bytes", "external_relocation",
+        "semantic_runtime_calls", "artifact_identity_sha256",
+    }
+    row_search = proof.get("route_variant") == "ordered-v15-row-search-v1"
     require_exact_keys(
         proof,
-        {
-            "route_variant", "required_prepare_capabilities",
-            "prepare_config_version", "prepare_operation_flags",
-            "max_handle_bytes", "max_scratch_bytes", "max_setup_work",
-            "runtime_program_len", "entry_identity_sha256",
-            "program_identity_sha256", "reducer_identity_sha256",
-            "span_fill_identity_sha256",
-        },
+        base_keys | (row_search_keys if row_search else set()),
         f"{context} uniform-capture proof",
     )
+    if row_search:
+        validate_normalized_linked_uniform_capture_row_search(
+            proof, provenance, context
+        )
+        return proof
     model = provenance.get("model")
     if model == "count-captures":
         adapter = "general-aot-native-uniform-capture-count-reducer-v1"
@@ -8332,6 +8981,7 @@ def validate_normalized_uniform_capture_reducer(
         or (operation_only and reducer_identity == entry_identity)
     ):
         raise CensusError(f"{context} uniform-capture route differs")
+    return proof
 
 
 def validate_normalized_shared_ordered_many(
@@ -9281,7 +9931,7 @@ def validate_provenance_record(provenance: object, context: str) -> None:
     if provenance.get("schema") == "fre.aot.rebar-runner.v2":
         if provenance.get("entry_abi") not in {
             EXISTS_SEARCH_ENTRY_ABI, SPAN_SEARCH_ENTRY_ABI,
-            PREPARED_SCALAR_REDUCE_ENTRY_ABI,
+            PREPARED_SPAN_SEARCH_ENTRY_ABI, PREPARED_SCALAR_REDUCE_ENTRY_ABI,
         }:
             raise CensusError(f"{context} scalar entry ABI differs")
         if provenance.get("entry_abi") == EXISTS_SEARCH_ENTRY_ABI and not (
@@ -9289,6 +9939,14 @@ def validate_provenance_record(provenance: object, context: str) -> None:
             and provenance.get("aggregate_strategy") == "Some(NativeFused)"
         ):
             raise CensusError(f"{context} Exists search ABI is attached to another route")
+        if provenance.get("entry_abi") == PREPARED_SPAN_SEARCH_ENTRY_ABI and not (
+            provenance.get("model") in UNIFORM_CAPTURE_ADAPTER_MODELS
+            and provenance.get("boundary")
+            == LINKED_UNIFORM_CAPTURE_ROW_SEARCH_BOUNDARY
+        ):
+            raise CensusError(
+                f"{context} prepared RowSearch ABI is attached to another route"
+            )
         if provenance.get("entry_abi") == PREPARED_SCALAR_REDUCE_ENTRY_ABI and not (
             provenance.get("aggregate_strategy") == "Some(NativeOrderedNfaFused)"
             and provenance.get("model") in {
@@ -10275,6 +10933,17 @@ def validate_receipt(
             }
             else [component["object_sha256"] for component in provenance["components"]]
         )
+        linked_uniform_capture = provenance.get("uniform_capture")
+        if not (
+            isinstance(linked_uniform_capture, dict)
+            and linked_uniform_capture.get("route_variant")
+            == "ordered-v15-row-search-v1"
+        ):
+            linked_uniform_capture = None
+        if linked_uniform_capture is not None:
+            expected_object_hashes.append(
+                linked_uniform_capture["reducer_object_sha256"]
+            )
         if provenance.get("composite_kind") == "regex-redux-fixed-v1":
             expected_object_hashes.append(provenance["object_sha256"])
         if provenance["kind"] == "weighted-capture-reducer-v6":
@@ -10319,6 +10988,20 @@ def validate_receipt(
             ):
                 raise CensusError(
                     f"{label} single-capture reducer object byte total differs"
+                )
+            if linked_uniform_capture is not None and (
+                len(artifact["objects"]) != 2
+                or artifact["objects"][0]["bytes"]
+                != linked_uniform_capture["row_object_bytes"]
+                or artifact["objects"][1]["bytes"]
+                != linked_uniform_capture["reducer_object_bytes"]
+                or artifact["objects"][0]["bytes"]
+                > linked_uniform_capture["max_object_bytes"]
+                or artifact["objects"][1]["bytes"]
+                > linked_uniform_capture["max_object_bytes"]
+            ):
+                raise CensusError(
+                    f"{label} linked uniform-capture object byte totals differ"
                 )
             if provenance["kind"] == "weighted-capture-reducer-v6":
                 component_count = len(provenance["components"])

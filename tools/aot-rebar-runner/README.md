@@ -166,7 +166,20 @@ timing belongs to a separately named compiler-stage benchmark.
   V15 operation-only reducer likewise enters that numerator only with
   `PreparedScalarReduceV1`, one COUNT child equal to the module entry, no bulk,
   SpanFill, prepared-search, or runtime-symbol surface, the exact V15 caps,
-  and a distinct multiplier wrapper. The compatibility prepared-SpanFill
+  and a distinct multiplier wrapper. If that operation-only object is rejected
+  solely by its typed object-byte envelope, a linker-capable build may instead
+  retain two separately authenticated objects: one Ordered-NFA V15
+  `PreparedSpanSearchV1` / `RowSearchOnly` row and one native multiplier
+  reducer. The reducer has exactly one unresolved PLT32/Branch26 call to the
+  public row entry and no semantic runtime helper; the row therefore performs
+  its normal handle/object authentication on the call. Its receipt binds the
+  complete uniform proof, row automaton/program/object identities, reducer
+  code/object identity, both object extents against the same independent cap,
+  and the exact external relocation. Formal qualification selects
+  `linked-native-uniform-capture-row-search-reducer-v1`, traps the reducer as
+  the operation entry, inventories the public row and serialized program, and
+  reauthenticates the object-local Count identity from the closed receipt. The
+  compatibility prepared-SpanFill
   reducer remains available only after a typed V15 unsupported, native-data,
   or object-byte decline and keeps its declared semantic helpers. Typed
   semantic or exact lower-work

@@ -725,6 +725,20 @@
         }
       }
     },
+    "uniformCaptureRowSearchRelocationProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "offset", "kind", "addend"],
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_exclusive_v1_[0-9a-f]{64}$"
+        },
+        "offset": { "type": "integer", "minimum": 0 },
+        "kind": { "enum": [1, 4] },
+        "addend": { "enum": [-4, 0] }
+      }
+    },
     "uniformCaptureReducerProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -738,7 +752,10 @@
       ],
       "properties": {
         "route_variant": {
-          "enum": ["direct-v1", "ordered-v15", "ordered-v15-operation-only"]
+          "enum": [
+            "direct-v1", "ordered-v15", "ordered-v15-operation-only",
+            "ordered-v15-row-search-v1"
+          ]
         },
         "required_prepare_capabilities": { "enum": [0, 1] },
         "prepare_config_version": { "enum": [2, 3] },
@@ -754,7 +771,56 @@
         "reducer_identity_sha256": { "$ref": "#/$defs/sha256" },
         "span_fill_identity_sha256": {
           "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
-        }
+        },
+        "prepared_surface": { "const": "RowSearchOnly" },
+        "link_receipt_schema": { "const": 1 },
+        "operation": { "enum": ["count-captures", "grep-captures"] },
+        "domain": {
+          "enum": ["whole-haystack", "byte-slice-lines-lf-crlf"]
+        },
+        "multiplier": { "type": "integer", "minimum": 1 },
+        "proof_algorithm_version": { "const": 1 },
+        "proof_accounting_version": { "const": 1 },
+        "minimum_match_bytes": { "type": "integer", "minimum": 1 },
+        "participating_user_captures": { "type": "integer", "minimum": 0 },
+        "canonical_capture_annotations": { "type": "integer", "minimum": 0 },
+        "proof_work": { "type": "integer", "minimum": 1, "maximum": 8000000 },
+        "proof_peak_stack_items": {
+          "type": "integer", "minimum": 1, "maximum": 1000000
+        },
+        "proof_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "line_terminator": { "const": 10 },
+        "row_automaton_sha256": { "$ref": "#/$defs/sha256" },
+        "row_program_sha256": { "$ref": "#/$defs/sha256" },
+        "row_object_sha256": { "$ref": "#/$defs/sha256" },
+        "row_object_bytes": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "row_entry_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_search_exclusive_v1_[0-9a-f]{64}$"
+        },
+        "count_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_count_exclusive_v1_[0-9a-f]{64}$"
+        },
+        "reducer_symbol": {
+          "type": "string",
+          "pattern": "^fre_aot_regex_(count|grep)_captures_exclusive_v1_[0-9a-f]{64}$"
+        },
+        "reducer_code_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_object_sha256": { "$ref": "#/$defs/sha256" },
+        "reducer_object_bytes": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "max_object_bytes": {
+          "type": "integer", "minimum": 1, "maximum": 268435456
+        },
+        "external_relocation": {
+          "$ref": "#/$defs/uniformCaptureRowSearchRelocationProvenance"
+        },
+        "semantic_runtime_calls": { "const": 0 },
+        "artifact_identity_sha256": { "$ref": "#/$defs/sha256" }
       },
       "allOf": [
         {
@@ -778,6 +844,63 @@
               "max_handle_bytes": { "const": 8388608 },
               "max_scratch_bytes": { "const": 8388608 },
               "max_setup_work": { "const": 2000000 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "route_variant": { "const": "ordered-v15-row-search-v1" }
+            },
+            "required": ["route_variant"]
+          },
+          "then": {
+            "required": [
+              "prepared_surface", "link_receipt_schema", "operation", "domain",
+              "multiplier", "proof_algorithm_version", "proof_accounting_version",
+              "minimum_match_bytes", "participating_user_captures",
+              "canonical_capture_annotations", "proof_work",
+              "proof_peak_stack_items", "proof_identity_sha256", "line_terminator",
+              "row_automaton_sha256", "row_program_sha256", "row_object_sha256",
+              "row_object_bytes", "row_entry_symbol", "count_symbol",
+              "reducer_symbol", "reducer_code_sha256", "reducer_object_sha256",
+              "reducer_object_bytes", "max_object_bytes", "external_relocation",
+              "semantic_runtime_calls", "artifact_identity_sha256"
+            ],
+            "properties": {
+              "span_fill_identity_sha256": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "prepared_surface": false,
+              "link_receipt_schema": false,
+              "operation": false,
+              "domain": false,
+              "multiplier": false,
+              "proof_algorithm_version": false,
+              "proof_accounting_version": false,
+              "minimum_match_bytes": false,
+              "participating_user_captures": false,
+              "canonical_capture_annotations": false,
+              "proof_work": false,
+              "proof_peak_stack_items": false,
+              "proof_identity_sha256": false,
+              "line_terminator": false,
+              "row_automaton_sha256": false,
+              "row_program_sha256": false,
+              "row_object_sha256": false,
+              "row_object_bytes": false,
+              "row_entry_symbol": false,
+              "count_symbol": false,
+              "reducer_symbol": false,
+              "reducer_code_sha256": false,
+              "reducer_object_sha256": false,
+              "reducer_object_bytes": false,
+              "max_object_bytes": false,
+              "external_relocation": false,
+              "semantic_runtime_calls": false,
+              "artifact_identity_sha256": false
             }
           }
         }
@@ -1412,7 +1535,8 @@
         "feature_bits": { "type": "string" },
         "entry_abi": {
           "enum": [
-            null, "ExistsSearchV1", "SpanSearchV1", "PreparedScalarReduceV1"
+            null, "ExistsSearchV1", "SpanSearchV1", "PreparedSpanSearchV1",
+            "PreparedScalarReduceV1"
           ]
         },
         "validation": { "$ref": "#/$defs/frozenValidation" },
@@ -1502,7 +1626,8 @@
             "properties": {
               "entry_abi": {
                 "enum": [
-                  "ExistsSearchV1", "SpanSearchV1", "PreparedScalarReduceV1"
+                  "ExistsSearchV1", "SpanSearchV1", "PreparedSpanSearchV1",
+                  "PreparedScalarReduceV1"
                 ]
               }
             }

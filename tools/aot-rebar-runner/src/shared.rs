@@ -23,12 +23,12 @@ use fre_aot_regex::{
     UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
     UniformCaptureCompileRequest, UniformCapturePreparedSpanFillCompileDisposition,
     UniformCapturePreparedSpanFillCompileError, UniformCapturePreparedSpanFillCompileReceipt,
-    UniformCaptureReducerCompileDisposition, UniformCaptureReducerCompileError,
+    UniformCaptureReducerCompileError, UniformCaptureReducerLinkCompileDispositionV1,
     UniformCaptureReducerOperation, compile_ordered_many_aot_reported,
     compile_rebar_single_capture_aot_v1, compile_rebar_single_capture_participation_aot_v1,
     compile_rebar_single_capture_reducer_aot_v1, compile_rebar_weighted_capture_reducer_aot_v1,
     compile_shared_uniform_capture_reducer_aot_reported,
-    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
+    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer_linked_v1,
     compile_uniform_capture_selector, compile_with_prepared_aggregate_exports_and_slow_aot_limits,
     compile_with_prepared_ordered_nfa_v15_row_search_reported,
     compile_with_prepared_ordered_nfa_v15_scalar_operation_reported, compile_with_slow_aot_limits,
@@ -2986,7 +2986,7 @@ pub fn compile_single_capture_reducer_bridge(
 pub fn try_compile_native_uniform_capture_reducer(
     benchmark: &Benchmark,
     target: Target,
-) -> Result<UniformCaptureReducerCompileDisposition, String> {
+) -> Result<UniformCaptureReducerLinkCompileDispositionV1, String> {
     if benchmark.patterns.len() != 1 || !benchmark.model.is_capture() {
         return Err(
             "native uniform-capture reducer requires one CountCaptures/GrepCaptures source"
@@ -3011,7 +3011,7 @@ pub fn try_compile_native_uniform_capture_reducer(
         _ => unreachable!("capture gate accepted a non-capture model"),
     };
     let compile_with_limits = |limits, slow_aot_limits| {
-        compile_uniform_capture_reducer(
+        compile_uniform_capture_reducer_linked_v1(
             &parsed,
             UniformCaptureCompileRequest::new(pattern.len(), target)
                 .profile(profile.clone())
@@ -3020,21 +3020,24 @@ pub fn try_compile_native_uniform_capture_reducer(
             operation,
         )
     };
-    let disposition =
-        match compile_with_limits(CompileLimitsV1::default(), SlowAotLimits::default()) {
-            Ok(disposition) => disposition,
-            Err(error) if is_uniform_reducer_lower_work_limit(&error) => compile_with_limits(
-                rebar_recovery_compile_limits(),
-                rebar_recovery_slow_aot_limits(),
-            )
-            .map_err(|error| format!("native uniform-capture reducer recovery failed: {error}"))?,
-            Err(error) => {
-                return Err(format!(
-                    "native uniform-capture reducer compilation failed: {error}"
-                ));
-            }
-        };
-    if let Some(selected) = disposition.selected() {
+    let mut default_limits = CompileLimitsV1::default();
+    default_limits.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+    let disposition = match compile_with_limits(default_limits, SlowAotLimits::default()) {
+        Ok(disposition) => disposition,
+        Err(error) if is_uniform_reducer_lower_work_limit(&error) => {
+            let mut limits = rebar_recovery_compile_limits();
+            limits.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+            compile_with_limits(limits, rebar_recovery_slow_aot_limits()).map_err(|error| {
+                format!("native uniform-capture reducer recovery failed: {error}")
+            })?
+        }
+        Err(error) => {
+            return Err(format!(
+                "native uniform-capture reducer compilation failed: {error}"
+            ));
+        }
+    };
+    if let Some(selected) = disposition.combined() {
         selected
             .authenticate()
             .map_err(|error| format!("native uniform-capture reducer seal failed: {error}"))?;
@@ -3043,6 +3046,21 @@ pub fn try_compile_native_uniform_capture_reducer(
         {
             return Err(format!(
                 "native uniform-capture reducer object is empty or exceeds {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES} bytes"
+            ));
+        }
+    }
+    if let Some(selected) = disposition.prepared_row_search() {
+        selected.authenticate().map_err(|error| {
+            format!("native linked-row uniform-capture reducer seal failed: {error}")
+        })?;
+        if selected.row().object().is_empty()
+            || selected.row().object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+            || selected.reducer_object().is_empty()
+            || selected.reducer_object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+            || selected.receipt().max_object_bytes() != MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        {
+            return Err(format!(
+                "native linked-row uniform-capture objects are empty or exceed {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES} bytes"
             ));
         }
     }
@@ -5630,7 +5648,7 @@ mod tests {
             let disposition = try_compile_native_uniform_capture_reducer(&benchmark, target)
                 .expect("native uniform capture reducer");
             let selected = disposition
-                .selected()
+                .combined()
                 .expect("uniform capture fixture proves one multiplier");
             selected.authenticate().expect("fresh reducer seal");
             assert_eq!(selected.receipt().operation(), expected_operation);
@@ -5655,7 +5673,7 @@ mod tests {
             let disposition = try_compile_native_uniform_capture_reducer(&benchmark, target)
                 .expect("operation-only uniform capture reducer");
             let selected = disposition
-                .selected()
+                .combined()
                 .expect("uniform fixture proves one multiplier");
             selected
                 .authenticate()

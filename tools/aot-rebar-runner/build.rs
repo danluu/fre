@@ -21,6 +21,8 @@ const INTERNAL_TEST_SHARED_CAPTURE_DECLINE_FEATURE_ENV: &str =
     "CARGO_FEATURE_INTERNAL_TEST_FORCE_SHARED_CAPTURE_NATIVE_DATA_DECLINE";
 const GENERATED_FILE: &str = "linked_artifact.rs";
 const OBJECT_FILE: &str = "aot-rebar-artifact.o";
+const LINKED_ROW_UNIFORM_REDUCER_OBJECT_FILE: &str =
+    "aot-rebar-linked-row-uniform-capture-reducer.o";
 
 #[derive(Debug)]
 struct ExpectedBinding {
@@ -133,8 +135,9 @@ fn main() {
             let disposition =
                 shared::try_compile_native_uniform_capture_reducer(&benchmark, target)
                     .expect("compile native public Rebar uniform-capture reducer");
-            if let fre_aot_regex::UniformCaptureReducerCompileDisposition::Selected(selected) =
-                disposition
+            if let fre_aot_regex::UniformCaptureReducerLinkCompileDispositionV1::Combined(
+                selected,
+            ) = &disposition
             {
                 let compiled = selected.compiled();
                 let capture_receipt = selected.receipt();
@@ -153,7 +156,9 @@ fn main() {
                         Some(&capture_receipt),
                         None,
                         None,
+                        None,
                         &object_path,
+                        None,
                         program_symbol,
                         program_len,
                         compiled.module().entry_symbol(),
@@ -172,6 +177,58 @@ fn main() {
                     "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
                     object_path.display()
                 );
+                return;
+            }
+            if let fre_aot_regex::UniformCaptureReducerLinkCompileDispositionV1::PreparedRowSearch(
+                selected,
+            ) = &disposition
+            {
+                selected
+                    .authenticate()
+                    .expect("authenticate linked RowSearch uniform-capture reducer");
+                let row = selected.row();
+                let receipt = selected.receipt();
+                let (program_symbol, program_len) = row
+                    .module()
+                    .required_runtime_program()
+                    .expect("linked RowSearch publishes its exact runtime program");
+                let reducer_object_path = output.join(LINKED_ROW_UNIFORM_REDUCER_OBJECT_FILE);
+                fs::write(&object_path, row.object())
+                    .expect("write strict RowSearch uniform-capture object");
+                fs::write(&reducer_object_path, selected.reducer_object())
+                    .expect("write linked RowSearch uniform-capture reducer object");
+                fs::write(
+                    &generated_path,
+                    configured_source(
+                        &benchmark,
+                        row,
+                        None,
+                        None,
+                        Some(receipt),
+                        None,
+                        None,
+                        &object_path,
+                        Some(&reducer_object_path),
+                        program_symbol,
+                        program_len,
+                        row.module().entry_symbol(),
+                        None,
+                        Some(selected.reducer_symbol()),
+                        &architecture,
+                        &operating_system,
+                        feature_bits,
+                        &source_commit,
+                        &source_tree,
+                    ),
+                )
+                .expect("write linked RowSearch uniform-capture reducer bindings");
+                append_validation_binding();
+                for path in [&object_path, &reducer_object_path] {
+                    println!(
+                        "cargo:rustc-link-arg-bin=fre-aot-rebar-runner={}",
+                        path.display()
+                    );
+                }
                 return;
             }
         }
@@ -218,9 +275,11 @@ fn main() {
                             compiled,
                             None,
                             None,
+                            None,
                             Some(artifact.receipt()),
                             None,
                             &object_path,
+                            None,
                             program_symbol,
                             program_len,
                             compiled.module().entry_symbol(),
@@ -332,7 +391,9 @@ fn main() {
                         None,
                         None,
                         None,
+                        None,
                         &object_path,
+                        None,
                         program_symbol,
                         program_len,
                         compiled.module().entry_symbol(),
@@ -498,8 +559,10 @@ fn main() {
                         None,
                         None,
                         None,
+                        None,
                         Some(&artifact.receipt()),
                         &object_path,
+                        None,
                         program_symbol,
                         program_len,
                         entry_symbol,
@@ -643,7 +706,9 @@ fn main() {
             None,
             None,
             None,
+            None,
             &object_path,
+            None,
             program_symbol,
             program_len,
             entry_symbol,
@@ -793,11 +858,15 @@ fn configured_source(
     compiled: &fre_aot_regex::CompiledRegex,
     uniform_capture_receipt: Option<&fre_aot_regex::UniformCapturePreparedSpanFillCompileReceipt>,
     uniform_capture_reducer_receipt: Option<&fre_aot_regex::UniformCaptureReducerCompileReceipt>,
+    linked_row_uniform_capture_receipt: Option<
+        &fre_aot_regex::LinkedPreparedRowUniformCaptureReducerReceiptV1,
+    >,
     shared_uniform_capture_reducer_receipt: Option<
         &fre_aot_regex::SharedUniformCaptureReducerAotReceipt,
     >,
     ordered_many_receipt: Option<&fre_aot_regex::OrderedManyAotReceipt>,
     object_path: &std::path::Path,
+    linked_reducer_object_path: Option<&std::path::Path>,
     program_symbol: &str,
     program_len: usize,
     entry_symbol: &str,
@@ -811,14 +880,17 @@ fn configured_source(
 ) -> String {
     let receipt = compiled.receipt();
     let prepared_uniform_capture = uniform_capture_receipt.is_some();
-    let single_native_uniform_capture = uniform_capture_reducer_receipt.is_some();
+    let linked_row_uniform_capture = linked_row_uniform_capture_receipt.is_some();
+    let single_native_uniform_capture =
+        uniform_capture_reducer_receipt.is_some() || linked_row_uniform_capture;
     let shared_uniform_capture = shared_uniform_capture_reducer_receipt.is_some();
     let native_uniform_capture = single_native_uniform_capture || shared_uniform_capture;
     let uniform_capture = prepared_uniform_capture || native_uniform_capture;
     let shared_ordered_many = ordered_many_receipt.is_some() || shared_uniform_capture;
     assert_eq!(
         usize::from(prepared_uniform_capture)
-            + usize::from(single_native_uniform_capture)
+            + usize::from(uniform_capture_reducer_receipt.is_some())
+            + usize::from(linked_row_uniform_capture)
             + usize::from(shared_uniform_capture),
         usize::from(uniform_capture),
     );
@@ -868,6 +940,55 @@ fn configured_source(
             receipt.required_prepare_capabilities
         );
     }
+    if let Some(linked) = linked_row_uniform_capture_receipt {
+        let expected_operation = match benchmark.model {
+            shared::Model::CountCaptures => {
+                fre_aot_regex::UniformCaptureReducerOperation::CountCaptures
+            }
+            shared::Model::GrepCaptures => {
+                fre_aot_regex::UniformCaptureReducerOperation::GrepCaptures
+            }
+            _ => unreachable!("linked-row receipt has a non-capture model"),
+        };
+        assert_eq!(linked.target(), receipt.target);
+        assert_eq!(linked.operation(), expected_operation);
+        assert_eq!(linked.domain(), expected_operation.domain());
+        assert_eq!(linked.line_terminator(), b'\n');
+        assert_eq!(linked.line_terminator(), receipt.line_terminator);
+        assert_eq!(
+            linked.multiplier().get(),
+            u64::try_from(
+                linked
+                    .participation()
+                    .participating_groups_per_match()
+                    .get()
+            )
+            .expect("linked-row capture multiplier fits u64")
+        );
+        assert_ne!(linked.proof_identity_sha256(), [0; 32]);
+        assert_eq!(linked.row_automaton_sha256(), receipt.automaton_sha256);
+        assert_eq!(linked.row_program_sha256(), receipt.program_sha256);
+        assert_eq!(linked.row_object_sha256(), receipt.object_sha256);
+        assert_eq!(linked.row_object_bytes(), compiled.object().len());
+        assert_eq!(linked.row_entry_symbol(), entry_symbol);
+        assert!(!linked.count_symbol().is_empty());
+        assert_eq!(
+            linked.reducer_symbol(),
+            reducer_symbol.expect("linked-row reducer symbol")
+        );
+        assert_eq!(
+            linked.max_object_bytes(),
+            shared::MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        );
+        assert!(linked.row_object_bytes() <= linked.max_object_bytes());
+        assert!(linked.reducer_object_bytes() <= linked.max_object_bytes());
+        assert_eq!(linked.semantic_runtime_calls(), 0);
+    }
+    assert_eq!(
+        linked_row_uniform_capture,
+        linked_reducer_object_path.is_some(),
+        "linked-row receipt and reducer object path must be inseparable",
+    );
     assert_eq!(
         native_uniform_capture,
         uniform_capture && reducer_symbol.is_some()
@@ -911,16 +1032,19 @@ fn configured_source(
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1;
     let native_uniform_capture_operation_only =
         single_native_uniform_capture_operation_only || shared_uniform_capture_operation_only;
+    let linked_row_uniform_capture_operation = linked_row_uniform_capture
+        && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedSpanSearchV1;
     let scalar_operation_only = (native_scalar_reducer
         && receipt.entry_abi == fre_aot_regex::EntryAbi::PreparedScalarReduceV1)
-        || native_uniform_capture_operation_only;
+        || native_uniform_capture_operation_only
+        || linked_row_uniform_capture_operation;
     let scalar_entry_symbol = match benchmark.model {
         shared::Model::SpanSum => compiled.module().prepared_span_sum_symbol(),
         shared::Model::GrepCount => compiled.module().prepared_grep_count_symbol(),
         _ => compiled.module().prepared_count_symbol(),
     };
     assert_eq!(
-        scalar_operation_only,
+        scalar_operation_only && !linked_row_uniform_capture_operation,
         required_prepare_capabilities == fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
             && scalar_entry_symbol == Some(entry_symbol)
             && compiled.module().prepared_bulk_strategy().is_none()
@@ -928,7 +1052,32 @@ fn configured_source(
             && span_fill_symbol.is_none(),
         "scalar operation-only ABI disagrees with the linked symbol topology",
     );
-    if single_native_uniform_capture_operation_only {
+    if linked_row_uniform_capture_operation {
+        let linked = linked_row_uniform_capture_receipt
+            .expect("linked-row uniform capture has no compiler receipt");
+        assert_eq!(receipt.engine, fre_aot_regex::EngineKind::OrderedNfa);
+        assert_eq!(
+            required_prepare_capabilities,
+            fre_aot_regex::PREPARED_CAPABILITY_ORDERED_NFA_V15
+        );
+        assert_eq!(
+            compiled.module().prepared_entry_symbol(),
+            Some(entry_symbol)
+        );
+        assert_eq!(compiled.module().entry_symbol(), entry_symbol);
+        assert!(compiled.module().prepared_count_symbol().is_none());
+        assert!(compiled.module().prepared_span_fill_symbol().is_none());
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert_eq!(linked.row_entry_symbol(), entry_symbol);
+        assert_ne!(linked.count_symbol(), entry_symbol);
+        assert_ne!(linked.reducer_symbol(), entry_symbol);
+    } else if single_native_uniform_capture_operation_only {
         let uniform = uniform_capture_reducer_receipt
             .expect("operation-only uniform capture has no compiler receipt");
         assert_eq!(
@@ -993,7 +1142,9 @@ fn configured_source(
         "linked-direct-entry-loop".to_owned()
     };
     let grep_iteration_strategy =
-        if native_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
+        if linked_row_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
+            "linked-native-uniform-capture-row-search-reducer-v1".to_owned()
+        } else if native_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
             "linked-native-uniform-capture-reducer-v1".to_owned()
         } else if prepared_uniform_capture && benchmark.model == shared::Model::GrepCaptures {
             "per-line-linked-prepared-span-fill-uniform-capture-v1".to_owned()
@@ -1006,6 +1157,8 @@ fn configured_source(
         };
     let aggregate_strategy = if prepared_uniform_capture {
         "prepared-span-fill-static-uniform-capture-multiplier-v1".to_owned()
+    } else if linked_row_uniform_capture {
+        "Some(LinkedPreparedRowUniformCaptureReducerV1)".to_owned()
     } else {
         format!("{:?}", receipt.prepared_aggregate_strategy)
     };
@@ -1054,6 +1207,76 @@ fn configured_source(
     .unwrap();
     writeln!(
         source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE: bool = {linked_row_uniform_capture};"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_RECEIPT_SCHEMA: u32 = {};",
+        linked_row_uniform_capture_receipt.map_or(0, |receipt| receipt.schema_version())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = {:?};",
+        linked_row_uniform_capture_receipt
+            .map_or([0; 32], |receipt| receipt.artifact_identity_sha256())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_CODE_SHA256: [u8; 32] = {:?};",
+        linked_row_uniform_capture_receipt.map_or([0; 32], |receipt| receipt.reducer_code_sha256())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = {:?};",
+        linked_row_uniform_capture_receipt
+            .map_or([0; 32], |receipt| receipt.reducer_object_sha256())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES: usize = {};",
+        linked_row_uniform_capture_receipt.map_or(0, |receipt| receipt.reducer_object_bytes())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_MAX_OBJECT_BYTES: usize = {};",
+        linked_row_uniform_capture_receipt.map_or(0, |receipt| receipt.max_object_bytes())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_OFFSET: u64 = {};",
+        linked_row_uniform_capture_receipt.map_or(0, |receipt| receipt.row_relocation().offset())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_KIND: &str = {:?};",
+        linked_row_uniform_capture_receipt.map_or_else(
+            || "".to_owned(),
+            |receipt| format!("{:?}", receipt.row_relocation().kind()),
+        )
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_ADDEND: i64 = {};",
+        linked_row_uniform_capture_receipt.map_or(0, |receipt| receipt.row_relocation().addend())
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_SEMANTIC_RUNTIME_CALLS: usize = {};",
+        linked_row_uniform_capture_receipt.map_or(0, |receipt| receipt.semantic_runtime_calls())
+    )
+    .unwrap();
+    writeln!(
+        source,
         "pub const UNIFORM_CAPTURE_BRIDGE: bool = {uniform_capture};"
     )
     .unwrap();
@@ -1074,6 +1297,16 @@ fn configured_source(
                 shared::Model::SpanSum => "general-aot-shared-ordered-many-native-span-sum-v1",
                 shared::Model::GrepCount => "general-aot-shared-ordered-many-native-grep-count-v1",
                 _ => unreachable!("shared ordered-many binding has a non-scalar model"),
+            }
+        } else if linked_row_uniform_capture {
+            match benchmark.model {
+                shared::Model::CountCaptures => {
+                    "general-aot-native-uniform-capture-count-row-search-reducer-v1"
+                }
+                shared::Model::GrepCaptures => {
+                    "general-aot-native-uniform-capture-grep-row-search-reducer-v1"
+                }
+                _ => unreachable!("linked-row uniform capture has a non-capture model"),
             }
         } else if native_uniform_capture {
             match benchmark.model {
@@ -1211,6 +1444,16 @@ fn configured_source(
                     uniform.selector_automaton_sha256(),
                     uniform.selector_program_sha256(),
                     uniform.selector_object_sha256(),
+                )
+            })
+        })
+        .or_else(|| {
+            linked_row_uniform_capture_receipt.map(|uniform| {
+                (
+                    uniform.participation(),
+                    uniform.row_automaton_sha256(),
+                    uniform.row_program_sha256(),
+                    uniform.row_object_sha256(),
                 )
             })
         });
@@ -1385,7 +1628,11 @@ fn configured_source(
         source,
         "pub const UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256: [u8; 32] = {:?};",
         shared_uniform_capture_reducer_receipt
-            .map_or([0; 32], |receipt| receipt.proof_identity_sha256())
+            .map(|receipt| receipt.proof_identity_sha256())
+            .or_else(|| {
+                linked_row_uniform_capture_receipt.map(|receipt| receipt.proof_identity_sha256())
+            })
+            .unwrap_or([0; 32])
     )
     .unwrap();
     writeln!(
@@ -1406,10 +1653,15 @@ fn configured_source(
         source,
         "pub const UNIFORM_CAPTURE_COUNT_SYMBOL: &str = {:?};",
         if native_uniform_capture {
-            compiled
-                .module()
-                .prepared_count_symbol()
-                .expect("native uniform-capture reducer has one Count child")
+            linked_row_uniform_capture_receipt.map_or_else(
+                || {
+                    compiled
+                        .module()
+                        .prepared_count_symbol()
+                        .expect("native uniform-capture reducer has one Count child")
+                },
+                |receipt| receipt.count_symbol(),
+            )
         } else {
             ""
         }
@@ -1423,6 +1675,11 @@ fn configured_source(
             .or_else(|| {
                 uniform_capture_reducer_receipt.map(|receipt| receipt.count_symbol_sha256())
             })
+            .or_else(|| {
+                linked_row_uniform_capture_receipt.map(|receipt| {
+                    <[u8; 32]>::from(Sha256::digest(receipt.count_symbol().as_bytes()))
+                })
+            })
             .unwrap_or([0; 32])
     )
     .unwrap();
@@ -1430,14 +1687,24 @@ fn configured_source(
         source,
         "pub const UNIFORM_CAPTURE_REDUCER_SYMBOL_SHA256: [u8; 32] = {:?};",
         shared_uniform_capture_reducer_receipt
-            .map_or([0; 32], |receipt| receipt.reducer_symbol_sha256())
+            .map(|receipt| receipt.reducer_symbol_sha256())
+            .or_else(|| {
+                linked_row_uniform_capture_receipt.map(|receipt| {
+                    <[u8; 32]>::from(Sha256::digest(receipt.reducer_symbol().as_bytes()))
+                })
+            })
+            .unwrap_or([0; 32])
     )
     .unwrap();
     writeln!(
         source,
         "pub const UNIFORM_CAPTURE_AGGREGATE_OBJECT_SHA256: [u8; 32] = {:?};",
         shared_uniform_capture_reducer_receipt
-            .map_or([0; 32], |receipt| receipt.aggregate_object_sha256())
+            .map(|receipt| receipt.aggregate_object_sha256())
+            .or_else(|| {
+                linked_row_uniform_capture_receipt.map(|receipt| receipt.reducer_object_sha256())
+            })
+            .unwrap_or([0; 32])
     )
     .unwrap();
     writeln!(
@@ -1553,6 +1820,18 @@ fn configured_source(
         object_path.display().to_string()
     )
     .unwrap();
+    if let Some(path) = linked_reducer_object_path {
+        writeln!(
+            source,
+            "pub static LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES_DATA: &[u8] = include_bytes!({:?});",
+            path.display().to_string()
+        )
+        .unwrap();
+    } else {
+        source.push_str(
+            "pub static LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES_DATA: &[u8] = &[];\n",
+        );
+    }
     source.push_str("unsafe extern \"C\" {\n");
     writeln!(source, "    #[link_name = {program_symbol:?}]").unwrap();
     source.push_str("    static LINKED_PROGRAM_START: u8;\n");
@@ -3798,6 +4077,26 @@ fn push_empty_weighted_capture_reducer_bindings(source: &mut String) {
 
 fn push_empty_shared_uniform_capture_bindings(source: &mut String) {
     source.push_str("pub const SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA: u32 = 0;\n");
+    source.push_str("pub const LINKED_ROW_UNIFORM_CAPTURE: bool = false;\n");
+    source.push_str("pub const LINKED_ROW_UNIFORM_CAPTURE_RECEIPT_SCHEMA: u32 = 0;\n");
+    source.push_str(
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];\n",
+    );
+    source.push_str(
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];\n",
+    );
+    source.push_str(
+        "pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];\n",
+    );
+    source.push_str("pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const LINKED_ROW_UNIFORM_CAPTURE_MAX_OBJECT_BYTES: usize = 0;\n");
+    source.push_str("pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_OFFSET: u64 = 0;\n");
+    source.push_str("pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_KIND: &str = \"\";\n");
+    source.push_str("pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_ADDEND: i64 = 0;\n");
+    source.push_str("pub const LINKED_ROW_UNIFORM_CAPTURE_SEMANTIC_RUNTIME_CALLS: usize = 0;\n");
+    source.push_str(
+        "pub static LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES_DATA: &[u8] = &[];\n",
+    );
     source.push_str("pub const UNIFORM_CAPTURE_PROOF_IDENTITY_SHA256: [u8; 32] = [0; 32];\n");
     source.push_str(
         "pub const SHARED_UNIFORM_CAPTURE_PROFILE_IDENTITY_SHA256: [u8; 32] = [0; 32];\n",
@@ -4387,6 +4686,17 @@ pub const SHARED_ORDERED_MANY_AGGREGATE: bool = false;
 pub const ORDERED_MANY_RECEIPT_SCHEMA: u32 = 0;
 pub const ORDERED_MANY_SOURCES_SHA256: [u8; 32] = [0; 32];
 pub const SHARED_UNIFORM_CAPTURE_RECEIPT_SCHEMA: u32 = 0;
+pub const LINKED_ROW_UNIFORM_CAPTURE: bool = false;
+pub const LINKED_ROW_UNIFORM_CAPTURE_RECEIPT_SCHEMA: u32 = 0;
+pub const LINKED_ROW_UNIFORM_CAPTURE_ARTIFACT_IDENTITY_SHA256: [u8; 32] = [0; 32];
+pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_CODE_SHA256: [u8; 32] = [0; 32];
+pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_SHA256: [u8; 32] = [0; 32];
+pub const LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES: usize = 0;
+pub const LINKED_ROW_UNIFORM_CAPTURE_MAX_OBJECT_BYTES: usize = 0;
+pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_OFFSET: u64 = 0;
+pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_KIND: &str = "";
+pub const LINKED_ROW_UNIFORM_CAPTURE_ROW_RELOCATION_ADDEND: i64 = 0;
+pub const LINKED_ROW_UNIFORM_CAPTURE_SEMANTIC_RUNTIME_CALLS: usize = 0;
 pub const UNIFORM_CAPTURE_BRIDGE: bool = false;
 pub const STRICT_CAPTURE_BRIDGE: bool = false;
 pub const STRICT_CAPTURE_GROUP_COUNT: usize = 0;
@@ -4595,6 +4905,7 @@ pub const REGEX_REDUX_REPORT_SCHEMA: &str = "";
 pub const REGEX_REDUX_REDUCER_LINK_SYMBOLS: &[&str] = &[];
 pub const REGEX_REDUX_SEMANTIC_RUNTIME_SYMBOLS: &[&str] = &[];
 pub static OBJECT_BYTES: &[u8] = &[];
+pub static LINKED_ROW_UNIFORM_CAPTURE_REDUCER_OBJECT_BYTES_DATA: &[u8] = &[];
 pub unsafe fn program_ptr() -> *const u8 { core::ptr::null() }
 pub unsafe fn reduce(
     _handle: fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1,

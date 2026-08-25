@@ -461,16 +461,20 @@ pub use rebar_weighted_capture::{
 };
 pub use uniform_capture::{
     CompiledUniformCapturePreparedSpanFillSelector, CompiledUniformCaptureReducer,
-    CompiledUniformCaptureSelector, UniformCaptureAuthenticationError,
+    CompiledUniformCaptureSelector,
+    LINKED_PREPARED_ROW_UNIFORM_CAPTURE_REDUCER_V1_RECEIPT_VERSION,
+    LinkedPreparedRowUniformCaptureReducerReceiptV1, LinkedPreparedRowUniformCaptureReducerV1,
+    LinkedPreparedRowUniformCaptureRelocationV1, UniformCaptureAuthenticationError,
     UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
     UniformCaptureCompileRequest, UniformCapturePreparedSpanFillAuthenticationError,
     UniformCapturePreparedSpanFillCompileDisposition,
     UniformCapturePreparedSpanFillCompileError, UniformCapturePreparedSpanFillCompileReceipt,
     UniformCaptureReducerAuthenticationError, UniformCaptureReducerCompileDisposition,
     UniformCaptureReducerCompileError, UniformCaptureReducerCompileReceipt,
-    UniformCaptureReducerDomain, UniformCaptureReducerOperation,
+    UniformCaptureReducerDomain, UniformCaptureReducerLinkCompileDispositionV1,
+    UniformCaptureReducerOperation,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
-    compile_uniform_capture_selector,
+    compile_uniform_capture_reducer_linked_v1, compile_uniform_capture_selector,
 };
 pub use shared_uniform_capture::{
     SHARED_UNIFORM_CAPTURE_REDUCER_AOT_RECEIPT_VERSION,
@@ -2119,6 +2123,38 @@ fn compile_raw_prepared_ordered_nfa_v15_scalar_operation_reported(
         export,
         max_native_data_bytes,
         module::PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the in-crate composite compiler keeps the strict RowSearch transaction explicit"
+)]
+// In-crate raw-plan hook for a helper-free, independently authenticated
+// PreparedSpanSearchV1 row. Unlike the scalar-operation surface, this exports
+// exactly the public RowSearch entry and no aggregate or compatibility helper.
+fn compile_raw_prepared_ordered_nfa_v15_row_search_reported(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    max_native_data_bytes: usize,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        target,
+        mode,
+        limits,
+        PreparedAggregateExports::NONE,
+        max_native_data_bytes,
+        module::PreparedOrderedNfaV15Surface::RowSearchOnly,
     )
 }
 
