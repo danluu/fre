@@ -551,8 +551,9 @@ fn generic_constructor_preserves_upstream_sources_ids_and_bounded_ingestion() {
 
     let yielded = core::cell::Cell::new(0_usize);
     let endless = core::iter::from_fn(|| {
-        yielded.set(yielded.get().saturating_add(1));
-        Some("")
+        let index = yielded.get();
+        yielded.set(index.saturating_add(1));
+        Some(if index == 0 { "(" } else { "" })
     });
     let Err(refused) = PortableRegexSet::new(endless) else {
         panic!("an endless source must stop at the default pattern limit");

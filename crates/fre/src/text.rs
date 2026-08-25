@@ -9,9 +9,10 @@ use crate::{
     BuildError, BuildLimits, BuildReport, CompatibilityProfile, Match, PlanKind, PlanSelection,
     PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
     PortableFindIterRunLimits, PortableK0StartFilterSetupAccounting, PortableMatches,
-    PortableRegex, PortableSearchSession, PortableSessionMatches, RustProfile, SearchAccounting,
-    SearchError, SearchLimits, SearchSessionLimits, SearchSessionSetupAccounting, SearchWindow,
-    charge_planner, finite, reserve_planner, rust_profile_size_limit, set_rust_profile_size_limit,
+    PortableOrdinaryCanonical, PortableRegex, PortableSearchSession, PortableSessionMatches,
+    RustProfile, SearchAccounting, SearchError, SearchLimits, SearchSessionLimits,
+    SearchSessionSetupAccounting, SearchWindow, charge_planner, finite, reserve_planner,
+    rust_profile_size_limit, set_rust_profile_size_limit,
 };
 
 /// Construction evidence for the first sound Rust text execution slices.
@@ -364,23 +365,23 @@ impl PortableTextBuilder {
     /// disagree or portable construction fails.
     pub fn build(mut self) -> Result<PortableTextRegex, PortableTextBuildError> {
         let text_profile = CompatibilityProfile::RustText(self.profile.clone());
-        let text_request = ParseRequest::rust(self.pattern.clone(), text_profile.clone())
+        let pattern = core::mem::take(&mut self.pattern);
+        let text_request = ParseRequest::rust(pattern, text_profile)
             .with_admission(self.limits.admission)
             .with_safety_envelope(self.limits.syntax_safety);
-        let text = fre_syntax::parse(text_request).map_err(PortableTextBuildError::TextSyntax)?;
-        let text_syntax = text.summary.clone();
-        let CanonicalPattern::Rust(text_pattern) = &text.pattern else {
+        let text = fre_syntax::parse_attempt(text_request)
+            .map_err(|error| PortableTextBuildError::TextSyntax(error.into_source()))?;
+        let bytes_profile = CompatibilityProfile::RustBytes(self.profile.clone());
+        let Some(text) = text.into_rust_reparse_handoff(bytes_profile) else {
             return Err(PortableTextBuildError::InternalInvariant(
                 "RustText parse produced a non-Rust pattern",
             ));
         };
+        let text_syntax = text.summary;
+        let text_pattern = text.rust;
+        let text_profile = text.source_profile;
 
-        let bytes_profile = CompatibilityProfile::RustBytes(self.profile.clone());
-        let pattern = core::mem::take(&mut self.pattern);
-        let bytes_request = ParseRequest::rust(pattern, bytes_profile)
-            .with_admission(self.limits.admission)
-            .with_safety_envelope(self.limits.syntax_safety);
-        let bytes = fre_syntax::parse_attempt(bytes_request)
+        let bytes = fre_syntax::parse_attempt(text.request)
             .map_err(|error| PortableTextBuildError::BytesProofSyntax(error.into_source()))?;
         let bytes_syntax = bytes.record().summary.clone();
         let CanonicalPattern::Rust(bytes_pattern) = &bytes.record().pattern else {
@@ -1075,6 +1076,10 @@ impl PortableTextRegex {
             inner: self.inner.fixed_endpoint_search_session(limits)?,
             shortest_value_eligible: self.report.portable.plan == PlanKind::K0,
         })
+    }
+
+    pub(crate) fn ordinary_canonical(&self) -> Result<PortableOrdinaryCanonical<'_>, SearchError> {
+        PortableOrdinaryCanonical::try_new(&self.inner)
     }
 
     /// Iterate over every non-overlapping match with Rust text empty-match

@@ -49,6 +49,38 @@ fn text_set_matches_pinned_rust_across_unicode_nullable_and_duplicate_patterns()
 }
 
 #[test]
+fn generic_text_constructor_preserves_sources_indices_and_bounded_ingestion() {
+    let owned = sources(&["alpha", "beta", "beta"]);
+    let set = PortableTextRegexSet::new(&owned).expect("generic borrowed-String text set");
+    assert_eq!(set.patterns(), owned);
+
+    let error = PortableTextRegexSet::new(["valid", "("])
+        .expect_err("the second generic text pattern must be invalid");
+    assert!(matches!(
+        error,
+        PortableTextRegexSetBuildError::Pattern { index: 1, .. }
+    ));
+
+    let yielded = core::cell::Cell::new(0_usize);
+    let endless = core::iter::from_fn(|| {
+        let index = yielded.get();
+        yielded.set(index.saturating_add(1));
+        Some(if index == 0 { "(" } else { "" })
+    });
+    let error = PortableTextRegexSet::new(endless)
+        .expect_err("the pattern limit must precede the early syntax error");
+    let limit = PortableRegexSetBuildLimits::default().max_patterns;
+    assert!(matches!(
+        error,
+        PortableTextRegexSetBuildError::PatternLimit {
+            needed,
+            limit: actual_limit,
+        } if needed == limit + 1 && actual_limit == limit
+    ));
+    assert_eq!(yielded.get(), limit + 1);
+}
+
+#[test]
 fn text_set_offset_search_matches_pinned_rust_at_every_byte() {
     let patterns = ["", r"\bbar\b", r"(?m)^bar$", "é", "東京"];
     let fre = PortableTextRegexSet::new(patterns).expect("FRE text offset set");

@@ -6,7 +6,7 @@ use fre::{
     CaptureBuilder, CaptureExecutionSource, CaptureMatchKind, CaptureRequiredLiteralBuildLimits,
     CaptureRequiredLiteralRunLimits, CaptureResource, CaptureRunLimits, CaptureSearchConfig,
     CaptureSearchError, CaptureSearchKind, CaptureSearchLimits, CaptureStreamDomains,
-    CaptureWindow, OrderedRootUnitCover, PortableTextCaptureBuilder,
+    CaptureWindow, OrderedRootUnitCover, PortableTextCaptureBuilder, RustProfile,
 };
 use fre_aggregate::OperationPhysicalRoute;
 use regex::RegexBuilder as TextRegexBuilder;
@@ -360,6 +360,35 @@ fn materialized_capture_iteration_exposes_earliest_end_identity() {
             .collect::<Vec<_>>(),
         vec![Some((0, 1)), Some((0, 1))]
     );
+}
+
+#[test]
+fn text_capture_profile_proof_reuses_the_direct_bytes_build_facts() {
+    let pattern = r"^(?P<word>\w+)[ \t]+TOKEN(?P<count>[0-9]+)?$";
+    let mut profile = RustProfile::default();
+    profile.options.multi_line = true;
+    profile.options.line_terminator = b';';
+    let limits = CaptureBuildLimits {
+        max_hir_work: 999_999,
+        required_literal: Some(CaptureRequiredLiteralBuildLimits::default()),
+        ..CaptureBuildLimits::default()
+    };
+    let bytes = CaptureBuilder::new(pattern)
+        .profile(profile.clone())
+        .limits(limits)
+        .build()
+        .expect("direct byte capture build");
+    let text = PortableTextCaptureBuilder::new(pattern)
+        .profile(profile)
+        .limits(limits)
+        .build()
+        .expect("text capture build");
+
+    assert_eq!(
+        text.build_report().bytes_syntax,
+        text.build_report().capture.syntax
+    );
+    assert_eq!(text.build_report().capture, *bytes.build_report());
 }
 
 #[test]

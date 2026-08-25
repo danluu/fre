@@ -677,7 +677,7 @@ fn session_reuse_alternates_sources_without_retaining_positions_or_results() {
 }
 
 #[test]
-fn native_constituents_still_charge_descriptor_slots_but_no_workspace_receipt() {
+fn native_constituents_charge_compact_bindings_without_workspace() {
     let patterns = ["a", "ab", "xyz"];
     let bytes = PortableRegexSet::new(patterns).expect("native byte set");
     assert!((0..bytes.len()).all(|index| {
@@ -687,12 +687,9 @@ fn native_constituents_still_charge_descriptor_slots_but_no_workspace_receipt() 
         .search_session(PortableRegexSetSessionLimits::unlimited())
         .expect("native set session")
         .setup_report();
-    let logical = patterns.len() * size_of::<PortableSearchSession<'_>>();
-    assert!(setup.session_capacity_bytes >= logical);
-    assert_eq!(
-        setup.session_capacity_bytes % size_of::<PortableSearchSession<'_>>(),
-        0
-    );
+    let full_byte_sessions = patterns.len() * size_of::<PortableSearchSession<'_>>();
+    assert!(setup.session_capacity_bytes > 0);
+    assert!(setup.session_capacity_bytes < full_byte_sessions);
     assert_eq!(setup.session_initialization_work, 3);
     assert_eq!(setup.workspace_setup_work, 0);
     assert_eq!(setup.workspace_allocated_bytes, 0);
@@ -701,7 +698,33 @@ fn native_constituents_still_charge_descriptor_slots_but_no_workspace_receipt() 
     assert_eq!(setup.charged_setup_work, 3);
     assert_eq!(setup.charged_retained_bytes, setup.session_capacity_bytes);
 
-    let exact = PortableRegexSetSessionLimits {
+    let text = PortableTextRegexSet::new(patterns).expect("native text set");
+    assert!((0..text.len()).all(|index| {
+        text.pattern_build_report(index)
+            .expect("text report")
+            .portable
+            .plan
+            != PlanKind::K0
+    }));
+    let text_setup = text
+        .search_session(PortableRegexSetSessionLimits::unlimited())
+        .expect("native text set session")
+        .setup_report();
+    let full_text_sessions = patterns.len() * size_of::<PortableTextSearchSession<'_>>();
+    assert!(text_setup.session_capacity_bytes > 0);
+    assert!(text_setup.session_capacity_bytes < full_text_sessions);
+    assert_eq!(text_setup.session_initialization_work, 3);
+    assert_eq!(text_setup.workspace_setup_work, 0);
+    assert_eq!(text_setup.workspace_allocated_bytes, 0);
+    assert_eq!(text_setup.workspace_initialized_bytes, 0);
+    assert_eq!(text_setup.workspace_retained_bytes, 0);
+    assert_eq!(text_setup.charged_setup_work, 3);
+    assert_eq!(
+        text_setup.charged_retained_bytes,
+        text_setup.session_capacity_bytes
+    );
+
+    let byte_exact = PortableRegexSetSessionLimits {
         pattern: SearchSessionLimits {
             max_setup_work: 0,
             max_scratch_bytes: 0,
@@ -710,11 +733,30 @@ fn native_constituents_still_charge_descriptor_slots_but_no_workspace_receipt() 
         max_total_setup_work: setup.charged_setup_work,
         max_total_retained_bytes: setup.charged_retained_bytes,
     };
-    assert!(bytes.search_session(exact).is_ok());
+    let text_exact = PortableRegexSetSessionLimits {
+        max_total_retained_bytes: text_setup.charged_retained_bytes,
+        ..byte_exact
+    };
+    assert!(bytes.search_session(byte_exact).is_ok());
+    assert!(text.search_session(text_exact).is_ok());
+    assert!(matches!(
+        bytes.search_session(PortableRegexSetSessionLimits {
+            max_total_retained_bytes: setup.charged_retained_bytes - 1,
+            ..byte_exact
+        }),
+        Err(PortableRegexSetSessionError::RetainedBytesLimit { .. })
+    ));
+    assert!(matches!(
+        text.search_session(PortableRegexSetSessionLimits {
+            max_total_retained_bytes: text_setup.charged_retained_bytes - 1,
+            ..text_exact
+        }),
+        Err(PortableRegexSetSessionError::RetainedBytesLimit { .. })
+    ));
     assert!(matches!(
         bytes.search_session(PortableRegexSetSessionLimits {
             max_total_setup_work: setup.charged_setup_work - 1,
-            ..exact
+            ..byte_exact
         }),
         Err(PortableRegexSetSessionError::SetupWorkLimit {
             needed: 3,

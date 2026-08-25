@@ -2,14 +2,15 @@
 //!
 //! The public and generic literal-set surface remains in `literal_set`. This
 //! module supplies only the outlined compact arm selected by the ripgrep
-//! stable-borrowed handoff, using aho-corasick's pinned `Automaton` search
-//! implementation rather than another scanner.
+//! stable-borrowed handoff. Ordinary positive-width span iteration and count
+//! may share one direct state scanner when the compact NFA has no prefilter;
+//! every other operation retains aho-corasick's pinned `Automaton` search.
 
-use aho_corasick::automaton::Automaton;
+use aho_corasick::automaton::{Automaton, StateID};
 use aho_corasick::dfa::DFA;
 use aho_corasick::nfa::contiguous::NFA;
 use aho_corasick::nfa::noncontiguous;
-use aho_corasick::{Input, MatchKind};
+use aho_corasick::{Anchored, Input, MatchKind};
 
 use crate::Window;
 use crate::literal_set::{
@@ -28,6 +29,45 @@ const MAX_DENSE_DEPTH: usize = 24;
 struct CompactEngine {
     automaton: NFA,
     width: usize,
+}
+
+/// One no-prefilter compact-NFA scan shared by ordinary iteration projections.
+///
+/// Compact admission proves that every pattern has the same positive width
+/// and Standard semantics. The first accepting state is therefore the
+/// selected endpoint, and resetting to the bound unanchored start state after
+/// acceptance exactly implements non-overlapping iteration. Count never
+/// constructs an Aho `Match`; span iteration recovers each start only after
+/// acceptance. One-shot operations retain Aho's incumbent search.
+struct CompactOrdinaryScanner<'a, 'h> {
+    automaton: &'a NFA,
+    haystack: &'h [u8],
+    start_state: StateID,
+    state: StateID,
+    at: usize,
+    end: usize,
+    width: usize,
+}
+
+#[cfg(test)]
+mod compact_ordinary_scanner_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static BINDS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        BINDS.set(0);
+    }
+
+    pub(super) fn record() {
+        BINDS.set(BINDS.get().saturating_add(1));
+    }
+
+    pub(super) fn binds() -> usize {
+        BINDS.get()
+    }
 }
 
 /// Compact contiguous-NFA owner for one authenticated flat literal set.
@@ -327,6 +367,75 @@ impl CompactEngine {
     }
 }
 
+impl<'a, 'h> CompactOrdinaryScanner<'a, 'h> {
+    /// Bind the direct scanner only when Aho has no construction-selected
+    /// prefilter to preserve. Compact construction independently proves the
+    /// positive fixed width and Standard semantics used by the scan body.
+    #[inline]
+    fn new(engine: &'a CompactEngine, haystack: &'h [u8], window: Window) -> Option<Self> {
+        if engine.width == 0 || engine.automaton.prefilter().is_some() {
+            return None;
+        }
+        debug_assert_eq!(engine.automaton.match_kind(), MatchKind::Standard);
+        debug_assert_eq!(engine.automaton.min_pattern_len(), engine.width);
+        debug_assert_eq!(engine.automaton.max_pattern_len(), engine.width);
+        let start_state = engine
+            .automaton
+            .start_state(Anchored::No)
+            .expect("the compact literal NFA retains its unanchored start state");
+        debug_assert!(!engine.automaton.is_match(start_state));
+        #[cfg(test)]
+        compact_ordinary_scanner_probe::record();
+        Some(Self {
+            automaton: &engine.automaton,
+            haystack,
+            start_state,
+            state: start_state,
+            at: window.start(),
+            end: window.end(),
+            width: engine.width,
+        })
+    }
+
+    /// Return the next non-overlapping first acceptance without constructing
+    /// an Aho input, iterator or match value.
+    #[inline(always)]
+    fn next_end(&mut self) -> Option<usize> {
+        while self.at < self.end {
+            self.state = self.automaton.next_state(
+                Anchored::No,
+                self.state,
+                self.haystack[self.at],
+            );
+            self.at += 1;
+            if !self.automaton.is_special(self.state) {
+                continue;
+            }
+            if self.automaton.is_dead(self.state) {
+                self.at = self.end;
+                return None;
+            }
+            // Aho deliberately excludes start states from `is_special` when
+            // no prefilter is retained, including impossible-root self-loops.
+            debug_assert!(
+                self.automaton.is_match(self.state),
+                "a compact NFA without a prefilter has no other special states",
+            );
+            let accepted_end = self.at;
+            self.state = self.start_state;
+            return Some(accepted_end);
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn next_span(&mut self) -> Option<(usize, usize)> {
+        let end = self.next_end()?;
+        debug_assert!(end >= self.width);
+        Some((end - self.width, end))
+    }
+}
+
 /// Construction-bound ordinary access to the compact owner.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
@@ -609,6 +718,19 @@ impl CompactEngine {
         F: FnMut((usize, usize)) -> Result<bool, E>,
     {
         debug_assert!(!self.window_is_too_short(window));
+        // This is only an optional engine arm inside the incumbent validated
+        // visitor. It does not replace the existing span-total structure or
+        // change callback/fallback control flow.
+        if let Some(mut scanner) = CompactOrdinaryScanner::new(self, haystack, window) {
+            while let Some(span) = scanner.next_span() {
+                match visitor(span) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Ok(())),
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            return Ok(Ok(()));
+        }
         let input = Input::new(haystack).span(window.start()..window.end());
         let matches = self
             .automaton
@@ -645,6 +767,17 @@ impl CompactEngine {
         window: Window,
     ) -> Result<u64, LiteralSetError> {
         debug_assert!(!self.window_is_too_short(window));
+        if let Some(mut scanner) = CompactOrdinaryScanner::new(self, haystack, window) {
+            let mut count = 0_usize;
+            while scanner.next_end().is_some() {
+                // Positive-width, non-overlapping matches bound this count by
+                // the already-validated window's byte length.
+                count += 1;
+            }
+            return u64::try_from(count).map_err(|_| LiteralSetError::ArithmeticOverflow {
+                computation: "compact literal-set ordinary match count",
+            });
+        }
         let input = Input::new(haystack).span(window.start()..window.end());
         let count = self
             .automaton
@@ -745,7 +878,8 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
         self.engine.find_window_value(haystack, window)
     }
 
-    /// Visit non-overlapping spans through one pinned Aho iterator.
+    /// Visit non-overlapping spans through the direct no-prefilter scanner or
+    /// the unchanged pinned Aho iterator fallback.
     #[doc(hidden)]
     #[inline]
     pub fn try_visit_spans_window_value<F, E>(
@@ -761,7 +895,8 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
             .try_visit_spans_window_value(haystack, window, visitor)
     }
 
-    /// Count non-overlapping spans through one pinned Aho iterator.
+    /// Count non-overlapping spans through the direct no-prefilter scanner or
+    /// the unchanged pinned Aho iterator fallback.
     #[doc(hidden)]
     #[inline]
     pub fn count_spans_window_value(
@@ -775,11 +910,14 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
 
 #[cfg(test)]
 mod tests {
+    use aho_corasick::automaton::Automaton;
+
     use super::{
         ALPHABET_LEN, BYTES_PER_DFA_CELL_ENVELOPE, BYTES_PER_TRIE_STATE_ENVELOPE, CompactPreflight,
-        LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
-        LiteralSetCompactOrdinaryCandidate, LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
-        MAX_DENSE_DEPTH, MAX_PATTERNS, MIN_PATTERN_BYTES, compact_preflight,
+        CompactOrdinaryScanner, LiteralSetCompactBuildOutcome,
+        LiteralSetCompactOrdinaryBuildOutcome, LiteralSetCompactOrdinaryCandidate,
+        LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan, MAX_DENSE_DEPTH, MAX_PATTERNS,
+        MIN_PATTERN_BYTES, compact_ordinary_scanner_probe, compact_preflight,
         deepest_branch_build_work_upper_bound, deepest_branch_dense_depth,
     };
     use crate::{
@@ -1044,8 +1182,12 @@ mod tests {
             .unwrap()
             .expect("aho-corasick accepts a zero forced-dense depth")
             .into_ordinary();
+        assert!(plan.engine.automaton.prefilter().is_none());
         let mut haystack = vec![b'z'; MIN_PATTERN_BYTES + 2];
         haystack[1..=MIN_PATTERN_BYTES].copy_from_slice(&patterns[17]);
+        assert!(
+            CompactOrdinaryScanner::new(&plan.engine, &haystack, Window::full(&haystack)).is_some()
+        );
         assert_eq!(
             plan.ordinary_executor()
                 .find_window_value(&haystack, Window::new(1, MIN_PATTERN_BYTES + 1),),
@@ -1153,8 +1295,16 @@ mod tests {
 
     #[test]
     fn uniform_spans_match_dense_across_overlap_adjacency_and_windows() {
-        let mut patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
-        patterns[0].fill(b'a');
+        let patterns = (0_u16..=255)
+            .map(|index| {
+                let mut pattern = vec![b'a'; MIN_PATTERN_BYTES];
+                pattern[0] = u8::try_from(index.min(254)).unwrap();
+                if index == 255 {
+                    pattern[1] = b'b';
+                }
+                pattern
+            })
+            .collect::<Vec<_>>();
         let dense =
             LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
         let compact_plan = compact(&patterns, LiteralSetBuildLimits::default())
@@ -1166,9 +1316,24 @@ mod tests {
             .into_ordinary();
         let ordinary = ordinary_plan.ordinary_executor();
 
-        let mut haystack = vec![b'z'];
+        let mut haystack = vec![u8::MAX];
         haystack.extend(core::iter::repeat_n(b'a', 2 * MIN_PATTERN_BYTES));
-        haystack.push(b'z');
+        haystack.push(u8::MAX);
+        assert!(ordinary.engine.automaton.prefilter().is_none());
+        let direct = CompactOrdinaryScanner::new(
+            ordinary.engine,
+            &haystack,
+            Window::full(&haystack),
+        )
+        .expect("the no-prefilter compact NFA admits direct scanning");
+        assert!(direct.automaton.is_start(direct.start_state));
+        assert!(!direct.automaton.is_special(direct.start_state));
+        compact_ordinary_scanner_probe::reset();
+        assert_eq!(
+            ordinary.selected_end_window_value(&haystack, Window::full(&haystack)),
+            Ok(Some(1 + MIN_PATTERN_BYTES)),
+            "the impossible root byte must leave the unanchored scanner at start",
+        );
         for window in [
             Window::full(&haystack),
             Window::new(1, haystack.len() - 1),
@@ -1196,8 +1361,13 @@ mod tests {
                 Ok(expected.is_some()),
             );
         }
+        assert_eq!(
+            compact_ordinary_scanner_probe::binds(),
+            0,
+            "one-shot find, endpoint and exists must retain Aho search",
+        );
 
-        let window = Window::new(1, haystack.len() - 1);
+        let window = Window::full(&haystack);
         let mut spans = Vec::new();
         assert_eq!(
             ordinary
@@ -1216,7 +1386,24 @@ mod tests {
             ],
             "overlapping starts are suppressed while adjacent matches remain",
         );
+        assert_eq!(compact_ordinary_scanner_probe::binds(), 1);
         assert_eq!(ordinary.count_spans_window_value(&haystack, window), Ok(2));
+        assert_eq!(compact_ordinary_scanner_probe::binds(), 2);
+        let mut stopped_calls = 0;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |_| {
+                stopped_calls += 1;
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(stopped_calls, 1);
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |_| {
+                Err::<bool, _>("direct callback")
+            }),
+            Ok(Err("direct callback")),
+        );
 
         let overlap_only = Window::new(1, 2 + MIN_PATTERN_BYTES);
         let mut overlap_spans = Vec::new();
@@ -1245,9 +1432,15 @@ mod tests {
         }
 
         let mut seed = 0x5cee_987d_a7a5_eed5_u64;
-        let mut patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        let mut patterns = (0_u16..=255)
+            .map(|first| {
+                let mut pattern = vec![b'a'; MIN_PATTERN_BYTES];
+                pattern[0] = u8::try_from(first).unwrap();
+                pattern
+            })
+            .collect::<Vec<_>>();
         for pattern in &mut patterns {
-            for byte in &mut pattern[12..] {
+            for byte in &mut pattern[1..] {
                 *byte = b'a' + u8::try_from(next(&mut seed) & 3).unwrap();
             }
         }
@@ -1263,6 +1456,7 @@ mod tests {
             .expect("the seeded uniform set admits the ordinary owner")
             .into_ordinary();
         let ordinary = ordinary_plan.ordinary_executor();
+        assert!(ordinary.engine.automaton.prefilter().is_none());
 
         for case in 0..64 {
             let len = usize::try_from(next(&mut seed) % 769).unwrap();
@@ -1625,6 +1819,11 @@ mod tests {
             .unwrap();
         let ordinary = compact.ordinary_executor();
         let haystack = &patterns[3];
+        assert!(ordinary.engine.automaton.prefilter().is_some());
+        assert!(
+            CompactOrdinaryScanner::new(ordinary.engine, haystack, Window::full(haystack)).is_none()
+        );
+        compact_ordinary_scanner_probe::reset();
         let invalid = Window::new(1, haystack.len() + 1);
         let expected = LiteralSetError::InvalidWindow {
             start: 1,
@@ -1685,5 +1884,6 @@ mod tests {
                 .try_visit_spans_window_value(haystack, full, |_| { Err::<bool, _>("callback") }),
             Ok(Err("callback")),
         );
+        assert_eq!(compact_ordinary_scanner_probe::binds(), 0);
     }
 }

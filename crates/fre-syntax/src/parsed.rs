@@ -720,6 +720,17 @@ pub struct ParseAttempt {
     receipt: ParseAttemptReceipt,
 }
 
+/// Owned facts transferred from one successful Rust parse into an independent
+/// parse of the same source under another Rust profile.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct RustParseHandoff {
+    pub request: ParseRequest,
+    pub source_profile: CompatibilityProfile,
+    pub summary: ParseSummary,
+    pub rust: RustParsed,
+}
+
 impl ParseAttempt {
     pub(crate) fn new(record: ParseRecord, mut receipt: ParseAttemptReceipt) -> Self {
         receipt.terminal = ParseAttemptTerminal::Success;
@@ -750,6 +761,35 @@ impl ParseAttempt {
     #[must_use]
     pub fn into_record(self) -> ParseRecord {
         self.record
+    }
+
+    /// Transfer one successfully parsed Rust source into a fresh Rust request
+    /// without copying or reconstructing its bytes.
+    ///
+    /// The returned request preserves the original admission and safety
+    /// envelopes while resetting attempt provenance for the independent parse.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_rust_reparse_handoff(
+        self,
+        target_profile: CompatibilityProfile,
+    ) -> Option<RustParseHandoff> {
+        let Self { record, receipt: _ } = self;
+        let CanonicalPattern::Rust(rust) = record.pattern else {
+            return None;
+        };
+        Some(RustParseHandoff {
+            request: ParseRequest {
+                pattern: record.key.pattern,
+                profile: target_profile,
+                admission: record.key.admission,
+                safety: record.key.safety,
+                attempt_source_owner: ParseAttemptSourceOwnerEvidence::default(),
+            },
+            source_profile: record.key.profile,
+            summary: record.summary,
+            rust,
+        })
     }
 
     /// Authenticate the successful cache owner and every observed syntax
