@@ -29646,6 +29646,8 @@ fn native_weighted_capture_module(
         ordered_nfa_bulk_gate_target: None,
         prepared_aggregate_exports: PreparedAggregateExports::NONE,
         prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
         runtime_symbol_index: None,
         runtime_program_symbol_index: None,
         start_accelerator: StartAccelerator::None,
@@ -30084,6 +30086,8 @@ fn native_rebar_multi_grep_module_v1(
         ordered_nfa_bulk_gate_target: None,
         prepared_aggregate_exports: PreparedAggregateExports::NONE,
         prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
         runtime_symbol_index: None,
         runtime_program_symbol_index: None,
         start_accelerator: StartAccelerator::None,
@@ -44894,6 +44898,7 @@ fn lower_x86_64_exact_finite_selected_end_grep_count()
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: Some(identity_relocation),
+        authenticated_body_offset: None,
     })
 }
 
@@ -47320,6 +47325,7 @@ fn lower_aarch64_exact_finite_selected_end_grep_count()
             page: offsets[1],
             page_offset: offsets[2],
         }),
+        authenticated_body_offset: None,
     })
 }
 
