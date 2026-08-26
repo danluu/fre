@@ -431,6 +431,43 @@ impl Plan {
         Some(Match { start, end })
     }
 
+    /// Count non-overlapping selected matches in one ordinary full-tail
+    /// projection without constructing spans, windows, or accounting.
+    #[must_use]
+    #[inline(never)]
+    pub(crate) fn ordinary_count_full_unmetered(&self, haystack: &[u8]) -> u64 {
+        let owner = self.owner();
+        let mut position = 0_usize;
+        let mut count = 0_u64;
+        while let Some(start) = owner.member_seek.seek_unmetered(
+            haystack,
+            position,
+            haystack.len(),
+            owner.classifier.as_ref(),
+        ) {
+            let minimum_end = start
+                .checked_add(1)
+                .expect("a selected byte before the slice end can advance once");
+            position = if owner.greedy {
+                owner
+                    .run_end_seek
+                    .seek_unmetered(
+                        haystack,
+                        minimum_end,
+                        haystack.len(),
+                        owner.classifier.as_ref(),
+                    )
+                    .unwrap_or(haystack.len())
+            } else {
+                minimum_end
+            };
+            count = count
+                .checked_add(1)
+                .expect("a positive-width slice match count fits u64");
+        }
+        count
+    }
+
     pub(crate) fn is_match_window(
         &self,
         haystack: &[u8],

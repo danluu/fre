@@ -24935,9 +24935,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// `Ok(Some(count))` is returned for a positive exact literal, a
     /// positive-width K0 plan, a reverse-inner or Unicode scalar-run plan over
     /// an exact tail window, a legacy literal/class-run plan over a full or
-    /// unguarded tail window, or a packed, ordinary non-uniform, or
-    /// uniform-standard literal-set plan. Each construction seals nonempty
-    /// selected spans.
+    /// unguarded tail window, a pure byte-class repeat, a packed literal set,
+    /// or an ordinary non-uniform or uniform-standard literal-set plan. Each
+    /// construction seals nonempty selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25098,6 +25098,14 @@ impl<'r> PortableOrdinarySession<'r> {
                         count_ordinary_unicode_scalar_selected_ends_at(
                             plan, haystack, start,
                         )
+                    }
+                    PortablePlan::PureByteClassRepeat(plan) => {
+                        let tail = haystack.get(start..).ok_or_else(|| {
+                            SearchError::from(
+                                PureByteClassRepeatSearchError::InvalidWindow,
+                            )
+                        })?;
+                        Ok(Some(plan.ordinary_count_full_unmetered(tail)))
                     }
                     _ => Ok(None),
                 }
@@ -48109,6 +48117,73 @@ mod tests {
             ))
         ));
         assert!(!invalid_callback);
+    }
+
+    #[test]
+    fn ordinary_pure_byte_class_repeat_counts_report_free_tails() {
+        fn selected_count(regex: &PortableRegex, haystack: &[u8], start: usize) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        for (pattern, haystack) in [
+            (r"(?-u:[ab]+)", b"!aab!!baba!c!abb!".as_slice()),
+            (r"(?-u:[ab]+?)", b"!aab!!baba!c!abb!".as_slice()),
+            (
+                r"(?-u:[^!]+)",
+                b"!alpha!!beta-gamma!delta!".as_slice(),
+            ),
+            (
+                r"(?-u:[aceg]+)",
+                b"!aacegg!!gcea!bbb!aceg!".as_slice(),
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::PureByteClassRepeat);
+            let mut ordinary = regex.ordinary_session().unwrap();
+
+            for start in 0..=haystack.len() {
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(haystack, start),
+                    Ok(Some(selected_count(&regex, haystack, start))),
+                    "pattern={pattern:?}, start={start}",
+                );
+            }
+            assert!(matches!(
+                ordinary.count_positive_width_selected_ends_at(
+                    haystack,
+                    haystack.len() + 1,
+                ),
+                Err(SearchError::PureByteClassRepeat(
+                    super::PureByteClassRepeatSearchError::InvalidWindow
+                )),
+            ));
+        }
+
+        let guarded = PortableBuilder::new(r"(?-u:\b[ab]+\b)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_ne!(guarded.build_report().plan, PlanKind::PureByteClassRepeat);
+        assert_eq!(
+            guarded
+                .ordinary_session()
+                .unwrap()
+                .count_positive_width_selected_ends_at(b"aab!", usize::MAX),
+            Ok(None),
+        );
     }
 
     #[test]
