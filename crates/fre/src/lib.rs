@@ -15918,6 +15918,10 @@ impl PortableRegex {
                     fixed_predicate_word64_search_limits(limits),
                 )
                 .map_err(SearchError::from),
+            PortablePlan::LineDomainByteAtoms(plan) => plan
+                .find_window_value(haystack, window, limits)
+                .map(|matched| matched.map(Match::end))
+                .map_err(SearchError::from),
             _ => {
                 if limits == SearchLimits::unlimited()
                     && let PortablePlan::BoundedByteClassSequence(plan) = &self.plan

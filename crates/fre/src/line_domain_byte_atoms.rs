@@ -70,6 +70,27 @@ pub(crate) struct SearchCursor<'plan, 'haystack> {
     haystack: &'haystack [u8],
 }
 
+#[cfg(test)]
+mod accounted_search_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
 /// Optional final-fallback publication result.
 #[derive(Debug)]
 pub(crate) enum PublicationOutcome {
@@ -271,6 +292,8 @@ impl OwnedPlan {
     }
 
     fn complete_search_accounting(&self, mut accounting: SearchAccounting) -> SearchAccounting {
+        #[cfg(test)]
+        accounted_search_probe::record();
         accounting.upper_bounds.persistent_bytes = self.build.persistent_bytes;
         accounting.actual.persistent_bytes = self.build.persistent_bytes;
         accounting
@@ -989,6 +1012,22 @@ mod tests {
                             expected,
                             "value case={case}, byte={byte}, window={start}..{end}",
                         );
+                        let shortest = fre
+                            .shortest_match_window_value(
+                                &haystack,
+                                SearchWindow::new(start, end),
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "shortest value case={case}, byte={byte}, window={start}..{end}: {error}"
+                                )
+                            });
+                        assert_eq!(
+                            shortest,
+                            expected.map(|(_match_start, match_end)| match_end),
+                            "shortest value case={case}, byte={byte}, window={start}..{end}",
+                        );
                         let SearchAccounting::LineDomainByteAtoms(accounting) = accounting else {
                             panic!("line-domain differential search lost its accounting type");
                         };
@@ -997,6 +1036,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shortest_value_preserves_errors_and_bypasses_accounting() {
+        let regex = PortableBuilder::new(r"(?m)^(?-u:[A-Z][a-z]{2,8})$")
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LineDomainByteAtoms);
+        let haystack = b"bad\nAlpha\nBeta\n";
+        let PortablePlan::LineDomainByteAtoms(owner) = &regex.plan else {
+            panic!("line-domain report and owner disagree");
+        };
+
+        for window in [
+            SearchWindow::new(haystack.len() + 1, haystack.len()),
+            SearchWindow::new(0, haystack.len() + 1),
+        ] {
+            assert_eq!(
+                regex
+                    .shortest_match_window_value(haystack, window, SearchLimits::unlimited())
+                    .unwrap_err(),
+                regex
+                    .shortest_match_window(haystack, window, SearchLimits::unlimited())
+                    .unwrap_err(),
+                "window={window:?}",
+            );
+        }
+
+        let exact_work = owner
+            .kernel
+            .search_upper_bounds(haystack.len(), 0, haystack.len())
+            .unwrap()
+            .work;
+        let refused = SearchLimits {
+            max_work: exact_work - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        assert_eq!(
+            regex
+                .shortest_match_window_value(haystack, SearchWindow::full(haystack), refused)
+                .unwrap_err(),
+            regex
+                .shortest_match_window(haystack, SearchWindow::full(haystack), refused)
+                .unwrap_err(),
+        );
+
+        super::accounted_search_probe::reset();
+        assert_eq!(
+            regex
+                .shortest_match_window_value(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(9),
+        );
+        assert_eq!(super::accounted_search_probe::calls(), 0);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert_eq!(ordinary.shortest_match_at(haystack, 0).unwrap(), Some(9));
+        assert_eq!(super::accounted_search_probe::calls(), 0);
+        assert_eq!(
+            regex
+                .shortest_match_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some(9),
+        );
+        assert_eq!(super::accounted_search_probe::calls(), 1);
     }
 
     #[test]
