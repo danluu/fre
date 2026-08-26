@@ -14639,7 +14639,13 @@ impl PortableRegex {
         let plan = match &self.plan {
             PortablePlan::ExactLiteral(literal) => {
                 if let Some(executor) = literal.ordinary_executor() {
-                    PortableOrdinarySessionPlan::ExactLiteral { executor }
+                    if executor.retained_count_eligible() {
+                        PortableOrdinarySessionPlan::ExactLiteralRetainedCount {
+                            executor,
+                        }
+                    } else {
+                        PortableOrdinarySessionPlan::ExactLiteral { executor }
+                    }
                 } else {
                     PortableOrdinarySessionPlan::Canonical(
                         PortableOrdinaryCanonical::try_new(self)?,
@@ -18728,6 +18734,11 @@ enum PortableOrdinarySessionPlan<'a> {
     /// Appended to preserve every established ordinary-session discriminant.
     LiteralSetCompact {
         executor: LiteralSetCompactOrdinaryExecutor<'a>,
+    },
+    /// Appended so the incumbent exact-literal variant and every preceding
+    /// ordinary-session discriminant retain their established representation.
+    ExactLiteralRetainedCount {
+        executor: ExactLiteralOrdinaryExecutor<'a>,
     },
 }
 
@@ -24785,7 +24796,8 @@ impl<'r> PortableOrdinarySession<'r> {
     #[inline]
     pub fn is_match_at(&mut self, haystack: &[u8], start: usize) -> Result<bool, SearchError> {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => executor
                 .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
@@ -24857,7 +24869,8 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<usize>, SearchError> {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => executor
                 .first_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
@@ -24945,7 +24958,8 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<Match>, SearchError> {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => executor
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
@@ -25051,7 +25065,8 @@ impl<'r> PortableOrdinarySession<'r> {
         F: FnMut(Match) -> Result<bool, E>,
     {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::ExactLiteral { executor } => {
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => {
                 let mut visitor = visitor;
                 executor
                     .try_visit_spans_window_value(
@@ -25195,6 +25210,13 @@ impl<'r> PortableOrdinarySession<'r> {
         match &mut self.plan {
             PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
                 .count_spans_window_value(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                )
+                .map(Some)
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => executor
+                .count_spans_window_value_retained(
                     haystack,
                     LiteralWindow::new(start, haystack.len()),
                 )
@@ -48322,7 +48344,10 @@ mod tests {
                 super::PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa { .. } => {
                     "literal-set-uniform-standard-dfa"
                 }
-                super::PortableOrdinarySessionPlan::ExactLiteral { .. } => "exact-literal",
+                super::PortableOrdinarySessionPlan::ExactLiteral { .. }
+                | super::PortableOrdinarySessionPlan::ExactLiteralRetainedCount { .. } => {
+                    "exact-literal"
+                }
                 super::PortableOrdinarySessionPlan::LiteralSetCompact { .. } => {
                     "literal-set-compact"
                 }
@@ -49511,6 +49536,45 @@ mod tests {
             &empty.plan,
             super::PortableOrdinarySessionPlan::Canonical(_)
         ));
+    }
+
+    #[test]
+    fn ordinary_session_routes_only_eligible_exact_literals_to_retained_count() {
+        fn retained_route(pattern: &str) -> bool {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+            let ordinary = regex.ordinary_session().unwrap();
+            matches!(
+                ordinary.plan,
+                super::PortableOrdinarySessionPlan::ExactLiteralRetainedCount { .. }
+            )
+        }
+
+        assert!(!retained_route("needle"));
+        assert!(!retained_route("abcdabcd"));
+        assert!(!retained_route("aaaaaaaaa"));
+        assert!(!retained_route("0123456789abcdef0123456789ABCDEFG"));
+        assert_eq!(retained_route("needleXYZ"), cfg!(target_arch = "aarch64"));
+        assert_eq!(
+            retained_route("0123456789abcdef0123456789ABCDEF"),
+            cfg!(target_arch = "aarch64"),
+        );
+
+        let regex = PortableBuilder::new("needleXYZ")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(
+                b"xxneedleXYZ,needleXYZ,needleXYZy",
+                0,
+            ),
+            Ok(Some(3)),
+        );
     }
 
     #[test]

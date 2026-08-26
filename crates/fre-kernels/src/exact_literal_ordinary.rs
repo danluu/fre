@@ -13,6 +13,39 @@ use super::{LiteralError, LiteralPlan, Window};
 /// Stable capability identity for report-free positive exact-literal search.
 pub const ORDINARY_CAPABILITY_ID: &str = "exact-literal.ordinary-positive.v1";
 
+#[cfg(target_arch = "aarch64")]
+const RETAINED_COUNT_MIN_NEEDLE_BYTES: usize = 8;
+#[cfg(target_arch = "aarch64")]
+const RETAINED_COUNT_MAX_NEEDLE_BYTES: usize = 32;
+
+#[inline]
+fn retained_count_eligible(needle: &[u8]) -> bool {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = needle;
+        false
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !(RETAINED_COUNT_MIN_NEEDLE_BYTES..=RETAINED_COUNT_MAX_NEEDLE_BYTES)
+            .contains(&needle.len())
+        {
+            return false;
+        }
+        let mut seen = [0_u64; 4];
+        let mut distinct = 0_usize;
+        for &byte in needle {
+            let word = usize::from(byte) / u64::BITS as usize;
+            let mask = 1_u64 << (usize::from(byte) % u64::BITS as usize);
+            if seen[word] & mask == 0 {
+                seen[word] |= mask;
+                distinct += 1;
+            }
+        }
+        distinct > needle.len() / 2
+    }
+}
+
 /// Immutable semantics sealed by an ordinary exact-literal executor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Identity {
@@ -81,6 +114,19 @@ impl ExactLiteralOrdinaryExecutor<'_> {
     #[inline]
     pub fn is_bound_to(&self, plan: &LiteralPlan) -> bool {
         core::ptr::eq(self.finder, &plan.finder)
+    }
+
+    /// Whether a separate ordinary-session count route may use the retained
+    /// finder iterator.
+    ///
+    /// This construction-only classification is sealed once by the session.
+    /// Other exact-literal operations and ineligible count calls retain their
+    /// established executor variant and implementation.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn retained_count_eligible(&self) -> bool {
+        retained_count_eligible(self.needle)
     }
 
     /// Return whether the retained literal occurs wholly inside `window`.
@@ -204,6 +250,35 @@ impl ExactLiteralOrdinaryExecutor<'_> {
         Ok(count)
     }
 
+    /// Count through one retained non-overlapping finder iterator.
+    ///
+    /// Ordinary sessions call this only from their separately admitted
+    /// retained-count variant. Outlining keeps iterator state out of the
+    /// incumbent exact-literal count implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-window error before binding the iterator, or a
+    /// checked counter-conversion failure.
+    #[doc(hidden)]
+    #[inline(never)]
+    pub fn count_spans_window_value_retained(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<u64, LiteralError> {
+        validate_window(window, haystack.len())?;
+        #[cfg(test)]
+        ordinary_probe::record_retained_count_bind();
+        let count = self
+            .finder
+            .find_iter(&haystack[window.start()..window.end()])
+            .count();
+        u64::try_from(count).map_err(|_| LiteralError::ArithmeticOverflow {
+            computation: "ordinary literal match count",
+        })
+    }
+
     #[inline]
     fn first_end_after_validation(
         &self,
@@ -285,10 +360,12 @@ mod ordinary_probe {
 
     std::thread_local! {
         static COUNTS: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
+        static RETAINED_COUNT_BINDS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
         COUNTS.set((0, 0, 0));
+        RETAINED_COUNT_BINDS.set(0);
     }
 
     pub(super) fn record_bind() {
@@ -308,6 +385,14 @@ mod ordinary_probe {
 
     pub(super) fn snapshot() -> (usize, usize, usize) {
         COUNTS.get()
+    }
+
+    pub(super) fn record_retained_count_bind() {
+        RETAINED_COUNT_BINDS.set(RETAINED_COUNT_BINDS.get().saturating_add(1));
+    }
+
+    pub(super) fn retained_count_binds() -> usize {
+        RETAINED_COUNT_BINDS.get()
     }
 }
 
@@ -534,5 +619,79 @@ mod tests {
                 .unwrap(),
             Err("callback"),
         );
+    }
+
+    #[test]
+    fn retained_count_eligibility_is_conservative_and_target_bound() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"1234567", false),
+            (b"12345678", true),
+            (b"needleXYZ", true),
+            (b"abcdabcd", false),
+            (b"abcdeabc", true),
+            (b"aaaaaaaaa", false),
+            (b"0123456789abcdef0123456789ABCDEF", true),
+            (b"0123456789abcdef0123456789ABCDEFG", false),
+        ];
+        for &(needle, aarch64_expected) in cases {
+            let plan = LiteralPlan::new(needle, LiteralBuildLimits::default()).unwrap();
+            let executor = plan.ordinary_executor().unwrap();
+            assert_eq!(
+                executor.retained_count_eligible(),
+                cfg!(target_arch = "aarch64") && aarch64_expected,
+                "needle={needle:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn retained_count_matches_checked_nonoverlapping_windows() {
+        let cases: &[(&[u8], &[u8], Window)] = &[
+            (
+                b"needleXYZ",
+                b"xxneedleXYZneedleXYZneedleXYZy",
+                Window::new(0, 30),
+            ),
+            (b"12345678", b"x1234567812345678y", Window::new(1, 17)),
+            (b"aba", b"xababaz", Window::new(1, 6)),
+            (b"needleXYZ", b"zzzzzzzz", Window::new(0, 8)),
+        ];
+        for &(needle, haystack, window) in cases {
+            let plan = LiteralPlan::new(needle, LiteralBuildLimits::default()).unwrap();
+            let executor = plan.ordinary_executor().unwrap();
+            let expected = canonical_spans(&plan, haystack, window);
+            assert_eq!(
+                executor.count_spans_window_value_retained(haystack, window),
+                Ok(u64::try_from(expected.len()).unwrap()),
+                "needle={needle:?} haystack={haystack:?} window={window:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn retained_count_validates_before_binding_its_iterator() {
+        let plan = LiteralPlan::new(b"needleXYZ", LiteralBuildLimits::default()).unwrap();
+        let executor = plan.ordinary_executor().unwrap();
+        let haystack = b"needleXYZ";
+
+        ordinary_probe::reset();
+        assert_eq!(
+            executor.count_spans_window_value_retained(haystack, Window::new(10, 9)),
+            Err(LiteralError::InvalidWindow {
+                start: 10,
+                end: 9,
+                haystack_len: 9,
+            }),
+        );
+        assert_eq!(ordinary_probe::snapshot(), (0, 1, 0));
+        assert_eq!(ordinary_probe::retained_count_binds(), 0);
+
+        ordinary_probe::reset();
+        assert_eq!(
+            executor.count_spans_window_value_retained(haystack, Window::full(haystack)),
+            Ok(1),
+        );
+        assert_eq!(ordinary_probe::snapshot(), (0, 1, 0));
+        assert_eq!(ordinary_probe::retained_count_binds(), 1);
     }
 }
