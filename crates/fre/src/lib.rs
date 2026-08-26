@@ -25219,9 +25219,10 @@ impl<'r> PortableOrdinarySession<'r> {
     /// positive-width K0 plan, a fixed-predicate word over an exact tail, a
     /// Unicode word-run over the exact full window, a reverse-inner or Unicode
     /// scalar-run plan over an exact tail window, a legacy literal/class-run
-    /// plan over a full or unguarded tail window, a pure byte-class repeat, a
-    /// packed literal set, or an ordinary non-uniform or uniform-standard
-    /// literal-set plan. Each construction seals nonempty selected spans.
+    /// plan over a full or unguarded tail window, a pure or bounded byte-class
+    /// repeat, a packed literal set, or an ordinary non-uniform or
+    /// uniform-standard literal-set plan. Each construction seals nonempty
+    /// selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25399,6 +25400,14 @@ impl<'r> PortableOrdinarySession<'r> {
                         )
                     }
                     PortablePlan::PureByteClassRepeat(plan) => {
+                        let tail = haystack.get(start..).ok_or_else(|| {
+                            SearchError::from(
+                                PureByteClassRepeatSearchError::InvalidWindow,
+                            )
+                        })?;
+                        Ok(Some(plan.ordinary_count_full_unmetered(tail)))
+                    }
+                    PortablePlan::BoundedByteClassRepeat(plan) => {
                         let tail = haystack.get(start..).ok_or_else(|| {
                             SearchError::from(
                                 PureByteClassRepeatSearchError::InvalidWindow,

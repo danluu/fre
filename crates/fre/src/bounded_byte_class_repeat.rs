@@ -202,6 +202,83 @@ impl Plan {
             .expect("the fixed bounded byte-class repeat layouts fit usize")
     }
 
+    /// Count non-overlapping selected matches in one ordinary full-tail
+    /// projection without constructing spans, windows, or accounting.
+    ///
+    /// Every selected match is contained in one maximal member run. Lazy
+    /// selection partitions that run into `minimum`-byte words. Greedy
+    /// selection consumes `maximum` bytes until only one shorter, still
+    /// qualifying word can remain. Counting those partitions after one run
+    /// scan is therefore exactly equivalent to restarting leftmost-first
+    /// search at every preceding selected end.
+    #[must_use]
+    #[inline(never)]
+    pub(crate) fn ordinary_count_full_unmetered(&self, haystack: &[u8]) -> u64 {
+        let owner = self.owner();
+        let minimum = usize::try_from(owner.minimum)
+            .expect("one repetition minimum fits the target index width");
+        let maximum = usize::try_from(owner.maximum)
+            .expect("one repetition maximum fits the target index width");
+        debug_assert!(minimum > 0 && maximum >= minimum);
+
+        let mut position = 0_usize;
+        let mut count = 0_u64;
+        while let Some(start) = owner.member_seek.seek_unmetered(
+            haystack,
+            position,
+            haystack.len(),
+            owner.classifier.as_ref(),
+        ) {
+            let after_first = start
+                .checked_add(1)
+                .expect("a selected byte before the slice end can advance once");
+            let run_end = owner
+                .run_end_seek
+                .seek_unmetered(
+                    haystack,
+                    after_first,
+                    haystack.len(),
+                    owner.classifier.as_ref(),
+                )
+                .unwrap_or(haystack.len());
+            let run_bytes = run_end
+                .checked_sub(start)
+                .expect("a maximal member run ends after its start");
+            let run_matches = if run_bytes < minimum {
+                0
+            } else if owner.greedy {
+                if maximum == 1 {
+                    run_bytes
+                } else if run_bytes <= maximum {
+                    1
+                } else {
+                    let complete = run_bytes / maximum;
+                    complete
+                        .checked_add(usize::from(run_bytes % maximum >= minimum))
+                        .expect("one run cannot contain more matches than bytes")
+                }
+            } else if minimum == 1 {
+                run_bytes
+            } else {
+                run_bytes / minimum
+            };
+            count = count
+                .checked_add(
+                    u64::try_from(run_matches)
+                        .expect("a slice-bounded match count fits u64"),
+                )
+                .expect("positive-width slice matches fit u64");
+            position = if run_end < haystack.len() {
+                run_end
+                    .checked_add(1)
+                    .expect("a run-ending byte before the slice end can advance once")
+            } else {
+                run_end
+            };
+        }
+        count
+    }
+
     pub(crate) fn is_match_window(
         &self,
         haystack: &[u8],
@@ -1077,6 +1154,106 @@ mod tests {
         );
         assert!(plan.owner().classifier.is_some());
         assert!(MemberMaskMode::from_owner(plan.owner()).is_none());
+    }
+
+    #[test]
+    fn ordinary_count_matches_selected_end_iteration_for_every_tail() {
+        fn selected_count(
+            regex: &crate::PortableRegex,
+            haystack: &[u8],
+            start: usize,
+        ) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        let patterns = [
+            ("a{2,5}", b'a', b'b'),
+            ("a{2,5}?", b'a', b'b'),
+            ("(?-u:[ab]){1,4}", b'a', b'!'),
+            ("(?-u:[ab]){1,4}?", b'a', b'!'),
+            ("(?-u:[^a]){3,7}", b'b', b'a'),
+            ("(?-u:[^a]){3,7}?", b'b', b'a'),
+            ("(?-u:[aceg]){2,5}", b'a', b'b'),
+            ("(?-u:[aceg]){2,5}?", b'a', b'b'),
+        ];
+        let alphabet = [b'a', b'b', b'!'];
+        for (pattern, member, separator) in patterns {
+            let regex = build(pattern);
+            let PortablePlan::BoundedByteClassRepeat(plan) = &regex.plan else {
+                panic!("expected bounded plan for {pattern:?}");
+            };
+            let mut ordinary = regex.ordinary_session().unwrap();
+            for length in 0_u32..=6 {
+                let cases = alphabet.len().pow(length);
+                for encoded in 0..cases {
+                    let mut value = encoded;
+                    let mut haystack = vec![0_u8; usize::try_from(length).unwrap()];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    for start in 0..=haystack.len() {
+                        let expected = selected_count(&regex, &haystack, start);
+                        assert_eq!(
+                            plan.ordinary_count_full_unmetered(&haystack[start..]),
+                            expected,
+                            "direct count: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                        assert_eq!(
+                            ordinary.count_positive_width_selected_ends_at(
+                                &haystack,
+                                start,
+                            ),
+                            Ok(Some(expected)),
+                            "facade count: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                    }
+                }
+            }
+
+            for run_bytes in [7, 10, 11, 12, 14, 15, 16, 31] {
+                let mut haystack = vec![separator; 2];
+                haystack.extend(core::iter::repeat_n(member, run_bytes));
+                haystack.push(separator);
+                haystack.extend(core::iter::repeat_n(member, run_bytes / 2));
+                haystack.push(separator);
+                for start in 0..=haystack.len() {
+                    let expected = selected_count(&regex, &haystack, start);
+                    assert_eq!(
+                        plan.ordinary_count_full_unmetered(&haystack[start..]),
+                        expected,
+                        "long direct count: pattern={pattern:?}, run_bytes={run_bytes}, start={start}",
+                    );
+                    assert_eq!(
+                        ordinary.count_positive_width_selected_ends_at(
+                            &haystack,
+                            start,
+                        ),
+                        Ok(Some(expected)),
+                        "long facade count: pattern={pattern:?}, run_bytes={run_bytes}, start={start}",
+                    );
+                }
+            }
+            assert!(matches!(
+                ordinary.count_positive_width_selected_ends_at(
+                    b"a",
+                    usize::MAX,
+                ),
+                Err(FacadeSearchError::PureByteClassRepeat(
+                    Error::InvalidWindow
+                )),
+            ));
+        }
     }
 
     #[test]
