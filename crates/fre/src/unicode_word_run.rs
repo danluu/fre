@@ -2143,7 +2143,7 @@ pub(crate) fn extract(hir: &Hir) -> Option<Plan> {
     }
     match (mode, transparent(&repetition.sub).kind()) {
         (WordMode::Ascii, HirKind::Class(Class::Bytes(class)))
-            if class == &parse_ascii_word_class()? => {}
+            if is_exact_ascii_word_class(class) => {}
         (WordMode::Unicode, HirKind::Class(Class::Unicode(class)))
             if class == &parse_unicode_word_class()? => {}
         _ => return None,
@@ -2424,19 +2424,6 @@ fn transparent(mut hir: &Hir) -> &Hir {
         hir = &capture.sub;
     }
     hir
-}
-
-fn parse_ascii_word_class() -> Option<regex_syntax::hir::ClassBytes> {
-    let hir = ParserBuilder::new()
-        .unicode(false)
-        .utf8(false)
-        .build()
-        .parse(r"\w")
-        .ok()?;
-    let HirKind::Class(Class::Bytes(class)) = hir.kind() else {
-        return None;
-    };
-    Some(class.clone())
 }
 
 fn parse_unicode_word_class() -> Option<regex_syntax::hir::ClassUnicode> {
@@ -3762,6 +3749,42 @@ mod tests {
                 .0,
             None
         );
+    }
+
+    #[test]
+    fn portable_ascii_word_extract_accepts_only_the_exact_word_class() {
+        let parse = |pattern| {
+            ParserBuilder::new()
+                .unicode(false)
+                .utf8(false)
+                .build()
+                .parse(pattern)
+                .expect("ASCII word-run HIR")
+        };
+        for (pattern, minimum) in [
+            (r"\b\w+\b", 1_usize),
+            (r"\b[0-9A-Z_a-z]{2,}\b", 2),
+            (r"(\b[0-9A-Z_a-z]{3,}\b)", 3),
+        ] {
+            assert_eq!(
+                super::extract(&parse(pattern)),
+                Some(Plan::new(minimum, WordMode::Ascii)),
+                "exact ASCII word class in {pattern:?}",
+            );
+        }
+
+        for pattern in [
+            r"\b[0-9A-Za-z]+\b",
+            r"\b[0-9A-Z_a-y]+\b",
+            r"\b[0-9A-Z_a-z-]+\b",
+            r"\b[0-9A-Z_a-z]{1,3}\b",
+        ] {
+            assert_eq!(
+                super::extract(&parse(pattern)),
+                None,
+                "nearby ASCII class must not acquire word-run authority: {pattern:?}",
+            );
+        }
     }
 
     #[test]
