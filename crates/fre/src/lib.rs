@@ -24754,6 +24754,49 @@ fn count_ordinary_literal_set_dfa_with_selected_seed(
         })
 }
 
+#[cold]
+#[inline(never)]
+fn fixed_predicate_word64_unlimited_count_error(
+    error: FixedPredicateWord64ReduceError,
+) -> SearchError {
+    let error = match error {
+        FixedPredicateWord64ReduceError::ArithmeticOverflow { computation } => {
+            FixedPredicateWord64SearchError::ArithmeticOverflow { computation }
+        }
+        FixedPredicateWord64ReduceError::InternalInvariant(detail) => {
+            FixedPredicateWord64SearchError::InternalInvariant(detail)
+        }
+        _ => FixedPredicateWord64SearchError::InternalInvariant(
+            "unlimited fixed-predicate count unexpectedly refused its resource envelope",
+        ),
+    };
+    SearchError::from(error)
+}
+
+#[inline(never)]
+fn count_ordinary_fixed_predicate_selected_ends_at(
+    plan: &FixedPredicateWord64Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<u64>, SearchError> {
+    // This plan contains only fixed byte predicates: no assertion can observe
+    // the discarded prefix, and Count publishes no offsets that need rebasing.
+    let tail = haystack.get(start..).ok_or_else(|| {
+        SearchError::from(FixedPredicateWord64SearchError::InvalidWindow {
+            start,
+            end: haystack.len(),
+            haystack_len: haystack.len(),
+        })
+    })?;
+    let limits = FixedPredicateWord64ReduceLimits::unlimited();
+    if let Some(count) = plan.count_value_success(tail, limits) {
+        return Ok(Some(count));
+    }
+    plan.count(tail, limits)
+        .map(|result| Some(result.count))
+        .map_err(fixed_predicate_word64_unlimited_count_error)
+}
+
 impl<'r> PortableOrdinarySession<'r> {
     /// Whether a match exists anywhere in `haystack`.
     ///
@@ -25173,12 +25216,12 @@ impl<'r> PortableOrdinarySession<'r> {
     /// their ordered endpoints.
     ///
     /// `Ok(Some(count))` is returned for a positive exact literal, a
-    /// positive-width K0 plan, a Unicode word-run over the exact full window,
-    /// a reverse-inner or Unicode scalar-run plan over an exact tail window, a
-    /// legacy literal/class-run plan over a full or unguarded tail window, a
-    /// pure byte-class repeat, a packed literal set, or an ordinary non-uniform
-    /// or uniform-standard literal-set plan. Each construction seals nonempty
-    /// selected spans.
+    /// positive-width K0 plan, a fixed-predicate word over an exact tail, a
+    /// Unicode word-run over the exact full window, a reverse-inner or Unicode
+    /// scalar-run plan over an exact tail window, a legacy literal/class-run
+    /// plan over a full or unguarded tail window, a pure byte-class repeat, a
+    /// packed literal set, or an ordinary non-uniform or uniform-standard
+    /// literal-set plan. Each construction seals nonempty selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25311,6 +25354,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 }
                 Ok(Some(count))
             }
+            PortableOrdinarySessionPlan::Canonical(
+                PortableOrdinaryCanonical::FixedPredicateWord64(plan),
+            ) => count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start),
             PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex)) => {
                 match &regex.plan {
                     PortablePlan::LiteralClassRunLiteral(plan) => {
@@ -49364,6 +49410,117 @@ mod tests {
                 fre_kernels::ReverseInnerReduceError::InvalidWindow { .. }
             )),
         ));
+    }
+
+    #[test]
+    fn ordinary_fixed_predicate_count_exhaustively_matches_selected_span_iteration() {
+        let regex = fixed_predicate_regex(r"[ab][cd][ef]");
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
+            )
+        ));
+
+        for haystack in byte_words(b"acefx", 6) {
+            for start in 0..=haystack.len() {
+                let mut cursor = start;
+                let mut expected = 0_u64;
+                while let Some(matched) = regex
+                    .find_at_value(&haystack, cursor, SearchLimits::unlimited())
+                    .unwrap()
+                {
+                    assert!(matched.end() > cursor);
+                    cursor = matched.end();
+                    expected = expected.checked_add(1).unwrap();
+                }
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(&haystack, start),
+                    Ok(Some(expected)),
+                    "haystack={haystack:?}, start={start}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_fixed_predicate_count_routes_exact_tails_and_preserves_errors() {
+        fn selected_count(regex: &PortableRegex, haystack: &[u8], start: usize) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        for (pattern, haystack) in [
+            (r"[ab][cd][ef]", &b"!ace-acf-xxx-aceacf?"[..]),
+            (r"[A-D][\x00-\x7F]Q", &b"\xff!Q-A!Q-B\x7fQ-\xff!Q-C0Q"[..]),
+            (
+                r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
+                &b"Qacegikmortvx0-Qbdfhjlnpsuwy1-Qacegikmortvx2-Qacegikmortvx0"[..],
+            ),
+        ] {
+            let regex = fixed_predicate_regex(pattern);
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
+                )
+            ));
+            for start in 0..=haystack.len() {
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(haystack, start),
+                    Ok(Some(selected_count(&regex, haystack, start))),
+                    "pattern={pattern:?}, start={start}",
+                );
+            }
+            assert_eq!(
+                ordinary.count_positive_width_selected_ends_at(haystack, haystack.len() + 1),
+                Err(SearchError::FixedPredicateWord64(
+                    fre_kernels::FixedPredicateWord64SearchError::InvalidWindow {
+                        start: haystack.len() + 1,
+                        end: haystack.len(),
+                        haystack_len: haystack.len(),
+                    }
+                )),
+                "pattern={pattern:?}",
+            );
+        }
+
+        assert_eq!(
+            super::fixed_predicate_word64_unlimited_count_error(
+                fre_kernels::FixedPredicateWord64ReduceError::ArithmeticOverflow {
+                    computation: "injected count overflow",
+                },
+            ),
+            SearchError::FixedPredicateWord64(
+                fre_kernels::FixedPredicateWord64SearchError::ArithmeticOverflow {
+                    computation: "injected count overflow",
+                }
+            ),
+        );
+        assert_eq!(
+            super::fixed_predicate_word64_unlimited_count_error(
+                fre_kernels::FixedPredicateWord64ReduceError::WorkLimit {
+                    needed: 2,
+                    limit: 1,
+                },
+            ),
+            SearchError::FixedPredicateWord64(
+                fre_kernels::FixedPredicateWord64SearchError::InternalInvariant(
+                    "unlimited fixed-predicate count unexpectedly refused its resource envelope",
+                )
+            ),
+        );
     }
 
     #[test]
