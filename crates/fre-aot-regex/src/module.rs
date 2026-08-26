@@ -89531,6 +89531,77 @@ mod tests {
         assert!(words.contains(
             &aarch64_cmp_x_imm(1, NATIVE_FINITE_ROOT_SCANNER_WIDE_BATCH_BYTES).unwrap(),
         ));
+        let wide_any = words
+            .windows(5)
+            .position(|window| {
+                window[0] == aarch64_orr_16b(4, 4, 28).unwrap()
+                    && window[1] == aarch64_umaxv_16b(7, 4).unwrap()
+                    && window[2] == aarch64_umov_b0(12, 7).unwrap()
+                    && window[3] == aarch64_cmp_w_zero(12).unwrap()
+                    && window[4] & 0xff00_0010 == 0x5400_0000
+            })
+            .map(|index| index + 1)
+            .expect("direct root wide aggregate any-test");
+        let wide_guard = words[..wide_any]
+            .iter()
+            .rposition(|&word| {
+                word
+                    == aarch64_cmp_x_imm(
+                        1,
+                        NATIVE_FINITE_ROOT_SCANNER_WIDE_BATCH_BYTES,
+                    )
+                    .unwrap()
+            })
+            .expect("direct root wide remaining-length guard");
+        let (condition, replay_target) =
+            aarch64_test_branch_target(&code, (wide_guard + 1) * 4);
+        assert_eq!(condition, Some(AARCH64_LO));
+        assert_eq!(
+            &words[replay_target / 4..replay_target / 4 + 2],
+            &[
+                aarch64_sub_x_reg(1, 3, 2).unwrap(),
+                aarch64_cmp_x_imm(1, AARCH64_BATCH_BYTES).unwrap(),
+            ],
+            "a sub-wide remainder must replay the ordinary batch",
+        );
+        assert_eq!(
+            words[wide_guard - 2],
+            aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap(),
+            "an ordinary probation miss must fall through into the wide sparse loop",
+        );
+        let (probation_hit_branch, condition, probation_hit) = (0..wide_guard - 2)
+            .rev()
+            .filter(|&index| words[index] & 0xff00_0010 == 0x5400_0000)
+            .find_map(|index| {
+                let (condition, target) = aarch64_test_branch_target(&code, index * 4);
+                (words.get(target / 4) == Some(&aarch64_ushr_16b_by_7(7, 0).unwrap()))
+                    .then_some((index, condition, target))
+            })
+            .expect("probation candidate hit branch");
+        assert_eq!(condition, Some(AARCH64_NE));
+        assert!(probation_hit_branch < wide_guard - 2);
+        assert_eq!(
+            words[probation_hit / 4],
+            aarch64_ushr_16b_by_7(7, 0).unwrap(),
+            "a probation hit must retain the incumbent density path",
+        );
+        let (condition, wide_hit_target) =
+            aarch64_test_branch_target(&code, (wide_any + 3) * 4);
+        assert_eq!(condition, Some(AARCH64_NE));
+        assert_eq!(
+            words[wide_hit_target / 4],
+            aarch64_sub_x_imm(
+                2,
+                2,
+                NATIVE_FINITE_ROOT_SCANNER_WIDE_REWIND_BYTES,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            wide_hit_target + 4,
+            replay_target,
+            "the rewind must fall through into ordinary-batch replay",
+        );
         assert!(words.contains(
             &aarch64_sub_x_imm(
                 2,
@@ -90963,6 +91034,39 @@ mod tests {
             .cycle()
             .take(128)
             .collect::<Vec<_>>();
+        let mut direct_boundary_cases = vec![
+            vec![b'!'; 319],
+            vec![b'!'; 320],
+            vec![b'!'; 321],
+        ];
+        for position in [64, 127, 128, 191, 192, 255, 256, 319] {
+            let mut haystack = vec![b'!'; 336];
+            haystack[position..position + direct_literal.len()]
+                .copy_from_slice(&direct_literal);
+            direct_boundary_cases.push(haystack);
+        }
+        let mut direct_cross_batch_candidates = vec![b'!'; 320];
+        for position in [64, 80, 128, 192] {
+            direct_cross_batch_candidates[position] = b'q';
+        }
+        direct_boundary_cases.push(direct_cross_batch_candidates);
+        let mut direct_scanner_cases = vec![
+            Vec::new(),
+            vec![b'!'; 3],
+            vec![b'!'; 4],
+            vec![b'!'; 15],
+            vec![b'!'; 16],
+            vec![b'!'; 63],
+            vec![b'!'; 64],
+            vec![b'!'; 65],
+            vec![b'!'; 128],
+            direct_late,
+            direct_three_hits,
+            direct_four_hits,
+            direct_dense_decoys,
+            direct_rearm,
+        ];
+        direct_scanner_cases.extend(direct_boundary_cases);
         let cases = vec![
             (
                 "a|ab|bab|ba",
@@ -91017,42 +91121,12 @@ mod tests {
             ),
             (
                 direct_scanner_pattern.as_str(),
-                vec![
-                    Vec::new(),
-                    vec![b'!'; 3],
-                    vec![b'!'; 4],
-                    vec![b'!'; 15],
-                    vec![b'!'; 16],
-                    vec![b'!'; 63],
-                    vec![b'!'; 64],
-                    vec![b'!'; 65],
-                    vec![b'!'; 128],
-                    direct_late.clone(),
-                    direct_three_hits.clone(),
-                    direct_four_hits.clone(),
-                    direct_dense_decoys.clone(),
-                    direct_rearm.clone(),
-                ],
+                direct_scanner_cases.clone(),
                 LinkedFiniteRoute::SparseScanner,
             ),
             (
                 direct_scanner_pattern.as_str(),
-                vec![
-                    Vec::new(),
-                    vec![b'!'; 3],
-                    vec![b'!'; 4],
-                    vec![b'!'; 15],
-                    vec![b'!'; 16],
-                    vec![b'!'; 63],
-                    vec![b'!'; 64],
-                    vec![b'!'; 65],
-                    vec![b'!'; 128],
-                    direct_late,
-                    direct_three_hits,
-                    direct_four_hits,
-                    direct_dense_decoys,
-                    direct_rearm,
-                ],
+                direct_scanner_cases,
                 LinkedFiniteRoute::DenseScanner,
             ),
             (
@@ -91209,23 +91283,35 @@ mod tests {
                     )
                     .expect("write ordered-finite haystack");
                     let windows = if haystack.len() > 256 {
-                        vec![
-                            (0, haystack.len()),
-                            (1, haystack.len()),
-                            (15, haystack.len()),
-                            (16, haystack.len()),
-                            (499, 516),
-                            (500, 516),
-                            (500, 515),
-                            (1_000, haystack.len()),
-                            (1_023, haystack.len()),
-                            (1_024, haystack.len()),
-                            (1_040, 1_056),
-                            (1_041, haystack.len()),
-                            (0, 1_040),
-                            (0, 1_055),
-                            (0, 1_056),
-                        ]
+                        let mut windows = vec![(0, haystack.len())];
+                        for start in [1, 15, 16] {
+                            if start <= haystack.len() {
+                                windows.push((start, haystack.len()));
+                            }
+                        }
+                        for end in [319, 320, 321] {
+                            if end <= haystack.len() {
+                                windows.push((0, end));
+                            }
+                        }
+                        if haystack.len() >= 516 {
+                            windows.extend([(499, 516), (500, 516), (500, 515)]);
+                        }
+                        if haystack.len() >= 1_056 {
+                            windows.extend([
+                                (1_000, haystack.len()),
+                                (1_023, haystack.len()),
+                                (1_024, haystack.len()),
+                                (1_040, 1_056),
+                                (1_041, haystack.len()),
+                                (0, 1_040),
+                                (0, 1_055),
+                                (0, 1_056),
+                            ]);
+                        }
+                        windows.sort_unstable();
+                        windows.dedup();
+                        windows
                     } else {
                         (0..=haystack.len())
                             .flat_map(|start| {
