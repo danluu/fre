@@ -5,9 +5,10 @@ use fre::{
     AggregateBuildLimits, AggregateBuilder, AggregateCountWorkspace, AggregateExecutionDetails,
     AggregateExecutionSource, AggregateFiniteLiteralSemantics, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregateRunLimits, AggregateSpanSumWorkspace,
-    AggregateStrategy, OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, RustProfile, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    SparseOrderedLiteralAggregateReduceError,
+    AggregateStrategy, ORDERED_LITERAL_FORWARD_BUCKET_TRIE_PREFIX_BYTES,
+    OrderedLiteralAggregatePhysicalRoute, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds, RustProfile,
+    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SparseOrderedLiteralAggregateReduceError,
 };
 
 fn builder(pattern: impl Into<String>) -> AggregateBuilder {
@@ -549,6 +550,13 @@ fn sparse_finite_construction_scales_beyond_old_hir_stack_and_state_ceilings() {
 
 fn counters(patterns: usize, input: usize) -> (usize, usize, usize) {
     let regex = builder(alternation(patterns)).build_count().unwrap();
+    let AggregateBuildAccounting::FiniteLiteral(build) = regex.build_report().build else {
+        panic!("finite scaling case built another plan")
+    };
+    assert_eq!(
+        build.physical_route,
+        OrderedLiteralAggregatePhysicalRoute::ByteBucketForwardTrie
+    );
     let haystack = vec![0xFF; input];
     let result = regex
         .count(&haystack, AggregateRunLimits::default())
@@ -562,21 +570,25 @@ fn counters(patterns: usize, input: usize) -> (usize, usize, usize) {
 #[test]
 fn finite_dfa_n_2n_and_query_scaling_rejects_input_times_alternatives() {
     let n = 8_192;
-    // Seventeen alternatives are just beyond the packed theorem and retain
-    // this test's dense-DFA scaling target.
+    // Seventeen alternatives are just beyond the packed theorem and select
+    // the wide finite-count route. No pattern can begin with 0xFF, so actual
+    // transitions are exactly the viable fixed-width candidate positions.
     let small_at_n = counters(17, n);
     let large_at_n = counters(64, n);
     let small_at_double_n = counters(17, 2 * n);
     let large_at_double_n = counters(64, 2 * n);
 
-    assert_eq!(small_at_n.0, n);
-    assert_eq!(large_at_n.0, n);
-    assert_eq!(small_at_double_n.0, 2 * n);
-    assert_eq!(large_at_double_n.0, 2 * n);
-    assert_eq!(small_at_n.1, n + 1);
-    assert_eq!(large_at_n.1, n + 1);
-    assert_eq!(small_at_double_n.1, 2 * n + 1);
-    assert_eq!(large_at_double_n.1, 2 * n + 1);
+    let candidates_at_n = n - ORDERED_LITERAL_FORWARD_BUCKET_TRIE_PREFIX_BYTES + 1;
+    let candidates_at_double_n = 2 * n - ORDERED_LITERAL_FORWARD_BUCKET_TRIE_PREFIX_BYTES + 1;
+
+    assert_eq!(small_at_n.0, candidates_at_n);
+    assert_eq!(large_at_n.0, candidates_at_n);
+    assert_eq!(small_at_double_n.0, candidates_at_double_n);
+    assert_eq!(large_at_double_n.0, candidates_at_double_n);
+    assert_eq!(small_at_n.1, candidates_at_n + 1);
+    assert_eq!(large_at_n.1, candidates_at_n + 1);
+    assert_eq!(small_at_double_n.1, candidates_at_double_n + 1);
+    assert_eq!(large_at_double_n.1, candidates_at_double_n + 1);
     assert_eq!(small_at_n.2, large_at_n.2);
     assert_eq!(small_at_double_n.2, large_at_double_n.2);
     assert!(small_at_double_n.2 < 2 * small_at_n.2 + 8);
