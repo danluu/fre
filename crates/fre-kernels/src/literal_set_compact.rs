@@ -416,16 +416,13 @@ impl<'a, 'h> CompactOrdinaryScanner<'a, 'h> {
             if !self.automaton.is_special(state) {
                 continue;
             }
-            if self.automaton.is_dead(state) {
-                self.state = state;
-                self.at = self.end;
-                return None;
-            }
-            // Aho deliberately excludes start states from `is_special` when
-            // no prefilter is retained, including impossible-root self-loops.
+            // Aho's unanchored Standard traversal has no transitions to its
+            // dead state. It also excludes start states from `is_special`
+            // when no prefilter is retained, including impossible-root
+            // self-loops.
             debug_assert!(
                 self.automaton.is_match(state),
-                "a compact NFA without a prefilter has no other special states",
+                "a Standard compact NFA without a prefilter has no other reachable special states",
             );
             let accepted_end = self.end - bytes.len();
             self.at = accepted_end;
@@ -964,6 +961,7 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
 #[cfg(test)]
 mod tests {
     use aho_corasick::automaton::Automaton;
+    use aho_corasick::{Anchored, MatchKind};
 
     use super::{
         ALPHABET_LEN, BYTES_PER_DFA_CELL_ENVELOPE, BYTES_PER_TRIE_STATE_ENVELOPE, CompactPreflight,
@@ -1245,6 +1243,88 @@ mod tests {
             plan.ordinary_executor()
                 .find_window_value(&haystack, Window::new(1, MIN_PATTERN_BYTES + 1),),
             Ok(Some((1, MIN_PATTERN_BYTES + 1))),
+        );
+    }
+
+    fn broad_root_256x128_patterns() -> Vec<Vec<u8>> {
+        let patterns = (0_u16..=255)
+            .map(|index| {
+                let mut pattern = vec![b'a'; MIN_PATTERN_BYTES];
+                pattern[0] = u8::try_from(index.min(254)).unwrap();
+                if index == 255 {
+                    pattern[1] = b'b';
+                }
+                pattern
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(patterns.len(), 256);
+        assert!(patterns.iter().all(|pattern| pattern.len() == 128));
+        patterns
+    }
+
+    #[test]
+    fn standard_unanchored_compact_paths_never_enter_dead() {
+        let patterns = broad_root_256x128_patterns();
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the broad-root fixed-width set admits the compact owner")
+            .into_ordinary();
+        let automaton = &plan.engine.automaton;
+        assert_eq!(automaton.match_kind(), MatchKind::Standard);
+        assert!(automaton.prefilter().is_none());
+        let start = automaton
+            .start_state(Anchored::No)
+            .expect("the compact owner retains its unanchored start");
+
+        for byte in u8::MIN..=u8::MAX {
+            let next = automaton.next_state(Anchored::No, start, byte);
+            assert!(!automaton.is_dead(next), "root byte {byte:#04x}");
+        }
+        for (pattern_index, pattern) in patterns.iter().enumerate() {
+            let mut state = start;
+            for (byte_index, &byte) in pattern.iter().enumerate() {
+                state = automaton.next_state(Anchored::No, state, byte);
+                assert!(
+                    !automaton.is_dead(state),
+                    "pattern {pattern_index}, byte {byte_index}",
+                );
+                for fallback in [u8::MIN, b'x', u8::MAX] {
+                    let next = automaton.next_state(Anchored::No, state, fallback);
+                    assert!(
+                        !automaton.is_dead(next),
+                        "pattern {pattern_index}, byte {byte_index}, fallback {fallback:#04x}",
+                    );
+                }
+            }
+            assert!(automaton.is_match(state), "pattern {pattern_index}");
+        }
+    }
+
+    #[test]
+    fn standard_unanchored_256x128_count_uses_direct_ordinary_scanner() {
+        let patterns = broad_root_256x128_patterns();
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the broad-root 256x128 set admits the compact ordinary owner")
+            .into_ordinary();
+        assert_eq!(plan.engine.automaton.match_kind(), MatchKind::Standard);
+        assert!(plan.engine.automaton.prefilter().is_none());
+
+        let mut haystack = vec![u8::MAX];
+        haystack.extend_from_slice(&patterns[0]);
+        haystack.push(u8::MAX);
+        haystack.extend_from_slice(&patterns[255]);
+        haystack.push(u8::MAX);
+        compact_ordinary_scanner_probe::reset();
+        assert_eq!(
+            plan.ordinary_executor()
+                .count_spans_window_value(&haystack, Window::full(&haystack)),
+            Ok(2),
+        );
+        assert_eq!(
+            compact_ordinary_scanner_probe::binds(),
+            1,
+            "ordinary count binds the direct no-prefilter scanner once",
         );
     }
 
