@@ -1747,6 +1747,12 @@ impl OrderedFiniteSparseState {
     pub(crate) const fn edge_count(self) -> u16 {
         self.edge_count
     }
+
+    /// Exact trie depth authenticated by `NativeFiniteLanguageProgram` before
+    /// target lowering receives a finite-language view.
+    pub(crate) const fn depth(self) -> u32 {
+        self.depth
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

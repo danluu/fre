@@ -2965,9 +2965,38 @@ struct NativeFiniteRootScannerLayout {
     /// and 64-byte expected-hit budgets. `None` retains the pre-feature
     /// split-nibble lowering byte-for-byte.
     direct_batch_filter: Option<NativeStartFilter>,
+    /// One exact graph-derived byte column that every finite source must
+    /// contain at this fixed offset. It decorates only the runtime-dense
+    /// direct route; absence leaves the established root-only lowering
+    /// byte-for-byte unchanged.
+    dense_continuation_filter: Option<NativeStartFilter>,
     lane_index_offset: u32,
     data_offset: u32,
     data_bytes: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Aarch64FiniteRootContinuationLabels {
+    entry: Aarch64Label,
+    scalar_dense: Aarch64Label,
+    scalar_backoff_to_end: Aarch64Label,
+    continuation_loop: Aarch64Label,
+    continuation_hit: Aarch64Label,
+    joint: Aarch64Label,
+    exit: Aarch64Label,
+    bound_to_end: Aarch64Label,
+    bound_set: Aarch64Label,
+}
+
+#[derive(Clone, Copy)]
+struct Aarch64FiniteRootContinuationEmission {
+    root: NativeStartFilter,
+    continuation: NativeStartFilter,
+    first_candidates: u8,
+    backoff_register: u8,
+    root_scan: Aarch64Label,
+    batch_select: Aarch64Label,
+    labels: Aarch64FiniteRootContinuationLabels,
 }
 
 struct NativeFiniteLanguageEmission {
@@ -3382,6 +3411,19 @@ fn exact_finite_selected_end_dfa_lowering_authenticates_with_basis(
         && Sha256::digest(&lowering.data).as_slice() == report.incumbent_data_sha256
         && module_exact_finite_selected_end_teddy::relocation_digest(&lowering.relocations)
             .is_some_and(|digest| digest == report.incumbent_relocations_sha256))
+}
+
+fn native_finite_language_minimum_accepted_width(
+    view: NativeFiniteLanguageView<'_>,
+) -> Option<usize> {
+    let mut minimum = None;
+    for (state, output) in view.sparse_states.iter().zip(view.outputs) {
+        let width = usize::try_from(output.width()).ok()?;
+        if width != 0 && usize::try_from(state.depth()).ok()? == width {
+            minimum = Some(minimum.map_or(width, |current: usize| current.min(width)));
+        }
+    }
+    minimum
 }
 
 impl NativeFiniteLanguageCost {
@@ -25776,9 +25818,19 @@ fn lower_selected_native_finite_language(
             &mut layout,
             &mut data,
         )?;
-        if layout.root_scanner.is_none() {
+        let Some(scanner) = layout.root_scanner else {
             return Err(ObjectError::InvalidModule(
                 "admitted finite root scanner was not installed",
+            ));
+        };
+        let expected_continuation = scanner
+            .direct_batch_filter
+            .map(|root| native_finite_root_dense_continuation_filter(view, root))
+            .transpose()?
+            .flatten();
+        if scanner.dense_continuation_filter != expected_continuation {
+            return Err(ObjectError::InvalidModule(
+                "finite root scanner continuation changed after source authentication",
             ));
         }
     }
@@ -25857,6 +25909,113 @@ fn native_finite_root_direct_batch_filter(
     Ok(use_aarch64_filter_batch(filter).then_some(filter))
 }
 
+/// Choose one exact fixed-offset byte column that every authenticated finite
+/// source must traverse. The explicit sparse graph is a canonical trie before
+/// its failure links are consulted: below the minimum source width, the union
+/// of outgoing bytes at depth `d` is therefore necessary at source offset
+/// `d`. This is a lowering-only decoration and uses the established filter
+/// representation, instruction cap and 64-byte hit budget.
+fn native_finite_root_dense_continuation_filter(
+    view: NativeFiniteLanguageView<'_>,
+    root: NativeStartFilter,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    if root.scan_offset != 0
+        || root.from_anchored_prefix
+        || start_filter_membership(root)? != view.root_members
+        || !use_aarch64_filter_batch(root)
+    {
+        return Err(ObjectError::InvalidModule(
+            "finite root continuation received an unauthenticated root filter",
+        ));
+    }
+    // `native_view` already proves unique targets and depth+1 explicit edges.
+    // Requiring every finite leaf to own an acceptance at its exact depth
+    // therefore proves that every traversed edge lies on an accepted source
+    // path, without allocating a separate liveness bitmap.
+    if view.sparse_states.len() != view.outputs.len()
+        || view
+            .sparse_states
+            .iter()
+            .zip(view.outputs)
+            .any(|(state, output)| {
+                state.edge_count() == 0
+                    && (state.depth() == 0 || output.width() != state.depth())
+            })
+    {
+        return Err(ObjectError::InvalidModule(
+            "finite root continuation trie has a non-accepting leaf",
+        ));
+    }
+    let Some(minimum_width) = native_finite_language_minimum_accepted_width(view) else {
+        return Err(ObjectError::InvalidModule(
+            "finite root continuation has no authenticated source width",
+        ));
+    };
+    let exclusive_depth = minimum_width.min(MAX_ANCHORED_PREFIX_BYTES);
+    let mut selected = None::<NativeStartFilter>;
+    for depth in 1..exclusive_depth {
+        let mut membership = [0_u64; 4];
+        let mut saw_state = false;
+        for state in view
+            .sparse_states
+            .iter()
+            .copied()
+            .filter(|state| {
+                usize::try_from(state.depth()).is_ok_and(|state_depth| state_depth == depth)
+            })
+        {
+            saw_state = true;
+            let start = usize::try_from(state.edge_start()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("finite continuation edge start")
+            })?;
+            let end = start.checked_add(usize::from(state.edge_count())).ok_or(
+                ObjectError::ArithmeticOverflow("finite continuation edge extent"),
+            )?;
+            let edges = view.sparse_edges.get(start..end).ok_or(
+                ObjectError::InvalidModule("finite continuation edge extent is invalid"),
+            )?;
+            if edges.is_empty() {
+                return Err(ObjectError::InvalidModule(
+                    "finite continuation ended before the authenticated minimum width",
+                ));
+            }
+            for edge in edges {
+                let byte = usize::from(edge.byte());
+                membership[byte / 64] |= 1_u64 << (byte % 64);
+            }
+        }
+        if !saw_state {
+            return Err(ObjectError::InvalidModule(
+                "finite continuation depth is absent from the authenticated trie",
+            ));
+        }
+        let Some(candidate) = filter_from_membership_words(membership, depth, true)? else {
+            continue;
+        };
+        if candidate.scan_offset != u8::try_from(depth).map_err(|_| {
+            ObjectError::ArithmeticOverflow("finite continuation scan offset")
+        })? || !candidate.from_anchored_prefix
+            || start_filter_membership(candidate)? != membership
+            || !use_aarch64_filter_batch(candidate)
+            || root
+                .constant_count()
+                .checked_add(candidate.constant_count())
+                .is_none_or(|count| count > AARCH64_STANDALONE_FILTER_CONSTANTS)
+            || vector_filter_instruction_units(root)
+                .checked_add(vector_filter_instruction_units(candidate))
+                .is_none_or(|units| units > MAX_VECTOR_FILTER_INSTRUCTION_UNITS)
+        {
+            continue;
+        }
+        if selected.is_none_or(|current| {
+            filter_selection_key(candidate) < filter_selection_key(current)
+        }) {
+            selected = Some(candidate);
+        }
+    }
+    Ok(selected)
+}
+
 fn plan_aarch64_native_finite_root_scanner(
     view: NativeFiniteLanguageView<'_>,
     target: Target,
@@ -25910,6 +26069,10 @@ fn install_aarch64_native_finite_root_scanner(
         return Ok(());
     };
     let direct_batch_filter = native_finite_root_direct_batch_filter(set)?;
+    let dense_continuation_filter = direct_batch_filter
+        .map(|root| native_finite_root_dense_continuation_filter(view, root))
+        .transpose()?
+        .flatten();
     if data.len() != layout.required_data_bytes {
         return Err(ObjectError::InvalidModule(
             "finite root scanner disagrees with the authenticated finite-language table",
@@ -25956,6 +26119,7 @@ fn install_aarch64_native_finite_root_scanner(
         set,
         storage,
         direct_batch_filter,
+        dense_continuation_filter,
         lane_index_offset,
         data_offset: u32::try_from(data_offset)
             .map_err(|_| ObjectError::ArithmeticOverflow("finite root scanner data offset"))?,
@@ -67082,6 +67246,7 @@ fn aarch64_ext_16b(
 const AARCH64_EXACT_FILTER_SCRATCH: u8 = 28;
 const AARCH64_VECTOR_FILTER_FIRST_CONSTANT: u8 = 1;
 const AARCH64_STANDALONE_FILTER_FIRST_CONSTANT: u8 = 16;
+const AARCH64_STANDALONE_FILTER_CONSTANTS: usize = 8;
 // Optimizing+Exists exact-pair suffix retries do not retain the endpoint
 // minimum used by other output contracts. Keep their one-way relation phase
 // in caller-saved W13 across the bounded verifier.
@@ -68638,15 +68803,25 @@ fn aarch64_emit_start_filter_batch_candidates(
     filter: NativeStartFilter,
     first_register: u8,
 ) -> Result<u8, ObjectError> {
-    let (first_source, first_candidates) = match first_register {
-        AARCH64_VECTOR_FILTER_FIRST_CONSTANT..=4 => (16_u8, 24_u8),
-        AARCH64_STANDALONE_FILTER_FIRST_CONSTANT => (24_u8, 0_u8),
+    let (first_source, first_candidates, constant_limit) = match first_register {
+        AARCH64_VECTOR_FILTER_FIRST_CONSTANT..=4 => (16_u8, 24_u8, 5_usize),
+        AARCH64_STANDALONE_FILTER_FIRST_CONSTANT..=23 => (24_u8, 0_u8, 24_usize),
         _ => {
             return Err(ObjectError::InvalidModule(
                 "ASIMD batch filter has an invalid constant allocation",
             ));
         }
     };
+    let constant_end = usize::from(first_register)
+        .checked_add(filter.constant_count())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ASIMD batch filter constant allocation",
+        ))?;
+    if constant_end > constant_limit {
+        return Err(ObjectError::InvalidModule(
+            "ASIMD batch filter constants overlap its source registers",
+        ));
+    }
     aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
     assembler.instruction(aarch64_ld1_four_16b(first_source, 12)?)?;
     for lane in 0_u8..4 {
@@ -68665,6 +68840,176 @@ fn aarch64_emit_start_filter_batch_candidates(
         )?;
     }
     Ok(first_candidates)
+}
+
+/// Intersect four retained candidate masks with one aligned necessary-byte
+/// column. V24..V27 hold the new source bytes, V4 is a per-lane temporary and
+/// V0..V3 remain the exact candidate masks consumed by ordered selection.
+fn aarch64_emit_start_filter_batch_intersection(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    first_register: u8,
+) -> Result<(), ObjectError> {
+    aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+    assembler.instruction(aarch64_ld1_four_16b(24, 12)?)?;
+    for lane in 0_u8..4 {
+        let source = 24_u8
+            .checked_add(lane)
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 LD1 source"))?;
+        aarch64_emit_start_filter_vector_candidates(
+            assembler,
+            filter,
+            source,
+            4,
+            first_register,
+        )?;
+        assembler.instruction(aarch64_and_16b(lane, lane, 4)?)?;
+    }
+    Ok(())
+}
+
+/// Emit the cold continuation refinement after the native leaf's return
+/// stubs. Keeping it out of line leaves the complete root-only D2 instruction
+/// stream and every pre-existing label address unchanged.
+fn aarch64_emit_finite_root_dense_continuation(
+    assembler: &mut Aarch64Assembler,
+    emission: Aarch64FiniteRootContinuationEmission,
+) -> Result<(), ObjectError> {
+    let Aarch64FiniteRootContinuationEmission {
+        root,
+        continuation,
+        first_candidates,
+        backoff_register,
+        root_scan,
+        batch_select,
+        labels,
+    } = emission;
+    if first_candidates != 0 {
+        return Err(ObjectError::InvalidModule(
+            "finite continuation changed its retained candidate bank",
+        ));
+    }
+    let continuation_first_register = AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+        .checked_add(u8::try_from(root.constant_count()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("finite root filter constants")
+        })?)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "finite continuation constant register",
+        ))?;
+    let continuation_batch_bytes = AARCH64_BATCH_BYTES
+        .checked_add(u16::from(continuation.scan_offset))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "finite continuation batch bound",
+        ))?;
+
+    assembler.bind(labels.entry)?;
+    aarch64_emit_start_filter_constants(
+        assembler,
+        continuation,
+        continuation_first_register,
+    )?;
+    aarch64_emit_start_filter_batch_intersection(
+        assembler,
+        continuation,
+        continuation_first_register,
+    )?;
+    aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
+    assembler.branch_cond(AARCH64_NE, labels.joint)?;
+
+    // No base in the current block can begin an authenticated source. Scan
+    // only the necessary continuation byte for at most 1 KiB, lazily loading
+    // roots after a continuation hit and then resampling the original route.
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        12,
+        NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+    )?)?;
+    assembler.branch_cond(AARCH64_LO, labels.bound_to_end)?;
+    assembler.instruction(aarch64_add_x_imm(
+        backoff_register,
+        2,
+        NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+    )?)?;
+    assembler.branch(labels.bound_set)?;
+    assembler.bind(labels.bound_to_end)?;
+    assembler.instruction(aarch64_add_x_imm(backoff_register, 3, 0)?)?;
+    assembler.bind(labels.bound_set)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+
+    assembler.bind(labels.continuation_loop)?;
+    assembler.instruction(aarch64_cmp_x(2, backoff_register)?)?;
+    assembler.branch_cond(AARCH64_HS, labels.exit)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(12, continuation_batch_bytes)?)?;
+    assembler.branch_cond(AARCH64_LO, labels.exit)?;
+    let continuation_candidates = aarch64_emit_start_filter_batch_candidates(
+        assembler,
+        continuation,
+        continuation_first_register,
+    )?;
+    if continuation_candidates != first_candidates {
+        return Err(ObjectError::InvalidModule(
+            "finite continuation changed its candidate bank",
+        ));
+    }
+    aarch64_emit_candidate_batch_any(assembler, continuation_candidates)?;
+    assembler.branch_cond(AARCH64_NE, labels.continuation_hit)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+    assembler.branch(labels.continuation_loop)?;
+
+    assembler.bind(labels.continuation_hit)?;
+    // The continuation-only mask is necessary but not sufficient. Intersect
+    // it lazily with exact root membership before ordered selection.
+    aarch64_emit_start_filter_batch_intersection(
+        assembler,
+        root,
+        AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+    )?;
+    aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
+    assembler.branch_cond(AARCH64_NE, labels.joint)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+    assembler.branch(labels.continuation_loop)?;
+
+    assembler.bind(labels.joint)?;
+    for block in 0_u8..4 {
+        let candidates = first_candidates.checked_add(block).ok_or(
+            ObjectError::ArithmeticOverflow("finite continuation candidate register"),
+        )?;
+        assembler.instruction(aarch64_ushr_16b_by_7(7, candidates)?)?;
+        assembler.instruction(aarch64_addv_16b(7, 7)?)?;
+        assembler.instruction(aarch64_umov_b0(12, 7)?)?;
+        assembler.instruction(aarch64_cmp_w_imm(
+            12,
+            NATIVE_FINITE_ROOT_SCANNER_DENSE_HITS,
+        )?)?;
+        assembler.branch_cond(AARCH64_HS, labels.scalar_dense)?;
+    }
+    // A sparse joint candidate immediately rearms SIMD after the
+    // authoritative graph transition.
+    assembler.instruction(aarch64_add_x_imm(backoff_register, 2, 0)?)?;
+    assembler.branch(batch_select)?;
+
+    assembler.bind(labels.exit)?;
+    assembler.instruction(aarch64_add_x_imm(backoff_register, 2, 0)?)?;
+    assembler.branch(root_scan)?;
+
+    assembler.bind(labels.scalar_dense)?;
+    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(
+        12,
+        NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+    )?)?;
+    assembler.branch_cond(AARCH64_LO, labels.scalar_backoff_to_end)?;
+    assembler.instruction(aarch64_add_x_imm(
+        backoff_register,
+        2,
+        NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+    )?)?;
+    assembler.branch(batch_select)?;
+    assembler.bind(labels.scalar_backoff_to_end)?;
+    assembler.instruction(aarch64_add_x_imm(backoff_register, 3, 0)?)?;
+    assembler.branch(batch_select)?;
+    Ok(())
 }
 
 fn aarch64_emit_start_filter_scalar_bound(
@@ -72737,6 +73082,24 @@ fn lower_aarch64_native_finite_language_impl(
     } else {
         None
     };
+    let root_dense_continuation_labels = if root_scanner
+        .is_some_and(|scanner| scanner.dense_continuation_filter.is_some())
+    {
+        Some(Aarch64FiniteRootContinuationLabels {
+            entry: assembler.label()?,
+            scalar_dense: assembler.label()?,
+            scalar_backoff_to_end: assembler.label()?,
+            continuation_loop: assembler.label()?,
+            continuation_hit: assembler.label()?,
+            joint: assembler.label()?,
+            exit: assembler.label()?,
+            bound_to_end: assembler.label()?,
+            bound_set: assembler.label()?,
+        })
+    } else {
+        None
+    };
+    let mut root_dense_continuation_emission = None;
     let root_batch = root_scanner.is_none() && native_finite_root_batch_is_admitted(layout);
     let root_scalar_only = if root_batch {
         Some(assembler.label()?)
@@ -72793,6 +73156,37 @@ fn lower_aarch64_native_finite_language_impl(
             return Err(ObjectError::InvalidModule(
                 "AArch64 finite root direct filter is inconsistent",
             ));
+        }
+        if let Some(continuation) = root_scanner.dense_continuation_filter {
+            let _ = start_filter_membership(continuation)?;
+        }
+        match (
+            root_scanner.direct_batch_filter,
+            root_scanner.dense_continuation_filter,
+        ) {
+            (None, Some(_)) => {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 finite root continuation has no direct root filter",
+                ));
+            }
+            (Some(root), Some(continuation))
+                if continuation.scan_offset == 0
+                    || !continuation.from_anchored_prefix
+                    || continuation.ranges().is_empty()
+                    || !use_aarch64_filter_batch(continuation)
+                    || root
+                        .constant_count()
+                        .checked_add(continuation.constant_count())
+                        .is_none_or(|count| count > AARCH64_STANDALONE_FILTER_CONSTANTS)
+                    || vector_filter_instruction_units(root)
+                        .checked_add(vector_filter_instruction_units(continuation))
+                        .is_none_or(|units| units > MAX_VECTOR_FILTER_INSTRUCTION_UNITS) =>
+            {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 finite root continuation filter is inconsistent",
+                ));
+            }
+            _ => {}
         }
     }
     aarch64_load_u32_constant(&mut assembler, 15, layout.maximum_width)?;
@@ -73003,20 +73397,63 @@ fn lower_aarch64_native_finite_language_impl(
                 assembler.branch(root_direct_batch_select)?;
 
                 assembler.bind(root_direct_batch_dense)?;
-                assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-                assembler.instruction(aarch64_cmp_x_imm(
-                    12,
-                    NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
-                )?)?;
-                assembler.branch_cond(AARCH64_LO, root_direct_batch_backoff_to_end)?;
-                assembler.instruction(aarch64_add_x_imm(
-                    backoff_register,
-                    2,
-                    NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
-                )?)?;
-                assembler.branch(root_direct_batch_select)?;
-                assembler.bind(root_direct_batch_backoff_to_end)?;
-                assembler.instruction(aarch64_add_x_imm(backoff_register, 3, 0)?)?;
+                if let Some(continuation) = root_scanner.dense_continuation_filter {
+                    let labels = root_dense_continuation_labels.ok_or(
+                        ObjectError::InvalidModule(
+                            "finite root continuation labels are absent",
+                        ),
+                    )?;
+                    let continuation_batch_bytes = AARCH64_BATCH_BYTES
+                        .checked_add(u16::from(continuation.scan_offset))
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "finite continuation batch bound",
+                        ))?;
+
+                    // Keep the established six-word dense side block exactly
+                    // six words long. Its untaken sibling is the complete D2
+                    // hot path, including the original batch-selection
+                    // address. Only the runtime-dense edge jumps to appended
+                    // post-return continuation code.
+                    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+                    assembler.instruction(aarch64_cmp_x_imm(
+                        12,
+                        continuation_batch_bytes,
+                    )?)?;
+                    assembler.branch_cond(AARCH64_LO, labels.scalar_dense)?;
+                    assembler.branch(labels.entry)?;
+                    assembler.bind(root_direct_batch_backoff_to_end)?;
+                    assembler.instruction(0xd503_201f)?; // unreachable NOP padding
+                    assembler.instruction(0xd503_201f)?; // unreachable NOP padding
+                    root_dense_continuation_emission =
+                        Some(Aarch64FiniteRootContinuationEmission {
+                            root: filter,
+                            continuation,
+                            first_candidates,
+                            backoff_register,
+                            root_scan,
+                            batch_select: root_direct_batch_select,
+                            labels,
+                        });
+                } else if root_dense_continuation_labels.is_some() {
+                    return Err(ObjectError::InvalidModule(
+                        "finite root continuation labels have no filter",
+                    ));
+                } else {
+                    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+                    assembler.instruction(aarch64_cmp_x_imm(
+                        12,
+                        NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+                    )?)?;
+                    assembler.branch_cond(AARCH64_LO, root_direct_batch_backoff_to_end)?;
+                    assembler.instruction(aarch64_add_x_imm(
+                        backoff_register,
+                        2,
+                        NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES,
+                    )?)?;
+                    assembler.branch(root_direct_batch_select)?;
+                    assembler.bind(root_direct_batch_backoff_to_end)?;
+                    assembler.instruction(aarch64_add_x_imm(backoff_register, 3, 0)?)?;
+                }
 
                 assembler.bind(root_direct_batch_select)?;
                 aarch64_emit_first_candidate_in_batch(&mut assembler, first_candidates)?;
@@ -73456,6 +73893,14 @@ fn lower_aarch64_native_finite_language_impl(
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.instruction(0xd65f_03c0)?;
+
+    if let Some(emission) = root_dense_continuation_emission {
+        aarch64_emit_finite_root_dense_continuation(&mut assembler, emission)?;
+    } else if root_dense_continuation_labels.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "finite root continuation was not emitted",
+        ));
+    }
 
     let mut relocation_offsets = [program_page, program_page_offset];
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
@@ -89180,6 +89625,10 @@ mod tests {
         .expect("install Dense finite root scanner");
         let scanner = layout.root_scanner.expect("Dense finite root scanner");
         assert!(scanner.direct_batch_filter.is_some());
+        let continuation = scanner
+            .dense_continuation_filter
+            .expect("Dense finite continuation column");
+        assert!(continuation.scan_offset > 0);
         assert_eq!(&data[..base_data.len()], base_data.as_slice());
 
         let cost = NativeFiniteLanguageCost::estimate(view, dense).unwrap();
@@ -89290,6 +89739,14 @@ mod tests {
                 .unwrap(),
         ));
         assert!(words.contains(&aarch64_add_x_imm(13, 3, 0).unwrap()));
+        assert!(words.contains(&aarch64_add_x_imm(13, 2, 0).unwrap()));
+        assert!(words.contains(&aarch64_cmp_x(2, 13).unwrap()));
+        assert!(words.contains(
+            &aarch64_add_x_imm(12, 12, u16::from(continuation.scan_offset)).unwrap(),
+        ));
+        for block in 0_u8..4 {
+            assert!(words.contains(&aarch64_and_16b(block, block, 4).unwrap()));
+        }
         assert!(!words.contains(
             &aarch64_add_x_imm(16, 2, NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES)
                 .unwrap(),
@@ -89416,6 +89873,33 @@ mod tests {
         .expect("install singleton finite root scanner");
         let scanner = layout.root_scanner.expect("singleton finite root scanner");
         assert_eq!(scanner.direct_batch_filter, Some(singleton));
+        let continuation = scanner
+            .dense_continuation_filter
+            .expect("authenticated finite continuation column");
+        assert!(continuation.scan_offset > 0);
+        assert!(continuation.from_anchored_prefix);
+        assert_eq!(
+            native_finite_root_dense_continuation_filter(view, singleton).unwrap(),
+            Some(continuation),
+        );
+        assert!(use_aarch64_filter_batch(continuation));
+        assert!(
+            singleton.constant_count() + continuation.constant_count()
+                <= AARCH64_STANDALONE_FILTER_CONSTANTS,
+        );
+        assert!(
+            vector_filter_instruction_units(singleton)
+                + vector_filter_instruction_units(continuation)
+                <= MAX_VECTOR_FILTER_INSTRUCTION_UNITS,
+        );
+        let continuation_first = AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+            .checked_add(u8::try_from(singleton.constant_count()).unwrap())
+            .unwrap();
+        for index in 0..continuation.constant_count() {
+            let register = aarch64_filter_constant_register(continuation_first, index).unwrap();
+            assert!((16..=23).contains(&register));
+            assert!(!(8..=15).contains(&register));
+        }
         assert_eq!(&data[..base_data.len()], base_data.as_slice());
         assert_eq!(
             data.len(),
@@ -89435,6 +89919,59 @@ mod tests {
             lower_aarch64_native_finite_language(OutputContract::Span, malformed_layout),
             Err(ObjectError::InvalidModule(
                 "AArch64 finite root direct filter is inconsistent",
+            )),
+        );
+
+        let mut malformed_layout = layout;
+        let mut malformed_scanner = scanner;
+        let mut malformed_continuation = continuation;
+        malformed_continuation.scan_offset = 0;
+        malformed_scanner.dense_continuation_filter = Some(malformed_continuation);
+        malformed_layout.root_scanner = Some(malformed_scanner);
+        assert_eq!(
+            lower_aarch64_native_finite_language(OutputContract::Span, malformed_layout),
+            Err(ObjectError::InvalidModule(
+                "AArch64 finite root continuation filter is inconsistent",
+            )),
+        );
+
+        let mut malformed_layout = layout;
+        let mut malformed_scanner = scanner;
+        let mut malformed_continuation = continuation;
+        malformed_continuation.ranges[0] = NativeByteRange { start: 2, end: 1 };
+        malformed_scanner.dense_continuation_filter = Some(malformed_continuation);
+        malformed_layout.root_scanner = Some(malformed_scanner);
+        assert_eq!(
+            lower_aarch64_native_finite_language(OutputContract::Span, malformed_layout),
+            Err(ObjectError::InvalidModule(
+                "native start-filter range is reversed",
+            )),
+        );
+
+        let mut malformed_layout = layout;
+        let mut malformed_scanner = scanner;
+        let mut malformed_continuation = continuation;
+        malformed_continuation.candidate_bytes = malformed_continuation
+            .candidate_bytes
+            .checked_add(1)
+            .unwrap();
+        malformed_scanner.dense_continuation_filter = Some(malformed_continuation);
+        malformed_layout.root_scanner = Some(malformed_scanner);
+        assert_eq!(
+            lower_aarch64_native_finite_language(OutputContract::Span, malformed_layout),
+            Err(ObjectError::InvalidModule(
+                "native start-filter cardinality is inconsistent",
+            )),
+        );
+
+        let mut orphaned_layout = layout;
+        let mut orphaned_scanner = scanner;
+        orphaned_scanner.direct_batch_filter = None;
+        orphaned_layout.root_scanner = Some(orphaned_scanner);
+        assert_eq!(
+            lower_aarch64_native_finite_language(OutputContract::Span, orphaned_layout),
+            Err(ObjectError::InvalidModule(
+                "AArch64 finite root continuation has no direct root filter",
             )),
         );
 
@@ -89486,6 +90023,7 @@ mod tests {
         let mut nibble_ablation_layout = layout;
         let mut nibble_ablation_scanner = scanner;
         nibble_ablation_scanner.direct_batch_filter = None;
+        nibble_ablation_scanner.dense_continuation_filter = None;
         nibble_ablation_layout.root_scanner = Some(nibble_ablation_scanner);
         let (nibble_ablation_code, nibble_ablation_relocations) =
             lower_aarch64_native_finite_language(
@@ -89504,9 +90042,21 @@ mod tests {
             &aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap(),
         ));
 
+        let mut continuation_ablation_layout = layout;
+        let mut continuation_ablation_scanner = scanner;
+        continuation_ablation_scanner.dense_continuation_filter = None;
+        continuation_ablation_layout.root_scanner = Some(continuation_ablation_scanner);
+        let (continuation_ablation_code, continuation_ablation_relocations) =
+            lower_aarch64_native_finite_language(
+                OutputContract::Span,
+                continuation_ablation_layout,
+            )
+            .unwrap();
+
         let (code, relocations) =
             lower_aarch64_native_finite_language(OutputContract::Span, layout).unwrap();
         assert_eq!(relocations.len(), 2);
+        assert_eq!(continuation_ablation_relocations, relocations);
         assert_eq!(nibble_ablation_relocations.len(), relocations.len());
         for (nibble, direct) in nibble_ablation_relocations.iter().zip(&relocations) {
             assert_eq!(nibble.section, direct.section);
@@ -89660,8 +90210,219 @@ mod tests {
         assert_eq!(
             words[dense_target / 4],
             aarch64_sub_x_reg(12, 3, 2).unwrap(),
-            "four candidates in any retained vector must enter bounded scalar backoff",
+            "four candidates in any retained vector must enter dense refinement",
         );
+        assert_eq!(
+            words[dense_target / 4 + 1],
+            aarch64_cmp_x_imm(
+                12,
+                AARCH64_BATCH_BYTES + u16::from(continuation.scan_offset),
+            )
+            .unwrap(),
+            "continuation loads must prove their complete aligned window",
+        );
+        assert!(words.contains(
+            &aarch64_add_x_imm(12, 12, u16::from(continuation.scan_offset)).unwrap(),
+        ));
+        for block in 0_u8..4 {
+            assert!(words.contains(&aarch64_and_16b(block, block, 4).unwrap()));
+        }
+        assert!(words.contains(&aarch64_cmp_x(2, 16).unwrap()));
+        assert!(words.contains(&aarch64_add_x_imm(16, 2, 0).unwrap()));
+
+        let ablation_words = continuation_ablation_code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let ablation_density = ablation_words
+            .windows(4)
+            .position(|window| {
+                window
+                    == [
+                        aarch64_ushr_16b_by_7(7, 0).unwrap(),
+                        aarch64_addv_16b(7, 7).unwrap(),
+                        aarch64_umov_b0(12, 7).unwrap(),
+                        aarch64_cmp_w_imm(
+                            12,
+                            NATIVE_FINITE_ROOT_SCANNER_DENSE_HITS,
+                        )
+                        .unwrap(),
+                    ]
+            })
+            .expect("root-only direct batch density sampling");
+        let (_, ablation_dense_target) = aarch64_test_branch_target(
+            &continuation_ablation_code,
+            (ablation_density + 4) * 4,
+        );
+        assert_eq!(dense_target, ablation_dense_target);
+        let dense_end = dense_target + 6 * 4;
+        assert_eq!(&code[..dense_target], &continuation_ablation_code[..dense_target]);
+        assert_eq!(
+            &code[dense_end..continuation_ablation_code.len()],
+            &continuation_ablation_code[dense_end..],
+            "the cold six-word dense side block and post-return appendix are the only direct-route changes",
+        );
+        assert!(code.len() > continuation_ablation_code.len());
+    }
+
+    #[test]
+    fn ordered_finite_root_continuation_declines_outside_existing_budgets() {
+        let mut pattern = String::from("(?-u:");
+        for ordinal in 0_u8..8 {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            pattern.push_str(&format!("\\x71\\x{:02x}", ordinal * 2));
+        }
+        pattern.push(')');
+        let compiled = ordered_finite_test_program(&pattern, OutputContract::Span);
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("budget-decline finite root sidecar");
+        let set = NativeExactByteSet::from_membership(view.root_members, 0, false)
+            .expect("budget-decline exact roots");
+        let root = native_finite_root_direct_batch_filter(set)
+            .unwrap()
+            .expect("rare root remains directly representable");
+        assert_eq!(root.constant_count(), 1);
+        assert_eq!(
+            native_finite_root_dense_continuation_filter(view, root).unwrap(),
+            None,
+            "an eight-way fragmented second byte must not escape the shared constant/instruction caps",
+        );
+
+        let mut layout = native_finite_language_sparse_layout(view)
+            .expect("budget-decline sparse layout");
+        let mut data = materialize_native_finite_language_data(view, layout)
+            .unwrap()
+            .expect("budget-decline finite data");
+        let base_data = data.clone();
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        install_aarch64_native_finite_root_scanner(
+            view,
+            target,
+            usize::MAX,
+            &mut layout,
+            &mut data,
+        )
+        .expect("install budget-decline root scanner");
+        let scanner = layout.root_scanner.expect("budget-decline root scanner");
+        assert_eq!(scanner.direct_batch_filter, Some(root));
+        assert_eq!(scanner.dense_continuation_filter, None);
+        assert_eq!(&data[..base_data.len()], base_data.as_slice());
+        assert_eq!(
+            data.len(),
+            ordered_finite_root_scanner_extent(base_data.len())
+                .unwrap()
+                .lane_index_end,
+            "continuation decline must not add retained tables",
+        );
+    }
+
+    #[test]
+    fn ordered_finite_root_continuation_inherited_output_decline_is_identity() {
+        let compiled = ordered_finite_test_program(
+            "(?-u:\\x00|\\x02\\x00\\x04)",
+            OutputContract::Span,
+        );
+        let view = compiled
+            .program()
+            .native_finite_language_view()
+            .expect("inherited-output finite root sidecar");
+        assert!(view
+            .sparse_states
+            .iter()
+            .zip(view.outputs)
+            .any(|(state, output)| state.depth() == 2 && output.width() == 1));
+        assert_eq!(native_finite_language_minimum_accepted_width(view), Some(1));
+        let set = NativeExactByteSet::from_membership(view.root_members, 0, false)
+            .expect("inherited-output exact roots");
+        let root = native_finite_root_direct_batch_filter(set)
+            .unwrap()
+            .expect("inherited-output direct root");
+        assert_eq!(
+            native_finite_root_dense_continuation_filter(view, root).unwrap(),
+            None,
+        );
+
+        let mut layout = native_finite_language_sparse_layout(view)
+            .expect("inherited-output sparse layout");
+        let mut data = materialize_native_finite_language_data(view, layout)
+            .unwrap()
+            .expect("inherited-output finite data");
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        install_aarch64_native_finite_root_scanner(
+            view,
+            target,
+            usize::MAX,
+            &mut layout,
+            &mut data,
+        )
+        .expect("install inherited-output root scanner");
+        let scanner = layout.root_scanner.expect("inherited-output root scanner");
+        assert_eq!(scanner.direct_batch_filter, Some(root));
+        assert_eq!(scanner.dense_continuation_filter, None);
+
+        let root_only = lower_aarch64_native_finite_language(OutputContract::Span, layout)
+            .expect("inherited-output root-only lowering");
+        let explicitly_ablated = {
+            let mut ablated = layout;
+            let mut scanner = scanner;
+            scanner.dense_continuation_filter = None;
+            ablated.root_scanner = Some(scanner);
+            lower_aarch64_native_finite_language(OutputContract::Span, ablated)
+                .expect("inherited-output explicit continuation ablation")
+        };
+        assert_eq!(root_only, explicitly_ablated);
+        let words = root_only
+            .0
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words.last(), Some(&0xd65f_03c0));
+    }
+
+    #[test]
+    fn ordered_finite_root_continuation_is_necessary_for_every_output_contract() {
+        let pattern = cache_large_branching_finite_pattern_for_roots(b"q", 4, 16);
+        let mut selected = None;
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = ordered_finite_test_program(&pattern, output);
+            let view = compiled
+                .program()
+                .native_finite_language_view()
+                .expect("contract-specific finite root sidecar");
+            let set = NativeExactByteSet::from_membership(view.root_members, 0, false)
+                .expect("contract-specific exact roots");
+            let root = native_finite_root_direct_batch_filter(set)
+                .unwrap()
+                .expect("contract-specific direct root");
+            let continuation = native_finite_root_dense_continuation_filter(view, root)
+                .unwrap()
+                .expect("contract-specific continuation");
+            if let Some(expected) = selected {
+                assert_eq!(continuation, expected);
+            } else {
+                selected = Some(continuation);
+            }
+            let membership = start_filter_membership(continuation).unwrap();
+            let offset = usize::from(continuation.scan_offset);
+            for branch in 0_u8..4 {
+                let mut literal = vec![b'q', branch];
+                literal.extend(core::iter::repeat_n(b'q', 14));
+                let byte = usize::from(literal[offset]);
+                assert_ne!(membership[byte / 64] & (1_u64 << (byte % 64)), 0);
+            }
+        }
     }
 
     #[test]
@@ -90372,6 +91133,19 @@ mod tests {
         )
     }
 
+    fn fragmented_depth_two_finite_pattern() -> String {
+        let mut pattern = String::from("(?-u:");
+        for second in u8::MIN..=u8::MAX {
+            if second != u8::MIN {
+                pattern.push('|');
+            }
+            let third = 2 * (second % 4);
+            pattern.push_str(&format!("\\x71\\x{second:02x}\\x{third:02x}"));
+        }
+        pattern.push(')');
+        pattern
+    }
+
     #[test]
     fn cache_large_compressed_binary_tries_select_compact_rows_before_the_hard_ceiling() {
         let compiled = ordered_finite_test_program(
@@ -90959,6 +91733,98 @@ mod tests {
             cache_large_branching_finite_pattern_for_roots(b"q", 4, 16);
         let direct_range_pattern =
             cache_large_branching_finite_pattern_for_roots(b"34567", 4, 16);
+        let fragmented_continuation_pattern = fragmented_depth_two_finite_pattern();
+        let direct_continuation = {
+            let semantic = ordered_finite_test_program(
+                &direct_scanner_pattern,
+                OutputContract::Span,
+            );
+            let view = semantic
+                .program()
+                .native_finite_language_view()
+                .expect("linked direct continuation view");
+            let set = NativeExactByteSet::from_membership(view.root_members, 0, false)
+                .expect("linked direct continuation roots");
+            let root = native_finite_root_direct_batch_filter(set)
+                .unwrap()
+                .expect("linked direct root filter");
+            native_finite_root_dense_continuation_filter(view, root)
+                .unwrap()
+                .expect("linked direct continuation filter")
+        };
+        let direct_continuation_membership =
+            start_filter_membership(direct_continuation).unwrap();
+        let direct_continuation_offset = usize::from(direct_continuation.scan_offset);
+        let direct_continuation_member = (u8::MIN..=u8::MAX)
+            .find(|&byte| {
+                direct_continuation_membership[usize::from(byte) / 64]
+                    & (1_u64 << (usize::from(byte) % 64))
+                    != 0
+            })
+            .expect("linked continuation has a member");
+        let direct_continuation_filler = (u8::MIN..=u8::MAX)
+            .find(|&byte| {
+                byte != b'q'
+                    && direct_continuation_membership[usize::from(byte) / 64]
+                        & (1_u64 << (usize::from(byte) % 64))
+                        == 0
+            })
+            .expect("linked continuation has a nonmember filler");
+        let fragmented_continuation = {
+            let semantic = ordered_finite_test_program(
+                &fragmented_continuation_pattern,
+                OutputContract::Span,
+            );
+            let view = semantic
+                .program()
+                .native_finite_language_view()
+                .expect("linked fragmented continuation view");
+            let set = NativeExactByteSet::from_membership(view.root_members, 0, false)
+                .expect("linked fragmented continuation roots");
+            let root = native_finite_root_direct_batch_filter(set)
+                .unwrap()
+                .expect("linked fragmented direct root filter");
+            let continuation = native_finite_root_dense_continuation_filter(view, root)
+                .unwrap()
+                .expect("linked fragmented continuation filter");
+            assert_eq!(root.constant_count(), 1);
+            assert_eq!(continuation.scan_offset, 2);
+            assert!(continuation.is_exact());
+            assert_eq!(continuation.constant_count(), 4);
+            assert_eq!(
+                continuation
+                    .ranges()
+                    .iter()
+                    .map(|range| range.start)
+                    .collect::<Vec<_>>(),
+                [0, 2, 4, 6],
+            );
+            assert_eq!(
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+                    + u8::try_from(root.constant_count()).unwrap(),
+                17,
+                "the fragmented constants must occupy the shifted V17..V20 bank",
+            );
+            continuation
+        };
+        assert_eq!(fragmented_continuation.scan_offset, 2);
+        let mut direct_dense_bases = Vec::new();
+        for base in 0_usize..16 {
+            if direct_dense_bases.iter().all(|&prior| {
+                usize::abs_diff(prior, base) != direct_continuation_offset
+            }) {
+                direct_dense_bases.push(base);
+                if direct_dense_bases.len() == 4 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(direct_dense_bases.len(), 4);
+        assert!(direct_dense_bases.iter().enumerate().all(|(index, &base)| {
+            direct_dense_bases[..index].iter().all(|&prior| {
+                usize::abs_diff(prior, base) != direct_continuation_offset
+            })
+        }));
         let mut hybrid_last = vec![2_u8; 16];
         hybrid_last[0] = 31;
         hybrid_last[1] = 3;
@@ -91011,6 +91877,34 @@ mod tests {
             .cycle()
             .take(128)
             .collect::<Vec<_>>();
+        let continuation_bound = usize::from(AARCH64_BATCH_BYTES)
+            + direct_continuation_offset;
+        let mut direct_dense_63 = vec![direct_continuation_filler; 63];
+        let mut direct_dense_64 = vec![direct_continuation_filler; 64];
+        let mut direct_continuation_short = vec![
+            direct_continuation_filler;
+            continuation_bound.saturating_sub(1)
+        ];
+        let mut direct_continuation_exact =
+            vec![direct_continuation_filler; continuation_bound];
+        for &base in &direct_dense_bases {
+            direct_dense_63[base] = b'q';
+            direct_dense_64[base] = b'q';
+            direct_continuation_short[base] = b'q';
+            direct_continuation_exact[base] = b'q';
+        }
+        let mut direct_secondary_only = vec![direct_continuation_filler; 320];
+        for &base in &direct_dense_bases {
+            direct_secondary_only[base] = b'q';
+            direct_secondary_only[64 + base + direct_continuation_offset] =
+                direct_continuation_member;
+        }
+        let mut direct_dense_joint = vec![direct_continuation_filler; 320];
+        for &base in &direct_dense_bases {
+            direct_dense_joint[base] = b'q';
+            direct_dense_joint[base + direct_continuation_offset] =
+                direct_continuation_member;
+        }
         let mut direct_rearm = vec![b'!'; 1_080];
         for (index, byte) in [b'q', b'!', b'!', b'!']
             .into_iter()
@@ -91024,6 +91918,12 @@ mod tests {
         direct_near[15] = b'!';
         direct_rearm[500..516].copy_from_slice(&direct_near);
         direct_rearm[1_040..1_056].copy_from_slice(&direct_literal);
+        let mut fragmented_continuation_accepted = vec![b'!'; 80];
+        for base in [0_usize, 4, 8, 12] {
+            fragmented_continuation_accepted[base] = b'q';
+        }
+        fragmented_continuation_accepted[13] = 3;
+        fragmented_continuation_accepted[14] = 6;
         let mut direct_range_literal = vec![b'5', 3];
         direct_range_literal.extend(core::iter::repeat_n(b'3', 14));
         let mut direct_range_late = vec![b'!'; 63];
@@ -91064,6 +91964,12 @@ mod tests {
             direct_three_hits,
             direct_four_hits,
             direct_dense_decoys,
+            direct_dense_63,
+            direct_dense_64,
+            direct_continuation_short,
+            direct_continuation_exact,
+            direct_secondary_only,
+            direct_dense_joint,
             direct_rearm,
         ];
         direct_scanner_cases.extend(direct_boundary_cases);
@@ -91127,6 +92033,16 @@ mod tests {
             (
                 direct_scanner_pattern.as_str(),
                 direct_scanner_cases,
+                LinkedFiniteRoute::DenseScanner,
+            ),
+            (
+                fragmented_continuation_pattern.as_str(),
+                vec![fragmented_continuation_accepted.clone()],
+                LinkedFiniteRoute::SparseScanner,
+            ),
+            (
+                fragmented_continuation_pattern.as_str(),
+                vec![fragmented_continuation_accepted],
                 LinkedFiniteRoute::DenseScanner,
             ),
             (
@@ -146594,6 +147510,89 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         );
         assert!(
             aarch64_filter_constant_register(AARCH64_STANDALONE_FILTER_FIRST_CONSTANT, 8).is_err()
+        );
+
+        let mut overflowing = EMPTY_NATIVE_START_FILTER;
+        for (index, range) in overflowing.ranges.iter_mut().enumerate() {
+            let byte = u8::try_from(index * 2).unwrap();
+            *range = NativeByteRange {
+                start: byte,
+                end: byte,
+            };
+        }
+        overflowing.range_count = u8::try_from(MAX_START_FILTER_RANGES).unwrap();
+        overflowing.candidate_bytes = u16::try_from(MAX_START_FILTER_RANGES).unwrap();
+        let mut assembler = Aarch64Assembler::new();
+        assert_eq!(
+            aarch64_emit_start_filter_batch_candidates(&mut assembler, overflowing, 17),
+            Err(ObjectError::InvalidModule(
+                "ASIMD batch filter constants overlap its source registers",
+            )),
+        );
+        assert!(assembler.finish().unwrap().is_empty());
+        let mut assembler = Aarch64Assembler::new();
+        assert_eq!(
+            aarch64_emit_start_filter_batch_candidates(&mut assembler, overflowing, 0),
+            Err(ObjectError::InvalidModule(
+                "ASIMD batch filter has an invalid constant allocation",
+            )),
+        );
+        assert!(assembler.finish().unwrap().is_empty());
+
+        let root = NativeStartFilter {
+            ranges: [
+                NativeByteRange {
+                    start: b'q',
+                    end: b'q',
+                },
+                EMPTY_NATIVE_BYTE_RANGE,
+                EMPTY_NATIVE_BYTE_RANGE,
+                EMPTY_NATIVE_BYTE_RANGE,
+                EMPTY_NATIVE_BYTE_RANGE,
+                EMPTY_NATIVE_BYTE_RANGE,
+                EMPTY_NATIVE_BYTE_RANGE,
+                EMPTY_NATIVE_BYTE_RANGE,
+            ],
+            range_count: 1,
+            candidate_bytes: 1,
+            scan_offset: 0,
+            from_anchored_prefix: false,
+        };
+        let continuation = NativeStartFilter {
+            scan_offset: 1,
+            from_anchored_prefix: true,
+            ..root
+        };
+        let mut assembler = Aarch64Assembler::new();
+        let labels = Aarch64FiniteRootContinuationLabels {
+            entry: assembler.label().unwrap(),
+            scalar_dense: assembler.label().unwrap(),
+            scalar_backoff_to_end: assembler.label().unwrap(),
+            continuation_loop: assembler.label().unwrap(),
+            continuation_hit: assembler.label().unwrap(),
+            joint: assembler.label().unwrap(),
+            exit: assembler.label().unwrap(),
+            bound_to_end: assembler.label().unwrap(),
+            bound_set: assembler.label().unwrap(),
+        };
+        let root_scan = assembler.label().unwrap();
+        let batch_select = assembler.label().unwrap();
+        assert_eq!(
+            aarch64_emit_finite_root_dense_continuation(
+                &mut assembler,
+                Aarch64FiniteRootContinuationEmission {
+                    root,
+                    continuation,
+                    first_candidates: 1,
+                    backoff_register: 16,
+                    root_scan,
+                    batch_select,
+                    labels,
+                },
+            ),
+            Err(ObjectError::InvalidModule(
+                "finite continuation changed its retained candidate bank",
+            )),
         );
 
         // Multi-column filters keep constants in V1..V4. The relation
