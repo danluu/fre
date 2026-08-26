@@ -15,7 +15,7 @@ use fre_lower::{
     analyze_hir_facts,
 };
 use fre_syntax::RustParsed;
-use regex_syntax::hir::Hir;
+use regex_syntax::hir::{Class, Hir, HirKind};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -41,6 +41,13 @@ const MAX_ORDERED_FINITE_FAILURE_STEPS: u64 = 64_000_000;
 /// Wider exact languages retain the existing Aho-Corasick candidate. This is
 /// a structural compiler bound, not a source-pattern or benchmark identity.
 const MAX_NATIVE_FINITE_TEDDY_LITERALS: usize = 64;
+
+/// The early wide-language lane exists only to avoid building an ordinary
+/// DFA for a language already large enough that the compact failure-link
+/// representation is its plausible native owner. Keep this structural gate
+/// aligned with the upper edge of the bounded packed-literal portfolio.
+const MIN_WIDE_EARLY_FINITE_STRINGS: usize = MAX_NATIVE_FINITE_TEDDY_LITERALS + 1;
+const MIN_WIDE_EARLY_LITERAL_BYTES: usize = 4;
 
 /// Separately bounded proof envelope used only after ordinary HIR lowering
 /// has already declined a numeric resource. The prospective fact analysis is
@@ -205,6 +212,43 @@ pub(crate) enum NativeFiniteLanguageAnalysis {
 }
 
 impl NativeFiniteLanguageCandidate {
+    /// Allocation-free prospective screen for the prepared Count/SpanSum
+    /// early finite-language lane. This is deliberately only a broad gate:
+    /// the independently allocated fact report below remains authoritative
+    /// for exact language membership, assertions, nullability and cardinality.
+    pub(crate) fn preflight_wide_early(parsed: &RustParsed) -> bool {
+        wide_early_hir_shape(&parsed.hir).is_some_and(|shape| {
+            shape.cardinality >= MIN_WIDE_EARLY_FINITE_STRINGS
+                && shape.minimum_width >= MIN_WIDE_EARLY_LITERAL_BYTES
+        })
+    }
+
+    /// Run the existing broad finite-language proof only after the
+    /// allocation-free HIR screen has admitted a prospective wide language.
+    /// Hard fact-construction failures stay terminal. The exact materialized
+    /// language is checked again so an intentionally conservative prospective
+    /// cardinality cannot publish this route by itself.
+    pub(crate) fn analyze_for_wide_early(
+        parsed: &RustParsed,
+        output: OutputContract,
+    ) -> Result<Option<Self>, LowerError> {
+        if !Self::preflight_wide_early(parsed) {
+            return Ok(None);
+        }
+        let Some(candidate) = Self::analyze_for_lower_state_rescue(parsed, output)? else {
+            return Ok(None);
+        };
+        if candidate.strings.len() < MIN_WIDE_EARLY_FINITE_STRINGS
+            || candidate
+                .strings
+                .iter()
+                .any(|string| string.len() < MIN_WIDE_EARLY_LITERAL_BYTES)
+        {
+            return Ok(None);
+        }
+        Ok(Some(candidate))
+    }
+
     /// Analyze one canonical parse for the exact output requested by the AOT
     /// entry. Optional proof failure is an optimization decline, never a
     /// compilation failure.
@@ -664,6 +708,167 @@ impl NativeFiniteLanguageCandidate {
         limits: LowerLimits,
     ) -> Result<Option<RawPlan>, LowerError> {
         PriorityTrieRawBuilder::new(&self.strings, self.total_bytes, limits).build()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WideEarlyHirShape {
+    /// Saturated at the structural admission threshold. This is prospective,
+    /// not a semantic proof: duplicate alternatives are permitted here and
+    /// rejected by the exact materialized-language check above.
+    cardinality: usize,
+    minimum_width: usize,
+}
+
+impl WideEarlyHirShape {
+    const ZERO_LANGUAGE: Self = Self {
+        cardinality: 0,
+        minimum_width: usize::MAX,
+    };
+
+    const EMPTY_STRING: Self = Self {
+        cardinality: 1,
+        minimum_width: 0,
+    };
+}
+
+const fn saturating_wide_cardinality_add(left: usize, right: usize) -> usize {
+    let sum = left.saturating_add(right);
+    if sum > MIN_WIDE_EARLY_FINITE_STRINGS {
+        MIN_WIDE_EARLY_FINITE_STRINGS
+    } else {
+        sum
+    }
+}
+
+const fn saturating_wide_cardinality_mul(left: usize, right: usize) -> usize {
+    let product = left.saturating_mul(right);
+    if product > MIN_WIDE_EARLY_FINITE_STRINGS {
+        MIN_WIDE_EARLY_FINITE_STRINGS
+    } else {
+        product
+    }
+}
+
+const fn saturating_wide_cardinality_pow(mut base: usize, mut exponent: u32) -> usize {
+    let mut product = 1_usize;
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            product = saturating_wide_cardinality_mul(product, base);
+        }
+        exponent >>= 1;
+        if exponent != 0 {
+            base = saturating_wide_cardinality_mul(base, base);
+        }
+    }
+    product
+}
+
+fn wide_early_class_shape(class: &Class) -> WideEarlyHirShape {
+    match class {
+        Class::Bytes(class) => {
+            let cardinality = class.ranges().iter().fold(0_usize, |total, range| {
+                saturating_wide_cardinality_add(total, range.len())
+            });
+            if cardinality == 0 {
+                WideEarlyHirShape::ZERO_LANGUAGE
+            } else {
+                WideEarlyHirShape {
+                    cardinality,
+                    minimum_width: 1,
+                }
+            }
+        }
+        Class::Unicode(class) => {
+            let cardinality = class.ranges().iter().fold(0_usize, |total, range| {
+                saturating_wide_cardinality_add(total, range.len())
+            });
+            if cardinality == 0 {
+                return WideEarlyHirShape::ZERO_LANGUAGE;
+            }
+            let minimum_width = class
+                .ranges()
+                .iter()
+                .map(|range| range.start().len_utf8())
+                .min()
+                .unwrap_or(usize::MAX);
+            WideEarlyHirShape {
+                cardinality,
+                minimum_width,
+            }
+        }
+    }
+}
+
+/// Allocation-free conservative finite-language census. Unbounded
+/// repetitions and look assertions decline before the wider fact proof.
+fn wide_early_hir_shape(hir: &Hir) -> Option<WideEarlyHirShape> {
+    match hir.kind() {
+        HirKind::Empty => Some(WideEarlyHirShape::EMPTY_STRING),
+        HirKind::Literal(literal) => Some(WideEarlyHirShape {
+            cardinality: 1,
+            minimum_width: literal.0.len(),
+        }),
+        HirKind::Class(class) => Some(wide_early_class_shape(class)),
+        HirKind::Look(_) => None,
+        HirKind::Capture(capture) => wide_early_hir_shape(&capture.sub),
+        HirKind::Concat(parts) => {
+            let mut combined = WideEarlyHirShape::EMPTY_STRING;
+            for part in parts {
+                let shape = wide_early_hir_shape(part)?;
+                if shape.cardinality == 0 {
+                    return Some(WideEarlyHirShape::ZERO_LANGUAGE);
+                }
+                combined.cardinality =
+                    saturating_wide_cardinality_mul(combined.cardinality, shape.cardinality);
+                combined.minimum_width = combined.minimum_width.checked_add(shape.minimum_width)?;
+            }
+            Some(combined)
+        }
+        HirKind::Alternation(parts) => {
+            let mut combined = WideEarlyHirShape::ZERO_LANGUAGE;
+            for part in parts {
+                let shape = wide_early_hir_shape(part)?;
+                combined.cardinality =
+                    saturating_wide_cardinality_add(combined.cardinality, shape.cardinality);
+                combined.minimum_width = combined.minimum_width.min(shape.minimum_width);
+            }
+            Some(combined)
+        }
+        HirKind::Repetition(repetition) => {
+            let maximum = repetition.max?;
+            let child = wide_early_hir_shape(&repetition.sub)?;
+            if child.cardinality == 0 {
+                return Some(if repetition.min == 0 {
+                    WideEarlyHirShape::EMPTY_STRING
+                } else {
+                    WideEarlyHirShape::ZERO_LANGUAGE
+                });
+            }
+            let minimum_width = child
+                .minimum_width
+                .checked_mul(usize::try_from(repetition.min).ok()?)?;
+            let mut cardinality = 0_usize;
+            let mut power = saturating_wide_cardinality_pow(child.cardinality, repetition.min);
+            let term_count = maximum.checked_sub(repetition.min)?.checked_add(1)?;
+            // Every nonempty child contributes at least one string. Once the
+            // prospective cardinality saturates, later bounded repetitions
+            // cannot change the gate, so even a u32-wide repeat range takes
+            // at most the admission threshold's work.
+            for term in 0..term_count.min(MIN_WIDE_EARLY_FINITE_STRINGS as u32) {
+                cardinality = saturating_wide_cardinality_add(cardinality, power);
+                if cardinality == MIN_WIDE_EARLY_FINITE_STRINGS {
+                    break;
+                }
+                if term + 1 != term_count {
+                    power = saturating_wide_cardinality_mul(power, child.cardinality);
+                }
+            }
+            Some(WideEarlyHirShape {
+                cardinality,
+                minimum_width,
+            })
+        }
     }
 }
 
@@ -1541,6 +1746,12 @@ impl OrderedFiniteSparseState {
 
     pub(crate) const fn edge_count(self) -> u16 {
         self.edge_count
+    }
+
+    /// Exact trie depth authenticated by `NativeFiniteLanguageProgram` before
+    /// target lowering receives a finite-language view.
+    pub(crate) const fn depth(self) -> u32 {
+        self.depth
     }
 }
 
@@ -2629,6 +2840,54 @@ mod tests {
 
     fn candidate(pattern: &str, output: OutputContract) -> Option<NativeFiniteLanguageCandidate> {
         NativeFiniteLanguageCandidate::analyze(&parsed(pattern), output)
+    }
+
+    fn numbered_alternation(count: usize, width: usize) -> String {
+        assert!(width >= 4);
+        (0..count)
+            .map(|index| format!("w{index:0fill$}", fill = width - 1))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    #[test]
+    fn wide_early_preflight_is_allocation_free_bounded_and_reauthenticated() {
+        let below = parsed(&numbered_alternation(64, 6));
+        assert!(!NativeFiniteLanguageCandidate::preflight_wide_early(
+            &below
+        ));
+
+        let admitted = parsed(&numbered_alternation(65, 6));
+        assert!(NativeFiniteLanguageCandidate::preflight_wide_early(
+            &admitted
+        ));
+        let candidate = NativeFiniteLanguageCandidate::analyze_for_wide_early(
+            &admitted,
+            OutputContract::Span,
+        )
+        .expect("wide exact finite proof")
+        .expect("wide exact finite candidate");
+        assert_eq!(candidate.strings.len(), 65);
+        assert!(candidate.strings.iter().all(|string| string.len() == 6));
+
+        // The helper's width floor is four, so use a direct three-byte class
+        // product to prove that cardinality alone cannot admit the route.
+        let short = parsed("[a-z][a-z][a-z]");
+        assert!(!NativeFiniteLanguageCandidate::preflight_wide_early(
+            &short
+        ));
+        assert!(!NativeFiniteLanguageCandidate::preflight_wide_early(
+            &parsed("^(?:abcd|efgh){1,2}")
+        ));
+        assert!(!NativeFiniteLanguageCandidate::preflight_wide_early(
+            &parsed("(?:abcd|efgh)+")
+        ));
+
+        assert_eq!(saturating_wide_cardinality_pow(2, u32::MAX), 65);
+        let huge_bounded = parsed("(?:abcd|efgh){4294967295}");
+        assert!(NativeFiniteLanguageCandidate::preflight_wide_early(
+            &huge_bounded
+        ));
     }
 
     fn bound_program(

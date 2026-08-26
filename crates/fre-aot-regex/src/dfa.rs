@@ -802,6 +802,45 @@ pub(crate) fn graph_alphabet_class_count(
     Ok(partition.classes)
 }
 
+/// Allocation-free graph-membership alphabet census for a current validated
+/// raw plan. This is compiler-private structural accounting, not a semantic
+/// shortcut: ordinary lowering remains authoritative for the graph itself.
+pub(crate) fn current_graph_alphabet_class_count(
+    raw: &RawPlan,
+) -> Result<Option<usize>, CompileError> {
+    let mut boundary_starts = [false; 256];
+    boundary_starts[0] = true;
+    for (edge, &kind) in raw.edge_kinds.iter().enumerate() {
+        match kind {
+            EdgeKind::Epsilon => {}
+            EdgeKind::ByteRange => {
+                let start = *raw
+                    .byte_starts
+                    .get(edge)
+                    .ok_or(CompileError::InternalInvariant(
+                        "graph alphabet census byte start is absent",
+                    ))?;
+                let end = *raw
+                    .byte_ends
+                    .get(edge)
+                    .ok_or(CompileError::InternalInvariant(
+                        "graph alphabet census byte end is absent",
+                    ))?;
+                boundary_starts[usize::from(start)] = true;
+                if let Some(after) = end.checked_add(1) {
+                    boundary_starts[usize::from(after)] = true;
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    graph_alphabet_class_count(raw, &boundary_starts)
+        .map(Some)
+        .map_err(|_| {
+            CompileError::InternalInvariant("current graph alphabet census was inconsistent")
+        })
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ForwardKey {
     items: Vec<u32>,
@@ -3939,6 +3978,112 @@ pub(crate) enum DeterminizeOutcome {
         partial: Option<PartialDfa>,
         native_slow_partial: Option<NativeSlowPartial>,
     },
+}
+
+/// Result of a compiler-private, forward-only cost comparison.
+///
+/// This deliberately retains no DFA rows. It lets an optional owner compare
+/// ordinary ordered-subset construction with another authenticated graph
+/// under explicit state, transition, work, and allocation ceilings without
+/// changing the ordinary determinization receipt. A host allocation refusal
+/// is distinct from exhausting the caller's logical allocation ceiling so a
+/// fallback cannot allocate after an allocator failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForwardCostProbeOutcome {
+    Complete {
+        states: usize,
+        transitions: usize,
+        work_completed: u64,
+        allocation_peak_bytes: usize,
+    },
+    NumericDecline {
+        resource: DeterminizationResource,
+        work_completed: u64,
+        states_completed: usize,
+        transitions_completed: usize,
+        allocation_peak_bytes: usize,
+    },
+    AllocationFailure {
+        requested_elements: usize,
+        element_size: usize,
+    },
+}
+
+fn forward_cost_probe_decline(
+    budget: &BuildBudget,
+    ledger: &DeterminizeAllocationLedger,
+) -> Result<ForwardCostProbeOutcome, CompileError> {
+    let decline = budget.decline.ok_or(CompileError::InternalInvariant(
+        "forward cost probe declined without a resource",
+    ))?;
+    if let DeterminizationResource::Allocation {
+        requested_elements,
+        element_size,
+    } = decline.resource
+        && !ledger.exhausted()
+    {
+        return Ok(ForwardCostProbeOutcome::AllocationFailure {
+            requested_elements,
+            element_size,
+        });
+    }
+    Ok(ForwardCostProbeOutcome::NumericDecline {
+        resource: decline.resource,
+        work_completed: decline.work_completed,
+        states_completed: decline.states_completed,
+        transitions_completed: decline.transitions_completed,
+        allocation_peak_bytes: ledger.peak_bytes(),
+    })
+}
+
+/// Compare only the ordinary ordered forward subset construction against a
+/// caller-derived cost envelope. No completed or partial graph escapes this
+/// transaction, and minimization, reverse construction, and column
+/// coalescing are intentionally outside the probe.
+pub(crate) fn probe_ordered_forward_cost(
+    raw: &RawPlan,
+    requested_limits: DeterminizeLimits,
+    max_allocation_bytes: usize,
+) -> Result<ForwardCostProbeOutcome, CompileError> {
+    if raw
+        .edge_kinds
+        .iter()
+        .any(|kind| !matches!(kind, EdgeKind::Epsilon | EdgeKind::ByteRange))
+    {
+        return Err(CompileError::InternalInvariant(
+            "assertion graph reached the forward cost probe",
+        ));
+    }
+    let ledger = DeterminizeAllocationLedger::new(max_allocation_bytes);
+    let mut budget = BuildBudget::new_slow(requested_limits, ledger.clone());
+    budget.begin_stage(DeterminizationStage::AlphabetPartition);
+    let Some(built_alphabet) = Alphabet::build(raw, &mut budget)? else {
+        return forward_cost_probe_decline(&budget, &ledger);
+    };
+    budget.complete_stage(DeterminizationStage::AlphabetPartition)?;
+    budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
+    let forward = build_forward(
+        raw,
+        &built_alphabet.alphabet,
+        &mut budget,
+        ForwardSemantics::Ordered,
+        DfaReplayOrder::DescendingEstimatedClassFrequency,
+    )?;
+    let ForwardBuildOutcome::Complete(forward) = forward else {
+        return forward_cost_probe_decline(&budget, &ledger);
+    };
+    budget.complete_stage(DeterminizationStage::ForwardSubsetConstruction)?;
+    if budget.states != forward.states || budget.transitions != forward.transitions.len() {
+        return Err(CompileError::InternalInvariant(
+            "forward cost probe accounting disagreed with its completed graph",
+        ));
+    }
+    Ok(ForwardCostProbeOutcome::Complete {
+        states: forward.states,
+        transitions: forward.transitions.len(),
+        work_completed: budget.work,
+        allocation_peak_bytes: ledger.peak_bytes(),
+    })
 }
 
 impl DeterminizeOutcome {
@@ -8285,6 +8430,39 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forward_cost_probe_distinguishes_logical_allocation_limit_from_allocator_failure() {
+        let host_failure_ledger = DeterminizeAllocationLedger::new(usize::MAX);
+        let mut host_failure =
+            BuildBudget::new_slow(DeterminizeLimits::default(), host_failure_ledger.clone());
+        host_failure.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
+        host_failure.allocation::<u32>(7);
+        assert_eq!(
+            forward_cost_probe_decline(&host_failure, &host_failure_ledger)
+                .expect("classify synthetic allocator refusal"),
+            ForwardCostProbeOutcome::AllocationFailure {
+                requested_elements: 7,
+                element_size: core::mem::size_of::<u32>(),
+            },
+        );
+
+        let limit_ledger = DeterminizeAllocationLedger::new(0);
+        let mut limit = BuildBudget::new_slow(DeterminizeLimits::default(), limit_ledger.clone());
+        limit.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
+        assert!(!limit.charge_allocation::<u32>(1));
+        assert!(matches!(
+            forward_cost_probe_decline(&limit, &limit_ledger)
+                .expect("classify synthetic allocation ceiling"),
+            ForwardCostProbeOutcome::NumericDecline {
+                resource: DeterminizationResource::Allocation {
+                    requested_elements: 1,
+                    element_size: 4,
+                },
+                ..
+            }
+        ));
+    }
 
     fn synthetic_complete_finalizer_machine() -> FinalizedCompleteDfa {
         let mut byte_classes = [3_u8; 256];

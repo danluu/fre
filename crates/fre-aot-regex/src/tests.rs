@@ -23,6 +23,527 @@ use crate::{
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
+fn generated_wide_finite_pattern(count: usize) -> String {
+    (0..count)
+        .map(|index| format!("word{index:05}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn compile_pre_wide_finite_prepared_incumbent(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+    slow_aot_limits: SlowAotLimits,
+) -> crate::CompiledRegex {
+    let target = request.target;
+    let mode = request.mode;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let _recipe = crate::module::complete_span_reduce_recipe_scope(
+        exports == PreparedAggregateExports::COUNT,
+    );
+    let compiled = compile_with_slow_aot_limits(request, slow_aot_limits)
+        .expect("compile exact pre-wide finite incumbent");
+    crate::append_prepared_aggregate_exports_to_compiled(
+        compiled,
+        exports,
+        target,
+        mode,
+        max_object_bytes,
+        slow_aot_limits,
+    )
+    .expect("append exact pre-wide finite incumbent")
+}
+
+fn assert_same_compiled_artifact(left: &crate::CompiledRegex, right: &crate::CompiledRegex) {
+    assert_eq!(left.object(), right.object());
+    assert_eq!(left.module(), right.module());
+    assert_eq!(left.receipt(), right.receipt());
+    assert_eq!(
+        left.program().serialize().expect("serialize left program"),
+        right
+            .program()
+            .serialize()
+            .expect("serialize right program"),
+    );
+}
+
+#[test]
+fn wide_finite_limit_relative_declines_replay_exact_incumbents() {
+    for (count, target, exports) in [
+        (65, Target::x86_64_linux(), PreparedAggregateExports::COUNT),
+        (
+            256,
+            Target::aarch64_macos(),
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            4_096,
+            Target::x86_64_macos(),
+            PreparedAggregateExports::COUNT,
+        ),
+    ] {
+        let request = CompileRequest::new(generated_wide_finite_pattern(count), target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span);
+        let incumbent = compile_pre_wide_finite_prepared_incumbent(
+            request.clone(),
+            exports,
+            SlowAotLimits::default(),
+        );
+        let actual = compile_with_prepared_aggregate_exports(request, exports)
+            .expect("limit-relative decline compiles its untouched incumbent");
+        assert_same_compiled_artifact(&actual, &incumbent);
+    }
+
+    let mut folded_profile = RustProfile::default();
+    folded_profile.options.case_insensitive = true;
+    let request = CompileRequest::new(generated_wide_finite_pattern(256), Target::aarch64_linux())
+        .profile(folded_profile)
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::Span);
+    let incumbent = compile_pre_wide_finite_prepared_incumbent(
+        request.clone(),
+        PreparedAggregateExports::COUNT,
+        SlowAotLimits::default(),
+    );
+    let actual = compile_with_prepared_aggregate_exports(request, PreparedAggregateExports::COUNT)
+        .expect("case-expanded decline compiles its untouched incumbent");
+    assert_same_compiled_artifact(&actual, &incumbent);
+}
+
+#[test]
+fn wide_finite_ineligible_neighbors_replay_exact_incumbents() {
+    let wide = generated_wide_finite_pattern(65);
+    let cases = [
+        (
+            CompileRequest::new(generated_wide_finite_pattern(64), Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::COUNT,
+        ),
+        (
+            CompileRequest::new(format!("^(?:{wide})"), Target::x86_64_macos())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            CompileRequest::new(format!("(?:{wide})+"), Target::aarch64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::COUNT,
+        ),
+        (
+            CompileRequest::new(wide.clone(), Target::aarch64_macos())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::COUNT,
+        ),
+        (
+            CompileRequest::new(wide, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM),
+        ),
+    ];
+    for (request, exports) in cases {
+        let incumbent = compile_pre_wide_finite_prepared_incumbent(
+            request.clone(),
+            exports,
+            SlowAotLimits::default(),
+        );
+        let actual = compile_with_prepared_aggregate_exports(request, exports)
+            .expect("ineligible neighbor compiles its untouched incumbent");
+        assert_same_compiled_artifact(&actual, &incumbent);
+    }
+}
+
+#[test]
+fn wide_finite_above_resource_boundary_retains_closed_native_route() {
+    let pattern = generated_wide_finite_pattern(16_384);
+    let compiled = compile_with_prepared_aggregate_exports(
+        CompileRequest::new(pattern, Target::x86_64_macos())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile generated above-boundary wide finite Count");
+    let report = compiled
+        .module()
+        .ordered_finite_language_aot_report()
+        .expect("above-boundary finite report");
+    assert_eq!(report.source_count, 16_384);
+    assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+    assert_eq!(
+        compiled.receipt().prepared_aggregate_strategy,
+        Some(PreparedAggregateStrategy::NativeFused),
+    );
+    assert!(compiled.module().required_runtime_symbol().is_none());
+    assert!(report.stored_transition_records <= report.transition_cells);
+    if report.sparse_failure {
+        assert_eq!(report.stored_transition_records, report.states - 1);
+    }
+    let haystack = b"xxword16383yy";
+    assert_eq!(
+        compiled
+            .search(haystack, SearchWindow::full(haystack))
+            .expect("above-boundary finite semantic search"),
+        MatchResult::Span(Some((2, 11))),
+    );
+}
+
+#[test]
+fn wide_finite_dense_cell_boundary_is_exact_and_overflow_is_terminal() {
+    assert!(!crate::wide_finite_crosses_dense_cell_boundary(17, 19, 323).unwrap());
+    assert!(crate::wide_finite_crosses_dense_cell_boundary(17, 19, 322).unwrap());
+    assert!(!crate::wide_finite_crosses_dense_cell_boundary(17, 19, 324).unwrap());
+    assert!(matches!(
+        crate::wide_finite_crosses_dense_cell_boundary(usize::MAX, 2, usize::MAX),
+        Err(CompileError::InternalInvariant(
+            "wide finite prospective dense-cell extent overflowed"
+        ))
+    ));
+}
+
+#[test]
+fn wide_finite_compact_state_and_edge_rescue_boundaries_are_exact() {
+    #[derive(Clone, Copy)]
+    enum Resource {
+        States,
+        Edges,
+    }
+
+    fn set_limit(limits: &mut CompileLimitsV1, resource: Resource, value: usize) {
+        match resource {
+            Resource::States => limits.lower.automata.max_states = value,
+            Resource::Edges => limits.lower.automata.max_edges = value,
+        }
+    }
+
+    let pattern = generated_prefix_dictionary(64, 16);
+    let parsed = parsed_rust_bytes(&pattern);
+    let ordinary = fre_lower::lower_raw_general(
+        &parsed,
+        fre_lower::OperationSemantics::CaptureFree,
+        fre_lower::LowerLimits::default(),
+    )
+    .expect("unconstrained rescue-boundary lowering")
+    .into_plan();
+    let candidate = crate::finite_language::NativeFiniteLanguageCandidate::analyze_for_wide_early(
+        &parsed,
+        OutputContract::Span,
+    )
+    .expect("checked rescue-boundary finite analysis")
+    .expect("rescue-boundary finite candidate");
+    let compact = candidate
+        .priority_trie_raw_plan(fre_lower::LowerLimits::default())
+        .expect("bounded rescue-boundary compact graph")
+        .expect("priority-compatible rescue-boundary language");
+    let no_dfa = DeterminizeLimits {
+        max_states: 0,
+        max_transitions: 0,
+        max_work: 0,
+    };
+    let base_limits = CompileLimitsV1 {
+        determinize: no_dfa,
+        ..CompileLimitsV1::default()
+    };
+    let slow_limits = SlowAotLimits {
+        determinize: no_dfa,
+        ..SlowAotLimits::default()
+    };
+
+    for (resource, compact_needed, ordinary_needed) in [
+        (Resource::States, compact.roles.len(), ordinary.roles.len()),
+        (
+            Resource::Edges,
+            compact.edge_targets.len(),
+            ordinary.edge_targets.len(),
+        ),
+    ] {
+        assert!(compact_needed < ordinary_needed);
+
+        let one_short = compact_needed
+            .checked_sub(1)
+            .expect("compact graph nonempty");
+        let mut one_short_limits = base_limits;
+        set_limit(&mut one_short_limits, resource, one_short);
+        let expected = fre_lower::lower_raw_general(
+            &parsed,
+            fre_lower::OperationSemantics::CaptureFree,
+            one_short_limits.lower,
+        )
+        .expect_err("ordinary graph exceeds a compact-minus-one ceiling");
+        let actual = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            CompileRequest::new(&pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(one_short_limits),
+            PreparedAggregateExports::COUNT,
+            slow_limits,
+        )
+        .expect_err("compact-minus-one ceiling preserves the ordinary error");
+        assert_same_lower_resource_failure(expected, actual);
+
+        for limit in [
+            compact_needed,
+            compact_needed.checked_add(1).expect("compact plus one"),
+            ordinary_needed
+                .checked_sub(1)
+                .expect("ordinary graph nonempty"),
+        ] {
+            let mut limits = base_limits;
+            set_limit(&mut limits, resource, limit);
+            let rescued = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+                CompileRequest::new(&pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+                    .limits(limits),
+                PreparedAggregateExports::COUNT,
+                slow_limits,
+            )
+            .expect("compact-through-ordinary-minus-one ceiling rescues");
+            assert_eq!(rescued.receipt().thompson_states, compact.roles.len());
+            assert!(rescued.receipt().ordered_finite_language_aot.is_some());
+            assert_eq!(
+                rescued.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            assert!(rescued.module().required_runtime_symbol().is_none());
+        }
+
+        let mut at_needed_limits = base_limits;
+        set_limit(&mut at_needed_limits, resource, ordinary_needed);
+        let at_needed_request = CompileRequest::new(&pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(at_needed_limits);
+        let at_needed_incumbent = compile_pre_wide_finite_prepared_incumbent(
+            at_needed_request.clone(),
+            PreparedAggregateExports::COUNT,
+            slow_limits,
+        );
+        let at_needed = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            at_needed_request,
+            PreparedAggregateExports::COUNT,
+            slow_limits,
+        )
+        .expect("ordinary graph at needed ceiling compiles");
+        assert_same_compiled_artifact(&at_needed, &at_needed_incumbent);
+
+        let mut plus_one_limits = base_limits;
+        set_limit(
+            &mut plus_one_limits,
+            resource,
+            ordinary_needed.checked_add(1).expect("ordinary plus one"),
+        );
+        let plus_one_request = CompileRequest::new(&pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(plus_one_limits);
+        let plus_one_incumbent = compile_pre_wide_finite_prepared_incumbent(
+            plus_one_request.clone(),
+            PreparedAggregateExports::COUNT,
+            slow_limits,
+        );
+        let plus_one = crate::compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            plus_one_request,
+            PreparedAggregateExports::COUNT,
+            slow_limits,
+        )
+        .expect("ordinary graph above needed ceiling compiles");
+        assert_same_compiled_artifact(&plus_one, &plus_one_incumbent);
+    }
+}
+
+#[test]
+fn wide_finite_early_fallback_classifier_never_swallows_hard_failures() {
+    assert!(crate::wide_finite_early_numeric_decline(
+        &CompileError::Resource {
+            resource: CompileResource::ProgramBytes,
+            limit: 31,
+            required: 32,
+        }
+    ));
+    assert!(crate::wide_finite_early_numeric_decline(
+        &CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 31,
+            required: 32,
+        })
+    ));
+    assert!(!crate::wide_finite_early_numeric_decline(
+        &CompileError::Object(ObjectError::Allocation(
+            "synthetic early wide finite allocation",
+        ))
+    ));
+    assert!(!crate::wide_finite_early_numeric_decline(
+        &CompileError::Lower(fre_lower::LowerError::AllocationFailed {
+            structure: "synthetic early wide finite proof",
+            additional: 1,
+        })
+    ));
+    assert!(!crate::wide_finite_early_numeric_decline(
+        &CompileError::Object(ObjectError::ArithmeticOverflow(
+            "synthetic early wide finite arithmetic",
+        ))
+    ));
+    assert!(!crate::wide_finite_early_numeric_decline(
+        &CompileError::Object(ObjectError::UnsupportedTarget)
+    ));
+
+    assert!(matches!(
+        crate::wide_finite_forward_probe_promotes(crate::dfa::ForwardCostProbeOutcome::Complete {
+            states: 3,
+            transitions: 9,
+            work_completed: 17,
+            allocation_peak_bytes: 31,
+        }),
+        Ok(false)
+    ));
+    assert!(matches!(
+        crate::wide_finite_forward_probe_promotes(
+            crate::dfa::ForwardCostProbeOutcome::NumericDecline {
+                resource: crate::DeterminizationResource::Work {
+                    limit: 16,
+                    required: 17,
+                },
+                work_completed: 16,
+                states_completed: 2,
+                transitions_completed: 6,
+                allocation_peak_bytes: 29,
+            }
+        ),
+        Ok(true)
+    ));
+    assert!(matches!(
+        crate::wide_finite_forward_probe_promotes(
+            crate::dfa::ForwardCostProbeOutcome::AllocationFailure {
+                requested_elements: 8,
+                element_size: 4,
+            }
+        ),
+        Err(CompileError::Object(ObjectError::Allocation(
+            "wide finite ordered forward cost probe"
+        )))
+    ));
+}
+
+#[test]
+fn wide_finite_forward_probe_resources_are_exact_and_allocation_is_bounded() {
+    let parsed = parsed_rust_bytes(&generated_wide_finite_pattern(65));
+    let ordinary = fre_lower::lower_raw_general(
+        &parsed,
+        fre_lower::OperationSemantics::CaptureFree,
+        fre_lower::LowerLimits::default(),
+    )
+    .expect("lower forward-probe fixture")
+    .into_plan();
+    let candidate = crate::finite_language::NativeFiniteLanguageCandidate::analyze_for_wide_early(
+        &parsed,
+        OutputContract::Span,
+    )
+    .expect("analyze forward-probe fixture")
+    .expect("finite forward-probe fixture");
+    let compact = candidate
+        .priority_trie_raw_plan(fre_lower::LowerLimits::default())
+        .expect("build forward-probe compact graph")
+        .expect("priority-compatible forward-probe fixture");
+    let classes = crate::dfa::current_graph_alphabet_class_count(&ordinary)
+        .expect("census forward-probe alphabet")
+        .expect("assertion-free forward-probe alphabet");
+    let broad = DeterminizeLimits {
+        max_states: compact.roles.len(),
+        max_transitions: compact
+            .roles
+            .len()
+            .checked_mul(classes)
+            .expect("forward-probe transition extent"),
+        max_work: fre_lower::LowerLimits::default().max_work,
+    };
+    let complete = crate::dfa::probe_ordered_forward_cost(
+        &ordinary,
+        broad,
+        fre_lower::LowerLimits::default().automata.max_storage_bytes,
+    )
+    .expect("complete forward-cost probe");
+    let crate::dfa::ForwardCostProbeOutcome::Complete {
+        states,
+        transitions,
+        work_completed,
+        allocation_peak_bytes,
+    } = complete
+    else {
+        panic!("broad forward-cost probe declined: {complete:?}");
+    };
+    assert!(states > 0 && transitions > 0 && work_completed > 0);
+    assert!(allocation_peak_bytes > 0);
+
+    let state_short = crate::dfa::probe_ordered_forward_cost(
+        &ordinary,
+        DeterminizeLimits {
+            max_states: states - 1,
+            ..broad
+        },
+        fre_lower::LowerLimits::default().automata.max_storage_bytes,
+    )
+    .expect("state-short forward-cost probe");
+    assert!(matches!(
+        state_short,
+        crate::dfa::ForwardCostProbeOutcome::NumericDecline {
+            resource: crate::DeterminizationResource::States { .. },
+            ..
+        }
+    ));
+    for max_states in [states, states + 1] {
+        assert!(matches!(
+            crate::dfa::probe_ordered_forward_cost(
+                &ordinary,
+                DeterminizeLimits {
+                    max_states,
+                    ..broad
+                },
+                fre_lower::LowerLimits::default().automata.max_storage_bytes,
+            )
+            .expect("at-or-above state forward-cost probe"),
+            crate::dfa::ForwardCostProbeOutcome::Complete { .. }
+        ));
+    }
+
+    let work_short = crate::dfa::probe_ordered_forward_cost(
+        &ordinary,
+        DeterminizeLimits {
+            max_work: work_completed - 1,
+            ..broad
+        },
+        fre_lower::LowerLimits::default().automata.max_storage_bytes,
+    )
+    .expect("work-short forward-cost probe");
+    assert!(matches!(
+        work_short,
+        crate::dfa::ForwardCostProbeOutcome::NumericDecline {
+            resource: crate::DeterminizationResource::Work { .. },
+            ..
+        }
+    ));
+
+    let allocation_short =
+        crate::dfa::probe_ordered_forward_cost(&ordinary, broad, allocation_peak_bytes - 1)
+            .expect("allocation-short forward-cost probe");
+    assert!(matches!(
+        allocation_short,
+        crate::dfa::ForwardCostProbeOutcome::NumericDecline {
+            resource: crate::DeterminizationResource::Allocation { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        crate::dfa::probe_ordered_forward_cost(&ordinary, broad, allocation_peak_bytes)
+            .expect("exact-allocation forward-cost probe"),
+        crate::dfa::ForwardCostProbeOutcome::Complete { .. }
+    ));
+}
+
 #[test]
 fn independent_exists_batch_allocator_failure_is_terminal_at_both_optional_seams() {
     const APPEND_SITE: &str = "injected direct Exists batch append allocation";

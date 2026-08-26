@@ -134,10 +134,10 @@ pub use module::{
     ExactFiniteSelectedEndTeddyIncumbentSourceV2, ExactFiniteSelectedEndTeddySelectionBasisV2,
     ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
     ExactSingleLiteralTwoWayShift, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
-    OperatingSystem, OrderedFiniteLanguageAotReport, PreparedAggregateExports,
-    PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits,
-    SlowAotReport, SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
-    PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    OperatingSystem, OrderedFiniteLanguageAotReport, OrderedFiniteRootScannerReport,
+    PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind,
+    SectionKind, SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator,
+    SymbolBinding, SymbolKind, Target, PREPARED_CAPABILITY_ORDERED_NFA_V15,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use operation_set::{
@@ -1379,6 +1379,24 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     let _complete_span_reduce_recipe = module::complete_span_reduce_recipe_scope(
         exports == PreparedAggregateExports::COUNT,
     );
+    if mode == CompileMode::Optimizing
+        && matches!(
+            exports,
+            PreparedAggregateExports::COUNT | PreparedAggregateExports::SPAN_SUM
+        )
+    {
+        let early_request = request.clone();
+        match try_compile_wide_finite_prepared_aggregate(
+            early_request,
+            exports,
+            slow_aot_limits,
+        ) {
+            Ok(Some(compiled)) => return Ok(compiled),
+            Ok(None) => {}
+            Err(error) if wide_finite_early_numeric_decline(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
     let compiled = compile_with_slow_aot_limits(request, slow_aot_limits)?;
     append_prepared_aggregate_exports_to_compiled(
         compiled,
@@ -1388,6 +1406,242 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
         max_object_bytes,
         slow_aot_limits,
     )
+}
+
+fn wide_finite_early_numeric_decline(error: &CompileError) -> bool {
+    let numeric_resource = |resource| {
+        matches!(
+            resource,
+            CompileResource::ProgramBytes
+                | CompileResource::ObjectBytes
+                | CompileResource::Work
+        )
+    };
+    match error {
+        CompileError::Resource {
+            resource,
+            limit,
+            required,
+        }
+        | CompileError::Object(ObjectError::Resource {
+            resource,
+            limit,
+            required,
+        }) => numeric_resource(*resource) && required > limit,
+        CompileError::Lower(LowerError::ResourceLimit { needed, limit, .. }) => needed > limit,
+        CompileError::Automaton(fre_automata::CompileError::ResourceLimit {
+            needed,
+            limit,
+            ..
+        }) => needed > limit,
+        _ => false,
+    }
+}
+
+fn wide_finite_forward_probe_promotes(
+    outcome: dfa::ForwardCostProbeOutcome,
+) -> Result<bool, CompileError> {
+    match outcome {
+        dfa::ForwardCostProbeOutcome::Complete { .. } => Ok(false),
+        dfa::ForwardCostProbeOutcome::NumericDecline { .. } => Ok(true),
+        dfa::ForwardCostProbeOutcome::AllocationFailure { .. } => {
+            Err(ObjectError::Allocation("wide finite ordered forward cost probe").into())
+        }
+    }
+}
+
+fn wide_finite_crosses_dense_cell_boundary(
+    ordinary_states: usize,
+    graph_classes: usize,
+    max_edges: usize,
+) -> Result<bool, CompileError> {
+    let prospective_dense_cells = ordinary_states.checked_mul(graph_classes).ok_or(
+        CompileError::InternalInvariant(
+            "wide finite prospective dense-cell extent overflowed",
+        ),
+    )?;
+    Ok(prospective_dense_cells > max_edges)
+}
+
+/// Try the compact finite-language native leaf before ordinary DFA
+/// construction for a sole prepared Count or SpanSum export. The caller owns
+/// an untouched request and reruns the exact established compiler whenever
+/// this returns a clean decline. Every allocator, arithmetic,
+/// authentication, and backend failure remains an error.
+fn try_compile_wide_finite_prepared_aggregate(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<Option<CompiledRegex>, CompileError> {
+    let CompileRequest {
+        pattern,
+        profile,
+        output,
+        target,
+        mode,
+        mut limits,
+    } = request;
+    if mode != CompileMode::Optimizing
+        || output != OutputContract::Span
+        || !matches!(
+            exports,
+            PreparedAggregateExports::COUNT | PreparedAggregateExports::SPAN_SUM
+        )
+    {
+        return Ok(None);
+    }
+    if let Some(profile_limit) = rust_profile_compiled_size_limit(&profile) {
+        limits.max_program_bytes = limits.max_program_bytes.min(profile_limit);
+    }
+    let source_bytes = pattern.len();
+    let line_terminator = profile.options.line_terminator;
+    let profile = CompatibilityProfile::RustBytes(profile);
+    let parsed = fre_syntax::parse(ParseRequest::rust(pattern, profile))?;
+    let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+        return Err(CompileError::InternalInvariant(
+            "Rust byte request produced a non-Rust syntax tree",
+        ));
+    };
+
+    // The inherited allocation-free screen bounds only the cost of this
+    // optional analysis. It cannot select the native route by itself.
+    if !finite_language::NativeFiniteLanguageCandidate::preflight_wide_early(&parsed) {
+        return Ok(None);
+    }
+
+    // Compare against the actual ordinary graph before materializing the
+    // broader finite-language proof. A dense DFA with one row per ordinary
+    // graph state is a source-independent prospective transition-cost
+    // reference available at this boundary. Remaining within the caller's
+    // ordinary graph-edge budget preserves the complete pre-feature
+    // portfolio; crossing it merely admits the bounded probe below.
+    let (ordinary_raw, compact_lower_resource_rescue) = match fre_lower::lower_raw_general(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        limits.lower,
+    ) {
+        Ok(lowered) => (Some(lowered.into_plan()), false),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::States | LowerResource::Edges,
+            ..
+        }) => (None, true),
+        Err(LowerError::ResourceLimit { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let graph_classes = if let Some(ordinary_raw) = ordinary_raw.as_ref() {
+        let Some(graph_classes) = dfa::current_graph_alphabet_class_count(ordinary_raw)? else {
+            return Ok(None);
+        };
+        if !wide_finite_crosses_dense_cell_boundary(
+            ordinary_raw.roles.len(),
+            graph_classes,
+            limits.lower.automata.max_edges,
+        )? {
+            return Ok(None);
+        }
+        Some(graph_classes)
+    } else {
+        None
+    };
+
+    let Some(candidate) =
+        finite_language::NativeFiniteLanguageCandidate::analyze_for_wide_early(&parsed, output)?
+    else {
+        return Ok(None);
+    };
+    // The whole point of this lane is to avoid materializing the ordinary
+    // Thompson graph for a wide language. Build the independently checked,
+    // priority-preserving compact graph directly from the exact proof. A
+    // structural or numeric refusal is a clean decline; allocator,
+    // arithmetic, and invariant failures remain terminal.
+    let Some(raw) = candidate.priority_trie_raw_plan(limits.lower)? else {
+        return Ok(None);
+    };
+    if !compact_lower_resource_rescue {
+        let graph_classes = graph_classes.ok_or(CompileError::InternalInvariant(
+            "wide finite probe lost its graph alphabet",
+        ))?;
+        let ordinary_raw = ordinary_raw.as_ref().ok_or(
+            CompileError::InternalInvariant("wide finite probe lost its ordinary graph"),
+        )?;
+        let compact_states = raw.roles.len();
+        let compact_transition_cells = compact_states.checked_mul(graph_classes).ok_or(
+            CompileError::InternalInvariant(
+                "wide finite compact transition-cell extent overflowed",
+            ),
+        )?;
+        let requested_probe_limits = limits.determinize.effective_for_stable_artifact();
+        let probe_allocation_bytes = limits.lower.automata.max_storage_bytes;
+        // A caller that deliberately selected a smaller ordinary compiler
+        // budget has not authorized that budget exhaustion to promote a
+        // different runtime. Only run the comparison when its complete
+        // sidecar-relative envelope fits every already-requested limit.
+        if requested_probe_limits.max_states < compact_states
+            || requested_probe_limits.max_transitions < compact_transition_cells
+            || requested_probe_limits.max_work < limits.lower.max_work
+            || slow_aot_limits.max_allocation_bytes < probe_allocation_bytes
+        {
+            return Ok(None);
+        }
+        let probe_limits = DeterminizeLimits {
+            max_states: compact_states,
+            max_transitions: compact_transition_cells,
+            max_work: limits.lower.max_work,
+        };
+        if !wide_finite_forward_probe_promotes(dfa::probe_ordered_forward_cost(
+            ordinary_raw,
+            probe_limits,
+            probe_allocation_bytes,
+        )?)? {
+            return Ok(None);
+        }
+    }
+    let compiled = match compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        Some(candidate),
+        NativeFiniteLanguageAttachPolicy::FailClosed,
+        None,
+        target,
+        mode,
+        limits,
+        slow_aot_limits,
+        ExactFiniteSelectedEndTeddyPolicyV2::Automatic,
+        NativeFiniteCompilePolicy::WideFiniteOnly,
+    )? {
+        RawCompileDisposition::Compiled(compiled) => compiled,
+        RawCompileDisposition::WideFiniteDeclined => return Ok(None),
+    };
+    let compiled = append_prepared_aggregate_exports_to_compiled(
+        compiled,
+        exports,
+        target,
+        mode,
+        limits.max_object_bytes,
+        slow_aot_limits,
+    )?;
+    let module_report = compiled.module().ordered_finite_language_aot_report();
+    let receipt_report = compiled.receipt().ordered_finite_language_aot.as_ref();
+    if module_report.is_none() && receipt_report.is_none() {
+        // The final object transaction may have removed the optional finite
+        // leaf under its authenticated byte ceiling and returned a complete
+        // incumbent. Discard that provisional artifact and let the caller
+        // rebuild the exact established request from its untouched owner.
+        return Ok(None);
+    }
+    if module_report.copied() != receipt_report.copied()
+        || compiled.module().required_runtime_symbol().is_some()
+        || compiled.module().prepared_aggregate_exports() != exports
+        || compiled.module().prepared_aggregate_strategy()
+            != Some(PreparedAggregateStrategy::NativeFused)
+    {
+        return Err(CompileError::InternalInvariant(
+            "early wide finite-language aggregate lost its closed native receipt",
+        ));
+    }
+    Ok(Some(compiled))
 }
 
 fn validate_prepared_aggregate_exports(
@@ -1406,6 +1660,17 @@ fn validate_prepared_aggregate_exports(
 enum NativeFiniteLanguageAttachPolicy {
     Optional,
     FailClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeFiniteCompilePolicy {
+    OrdinaryPortfolio,
+    WideFiniteOnly,
+}
+
+enum RawCompileDisposition {
+    Compiled(CompiledRegex),
+    WideFiniteDeclined,
 }
 
 fn is_proven_object_byte_limit(error: &ObjectError) -> bool {
@@ -1494,7 +1759,7 @@ fn append_prepared_aggregate_exports_to_compiled(
         & PREPARED_CAPABILITY_ORDERED_NFA_V15
         != 0;
     let format = ObjectFormat::for_target(target);
-    let (mut module, mut object) = match emit_with_ordered_nfa_accelerator_retries(
+    let aggregate_attempt = emit_with_ordered_nfa_accelerator_retries(
         module,
         format,
         max_object_bytes,
@@ -1561,7 +1826,22 @@ fn append_prepared_aggregate_exports_to_compiled(
             )?;
             append_exports(scalar_base)
         },
-    )? {
+    )?;
+    let aggregate_attempt = emit_ordered_finite_root_scanner_scalar_retry(
+        aggregate_attempt,
+        format,
+        max_object_bytes,
+        |selected_report| {
+            let scalar = CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+                &program,
+                target,
+                effective_native_data_limit_bytes,
+                selected_report,
+            )?;
+            append_exports(scalar)
+        },
+    )?;
+    let (mut module, mut object) = match aggregate_attempt {
         FinalObjectAttempt::Fit { module, object } => (module, object),
         FinalObjectAttempt::ObjectBytes {
             module,
@@ -2954,6 +3234,58 @@ enum FinalObjectAttempt {
     },
 }
 
+fn emit_ordered_finite_root_scanner_scalar_retry(
+    attempt: FinalObjectAttempt,
+    format: ObjectFormat,
+    max_object_bytes: usize,
+    rebuild_scalar: impl FnOnce(
+        OrderedFiniteLanguageAotReport,
+    ) -> Result<CompiledModule, CompileError>,
+) -> Result<FinalObjectAttempt, CompileError> {
+    let FinalObjectAttempt::ObjectBytes {
+        module,
+        first_error,
+    } = attempt
+    else {
+        return Ok(attempt);
+    };
+    let Some(selected_report) = module
+        .ordered_finite_language_aot_report()
+        .copied()
+        .filter(|_| module.ordered_finite_root_scanner_report().is_some())
+    else {
+        return Ok(FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        });
+    };
+    if !is_proven_object_byte_limit(&first_error) {
+        return Err(first_error.into());
+    }
+    let fallback_permission = module.optimizing_fallbacks_may_continue();
+    let scalar = rebuild_scalar(selected_report)?
+        .with_optimizing_fallbacks_may_continue(fallback_permission);
+    if !module.ordered_finite_root_scanner_scalar_ablation_is_exact(&scalar) {
+        return Err(CompileError::InternalInvariant(
+            "finite root-scanner ObjectBytes retry changed its scalar leaf",
+        ));
+    }
+    match emit_object(&scalar, format, max_object_bytes) {
+        Ok(object) => Ok(FinalObjectAttempt::Fit {
+            module: scalar,
+            object,
+        }),
+        Err(error @ ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) if is_proven_object_byte_limit(&error) => Ok(FinalObjectAttempt::ObjectBytes {
+            module: scalar,
+            first_error: error,
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Emit one selected module and retry its compositional Ordered-NFA
 /// accelerators in exact additive order. Compiler-only fragmented terminal-set
 /// aggregate text is removed first, followed by the whole-window width gate,
@@ -3520,19 +3852,63 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     output: OutputContract,
     native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
     native_finite_language_attach_policy: NativeFiniteLanguageAttachPolicy,
-    mut finite_lower_state_rescue: Option<LowerError>,
+    finite_lower_state_rescue: Option<LowerError>,
     target: Target,
     mode: CompileMode,
     limits: CompileLimitsV1,
     slow_aot_limits: SlowAotLimits,
     teddy_policy: ExactFiniteSelectedEndTeddyPolicyV2,
 ) -> Result<CompiledRegex, CompileError> {
+    match compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        native_finite_language_candidate,
+        native_finite_language_attach_policy,
+        finite_lower_state_rescue,
+        target,
+        mode,
+        limits,
+        slow_aot_limits,
+        teddy_policy,
+        NativeFiniteCompilePolicy::OrdinaryPortfolio,
+    )? {
+        RawCompileDisposition::Compiled(compiled) => Ok(compiled),
+        RawCompileDisposition::WideFiniteDeclined => Err(CompileError::InternalInvariant(
+            "ordinary compile reported a wide finite-only decline",
+        )),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the public request decomposition, lowering fallback order, and one final receipt stay one transaction"
+)]
+fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
+    native_finite_language_attach_policy: NativeFiniteLanguageAttachPolicy,
+    mut finite_lower_state_rescue: Option<LowerError>,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    slow_aot_limits: SlowAotLimits,
+    teddy_policy: ExactFiniteSelectedEndTeddyPolicyV2,
+    native_compile_policy: NativeFiniteCompilePolicy,
+) -> Result<RawCompileDisposition, CompileError> {
     let digest = program::automaton_digest(&raw, line_terminator);
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
         .with_line_terminator(line_terminator);
     let stats = automaton.stats();
     let is_lower_state_rescue = finite_lower_state_rescue.is_some();
-    let build_determinize_limits = if is_lower_state_rescue {
+    let build_determinize_limits = if is_lower_state_rescue
+        || native_compile_policy == NativeFiniteCompilePolicy::WideFiniteOnly
+    {
         DeterminizeLimits {
             max_states: 0,
             max_transitions: 0,
@@ -3575,7 +3951,53 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         .native_exact_singleton_count_literal()
         .is_some()
         .then(|| module::complete_span_reduce_recipe_scope(false));
-    let (module, object) = match mode {
+    let (module, object) = if native_compile_policy == NativeFiniteCompilePolicy::WideFiniteOnly {
+        if mode != CompileMode::Optimizing || is_lower_state_rescue {
+            return Err(CompileError::InternalInvariant(
+                "early wide finite-language route received an incompatible compile mode",
+            ));
+        }
+        let effective_native_data_limit_bytes = slow_aot_limits
+            .max_native_data_bytes
+            .min(limits.max_object_bytes);
+        let Some(module) = CompiledModule::lower_wide_finite_language_only(
+            &program,
+            target,
+            effective_native_data_limit_bytes,
+        )? else {
+            return Ok(RawCompileDisposition::WideFiniteDeclined);
+        };
+        let initial = match emit_object(&module, format, limits.max_object_bytes) {
+            Ok(object) => FinalObjectAttempt::Fit { module, object },
+            Err(error @ ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                ..
+            }) if is_proven_object_byte_limit(&error) => FinalObjectAttempt::ObjectBytes {
+                module,
+                first_error: error,
+            },
+            Err(error) => return Err(error.into()),
+        };
+        match emit_ordered_finite_root_scanner_scalar_retry(
+            initial,
+            format,
+            limits.max_object_bytes,
+            |selected_report| {
+                CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+                    &program,
+                    target,
+                    effective_native_data_limit_bytes,
+                    selected_report,
+                )
+            },
+        )? {
+            FinalObjectAttempt::Fit { module, object } => (module, object),
+            FinalObjectAttempt::ObjectBytes { .. } => {
+                return Ok(RawCompileDisposition::WideFiniteDeclined);
+            }
+        }
+    } else {
+        match mode {
         CompileMode::Fast => lower_ordinary_with_endpoint_oracle_object_retry(
             &program,
             target,
@@ -3608,7 +4030,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 true,
                 teddy_policy,
             )?;
-            match emit_with_ordered_nfa_accelerator_retries(
+            let optimized_attempt = emit_with_ordered_nfa_accelerator_retries(
                 optimized,
                 format,
                 limits.max_object_bytes,
@@ -3667,7 +4089,21 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                         effective_native_data_limit_bytes,
                     )
                 },
-            )? {
+            )?;
+            let optimized_attempt = emit_ordered_finite_root_scanner_scalar_retry(
+                optimized_attempt,
+                format,
+                limits.max_object_bytes,
+                |selected_report| {
+                    CompiledModule::lower_ordered_finite_language_scalar_incumbent(
+                        &program,
+                        target,
+                        effective_native_data_limit_bytes,
+                        selected_report,
+                    )
+                },
+            )?;
+            match optimized_attempt {
                 FinalObjectAttempt::Fit { module, object } => (module, object),
                 FinalObjectAttempt::ObjectBytes {
                     module: optimized,
@@ -3789,6 +4225,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                 }
             }
         }
+        }
     };
     let object_sha256 = Sha256::digest(&object).into();
     let engine_selection_reason =
@@ -3855,12 +4292,12 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
             .sum(),
         object_bytes: object.len(),
     };
-    Ok(CompiledRegex {
+    Ok(RawCompileDisposition::Compiled(CompiledRegex {
         program,
         module,
         object: object.into_boxed_slice(),
         receipt,
-    })
+    }))
 }
 
 fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<OptimizationPass> {
@@ -4018,6 +4455,9 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                     .is_some()
             {
                 passes.push(OptimizationPass::ExactFiniteSelectedEndTeddyLowering);
+            }
+            if module.start_accelerator() != StartAccelerator::None {
+                passes.push(OptimizationPass::StartStateScanAcceleration);
             }
             passes.extend_from_slice(&[
                 OptimizationPass::TargetInstructionSelection,
