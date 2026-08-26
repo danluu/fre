@@ -18494,6 +18494,8 @@ pub struct PortableSearchSession<'a> {
 /// immutable capabilities and reusable workspace, when this session is
 /// constructed. Unanchored required-literal matchers bind their value-only
 /// projection once while retaining the native regex owner for spans.
+/// A legacy literal/class-run owner retains its direct reducer beside the
+/// canonical binding so exhaustive positive-width counts need one traversal.
 /// A positive leftmost-first literal set similarly binds one compact span
 /// executor and leaves its endpoint-only sidecar unbound. The first Exists
 /// call settles that sidecar once, caching both a qualified AArch64 ASCII-root
@@ -18587,15 +18589,21 @@ enum PortableOrdinarySessionPlan<'a> {
 /// Compact binding for ordinary fallbacks that construction has already
 /// proved cannot require mutable K0 workspace.
 ///
-/// This mirrors the three source-free variants of [`PortableSearchSessionPlan`]
-/// without inheriting that enum's inline K0 payload. It fits inside the space
-/// already required by the outer K0 variant, so canonical construction needs
-/// no separate allocation and does not enlarge the ordinary session.
+/// This mirrors source-free non-K0 projections of
+/// [`PortableSearchSessionPlan`] without inheriting that enum's inline K0
+/// payload. It fits inside the space already required by the outer K0 variant,
+/// so canonical construction needs no separate allocation and does not
+/// enlarge the ordinary session.
 #[derive(Debug)]
 pub(crate) enum PortableOrdinaryCanonical<'a> {
     Native(&'a PortableRegex),
     ExactLiteral(&'a LiteralPlan),
     FixedPredicateWord64(&'a FixedPredicateWord64Plan),
+    /// Appended to preserve every established compact-binding discriminant.
+    LiteralClassRunLiteral {
+        regex: &'a PortableRegex,
+        plan: &'a LiteralClassRunLiteralPlan,
+    },
 }
 
 impl<'a> PortableOrdinaryCanonical<'a> {
@@ -18606,6 +18614,9 @@ impl<'a> PortableOrdinaryCanonical<'a> {
             })),
             PortablePlan::ExactLiteral(plan) => Ok(Self::ExactLiteral(plan)),
             PortablePlan::FixedPredicateWord64(plan) => Ok(Self::FixedPredicateWord64(plan)),
+            PortablePlan::LiteralClassRunLiteral(plan) => {
+                Ok(Self::LiteralClassRunLiteral { regex, plan })
+            }
             _ => Ok(Self::Native(regex)),
         }
     }
@@ -18640,7 +18651,9 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     SearchAccounting::FixedPredicateWord64(accounting),
                 ))
             }
-            Self::Native(regex) => regex.is_match_window(haystack, window, limits),
+            Self::Native(regex) | Self::LiteralClassRunLiteral { regex, .. } => {
+                regex.is_match_window(haystack, window, limits)
+            }
         }
     }
 
@@ -18672,7 +18685,9 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     fixed_predicate_word64_search_limits(limits),
                 )
                 .map_err(SearchError::from),
-            Self::Native(regex) => regex.is_match_window_value(haystack, window, limits),
+            Self::Native(regex) | Self::LiteralClassRunLiteral { regex, .. } => {
+                regex.is_match_window_value(haystack, window, limits)
+            }
         }
     }
 
@@ -18700,11 +18715,8 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|(end, _)| end)
                 .map_err(SearchError::from),
-            Self::Native(regex) => regex.shortest_match_window_value(
-                haystack,
-                window,
-                SearchLimits::unlimited(),
-            ),
+            Self::Native(regex) | Self::LiteralClassRunLiteral { regex, .. } => regex
+                .shortest_match_window_value(haystack, window, SearchLimits::unlimited()),
         }
     }
 
@@ -18732,7 +18744,7 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
-            Self::Native(regex) => {
+            Self::Native(regex) | Self::LiteralClassRunLiteral { regex, .. } => {
                 regex.find_window_value(haystack, window, SearchLimits::unlimited())
             }
         }
@@ -24810,7 +24822,8 @@ impl<'r> PortableOrdinarySession<'r> {
     /// their ordered endpoints.
     ///
     /// `Ok(Some(count))` is returned for a positive exact literal, a
-    /// positive-width K0 plan, or a packed, ordinary non-uniform, or
+    /// positive-width K0 plan, a legacy literal/class-run plan over a full or
+    /// unguarded tail window, or a packed, ordinary non-uniform, or
     /// uniform-standard literal-set plan. Each construction seals nonempty
     /// selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
@@ -24937,6 +24950,24 @@ impl<'r> PortableOrdinarySession<'r> {
                     *direct_next = true;
                 }
                 Ok(Some(count))
+            }
+            PortableOrdinarySessionPlan::Canonical(
+                PortableOrdinaryCanonical::LiteralClassRunLiteral { plan, .. },
+            ) if start == 0
+                || plan.boundary_semantics()
+                    == LiteralClassRunLiteralBoundarySemantics::Unguarded =>
+            {
+                let tail = haystack.get(start..).ok_or_else(|| {
+                    SearchError::from(LiteralClassRunLiteralSearchError::InvalidWindow {
+                        start,
+                        end: haystack.len(),
+                        haystack_len: haystack.len(),
+                    })
+                })?;
+                plan.count(tail, LiteralClassRunLiteralReduceLimits::unlimited())
+                    .map(|result| Some(result.count))
+                    .map_err(LiteralClassRunLiteralSearchError::from)
+                    .map_err(SearchError::from)
             }
             _ => Ok(None),
         }
@@ -47476,6 +47507,90 @@ mod tests {
                 ..
             } if core::ptr::eq(*bound, &required)
         ));
+    }
+
+    #[test]
+    fn ordinary_literal_class_run_binding_counts_full_and_unguarded_tails_once() {
+        fn selected_count(regex: &PortableRegex, haystack: &[u8], start: usize) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        for (pattern, haystack) in [
+            (
+                r"(?-u:ab[xy]+cd)",
+                b"zabxcd--abyycd--abxyce--abxxxcd".as_slice(),
+            ),
+            (
+                r"(?-u:[ab]+aba)",
+                b"aababa!aba!bbaba!aababa".as_slice(),
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+            let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan else {
+                unreachable!("literal/class-run fixture changed plan")
+            };
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::LiteralClassRunLiteral {
+                        regex: bound_regex,
+                        plan: bound_plan,
+                    }
+                ) if core::ptr::eq(*bound_regex, &regex) && core::ptr::eq(*bound_plan, plan)
+            ));
+
+            for start in 0..=haystack.len() {
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(haystack, start),
+                    Ok(Some(selected_count(&regex, haystack, start))),
+                    "pattern={pattern:?}, start={start}",
+                );
+            }
+            assert!(matches!(
+                ordinary.count_positive_width_selected_ends_at(
+                    haystack,
+                    haystack.len() + 1,
+                ),
+                Err(SearchError::LiteralClassRunLiteral(
+                    fre_kernels::LiteralClassRunLiteralSearchError::InvalidWindow { .. }
+                )),
+            ));
+        }
+
+        let guarded = PortableBuilder::new(r"(?-u:\b\w+ing\b)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(guarded.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        let haystack = b"testing singing xing bringing";
+        let mut ordinary = guarded.ordinary_session().unwrap();
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, 0),
+            Ok(Some(selected_count(&guarded, haystack, 0))),
+        );
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, 1),
+            Ok(None),
+        );
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, usize::MAX),
+            Ok(None),
+        );
     }
 
     #[test]
