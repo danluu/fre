@@ -301,22 +301,25 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
     data.try_reserve_exact(literal.len())
         .map_err(|_| ObjectError::Allocation("exact single-literal data"))?;
     data.extend_from_slice(literal);
-    let (code, relocations, emitted_isa, scanner) = match target.architecture {
+    let (code, relocations, trusted_core_offset, emitted_isa, scanner) = match target.architecture {
         Architecture::X86_64 => {
-            let (code, relocations) = lower_x86_64_two_way(plan)?;
+            let (code, relocations, trusted_core_offset) = lower_x86_64_two_way(plan)?;
             (
                 code,
                 relocations,
+                trusted_core_offset,
                 ExactSingleLiteralAotIsa::X86Scalar,
                 StartAccelerator::Scalar,
             )
         }
         Architecture::Aarch64 => {
-            let (code, relocations) = lower_aarch64_two_way(plan, pair_prefilter)?;
+            let (code, relocations, trusted_core_offset) =
+                lower_aarch64_two_way(plan, pair_prefilter)?;
             if pair_prefilter.is_some() {
                 (
                     code,
                     relocations,
+                    trusted_core_offset,
                     ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter,
                     StartAccelerator::Aarch64Asimd,
                 )
@@ -324,15 +327,47 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
                 (
                     code,
                     relocations,
+                    trusted_core_offset,
                     ExactSingleLiteralAotIsa::Aarch64Scalar,
                     StartAccelerator::Scalar,
                 )
             }
         }
     };
+    let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
+    let program_sha256: [u8; 32] = Sha256::digest(&data).into();
+    let trusted_core = NativeDirectSearchTrustedCore {
+        code_offset: trusted_core_offset,
+        output: OutputContract::Exists,
+        entry_contract: NativeDirectSearchEntryContract::PublicCompleteV1,
+        result_abi: NativeDirectSearchResultAbi::ExistsStatusOnlyV1,
+        entry_code_sha256,
+        prologue: match target.architecture {
+            Architecture::X86_64 => NativeDirectSearchTrustedCorePrologue::X86_64 {
+                save_rbx: false,
+                save_r12_r13: false,
+                save_r14_r15: false,
+            },
+            Architecture::Aarch64 => NativeDirectSearchTrustedCorePrologue::Aarch64,
+        },
+        landmark: NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+            program_bytes: data.len(),
+            program_sha256,
+        },
+    };
+    authenticate_native_direct_search_trusted_core(
+        target.architecture,
+        &code,
+        0,
+        code.len(),
+        &data,
+        &relocations,
+        trusted_core,
+        OutputContract::Exists,
+    )?;
     let report = ExactSingleLiteralAotReport {
         literal_sha256: Sha256::digest(literal).into(),
-        native_code_sha256: Sha256::digest(&code).into(),
+        native_code_sha256: entry_code_sha256,
         relocations_sha256: relocation_digest(&relocations).ok_or(
             ObjectError::ArithmeticOverflow("Two-Way relocation receipt"),
         )?,
@@ -357,7 +392,7 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_search_trusted_core: None,
+            direct_search_trusted_core: Some(trusted_core),
             complete_span_reduce_source: None,
         },
         report,
@@ -428,6 +463,19 @@ pub(super) fn report_matches_lowering(
         (Architecture::Aarch64, true) => ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter,
         (Architecture::X86_64, true) => return false,
     };
+    let trusted_core_matches = lowering.direct_search_trusted_core.is_some_and(|core| {
+        authenticate_native_direct_search_trusted_core(
+            target.architecture,
+            &lowering.code,
+            0,
+            lowering.code.len(),
+            &lowering.data,
+            &lowering.relocations,
+            core,
+            OutputContract::Exists,
+        )
+        .is_ok()
+    });
     let literal_sha256: [u8; 32] = Sha256::digest(&lowering.data).into();
     let native_code_sha256: [u8; 32] = Sha256::digest(&lowering.code).into();
     report.emitted_isa == expected_isa
@@ -448,6 +496,7 @@ pub(super) fn report_matches_lowering(
         && !lowering.needs_runtime
         && lowering.slow_partial_table.is_none()
         && relocations_match_target(lowering, target)
+        && trusted_core_matches
 }
 
 fn x86_mov_r32_imm(
@@ -478,7 +527,9 @@ fn x86_emit_two_way_byte_compare(assembler: &mut X86Assembler) -> Result<(), Obj
     clippy::too_many_lines,
     reason = "the complete call-free Two-Way control-flow graph is kept in one auditable checked-assembler transaction"
 )]
-fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+fn lower_x86_64_two_way(
+    plan: TwoWayPlan,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>, usize), ObjectError> {
     let width = plan.literal_len;
     let critical = plan.critical_position;
     let last = width
@@ -495,11 +546,17 @@ fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocati
     let matched = assembler.label()?;
     let no_match = assembler.label()?;
     let invalid = assembler.label()?;
+    let trusted_core = assembler.label()?;
 
     x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x49, 0x89, 0x00])?;
     assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
+    // The independent-batch trampoline reproduces the XOR-established RAX
+    // and flags before entering here. It supplies start zero, end equal to
+    // length, and private aligned result storage; this Exists leaf never
+    // consults that storage after the two public-only initialization writes.
+    assembler.bind(trusted_core)?;
     assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
     let program_displacement = assembler.label()?;
     assembler.bind(program_displacement)?;
@@ -593,6 +650,7 @@ fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocati
     x86_finish_native_finite_exists_leaf(&mut assembler, matched, no_match, invalid, false)?;
     let finished = assembler.finish_with_label_offsets()?;
     let program_displacement = finished.label_offset(program_displacement)?;
+    let trusted_core = finished.label_offset(trusted_core)?;
     Ok((
         finished.code,
         vec![ModuleRelocation {
@@ -602,6 +660,7 @@ fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocati
             symbol: PROGRAM_SYMBOL,
             addend: -4,
         }],
+        trusted_core,
     ))
 }
 
@@ -643,7 +702,7 @@ fn aarch64_emit_pair_prefilter_activation_observation(
 fn lower_aarch64_two_way(
     plan: TwoWayPlan,
     pair_prefilter: Option<PairPrefilterPlan>,
-) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>, usize), ObjectError> {
     let width = u64::from(plan.literal_len);
     let critical = u64::from(plan.critical_position);
     let last = width
@@ -670,6 +729,7 @@ fn lower_aarch64_two_way(
     let matched = assembler.label()?;
     let no_match = assembler.label()?;
     let invalid = assembler.label()?;
+    let trusted_core = assembler.label()?;
     let scalar_candidate = assembler.label()?;
     let warm_scalar_candidate = assembler.label()?;
     let retired_scalar_candidate = assembler.label()?;
@@ -703,6 +763,11 @@ fn lower_aarch64_two_way(
     aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
     assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+    // The batch trampoline repeats the public validation's final CMP X0,#0
+    // before entering here and supplies the proved full window plus private
+    // aligned result storage. No later instruction reads the public-only
+    // zeroed result words.
+    assembler.bind(trusted_core)?;
     let program_relocation = aarch64_emit_native_finite_exists_program_base(&mut assembler)?;
     assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
     assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
@@ -1078,10 +1143,39 @@ fn lower_aarch64_two_way(
     }
 
     aarch64_finish_native_finite_exists_leaf(&mut assembler, matched, no_match, invalid)?;
-    aarch64_finish_native_finite_exists_with_optional_program_relocation(
-        assembler,
-        Some(program_relocation),
-    )
+    let (program_page, program_page_offset) = program_relocation;
+    let mut relocation_offsets = [program_page, program_page_offset];
+    let (code, trusted_core) =
+        assembler.finish_with_offsets_and_label(&mut relocation_offsets, Some(trusted_core))?;
+    let trusted_core = trusted_core.ok_or(ObjectError::InvalidModule(
+        "AArch64 Two-Way trusted core label is absent",
+    ))?;
+    Ok((
+        code,
+        vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[0],
+                    "AArch64 Two-Way ADRP relocation offset",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[1],
+                    "AArch64 Two-Way ADD relocation offset",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+        ],
+        trusted_core,
+    ))
 }
 
 #[cfg(test)]
@@ -1569,7 +1663,7 @@ mod tests {
         let pair = select_pair_prefilter(literal.as_bytes()).expect("select ASIMD pair");
         let minimum_batch_remaining_bytes =
             pair_prefilter_minimum_batch_remaining_bytes(pair).expect("batch extent");
-        let (code, _) = lower_aarch64_two_way(plan, Some(pair)).expect("lower ASIMD pair");
+        let (code, _, _) = lower_aarch64_two_way(plan, Some(pair)).expect("lower ASIMD pair");
         let words = code
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("instruction word")))
@@ -1838,7 +1932,7 @@ mod tests {
                 .expect("adaptive warm-up threshold")
             )
         );
-        let (scalar, _) = lower_aarch64_two_way(plan, None).expect("lower scalar control");
+        let (scalar, _, _) = lower_aarch64_two_way(plan, None).expect("lower scalar control");
         assert!(!scalar.windows(4).any(|bytes| {
             u32::from_le_bytes(bytes.try_into().expect("scalar word"))
                 == aarch64_movi_16b(16, pair.bytes[0]).expect("first splat")
@@ -1993,13 +2087,14 @@ mod tests {
         assert!(derive_two_way_plan(&vec![b'x'; MAX_TWO_WAY_LITERAL_BYTES + 1]).is_none());
         for target in [Target::x86_64_linux(), Target::aarch64_macos()] {
             let plan = derive_two_way_plan(literal).expect("derive plan");
-            let (code, relocations) = match target.architecture {
+            let (code, relocations, trusted_core) = match target.architecture {
                 Architecture::X86_64 => lower_x86_64_two_way(plan).expect("x86 lowering"),
                 Architecture::Aarch64 => {
                     lower_aarch64_two_way(plan, None).expect("AArch64 lowering")
                 }
             };
             assert!(!code.is_empty());
+            assert!(trusted_core < code.len());
             assert_eq!(
                 relocations.len(),
                 if target.architecture == Architecture::X86_64 {
@@ -2072,6 +2167,141 @@ mod tests {
             assert!(!report_matches_lowering(&bad, &lowering, target));
             lowering.code[0] ^= 1;
             assert!(!report_matches_lowering(&report, &lowering, target));
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-target transaction covers opt-in publication, resource fallback, and every private receipt input"
+    )]
+    fn exact_single_literal_two_way_trusted_batch_core_is_opt_in_and_tamper_evident() {
+        let pattern = "abababababababababababababababababababababababababababababababc";
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let request = CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists);
+            let ordinary = compile(request.clone()).expect("compile ordinary Two-Way leaf");
+            assert!(ordinary.receipt().exact_single_literal_aot.is_some());
+            assert!(ordinary.module().direct_exists_batch_symbol().is_none());
+            let core = ordinary
+                .module()
+                .native_direct_search_trusted_core
+                .expect("Two-Way trusted core receipt");
+            assert!(matches!(
+                core.landmark,
+                NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+                    program_bytes,
+                    ..
+                } if program_bytes == pattern.len()
+            ));
+            authenticate_native_direct_search_trusted_core(
+                target.architecture,
+                ordinary.module().sections[TEXT_SECTION].bytes(),
+                0,
+                ordinary.module().sections[TEXT_SECTION].bytes().len(),
+                ordinary.module().sections[PROGRAM_SECTION].bytes(),
+                ordinary.module().relocations.as_ref(),
+                core,
+                OutputContract::Exists,
+            )
+            .expect("authenticate exact Two-Way trusted core");
+
+            let batched = crate::compile_with_independent_exists_batch(request.clone())
+                .expect("append Two-Way independent Exists batch");
+            assert!(batched.module().direct_exists_batch_symbol().is_some());
+            assert_eq!(
+                batched.module().direct_exists_batch_strategy(),
+                Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop),
+            );
+            assert!(batched.module().prepared_exists_batch_symbol().is_none());
+            assert!(batched.module().required_runtime_symbols().next().is_none());
+            let ordinary_text = ordinary.module().sections[TEXT_SECTION].bytes();
+            let batched_text = batched.module().sections[TEXT_SECTION].bytes();
+            assert_eq!(
+                batched_text.get(..ordinary_text.len()),
+                Some(ordinary_text),
+                "additive batch changed the public Two-Way entry",
+            );
+            assert_eq!(
+                batched.module().sections[PROGRAM_SECTION].bytes(),
+                ordinary.module().sections[PROGRAM_SECTION].bytes(),
+            );
+
+            let mut limits = crate::CompileLimitsV1::default();
+            limits.max_object_bytes = ordinary.object().len();
+            let capped =
+                crate::compile_with_independent_exists_batch(request.clone().limits(limits))
+                    .expect("optional Two-Way batch object-cap decline");
+            assert_eq!(capped.object(), ordinary.object());
+            assert_eq!(capped.module(), ordinary.module());
+            assert!(capped.module().direct_exists_batch_symbol().is_none());
+
+            let assert_rejected = |module: CompiledModule| {
+                assert!(matches!(
+                    module.append_direct_exists_batch(OutputContract::Exists),
+                    Err(ObjectError::InvalidModule(
+                        "direct search trusted core contract is inconsistent"
+                            | "direct search trusted core entry identity is inconsistent"
+                            | "direct search trusted core program surface is inconsistent"
+                            | "direct search trusted core landmark is malformed"
+                    ))
+                ));
+            };
+
+            let mut wrong_family = ordinary.module().clone();
+            let mut forged_core = core;
+            forged_core.landmark = NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1;
+            wrong_family.native_direct_search_trusted_core = Some(forged_core);
+            assert_rejected(wrong_family);
+
+            let mut wrong_program = ordinary.module().clone();
+            let mut forged_core = core;
+            let NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+                program_bytes,
+                mut program_sha256,
+            } = forged_core.landmark
+            else {
+                panic!("expected Two-Way core family");
+            };
+            program_sha256[0] ^= 1;
+            forged_core.landmark =
+                NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+                    program_bytes,
+                    program_sha256,
+                };
+            wrong_program.native_direct_search_trusted_core = Some(forged_core);
+            assert_rejected(wrong_program);
+
+            let mut wrong_text = ordinary.module().clone();
+            wrong_text.sections[TEXT_SECTION].data[core.code_offset] ^= 1;
+            let mut forged_core = core;
+            forged_core.entry_code_sha256 =
+                Sha256::digest(wrong_text.sections[TEXT_SECTION].bytes()).into();
+            wrong_text.native_direct_search_trusted_core = Some(forged_core);
+            assert_rejected(wrong_text);
+
+            let mut wrong_data = ordinary.module().clone();
+            wrong_data.sections[PROGRAM_SECTION].data[0] ^= 1;
+            assert_rejected(wrong_data);
+
+            let mut wrong_relocation = ordinary.module().clone();
+            wrong_relocation.relocations[0].offset =
+                wrong_relocation.relocations[0].offset.saturating_add(4);
+            assert_rejected(wrong_relocation);
+
+            let mut wrong_symbol = ordinary.module().clone();
+            wrong_symbol.symbols[PROGRAM_SYMBOL].size = 0;
+            assert_rejected(wrong_symbol);
+
+            let mut wrong_section = ordinary.module().clone();
+            wrong_section.sections[PROGRAM_SECTION].alignment = 1;
+            assert_rejected(wrong_section);
         }
     }
 
@@ -2185,7 +2415,7 @@ mod tests {
             .native_finite_exists_choice_view()
             .expect("scalar Choice");
         let plan = derive_two_way_plan(pattern.as_bytes()).expect("scalar plan");
-        let (expected_code, expected_relocations) =
+        let (expected_code, expected_relocations, _) =
             lower_aarch64_two_way(plan, None).expect("canonical scalar lowering");
         let (actual, _) =
             lower_optional_exact_single_literal_two_way(choice, scalar_target, usize::MAX)
@@ -2292,11 +2522,23 @@ mod tests {
             std::process::id(),
         ));
         fs::create_dir(&directory).expect("create linker directory");
-        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
-        let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\ntypedef struct { const uint8_t *ptr; size_t len; } H;\n",
+        );
+        let mut calls = String::from("int main(void){size_t r[2],p;uint32_t s;uint8_t m[64];\n");
         let mut objects = Vec::new();
         for (case, pattern) in patterns.iter().enumerate() {
-            let compiled = compile_two_way(pattern, target, OutputContract::Exists);
+            let compiled = crate::compile_with_independent_exists_batch(
+                CompileRequest::new(*pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .expect("compile linked Two-Way batch leaf");
+            assert!(compiled.receipt().exact_single_literal_aot.is_some());
+            let batch_symbol = compiled
+                .module()
+                .direct_exists_batch_symbol()
+                .expect("linked Two-Way direct batch symbol");
             let needle = pattern.as_bytes();
             let mut haystacks = vec![
                 [vec![b'!'; 20], needle.to_vec(), vec![b'?']].concat(),
@@ -2364,9 +2606,16 @@ mod tests {
                 "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
             )
             .expect("write declaration");
+            writeln!(
+                source,
+                "extern uint32_t {batch_symbol}(const H*,size_t,uint8_t*,size_t*);"
+            )
+            .expect("write batch declaration");
             let object = directory.join(format!("case{case}.o"));
             fs::write(&object, compiled.object()).expect("write object");
             objects.push(object);
+            let mut batch_names = Vec::new();
+            let mut batch_expected = Vec::new();
             for (haystack_index, haystack) in haystacks.iter().enumerate() {
                 let name = format!("h{case}_{haystack_index}");
                 let bytes = haystack
@@ -2376,6 +2625,14 @@ mod tests {
                     .join(",");
                 writeln!(source, "static const unsigned char {name}[]={{{bytes}}};")
                     .expect("write haystack");
+                let MatchResult::Exists(expected) = compiled
+                    .search(haystack, SearchWindow::new(0, haystack.len()))
+                    .expect("portable full-haystack batch result")
+                else {
+                    panic!("unexpected output contract");
+                };
+                batch_names.push(name.clone());
+                batch_expected.push(u8::from(expected));
                 let windows: Box<dyn Iterator<Item = (usize, usize)>> =
                     if haystack_index == 0 {
                         Box::new((0..=haystack.len()).flat_map(|start| {
@@ -2409,6 +2666,44 @@ mod tests {
                     .expect("write differential call");
                 }
             }
+            let descriptors = batch_names
+                .iter()
+                .map(|name| format!("{{{name},sizeof({name})}}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const H d{case}[]={{{descriptors}}};")
+                .expect("write batch descriptors");
+            let first_name = &batch_names[0];
+            let second_name = &batch_names[1];
+            let bad_descriptors = format!(
+                "{{{first_name},sizeof({first_name})}},{{NULL,0}},{{{second_name},sizeof({second_name})}}"
+            );
+            writeln!(source, "static const H bad{case}[]={{{bad_descriptors}}};")
+                .expect("write late-invalid batch descriptors");
+            write!(
+                calls,
+                "p=99;s={batch_symbol}(d{case},{},m,&p);if(s!=0||p!={}",
+                batch_names.len(),
+                batch_names.len(),
+            )
+            .expect("write batch call");
+            for (index, expected) in batch_expected.iter().enumerate() {
+                write!(calls, "||m[{index}]!={expected}").expect("write batch expectation");
+            }
+            writeln!(calls, ")return {};", 70 + case).expect("finish batch call");
+            writeln!(
+                calls,
+                "m[0]=77;m[1]=78;m[2]=79;p=99;s={batch_symbol}(bad{case},3,m,&p);if(s!=2||p!=1||m[0]!={}||m[1]!=78||m[2]!=79)return {};",
+                batch_expected[0],
+                80 + case,
+            )
+            .expect("write late-invalid batch transaction");
+            writeln!(
+                calls,
+                "p=99;s={batch_symbol}(NULL,0,NULL,&p);if(s!=0||p!=0)return {};",
+                90 + case,
+            )
+            .expect("write empty batch call");
             writeln!(
                 calls,
                 "r[0]=91;r[1]=92;s={symbol}((const unsigned char*)\"x\",1,1,0,r);if(s!=2||r[0]!=91||r[1]!=92)return {};",
