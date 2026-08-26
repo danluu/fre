@@ -17,6 +17,7 @@ pub(super) const MIN_TWO_WAY_LITERAL_BYTES: usize = 33;
 pub(super) const MAX_TWO_WAY_LITERAL_BYTES: usize = 4096;
 const MAX_PAIR_PREFILTER_LITERAL_BYTES: usize = 255;
 const PAIR_PREFILTER_VECTOR_BYTES: u8 = 16;
+const PAIR_PREFILTER_BATCH_BYTES: u8 = 32;
 const PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES: u8 = 4;
 const PAIR_PREFILTER_MAX_CANDIDATE_REPORTS: u8 = 2;
 const PAIR_PREFILTER_MAX_FREQUENCY_NUMERATOR: u16 = 32;
@@ -41,6 +42,11 @@ struct PairPrefilterPlan {
     bytes: [u8; 2],
     minimum_vector_remaining_bytes: u16,
     estimated_frequency_numerator: u16,
+}
+
+fn pair_prefilter_minimum_batch_remaining_bytes(plan: PairPrefilterPlan) -> Option<u16> {
+    plan.minimum_vector_remaining_bytes
+        .checked_add(u16::from(PAIR_PREFILTER_VECTOR_BYTES))
 }
 
 #[derive(Clone, Copy)]
@@ -682,7 +688,10 @@ fn lower_aarch64_two_way(
     let pair_labels = if pair_prefilter.is_some() {
         Some((
             assembler.label()?, // retire at the final partial vector
-            assembler.label()?, // pair-vector miss
+            assembler.label()?, // final single-vector scan
+            assembler.label()?, // pair-batch miss
+            assembler.label()?, // final single-vector miss
+            assembler.label()?, // initialize scalar lane refinement
             assembler.label()?, // scalar first-lane refinement
             assembler.label()?, // scalar lane miss
             assembler.label()?, // refined pair candidate
@@ -711,17 +720,14 @@ fn lower_aarch64_two_way(
     }
 
     if let Some(pair) = pair_prefilter {
-        let (_, _, _, _, _) = pair_labels.ok_or(ObjectError::InvalidModule(
+        let (_, _, _, _, _, _, _, _) = pair_labels.ok_or(ObjectError::InvalidModule(
             "AArch64 pair-prefilter labels are absent",
         ))?;
         // A call that cannot contain one complete pair vector cannot ever use
         // the prefilter. Route it directly to the baseline-equivalent scalar
         // loop before initializing or dispatching any adaptive state.
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(
-            12,
-            pair.minimum_vector_remaining_bytes,
-        )?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes)?)?;
         assembler.branch_cond(AARCH64_LO, retired_search)?;
         assembler.instruction(aarch64_movz_x(16, 0, 0)?)?;
         assembler.instruction(aarch64_movz_x(17, 0, 0)?)?;
@@ -847,9 +853,22 @@ fn lower_aarch64_two_way(
     }
 
     if let Some(pair) = pair_prefilter {
-        let (vector_tail, vector_miss, lane, lane_miss, pair_candidate) = pair_labels.ok_or(
-            ObjectError::InvalidModule("AArch64 pair-prefilter labels are absent"),
-        )?;
+        let (
+            vector_tail,
+            single_vector_search,
+            batch_miss,
+            single_vector_miss,
+            lane_start,
+            lane,
+            lane_miss,
+            pair_candidate,
+        ) = pair_labels.ok_or(ObjectError::InvalidModule(
+            "AArch64 pair-prefilter labels are absent",
+        ))?;
+        let minimum_batch_remaining_bytes = pair_prefilter_minimum_batch_remaining_bytes(pair)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "pair-prefilter batch extent",
+            ))?;
         assembler.bind(warm_search)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
         assembler.instruction(aarch64_cmp_x(12, 6)?)?;
@@ -921,9 +940,10 @@ fn lower_aarch64_two_way(
         assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
         assembler.branch(retired_search)?;
 
-        // This cold tail and the hot guard together occupy the exact seven
-        // words used by the original vector guard. The hot body and every
-        // downstream instruction therefore retain their established address.
+        // This cold tail and the batch guard together occupy the exact seven
+        // words used before the original vector body, so the new hot batch
+        // begins at the established address even though its wider body moves
+        // later cold code.
         // The active scanner may have fewer than `width` bytes left after its
         // last complete vector; recheck that scalar bound before loading the
         // terminal byte in `retired_scalar_candidate`.
@@ -936,13 +956,44 @@ fn lower_aarch64_two_way(
         // Only active states one and two reach this label: a pair candidate
         // increments the state and leaves this loop, scalar mismatch dispatch
         // rejects the resulting disabled state, and vector misses preserve it.
-        // The vector extent (`width + 15`) also implies the scalar `width`
-        // extent, so neither invariant needs another per-vector comparison.
+        // A complete pair batch needs `width + 31` bytes: each selected offset
+        // is at most `width - 1`, and LDP reads through lane 31. The cold
+        // single-vector tail retains the established `width + 15` boundary.
         assembler.bind(vector_search)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, minimum_batch_remaining_bytes)?)?;
+        assembler.branch_cond(AARCH64_LO, single_vector_search)?;
+
+        assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0]))?)?;
+        assembler.instruction(aarch64_load_pair_q(0, 1, 12, 0)?)?;
+        assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1]))?)?;
+        assembler.instruction(aarch64_load_pair_q(2, 3, 12, 0)?)?;
+        assembler.instruction(aarch64_cmeq_16b(24, 0, 16)?)?;
+        assembler.instruction(aarch64_cmeq_16b(25, 1, 16)?)?;
+        assembler.instruction(aarch64_cmeq_16b(26, 2, 17)?)?;
+        assembler.instruction(aarch64_cmeq_16b(27, 3, 17)?)?;
+        assembler.instruction(aarch64_and_16b(24, 24, 26)?)?;
+        assembler.instruction(aarch64_and_16b(25, 25, 27)?)?;
+        assembler.instruction(aarch64_orr_16b(28, 24, 25)?)?;
+        aarch64_emit_candidate_any(&mut assembler, 28)?;
+        assembler.branch_cond(AARCH64_EQ, batch_miss)?;
+        assembler.instruction(aarch64_movz_x(0, u16::from(PAIR_PREFILTER_BATCH_BYTES), 0)?)?;
+        assembler.branch(lane_start)?;
+
+        assembler.bind(batch_miss)?;
+        assembler.instruction(aarch64_add_x_imm(
+            2,
+            2,
+            u16::from(PAIR_PREFILTER_BATCH_BYTES),
+        )?)?;
+        assembler.branch(vector_search)?;
+
+        // A 16-byte vector covers the only partial batch worth retaining.
+        // Its miss leaves fewer than 16 searchable lanes, so it converges
+        // directly on the scalar retirement tail instead of retrying a batch.
+        assembler.bind(single_vector_search)?;
         assembler.instruction(aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes)?)?;
         assembler.branch_cond(AARCH64_LO, vector_tail)?;
-
         assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0]))?)?;
         assembler.instruction(aarch64_load_q(0, 12)?)?;
         assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1]))?)?;
@@ -951,8 +1002,14 @@ fn lower_aarch64_two_way(
         assembler.instruction(aarch64_cmeq_16b(1, 1, 17)?)?;
         assembler.instruction(aarch64_and_16b(24, 24, 1)?)?;
         aarch64_emit_candidate_any(&mut assembler, 24)?;
-        assembler.branch_cond(AARCH64_EQ, vector_miss)?;
+        assembler.branch_cond(AARCH64_EQ, single_vector_miss)?;
+        assembler.instruction(aarch64_movz_x(
+            0,
+            u16::from(PAIR_PREFILTER_VECTOR_BYTES),
+            0,
+        )?)?;
 
+        assembler.bind(lane_start)?;
         assembler.instruction(aarch64_movz_x(12, 0, 0)?)?;
         assembler.bind(lane)?;
         assembler.instruction(aarch64_add_x_reg(9, 2, 12)?)?;
@@ -964,19 +1021,22 @@ fn lower_aarch64_two_way(
         assembler.branch_cond(AARCH64_EQ, pair_candidate)?;
         assembler.bind(lane_miss)?;
         assembler.instruction(aarch64_add_x_imm(12, 12, 1)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(
-            12,
-            u16::from(PAIR_PREFILTER_VECTOR_BYTES),
-        )?)?;
+        assembler.instruction(aarch64_cmp_x(12, 0)?)?;
         assembler.branch_cond(AARCH64_LO, lane)?;
+        // The vector reduction and scalar refinement are exact copies of the
+        // same bytes, so exhaustion is unreachable for a valid immutable
+        // haystack. Retain a bounded forward-progress edge for robustness.
+        assembler.instruction(aarch64_add_x_reg(2, 2, 0)?)?;
+        assembler.branch(vector_search)?;
 
-        assembler.bind(vector_miss)?;
+        assembler.bind(single_vector_miss)?;
         assembler.instruction(aarch64_add_x_imm(
             2,
             2,
             u16::from(PAIR_PREFILTER_VECTOR_BYTES),
         )?)?;
-        assembler.branch(vector_search)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.branch(vector_tail)?;
 
         assembler.bind(pair_candidate)?;
         assembler.instruction(aarch64_mov_x(2, 9)?)?;
@@ -1112,6 +1172,10 @@ struct PairPrefilterModelStats {
     consecutive_failures: usize,
     candidate_reports: usize,
     vector_windows: usize,
+    batch_windows: usize,
+    single_vector_windows: usize,
+    last_candidate_lane: Option<usize>,
+    last_candidate_scan_bytes: usize,
     retired: bool,
 }
 
@@ -1145,16 +1209,27 @@ fn pair_prefilter_find_counted(
         }
         if active {
             stats.vector_windows += 1;
-            let lane = (0..usize::from(PAIR_PREFILTER_VECTOR_BYTES)).find(|&lane| {
+            let remaining = haystack.len() - position;
+            let scan_bytes =
+                if remaining >= usize::from(pair_prefilter_minimum_batch_remaining_bytes(pair)?) {
+                    stats.batch_windows += 1;
+                    usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                } else {
+                    stats.single_vector_windows += 1;
+                    usize::from(PAIR_PREFILTER_VECTOR_BYTES)
+                };
+            let lane = (0..scan_bytes).find(|&lane| {
                 haystack[position + lane + usize::from(pair.offsets[0])] == pair.bytes[0]
                     && haystack[position + lane + usize::from(pair.offsets[1])] == pair.bytes[1]
             });
             let Some(lane) = lane else {
-                position += usize::from(PAIR_PREFILTER_VECTOR_BYTES);
+                position += scan_bytes;
                 continue;
             };
             position += lane;
             stats.candidate_reports += 1;
+            stats.last_candidate_lane = Some(lane);
+            stats.last_candidate_scan_bytes = scan_bytes;
         }
         if plan.approximate_byteset & (1_u64 << (haystack[position + width - 1] % 64)) == 0 {
             if !active && !stats.retired {
@@ -1394,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_pair_vector_extent_partitions_every_tail_boundary() {
+    fn packed_pair_hybrid_extents_partition_every_tail_boundary() {
         let target = Target::aarch64_macos()
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
             .expect("ASIMD target");
@@ -1411,14 +1486,32 @@ mod tests {
             assert!(pair.offsets.contains(&last_pair_offset));
 
             let vector_extent = usize::from(pair.minimum_vector_remaining_bytes);
+            let batch_extent = usize::from(
+                pair_prefilter_minimum_batch_remaining_bytes(pair).expect("bounded batch extent"),
+            );
             assert_eq!(
                 vector_extent,
                 width + usize::from(PAIR_PREFILTER_VECTOR_BYTES) - 1
             );
-            for remaining in 0..=vector_extent + usize::from(PAIR_PREFILTER_VECTOR_BYTES) {
+            assert_eq!(
+                batch_extent,
+                width + usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1,
+            );
+            for remaining in 0..=batch_extent + usize::from(PAIR_PREFILTER_BATCH_BYTES) {
                 let scalar_candidate_is_safe = remaining >= width;
                 let vector_candidate_is_safe = remaining >= vector_extent;
-                if vector_candidate_is_safe {
+                let batch_candidate_is_safe = remaining >= batch_extent;
+                if batch_candidate_is_safe {
+                    assert!(vector_candidate_is_safe);
+                    assert!(scalar_candidate_is_safe);
+                    for &offset in &pair.offsets {
+                        assert!(
+                            usize::from(offset) + usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                                <= remaining,
+                        );
+                    }
+                    assert!(width + usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1 <= remaining);
+                } else if vector_candidate_is_safe {
                     assert!(scalar_candidate_is_safe);
                     for &offset in &pair.offsets {
                         assert!(
@@ -1426,6 +1519,7 @@ mod tests {
                                 <= remaining,
                         );
                     }
+                    assert!((vector_extent..batch_extent).contains(&remaining));
                 } else if scalar_candidate_is_safe {
                     assert!((width..vector_extent).contains(&remaining));
                 } else {
@@ -1440,42 +1534,54 @@ mod tests {
                 usize::from(last_pair_offset) + usize::from(PAIR_PREFILTER_VECTOR_BYTES)
                     <= vector_extent,
             );
+            assert!(
+                usize::from(last_pair_offset) + usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                    > batch_extent - 1,
+            );
+            assert!(
+                usize::from(last_pair_offset) + usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                    <= batch_extent,
+            );
         }
     }
 
     #[test]
-    fn asimd_pair_prefilter_emits_exact_vector_and_first_lane_primitives() {
+    fn asimd_pair_prefilter_emits_exact_batch_tail_and_lane_cfg() {
         let literal = format!("{}c", "ab".repeat(31));
         let plan = derive_two_way_plan(literal.as_bytes()).expect("derive ASIMD plan");
         let pair = select_pair_prefilter(literal.as_bytes()).expect("select ASIMD pair");
+        let minimum_batch_remaining_bytes =
+            pair_prefilter_minimum_batch_remaining_bytes(pair).expect("batch extent");
         let (code, _) = lower_aarch64_two_way(plan, Some(pair)).expect("lower ASIMD pair");
         let words = code
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("instruction word")))
             .collect::<Vec<_>>();
-        let vector = [
+        let batch = [
             aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0])).expect("first address"),
-            aarch64_load_q(0, 12).expect("first vector load"),
+            aarch64_load_pair_q(0, 1, 12, 0).expect("first pair load"),
             aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1])).expect("second address"),
-            aarch64_load_q(1, 12).expect("second vector load"),
-            aarch64_cmeq_16b(24, 0, 16).expect("first equality"),
-            aarch64_cmeq_16b(1, 1, 17).expect("second equality"),
-            aarch64_and_16b(24, 24, 1).expect("pair intersection"),
-            aarch64_umaxv_16b(7, 24).expect("candidate reduction"),
+            aarch64_load_pair_q(2, 3, 12, 0).expect("second pair load"),
+            aarch64_cmeq_16b(24, 0, 16).expect("first block first equality"),
+            aarch64_cmeq_16b(25, 1, 16).expect("second block first equality"),
+            aarch64_cmeq_16b(26, 2, 17).expect("first block second equality"),
+            aarch64_cmeq_16b(27, 3, 17).expect("second block second equality"),
+            aarch64_and_16b(24, 24, 26).expect("first block intersection"),
+            aarch64_and_16b(25, 25, 27).expect("second block intersection"),
+            aarch64_orr_16b(28, 24, 25).expect("batch union"),
+            aarch64_umaxv_16b(7, 28).expect("candidate reduction"),
             aarch64_umov_b0(12, 7).expect("candidate scalar"),
             aarch64_cmp_w_zero(12).expect("candidate test"),
         ];
-        let vector_body = words
-            .windows(vector.len())
-            .position(|window| window == vector)
-            .expect("vector body");
-        // These are the pre-change code size and vector-body address. The
-        // guard hoist must not perturb either one.
-        assert_eq!(words.len(), 176);
-        assert_eq!(vector_body, 135);
+        let batch_body = words
+            .windows(batch.len())
+            .position(|window| window == batch)
+            .expect("batch body");
+        assert_eq!(words.len(), 201);
+        assert_eq!(batch_body, 135);
 
-        let vector_tail = vector_body - 7;
-        let vector_search = vector_body - 3;
+        let vector_tail = batch_body - 7;
+        let vector_search = batch_body - 3;
         let disabled_state = u16::from(
             PAIR_PREFILTER_MAX_CANDIDATE_REPORTS
                 .checked_add(1)
@@ -1507,10 +1613,124 @@ mod tests {
         );
         assert_eq!(
             words[vector_search + 1],
-            aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes).expect("hot vector extent"),
+            aarch64_cmp_x_imm(12, minimum_batch_remaining_bytes).expect("hot batch extent"),
+        );
+        let single_vector_search =
+            aarch64_conditional_target(&words, vector_search + 2, AARCH64_LO);
+
+        let batch_candidate_branch = batch_body + batch.len();
+        let batch_miss = aarch64_conditional_target(&words, batch_candidate_branch, AARCH64_EQ);
+        assert_eq!(
+            words[batch_candidate_branch + 1],
+            aarch64_movz_x(0, u16::from(PAIR_PREFILTER_BATCH_BYTES), 0).expect("batch lane limit"),
+        );
+        let lane_start = aarch64_unconditional_target(&words, batch_candidate_branch + 2);
+        assert_eq!(
+            words[batch_miss],
+            aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_BATCH_BYTES))
+                .expect("batch miss advance"),
         );
         assert_eq!(
-            aarch64_conditional_target(&words, vector_search + 2, AARCH64_LO),
+            aarch64_unconditional_target(&words, batch_miss + 1),
+            vector_search,
+        );
+        assert_eq!(batch_candidate_branch + 1 - vector_search + 2, 20);
+        assert_eq!(single_vector_search, batch_miss + 2);
+
+        assert_eq!(
+            words[single_vector_search],
+            aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes)
+                .expect("single-vector extent"),
+        );
+        assert_eq!(
+            aarch64_conditional_target(&words, single_vector_search + 1, AARCH64_LO),
+            vector_tail,
+        );
+        let single = [
+            aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0])).expect("single first address"),
+            aarch64_load_q(0, 12).expect("single first load"),
+            aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1])).expect("single second address"),
+            aarch64_load_q(1, 12).expect("single second load"),
+            aarch64_cmeq_16b(24, 0, 16).expect("single first equality"),
+            aarch64_cmeq_16b(1, 1, 17).expect("single second equality"),
+            aarch64_and_16b(24, 24, 1).expect("single pair intersection"),
+            aarch64_umaxv_16b(7, 24).expect("single candidate reduction"),
+            aarch64_umov_b0(12, 7).expect("single candidate scalar"),
+            aarch64_cmp_w_zero(12).expect("single candidate test"),
+        ];
+        let single_body = single_vector_search + 2;
+        assert_eq!(&words[single_body..single_body + single.len()], &single);
+        let single_candidate_branch = single_body + single.len();
+        let single_vector_miss =
+            aarch64_conditional_target(&words, single_candidate_branch, AARCH64_EQ);
+        assert_eq!(
+            words[single_candidate_branch + 1],
+            aarch64_movz_x(0, u16::from(PAIR_PREFILTER_VECTOR_BYTES), 0)
+                .expect("single lane limit"),
+        );
+        assert_eq!(lane_start, single_candidate_branch + 2);
+        assert_eq!(
+            words[lane_start],
+            aarch64_movz_x(12, 0, 0).expect("lane zero"),
+        );
+
+        let lane = lane_start + 1;
+        assert_eq!(
+            words[lane],
+            aarch64_add_x_reg(9, 2, 12).expect("lane address"),
+        );
+        assert_eq!(
+            words[lane + 1],
+            aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[0])).expect("first lane byte"),
+        );
+        assert_eq!(
+            words[lane + 2],
+            aarch64_cmp_w_imm(8, u16::from(pair.bytes[0])).expect("first lane compare"),
+        );
+        assert_eq!(
+            aarch64_conditional_target(&words, lane + 3, AARCH64_NE),
+            lane + 7,
+        );
+        assert_eq!(
+            words[lane + 4],
+            aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[1])).expect("second lane byte"),
+        );
+        assert_eq!(
+            words[lane + 5],
+            aarch64_cmp_w_imm(8, u16::from(pair.bytes[1])).expect("second lane compare"),
+        );
+        assert_eq!(
+            words[lane + 7],
+            aarch64_add_x_imm(12, 12, 1).expect("next lane"),
+        );
+        assert_eq!(
+            words[lane + 8],
+            aarch64_cmp_x(12, 0).expect("dynamic lane limit"),
+        );
+        assert_eq!(
+            aarch64_conditional_target(&words, lane + 9, AARCH64_LO),
+            lane,
+        );
+        assert_eq!(
+            words[lane + 10],
+            aarch64_add_x_reg(2, 2, 0).expect("defensive lane exhaustion"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&words, lane + 11),
+            vector_search,
+        );
+        assert_eq!(single_vector_miss, lane + 12);
+        assert_eq!(
+            words[single_vector_miss],
+            aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_VECTOR_BYTES))
+                .expect("single-vector miss advance"),
+        );
+        assert_eq!(
+            words[single_vector_miss + 1],
+            aarch64_sub_x_reg(12, 3, 2).expect("remaining scalar tail"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&words, single_vector_miss + 2),
             vector_tail,
         );
 
@@ -1524,29 +1744,16 @@ mod tests {
         assert_eq!(state_comparisons.len(), 1);
         assert!(state_comparisons[0] < vector_tail);
 
-        let candidate_branch = vector_body + vector.len();
-        let vector_miss = aarch64_conditional_target(&words, candidate_branch, AARCH64_EQ);
+        let pair_candidate = aarch64_conditional_target(&words, lane + 6, AARCH64_EQ);
+        assert_eq!(pair_candidate, single_vector_miss + 3);
         assert_eq!(
-            words[vector_miss],
-            aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_VECTOR_BYTES))
-                .expect("vector miss advance"),
+            words[pair_candidate],
+            aarch64_mov_x(2, 9).expect("refined candidate position"),
         );
         assert_eq!(
-            aarch64_unconditional_target(&words, vector_miss + 1),
-            vector_search,
+            words[pair_candidate + 1],
+            aarch64_add_x_imm(16, 16, 1).expect("candidate report"),
         );
-        assert_eq!(candidate_branch + 1 - vector_search + 2, 16);
-
-        let pair_candidate = words
-            .windows(2)
-            .position(|window| {
-                window
-                    == [
-                        aarch64_mov_x(2, 9).expect("refined candidate position"),
-                        aarch64_add_x_imm(16, 16, 1).expect("candidate report"),
-                    ]
-            })
-            .expect("pair candidate block");
         let pair_scalar = aarch64_unconditional_target(&words, pair_candidate + 2);
         assert_eq!(pair_scalar, pair_candidate + 5);
         assert_eq!(
@@ -1562,21 +1769,6 @@ mod tests {
             aarch64_load_byte_reg(8, 2, 7).expect("pair terminal byte"),
         );
 
-        let scalar_lane = [
-            aarch64_add_x_reg(9, 2, 12).expect("lane address"),
-            aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[0])).expect("first lane byte"),
-            aarch64_cmp_w_imm(8, u16::from(pair.bytes[0])).expect("first lane compare"),
-        ];
-        assert!(
-            words
-                .windows(scalar_lane.len())
-                .any(|window| window == scalar_lane),
-        );
-        assert!(
-            words.contains(
-                &aarch64_cmp_x_imm(16, disabled_state).expect("candidate budget comparison"),
-            ),
-        );
         assert!(
             words.contains(
                 &aarch64_cmp_x_imm(
@@ -1586,13 +1778,6 @@ mod tests {
                 .expect("adaptive warm-up threshold")
             )
         );
-        assert!(
-            words.contains(
-                &aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_VECTOR_BYTES),)
-                    .expect("vector miss advance")
-            )
-        );
-
         let (scalar, _) = lower_aarch64_two_way(plan, None).expect("lower scalar control");
         assert!(!scalar.windows(4).any(|bytes| {
             u32::from_le_bytes(bytes.try_into().expect("scalar word"))
@@ -1622,18 +1807,13 @@ mod tests {
         let mut stats = PairPrefilterModelStats::default();
         let scalar_skip_haystack = vec![b'~'; 64 * 1024];
         assert_eq!(
-            pair_prefilter_find_counted(
-                plan,
-                pair,
-                &scalar_skip_haystack,
-                &needle,
-                &mut stats,
-            ),
+            pair_prefilter_find_counted(plan, pair, &scalar_skip_haystack, &needle, &mut stats,),
             None,
         );
         assert_eq!(stats, PairPrefilterModelStats::default());
-        for lane in 0_usize..16 {
-            let mut haystack = vec![b'!'; needle.len() + 15];
+        for lane in 0_usize..usize::from(PAIR_PREFILTER_BATCH_BYTES) {
+            let mut haystack =
+                vec![b'!'; needle.len() + usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1];
             haystack[lane..lane + needle.len()].copy_from_slice(&needle);
             let mut stats = PairPrefilterModelStats::default();
             assert_eq!(
@@ -1667,6 +1847,7 @@ mod tests {
         for _ in 0..8 {
             adaptive_haystack.extend_from_slice(&low_progress_candidate);
         }
+        let adaptive_prefix = adaptive_haystack.clone();
         for _ in 0..=usize::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS) {
             adaptive_haystack.extend_from_slice(&large_shift_candidate);
         }
@@ -1687,6 +1868,32 @@ mod tests {
             usize::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS),
         );
         assert!(stats.retired);
+
+        let mut covered_batch_lanes = vec![false; usize::from(PAIR_PREFILTER_BATCH_BYTES)];
+        for padding in 0..usize::from(PAIR_PREFILTER_BATCH_BYTES) * 4 {
+            let mut haystack = adaptive_prefix.clone();
+            haystack.extend(std::iter::repeat_n(b'!', padding));
+            haystack.extend_from_slice(&needle);
+            haystack.extend(std::iter::repeat_n(
+                b'!',
+                usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1,
+            ));
+            let expected = adaptive_prefix.len() + padding;
+            let mut stats = PairPrefilterModelStats::default();
+            assert_eq!(
+                pair_prefilter_find_counted(plan, pair, &haystack, &needle, &mut stats),
+                Some(expected),
+            );
+            if stats.last_candidate_scan_bytes == usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                && let Some(lane) = stats.last_candidate_lane
+            {
+                covered_batch_lanes[lane] = true;
+            }
+        }
+        assert!(
+            covered_batch_lanes.into_iter().all(std::convert::identity),
+            "generated adaptive fixtures did not cover every pair-batch lane",
+        );
     }
 
     #[test]
@@ -2022,6 +2229,46 @@ mod tests {
                 }
                 budget_haystack.extend_from_slice(needle);
                 haystacks.push(budget_haystack);
+
+                if target.architecture == Architecture::Aarch64 {
+                    let plan = derive_two_way_plan(needle).expect("linked pair plan");
+                    let pair = derive_pair_prefilter(needle, plan, target)
+                        .expect("linked ASIMD pair plan");
+                    let mut adaptive_prefix = Vec::new();
+                    for _ in 0..8 {
+                        adaptive_prefix.extend_from_slice(&low_progress_candidate);
+                    }
+                    let mut lane_haystacks = vec![None; usize::from(PAIR_PREFILTER_BATCH_BYTES)];
+                    for padding in 0..usize::from(PAIR_PREFILTER_BATCH_BYTES) * 4 {
+                        let mut haystack = adaptive_prefix.clone();
+                        haystack.extend(std::iter::repeat_n(b'!', padding));
+                        haystack.extend_from_slice(needle);
+                        haystack.extend(std::iter::repeat_n(
+                            b'!',
+                            usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1,
+                        ));
+                        let mut stats = PairPrefilterModelStats::default();
+                        let expected = adaptive_prefix.len() + padding;
+                        assert_eq!(
+                            pair_prefilter_find_counted(plan, pair, &haystack, needle, &mut stats,),
+                            Some(expected),
+                        );
+                        if stats.last_candidate_scan_bytes
+                            == usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                            && let Some(lane) = stats.last_candidate_lane
+                            && lane_haystacks[lane].is_none()
+                        {
+                            lane_haystacks[lane] = Some(haystack);
+                        }
+                    }
+                    haystacks.extend(lane_haystacks.into_iter().enumerate().map(
+                        |(lane, haystack)| {
+                            haystack.unwrap_or_else(|| {
+                                panic!("linked adaptive fixture missed pair-batch lane {lane}")
+                            })
+                        },
+                    ));
+                }
             }
             let symbol = compiled.module().entry_symbol();
             writeln!(
