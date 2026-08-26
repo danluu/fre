@@ -743,7 +743,22 @@ fn lower_aarch64_two_way(
     assembler.instruction(aarch64_and_low_x(8, 8, 63)?)?;
     assembler.instruction(aarch64_lsrv_x(10, 11, 8)?)?;
     assembler.instruction(aarch64_and_low_x(10, 10, 1)?)?;
-    assembler.branch_zero_x(10, byteset_skip)?;
+    if pair_prefilter.is_some() {
+        // A pair-prefilter leaf reaches this initial loop before activation.
+        // Keep its common terminal-byte miss and backedge adjacent instead of
+        // bouncing across the scalar verifier. Pair admission requires a
+        // Large-shift plan, but retain the periodic reset defensively so this
+        // private lowerer remains correct for every internally supplied plan.
+        assembler.branch_nonzero_x(10, scalar_verify)?;
+        assembler.bind(byteset_skip)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
+        if matches!(plan.shift, TwoWayShift::SmallPeriod { .. }) {
+            assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
+        }
+        assembler.branch(search)?;
+    } else {
+        assembler.branch_zero_x(10, byteset_skip)?;
+    }
 
     assembler.bind(scalar_verify)?;
     assembler.instruction(aarch64_mov_x(9, 14)?)?;
@@ -839,12 +854,14 @@ fn lower_aarch64_two_way(
         assembler.branch(vector_search)?;
     }
 
-    assembler.bind(byteset_skip)?;
-    assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
-    if matches!(plan.shift, TwoWayShift::SmallPeriod { .. }) {
-        assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
+    if pair_prefilter.is_none() {
+        assembler.bind(byteset_skip)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
+        if matches!(plan.shift, TwoWayShift::SmallPeriod { .. }) {
+            assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
+        }
+        assembler.branch(search)?;
     }
-    assembler.branch(search)?;
 
     if pair_prefilter.is_some() {
         assembler.bind(pair_byteset_skip)?;
@@ -1557,6 +1574,49 @@ mod tests {
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("instruction word")))
             .collect::<Vec<_>>();
+        let primary_filter = [
+            aarch64_load_byte_reg(8, 2, 7).expect("primary terminal byte"),
+            aarch64_and_low_x(8, 8, 63).expect("primary terminal modulo"),
+            aarch64_lsrv_x(10, 11, 8).expect("primary membership shift"),
+            aarch64_and_low_x(10, 10, 1).expect("primary membership bit"),
+        ];
+        let primary_candidate = words
+            .windows(primary_filter.len())
+            .position(|window| window == primary_filter)
+            .expect("primary scalar candidate");
+        let primary_search = primary_candidate
+            .checked_sub(3)
+            .expect("primary search precedes candidate");
+        assert_eq!(
+            words[primary_search],
+            aarch64_sub_x_reg(12, 3, 2).expect("primary remaining bytes"),
+        );
+        assert_eq!(
+            words[primary_search + 1],
+            aarch64_cmp_x(12, 6).expect("primary width bound"),
+        );
+        let primary_membership = primary_candidate + primary_filter.len();
+        assert_eq!(
+            words[primary_membership] & 0xff00_001f,
+            0xb500_000a,
+            "pair primary membership must use CBNZ X10",
+        );
+        assert_eq!(
+            aarch64_relative_target(primary_membership, words[primary_membership], 19, 5,),
+            primary_membership + 3,
+        );
+        assert_eq!(
+            words[primary_membership + 1],
+            aarch64_add_x_reg(2, 2, 6).expect("local primary miss advance"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&words, primary_membership + 2),
+            primary_search,
+        );
+        assert_eq!(
+            words[primary_membership + 3],
+            aarch64_mov_x(9, 14).expect("primary scalar verifier"),
+        );
         let batch = [
             aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0])).expect("first address"),
             aarch64_load_pair_q(0, 1, 12, 0).expect("first pair load"),
@@ -1783,6 +1843,34 @@ mod tests {
             u32::from_le_bytes(bytes.try_into().expect("scalar word"))
                 == aarch64_movi_16b(16, pair.bytes[0]).expect("first splat")
         }));
+        let scalar_words = scalar
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("scalar instruction word")))
+            .collect::<Vec<_>>();
+        let scalar_candidate = scalar_words
+            .windows(primary_filter.len())
+            .position(|window| window == primary_filter)
+            .expect("scalar-control primary candidate");
+        let scalar_search = scalar_candidate
+            .checked_sub(3)
+            .expect("scalar-control search precedes candidate");
+        let scalar_membership = scalar_candidate + primary_filter.len();
+        assert_eq!(
+            scalar_words[scalar_membership] & 0xff00_001f,
+            0xb400_000a,
+            "non-pair primary membership must retain CBZ X10",
+        );
+        let scalar_skip =
+            aarch64_relative_target(scalar_membership, scalar_words[scalar_membership], 19, 5);
+        assert!(scalar_skip > scalar_membership + 3);
+        assert_eq!(
+            scalar_words[scalar_skip],
+            aarch64_add_x_reg(2, 2, 6).expect("scalar-control miss advance"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&scalar_words, scalar_skip + 1),
+            scalar_search,
+        );
     }
 
     #[test]
