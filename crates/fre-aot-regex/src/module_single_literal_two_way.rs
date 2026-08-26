@@ -681,7 +681,7 @@ fn lower_aarch64_two_way(
     let active_after_scalar_mismatch = assembler.label()?;
     let pair_labels = if pair_prefilter.is_some() {
         Some((
-            assembler.label()?, // permanently disable the prefilter
+            assembler.label()?, // retire at the final partial vector
             assembler.label()?, // pair-vector miss
             assembler.label()?, // scalar first-lane refinement
             assembler.label()?, // scalar lane miss
@@ -847,7 +847,7 @@ fn lower_aarch64_two_way(
     }
 
     if let Some(pair) = pair_prefilter {
-        let (prefilter_disable, vector_miss, lane, lane_miss, pair_candidate) = pair_labels.ok_or(
+        let (vector_tail, vector_miss, lane, lane_miss, pair_candidate) = pair_labels.ok_or(
             ObjectError::InvalidModule("AArch64 pair-prefilter labels are absent"),
         )?;
         assembler.bind(warm_search)?;
@@ -921,14 +921,27 @@ fn lower_aarch64_two_way(
         assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
         assembler.branch(retired_search)?;
 
-        assembler.bind(vector_search)?;
-        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        // This cold tail and the hot guard together occupy the exact seven
+        // words used by the original vector guard. The hot body and every
+        // downstream instruction therefore retain their established address.
+        // The active scanner may have fewer than `width` bytes left after its
+        // last complete vector; recheck that scalar bound before loading the
+        // terminal byte in `retired_scalar_candidate`.
+        assembler.bind(vector_tail)?;
         assembler.instruction(aarch64_cmp_x(12, 6)?)?;
         assembler.branch_cond(AARCH64_LO, no_match)?;
-        assembler.instruction(aarch64_cmp_x_imm(16, pair_disabled_state)?)?;
-        assembler.branch_cond(AARCH64_HS, prefilter_disable)?;
+        assembler.instruction(aarch64_movz_x(16, pair_disabled_state, 0)?)?;
+        assembler.branch(retired_scalar_candidate)?;
+
+        // Only active states one and two reach this label: a pair candidate
+        // increments the state and leaves this loop, scalar mismatch dispatch
+        // rejects the resulting disabled state, and vector misses preserve it.
+        // The vector extent (`width + 15`) also implies the scalar `width`
+        // extent, so neither invariant needs another per-vector comparison.
+        assembler.bind(vector_search)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
         assembler.instruction(aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes)?)?;
-        assembler.branch_cond(AARCH64_LO, prefilter_disable)?;
+        assembler.branch_cond(AARCH64_LO, vector_tail)?;
 
         assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0]))?)?;
         assembler.instruction(aarch64_load_q(0, 12)?)?;
@@ -970,7 +983,11 @@ fn lower_aarch64_two_way(
         assembler.instruction(aarch64_add_x_imm(16, 16, 1)?)?;
         assembler.branch(pair_scalar_candidate)?;
 
-        assembler.bind(prefilter_disable)?;
+        // Preserve the former disable block as unreachable layout padding.
+        // `pair_candidate` branches over it and all live retirement edges now
+        // use `vector_tail`, but keeping these two exact words prevents an
+        // unrelated downstream layout change from obscuring this hot-loop
+        // experiment.
         assembler.instruction(aarch64_movz_x(16, pair_disabled_state, 0)?)?;
         assembler.branch(retired_scalar_candidate)?;
 
@@ -1207,6 +1224,44 @@ mod tests {
         .expect("compile exact single-literal Two-Way leaf")
     }
 
+    fn aarch64_relative_target(
+        source_word: usize,
+        instruction: u32,
+        immediate_bits: u32,
+        immediate_shift: u32,
+    ) -> usize {
+        let mask = (1_u32 << immediate_bits) - 1;
+        let encoded = (instruction >> immediate_shift) & mask;
+        let sign = 1_u32 << (immediate_bits - 1);
+        let displacement = if encoded & sign == 0 {
+            i64::from(encoded)
+        } else {
+            i64::from(encoded) - (1_i64 << immediate_bits)
+        };
+        usize::try_from(i64::try_from(source_word).expect("word offset fits i64") + displacement)
+            .expect("test branch target is nonnegative")
+    }
+
+    fn aarch64_conditional_target(words: &[u32], source_word: usize, condition: u8) -> usize {
+        let instruction = words[source_word];
+        assert_eq!(
+            instruction & 0xff00_001f,
+            0x5400_0000 | u32::from(condition),
+            "word {source_word} is not the expected conditional branch",
+        );
+        aarch64_relative_target(source_word, instruction, 19, 5)
+    }
+
+    fn aarch64_unconditional_target(words: &[u32], source_word: usize) -> usize {
+        let instruction = words[source_word];
+        assert_eq!(
+            instruction & 0xfc00_0000,
+            0x1400_0000,
+            "word {source_word} is not an unconditional branch",
+        );
+        aarch64_relative_target(source_word, instruction, 26, 0)
+    }
+
     #[test]
     fn critical_factorization_matches_naive_search_including_period_memory() {
         let periodic = b"ababababababababababababababababab";
@@ -1339,6 +1394,56 @@ mod tests {
     }
 
     #[test]
+    fn packed_pair_vector_extent_partitions_every_tail_boundary() {
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("ASIMD target");
+        for width in MIN_TWO_WAY_LITERAL_BYTES..=MAX_PAIR_PREFILTER_LITERAL_BYTES {
+            let mut literal = (0..width)
+                .map(|index| if index.is_multiple_of(2) { b'a' } else { b'b' })
+                .collect::<Vec<_>>();
+            literal[width - 1] = b'c';
+            let plan = derive_two_way_plan(&literal).expect("derive bounded Two-Way plan");
+            assert!(matches!(plan.shift, TwoWayShift::Large { .. }));
+            let pair = derive_pair_prefilter(&literal, plan, target)
+                .expect("derive bounded pair prefilter");
+            let last_pair_offset = u8::try_from(width - 1).expect("bounded last offset");
+            assert!(pair.offsets.contains(&last_pair_offset));
+
+            let vector_extent = usize::from(pair.minimum_vector_remaining_bytes);
+            assert_eq!(
+                vector_extent,
+                width + usize::from(PAIR_PREFILTER_VECTOR_BYTES) - 1
+            );
+            for remaining in 0..=vector_extent + usize::from(PAIR_PREFILTER_VECTOR_BYTES) {
+                let scalar_candidate_is_safe = remaining >= width;
+                let vector_candidate_is_safe = remaining >= vector_extent;
+                if vector_candidate_is_safe {
+                    assert!(scalar_candidate_is_safe);
+                    for &offset in &pair.offsets {
+                        assert!(
+                            usize::from(offset) + usize::from(PAIR_PREFILTER_VECTOR_BYTES)
+                                <= remaining,
+                        );
+                    }
+                } else if scalar_candidate_is_safe {
+                    assert!((width..vector_extent).contains(&remaining));
+                } else {
+                    assert!(remaining < width);
+                }
+            }
+            assert!(
+                usize::from(last_pair_offset) + usize::from(PAIR_PREFILTER_VECTOR_BYTES)
+                    > width + usize::from(PAIR_PREFILTER_VECTOR_BYTES) - 2,
+            );
+            assert!(
+                usize::from(last_pair_offset) + usize::from(PAIR_PREFILTER_VECTOR_BYTES)
+                    <= vector_extent,
+            );
+        }
+    }
+
+    #[test]
     fn asimd_pair_prefilter_emits_exact_vector_and_first_lane_primitives() {
         let literal = format!("{}c", "ab".repeat(31));
         let plan = derive_two_way_plan(literal.as_bytes()).expect("derive ASIMD plan");
@@ -1360,7 +1465,103 @@ mod tests {
             aarch64_umov_b0(12, 7).expect("candidate scalar"),
             aarch64_cmp_w_zero(12).expect("candidate test"),
         ];
-        assert!(words.windows(vector.len()).any(|window| window == vector));
+        let vector_body = words
+            .windows(vector.len())
+            .position(|window| window == vector)
+            .expect("vector body");
+        // These are the pre-change code size and vector-body address. The
+        // guard hoist must not perturb either one.
+        assert_eq!(words.len(), 176);
+        assert_eq!(vector_body, 135);
+
+        let vector_tail = vector_body - 7;
+        let vector_search = vector_body - 3;
+        let disabled_state = u16::from(
+            PAIR_PREFILTER_MAX_CANDIDATE_REPORTS
+                .checked_add(1)
+                .expect("candidate disabled state"),
+        );
+        assert_eq!(
+            words[vector_tail],
+            aarch64_cmp_x(12, 6).expect("tail width bound"),
+        );
+        let no_match = aarch64_conditional_target(&words, vector_tail + 1, AARCH64_LO);
+        assert_eq!(
+            words[no_match],
+            aarch64_movz_w(0, 0).expect("no-match status"),
+        );
+        assert_eq!(words[no_match + 1], 0xd65f_03c0);
+        assert_eq!(
+            words[vector_tail + 2],
+            aarch64_movz_x(16, disabled_state, 0).expect("retired pair state"),
+        );
+        let retired_scalar = aarch64_unconditional_target(&words, vector_tail + 3);
+        assert_eq!(
+            words[retired_scalar],
+            aarch64_load_byte_reg(8, 2, 7).expect("retired terminal byte"),
+        );
+
+        assert_eq!(
+            words[vector_search],
+            aarch64_sub_x_reg(12, 3, 2).expect("hot remaining bytes"),
+        );
+        assert_eq!(
+            words[vector_search + 1],
+            aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes).expect("hot vector extent"),
+        );
+        assert_eq!(
+            aarch64_conditional_target(&words, vector_search + 2, AARCH64_LO),
+            vector_tail,
+        );
+
+        let state_comparison =
+            aarch64_cmp_x_imm(16, disabled_state).expect("candidate budget comparison");
+        let state_comparisons = words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| (word == state_comparison).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(state_comparisons.len(), 1);
+        assert!(state_comparisons[0] < vector_tail);
+
+        let candidate_branch = vector_body + vector.len();
+        let vector_miss = aarch64_conditional_target(&words, candidate_branch, AARCH64_EQ);
+        assert_eq!(
+            words[vector_miss],
+            aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_VECTOR_BYTES))
+                .expect("vector miss advance"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&words, vector_miss + 1),
+            vector_search,
+        );
+        assert_eq!(candidate_branch + 1 - vector_search + 2, 16);
+
+        let pair_candidate = words
+            .windows(2)
+            .position(|window| {
+                window
+                    == [
+                        aarch64_mov_x(2, 9).expect("refined candidate position"),
+                        aarch64_add_x_imm(16, 16, 1).expect("candidate report"),
+                    ]
+            })
+            .expect("pair candidate block");
+        let pair_scalar = aarch64_unconditional_target(&words, pair_candidate + 2);
+        assert_eq!(pair_scalar, pair_candidate + 5);
+        assert_eq!(
+            words[pair_candidate + 3],
+            aarch64_movz_x(16, disabled_state, 0).expect("stable disabled padding"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&words, pair_candidate + 4),
+            retired_scalar,
+        );
+        assert_eq!(
+            words[pair_scalar],
+            aarch64_load_byte_reg(8, 2, 7).expect("pair terminal byte"),
+        );
+
         let scalar_lane = [
             aarch64_add_x_reg(9, 2, 12).expect("lane address"),
             aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[0])).expect("first lane byte"),
@@ -1373,16 +1574,8 @@ mod tests {
         );
         assert!(
             words.contains(
-                &aarch64_cmp_x_imm(
-                    16,
-                    u16::from(
-                        PAIR_PREFILTER_MAX_CANDIDATE_REPORTS
-                            .checked_add(1)
-                            .expect("candidate disabled state"),
-                    ),
-                )
-                .expect("candidate budget")
-            )
+                &aarch64_cmp_x_imm(16, disabled_state).expect("candidate budget comparison"),
+            ),
         );
         assert!(
             words.contains(
