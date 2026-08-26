@@ -15946,6 +15946,8 @@ impl PortableRegex {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
+        #[cfg(test)]
+        ordinary_session_full_is_match_probe::record_accounted_shortest();
         match &self.plan {
             PortablePlan::ExactLiteral(literal) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
@@ -18977,6 +18979,64 @@ mod required_literal_ordinary_session_probe {
 
     pub(super) fn endpoint_calls() -> usize {
         ENDPOINT_CALLS.get()
+    }
+}
+
+#[cfg(test)]
+mod ordinary_session_full_is_match_probe {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) native: usize,
+        pub(super) delegated: usize,
+        pub(super) accounted_shortest: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            native: 0,
+            delegated: 0,
+            accounted_shortest: 0,
+        }) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_native() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                native: counts.native.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_delegated() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                delegated: counts.delegated.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_accounted_shortest() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                accounted_shortest: counts.accounted_shortest.saturating_add(1),
+                ..counts
+            });
+        });
     }
 }
 
@@ -24550,6 +24610,31 @@ fn count_ordinary_literal_set_dfa_with_selected_seed(
 }
 
 impl<'r> PortableOrdinarySession<'r> {
+    /// Whether a match exists anywhere in `haystack`.
+    ///
+    /// A compact native binding enters the matcher's existing full-origin
+    /// ordinary existence projection. K0 and every direct or stateful binding
+    /// preserve the exact route and state transition of
+    /// [`Self::is_match_at`] at offset zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if ordinary execution encounters an allocation,
+    /// arithmetic, or invariant failure.
+    #[inline]
+    pub fn is_match(&mut self, haystack: &[u8]) -> Result<bool, SearchError> {
+        if let PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex)) =
+            &self.plan
+        {
+            #[cfg(test)]
+            ordinary_session_full_is_match_probe::record_native();
+            return regex.try_is_match_ordinary(haystack);
+        }
+        #[cfg(test)]
+        ordinary_session_full_is_match_probe::record_delegated();
+        self.is_match_at(haystack, 0)
+    }
+
     /// Whether a match exists at or after `start`.
     ///
     /// A positive exact literal uses its retained finder without reconstructing
@@ -47744,6 +47829,315 @@ mod tests {
                 ..
             } if core::ptr::eq(*bound, &required)
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one routing matrix closes every ordinary-session variant, its retained state, and post-call error parity"
+    )]
+    fn ordinary_session_full_is_match_changes_only_native_canonical_routing() {
+        fn route(session: &super::PortableOrdinarySession<'_>) -> &'static str {
+            match &session.plan {
+                super::PortableOrdinarySessionPlan::K0 { .. } => "k0",
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(_),
+                ) => "canonical-native",
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::ExactLiteral(_),
+                ) => "canonical-exact-literal",
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::FixedPredicateWord64(_),
+                ) => "canonical-fixed-predicate",
+                super::PortableOrdinarySessionPlan::RequiredLiteral { .. } => {
+                    "required-literal"
+                }
+                super::PortableOrdinarySessionPlan::PackedLiteralSet { .. } => {
+                    "packed-literal-set"
+                }
+                super::PortableOrdinarySessionPlan::LiteralSetDfa { .. } => {
+                    "literal-set-dfa"
+                }
+                super::PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa { .. } => {
+                    "literal-set-uniform-standard-dfa"
+                }
+                super::PortableOrdinarySessionPlan::ExactLiteral { .. } => "exact-literal",
+                super::PortableOrdinarySessionPlan::LiteralSetCompact { .. } => {
+                    "literal-set-compact"
+                }
+            }
+        }
+
+        fn retained_state(
+            session: &super::PortableOrdinarySession<'_>,
+        ) -> (&'static str, bool) {
+            match &session.plan {
+                super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                    ascii_exists, ..
+                } => (
+                    match ascii_exists {
+                        super::PortableOrdinaryLiteralSetExists::Unbound => "unbound",
+                        super::PortableOrdinaryLiteralSetExists::Unavailable => "unavailable",
+                        super::PortableOrdinaryLiteralSetExists::Bound(_) => "bound",
+                    },
+                    false,
+                ),
+                super::PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                    direct_next,
+                    ..
+                } => ("uniform", *direct_next),
+                _ => ("none", false),
+            }
+        }
+
+        fn check(
+            label: &str,
+            regex: &PortableRegex,
+            haystack: &[u8],
+            expected_route: &str,
+            legacy_accounted_shortest: usize,
+        ) {
+            let native = expected_route == "canonical-native";
+            let mut actual_session = regex.ordinary_session().unwrap();
+            let mut legacy_session = regex.ordinary_session().unwrap();
+            assert_eq!(route(&actual_session), expected_route, "{label}");
+            assert_eq!(route(&legacy_session), expected_route, "{label}");
+
+            super::ordinary_session_full_is_match_probe::reset();
+            let actual = actual_session.is_match(haystack);
+            assert_eq!(
+                super::ordinary_session_full_is_match_probe::snapshot(),
+                super::ordinary_session_full_is_match_probe::Counts {
+                    native: if native { 1 } else { 0 },
+                    delegated: if native { 0 } else { 1 },
+                    accounted_shortest: 0,
+                },
+                "new route label={label}",
+            );
+
+            super::ordinary_session_full_is_match_probe::reset();
+            let expected = legacy_session.is_match_at(haystack, 0);
+            assert_eq!(actual, expected, "full-origin result label={label}");
+            assert_eq!(
+                retained_state(&actual_session),
+                retained_state(&legacy_session),
+                "retained state label={label}",
+            );
+            assert_eq!(
+                super::ordinary_session_full_is_match_probe::snapshot(),
+                super::ordinary_session_full_is_match_probe::Counts {
+                    accounted_shortest: legacy_accounted_shortest,
+                    ..super::ordinary_session_full_is_match_probe::Counts::default()
+                },
+                "legacy route label={label}",
+            );
+
+            let invalid_start = haystack.len().checked_add(1).unwrap();
+            let actual_error = actual_session.is_match_at(haystack, invalid_start);
+            let legacy_error = legacy_session.is_match_at(haystack, invalid_start);
+            assert!(actual_error.is_err(), "post-call invalid start label={label}");
+            assert_eq!(
+                actual_error, legacy_error,
+                "post-call error and chronology label={label}",
+            );
+        }
+
+        let exact = PortableBuilder::new("needle")
+            .unicode(false)
+            .build()
+            .unwrap();
+        check("exact", &exact, b"xxneedle", "exact-literal", 0);
+
+        let k0 = PortableBuilder::new("ab|a")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        check("k0", &k0, b"zab", "k0", 0);
+
+        let empty = PortableBuilder::new("")
+            .unicode(false)
+            .build()
+            .unwrap();
+        check(
+            "canonical exact",
+            &empty,
+            b"source",
+            "canonical-exact-literal",
+            0,
+        );
+
+        let fixed = PortableBuilder::new(
+            r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
+        )
+        .unicode(false)
+        .build()
+        .unwrap();
+        check(
+            "canonical fixed predicate",
+            &fixed,
+            b"unmatched",
+            "canonical-fixed-predicate",
+            0,
+        );
+
+        let native = PortableBuilder::new(r"(?-u:\A[ab]+Z)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        super::forward_anchored_ordinary_facade_probe::reset();
+        check(
+            "canonical native",
+            &native,
+            b"abbaZ",
+            "canonical-native",
+            1,
+        );
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (1, 0),
+            "only the new full-origin call enters the ordinary Exists facade",
+        );
+
+        let required = PortableBuilder::new(r"(?-u:[a-z]+ZQ)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        check(
+            "required literal",
+            &required,
+            b"!aaaaZQ",
+            "required-literal",
+            0,
+        );
+
+        let packed = PortableBuilder::new("alpha|beta|gamma")
+            .unicode(false)
+            .build()
+            .unwrap();
+        check(
+            "packed literal set",
+            &packed,
+            b"zzbeta",
+            "packed-literal-set",
+            0,
+        );
+
+        let dfa = PortableBuilder::new("ab|a|ba")
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        check(
+            "literal set DFA",
+            &dfa,
+            b"zzababa",
+            "literal-set-dfa",
+            0,
+        );
+
+        let uniform_pattern = (0..=128)
+            .map(|index| format!("p{index:03}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let uniform = PortableBuilder::new(&uniform_pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        check(
+            "uniform literal set DFA",
+            &uniform,
+            b"p000zzzz",
+            "literal-set-uniform-standard-dfa",
+            0,
+        );
+
+        let compact_patterns = public_uniform_ripgrep_literals(256, 128);
+        let compact_haystack = compact_patterns[0].as_bytes();
+        let compact = build_public_uniform_ripgrep_literals(&compact_patterns);
+        check(
+            "compact literal set",
+            &compact,
+            compact_haystack,
+            "literal-set-compact",
+            0,
+        );
+    }
+
+    #[test]
+    fn ordinary_session_full_is_match_native_routes_match_offset_zero_exhaustively() {
+        fn sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
+            let mut sources = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..maximum_len {
+                let mut next = Vec::new();
+                for prefix in &level {
+                    for &byte in alphabet {
+                        let mut source = prefix.clone();
+                        source.push(byte);
+                        sources.push(source.clone());
+                        next.push(source);
+                    }
+                }
+                level = next;
+            }
+            sources
+        }
+
+        let mut haystacks = sources(&[b'a', b'b', b'Z', b'!', b'\n', 0, 0x80, 0xE1], 3);
+        haystacks.extend([
+            "!αβ!".as_bytes().to_vec(),
+            "AΩ!β".as_bytes().to_vec(),
+            vec![0xCE, b'a', 0x80, b'!', 0xFF],
+            b"a\nA\n\xE1\n!".to_vec(),
+        ]);
+
+        for (pattern, expected_plan) in [
+            (r"(?-u:\A[ab]+Z)", PlanKind::ForwardAnchored),
+            (
+                r"(?-u:ab[0-9]+|cd[A-Z]+)",
+                PlanKind::PrefixClassAlternation,
+            ),
+            (r"\b\w{2,}\b", PlanKind::UnicodeWordRun),
+            (r"\p{Greek}+", PlanKind::UnicodeScalarRun),
+            (
+                r"(?m)^(?-u:[\x00\xE1])$",
+                PlanKind::LineDomainByteAtoms,
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            assert_eq!(regex.build_report().plan, expected_plan, "pattern={pattern:?}");
+            let baseline = regex::bytes::Regex::new(pattern).unwrap();
+            let mut actual = regex.ordinary_session().unwrap();
+            let mut legacy = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &actual.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(bound)
+                ) if core::ptr::eq(*bound, &regex)
+            ));
+
+            for haystack in &haystacks {
+                let expected = baseline.is_match(haystack);
+                assert_eq!(
+                    actual.is_match(haystack),
+                    Ok(expected),
+                    "new route pattern={pattern:?}, haystack={haystack:?}",
+                );
+                assert_eq!(
+                    legacy.is_match_at(haystack, 0),
+                    Ok(expected),
+                    "offset-zero route pattern={pattern:?}, haystack={haystack:?}",
+                );
+            }
+        }
     }
 
     #[test]
