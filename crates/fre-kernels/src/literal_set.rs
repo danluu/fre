@@ -290,14 +290,15 @@ pub struct LiteralSetOrdinaryExecutor<'a> {
     direct_dfa_identity: Option<LiteralSetDirectDfaIdentity>,
 }
 
-/// Worker-bound ordinary literal-set execution substrate.
+/// Worker-bound endpoint-only ordinary literal-set projection.
 ///
-/// Identity and direct-DFA capabilities are bound once when the worker
-/// constructs this engine. Exists and first acceptance lazily prepare one
-/// exact ASCII root on their first call; selected-span, visit and count
-/// operations recover the unchanged compact executor without preparing that
-/// projection. Finite, accounted and explicit search-session entry points do
-/// not construct or use this type.
+/// Identity and direct-DFA capabilities are sealed once when the worker
+/// constructs this projection. Exists and first acceptance lazily prepare one
+/// exact ASCII root on their first call. This type deliberately exposes no
+/// selected-span executor: the ordinary facade retains the original compact
+/// executor beside this optional projection, so find, visit and count keep
+/// their established direct route. Finite, accounted and explicit
+/// search-session entry points do not construct or use this type.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct LiteralSetOrdinaryEngine<'a> {
@@ -2452,8 +2453,8 @@ fn ordinary_direct_dfa_first_acceptance_end_prepared_ascii(
 }
 
 impl<'a> LiteralSetOrdinaryExecutor<'a> {
-    /// Bind one worker-owned ordinary engine whose exact ASCII Exists root can
-    /// be prepared lazily against this executor's immutable direct-DFA
+    /// Bind one worker-owned endpoint projection whose exact ASCII Exists root
+    /// can be prepared lazily against this executor's immutable direct-DFA
     /// identity.
     ///
     /// AArch64 retains one exact 5..=16-member ASCII classifier only when its
@@ -2882,15 +2883,6 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
             base.checked_add(end)
                 .expect("a prepared relative endpoint inside the window is absolute")
         }))
-    }
-
-    /// Recover the unchanged selected-span projection bound to this same
-    /// immutable literal-set identity.
-    #[doc(hidden)]
-    #[must_use]
-    #[inline]
-    pub const fn span_executor(&self) -> LiteralSetOrdinaryExecutor<'a> {
-        self.executor
     }
 }
 
@@ -8093,11 +8085,11 @@ mod tests {
             expected_words[usize::from(root / 64)] |= 1_u64 << u32::from(root % 64);
         }
         assert!(core::ptr::eq(
-            prepared.span_executor().plan,
+            prepared.executor.plan,
             ordinary.plan,
         ));
         assert_eq!(
-            prepared.span_executor().direct_dfa_identity,
+            prepared.executor.direct_dfa_identity,
             ordinary.direct_dfa_identity,
         );
 
@@ -8110,17 +8102,15 @@ mod tests {
             .copy_from_slice(&patterns[0]);
 
         // Binding and span/count-only execution never construct the Exists
-        // classifier, even for a window that would use it if asked.
+        // classifier, even for a window that would use it if asked. Those
+        // operations remain on the original executor rather than projecting
+        // one back out of the endpoint-only engine.
         assert_eq!(
-            prepared
-                .span_executor()
-                .find_window_value(&haystack, Window::full(&haystack)),
+            ordinary.find_window_value(&haystack, Window::full(&haystack)),
             Ok(Some((root_offset, root_offset + patterns[0].len()))),
         );
         assert_eq!(
-            prepared
-                .span_executor()
-                .count_spans_window_value(&haystack, Window::full(&haystack)),
+            ordinary.count_spans_window_value(&haystack, Window::full(&haystack)),
             Ok(1),
         );
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
