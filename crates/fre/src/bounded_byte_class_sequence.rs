@@ -354,6 +354,49 @@ impl Plan {
             .expect("the fixed bounded byte-class sequence layouts fit usize")
     }
 
+    /// Count ordinary non-overlapping selected matches at or after `start`.
+    ///
+    /// The original haystack remains intact so the admitted absolute-start
+    /// look keeps its global context. Construction proves every selected span
+    /// has positive width, so each search resumes at its selected end. When
+    /// the complete tail admits the report-free work bound, that admission is
+    /// monotone for every remaining suffix and the loop enters the unmetered
+    /// value engine directly. An arithmetically exceptional tail retains the
+    /// established unlimited value path and its typed failure behavior.
+    #[inline(never)]
+    pub(crate) fn ordinary_count_selected_ends_at(
+        &self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<u64, SearchError> {
+        let initial = SearchWindow::new(start, haystack.len());
+        validate_window(haystack, initial)?;
+        let direct = self.unmetered_work_fits(initial);
+        let mut cursor = start;
+        let mut count = 0_u64;
+        loop {
+            let window = SearchWindow::new(cursor, haystack.len());
+            let selected_end = if direct {
+                self.search_value(haystack, window, false)
+                    .map(|(_, end)| end)
+            } else {
+                self.find_window_value(haystack, window, SearchLimits::unlimited())?
+                    .map(|matched| matched.end())
+            };
+            let Some(selected_end) = selected_end else {
+                return Ok(count);
+            };
+            debug_assert!(
+                selected_end > cursor,
+                "a bounded byte-class sequence has positive selected width",
+            );
+            cursor = selected_end;
+            count = count.checked_add(1).ok_or(Error::CounterOverflow {
+                counter: "ordinary selected-match count",
+            })?;
+        }
+    }
+
     pub(crate) fn is_match_window(
         &self,
         haystack: &[u8],
@@ -2034,6 +2077,155 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ordinary_count_matches_upstream_selected_iteration_for_every_start() {
+        fn selected_count(
+            regex: &regex::bytes::Regex,
+            haystack: &[u8],
+            start: usize,
+        ) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = regex.find_at(haystack, cursor) {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        let cases: [(&str, &[u8]); 5] = [
+            (r"(?-u:[ab]){1,2}(?-u:[CD]){1,2}", b"aCD!"),
+            (
+                r"(?-u:[ab])(?-u:[CD])(?-u:[ab]){0,2}",
+                b"aCb!",
+            ),
+            (
+                r"(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[bd])",
+                b"WZabd!",
+            ),
+            (
+                r"(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[d])",
+                b"WZabd!",
+            ),
+            (
+                r"\A(?-u:[ab]){1,2}(?-u:[CD]){1,2}",
+                b"aCD!",
+            ),
+        ];
+        for (pattern, alphabet) in cases {
+            let fre = build(pattern);
+            let PortablePlan::BoundedByteClassSequence(plan) = &fre.plan else {
+                panic!("expected bounded sequence plan for {pattern:?}");
+            };
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut ordinary = fre.ordinary_session().unwrap();
+            for length in 0_u32..=5 {
+                let haystack_count = alphabet.len().pow(length);
+                for encoded in 0..haystack_count {
+                    let mut value = encoded;
+                    let mut haystack = vec![0_u8; usize::try_from(length).unwrap()];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    for start in 0..=haystack.len() {
+                        let expected = selected_count(&upstream, &haystack, start);
+                        assert_eq!(
+                            plan.ordinary_count_selected_ends_at(&haystack, start),
+                            Ok(expected),
+                            "direct count: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                        assert_eq!(
+                            ordinary.count_positive_width_selected_ends_at(
+                                &haystack,
+                                start,
+                            ),
+                            Ok(Some(expected)),
+                            "facade count: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_count_advances_by_the_selected_greedy_end() {
+        let fre = build(r"(?-u:[ab])(?-u:[CD])(?-u:[ab]){0,2}");
+        let PortablePlan::BoundedByteClassSequence(plan) = &fre.plan else {
+            panic!("expected bounded sequence plan");
+        };
+        let haystack = b"aCaC";
+
+        let mut earliest_cursor = 0_usize;
+        let mut earliest_count = 0_u64;
+        while let Some(end) = fre
+            .shortest_match_at_value(
+                haystack,
+                earliest_cursor,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+        {
+            assert!(end > earliest_cursor);
+            earliest_cursor = end;
+            earliest_count = earliest_count.checked_add(1).unwrap();
+        }
+        assert_eq!(earliest_count, 2);
+        assert_eq!(
+            plan.ordinary_count_selected_ends_at(haystack, 0),
+            Ok(1),
+        );
+        assert_eq!(
+            fre.ordinary_session()
+                .unwrap()
+                .count_positive_width_selected_ends_at(haystack, 0),
+            Ok(Some(1)),
+        );
+    }
+
+    #[test]
+    fn ordinary_count_preserves_absolute_start_and_invalid_windows() {
+        let fre = build(r"\A(?-u:[ab]){1,2}(?-u:[CD]){1,2}");
+        let PortablePlan::BoundedByteClassSequence(plan) = &fre.plan else {
+            panic!("expected bounded sequence plan");
+        };
+        let haystack = b"aCaC";
+        assert_eq!(plan.ordinary_count_selected_ends_at(haystack, 0), Ok(1));
+        assert_eq!(plan.ordinary_count_selected_ends_at(haystack, 2), Ok(0));
+        assert_eq!(
+            plan.ordinary_count_selected_ends_at(haystack, haystack.len()),
+            Ok(0),
+        );
+        assert_eq!(
+            plan.ordinary_count_selected_ends_at(haystack, usize::MAX),
+            Err(Error::InvalidWindow),
+        );
+
+        let mut ordinary = fre.ordinary_session().unwrap();
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, 0),
+            Ok(Some(1)),
+        );
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, 2),
+            Ok(Some(0)),
+        );
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(
+                haystack,
+                usize::MAX,
+            ),
+            Err(FacadeSearchError::BoundedByteClassSequence(
+                Error::InvalidWindow,
+            )),
+        );
     }
 
     #[test]

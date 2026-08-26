@@ -18644,8 +18644,10 @@ pub struct PortableSearchSession<'a> {
 /// their ordinary report-free span searches on each remaining tail. Their
 /// construction proofs establish positive width and the absence of discarded
 /// prefix context. Literal/class-run also retains its direct reducer for
-/// exhaustive positive-width counts. A Unicode word-run binding reuses its
-/// aggregate reducer only for an exact full-source count; a nonzero start
+/// exhaustive positive-width counts. A bounded byte-class sequence retains
+/// its report-free selected-end engine across one monotone exhaustive count
+/// while preserving absolute-start context. A Unicode word-run binding reuses
+/// its aggregate reducer only for an exact full-source count; a nonzero start
 /// retains the canonical context-aware fallback.
 /// A positive leftmost-first literal set similarly binds one compact span
 /// executor and leaves its endpoint-only sidecar unbound. The first Exists
@@ -25220,9 +25222,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Unicode word-run over the exact full window, a reverse-inner or Unicode
     /// scalar-run plan over an exact tail window, a legacy literal/class-run
     /// plan over a full or unguarded tail window, a pure or bounded byte-class
-    /// repeat, a packed literal set, or an ordinary non-uniform or
-    /// uniform-standard literal-set plan. Each construction seals nonempty
-    /// selected spans.
+    /// repeat, a bounded byte-class sequence, a packed literal set, or an
+    /// ordinary non-uniform or uniform-standard literal-set plan. Each
+    /// construction seals nonempty selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25231,7 +25233,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Each successful search resumes at the selected endpoint. K0 reports a
     /// failure to advance despite its positive-width proof as an invariant
     /// error rather than risking an infinite loop. Packed literal sets use
-    /// their bound non-overlapping span iterator. An ordinary non-uniform
+    /// their bound non-overlapping span iterator. A bounded byte-class
+    /// sequence validates one absolute tail and retains its report-free
+    /// selected-end admission while that tail shrinks. An ordinary non-uniform
     /// literal set advances through its construction-selected DFA endpoints.
     /// When that DFA seals direct leftmost-first counting, one canonical
     /// selected match seeds the direct scanner at the selected endpoint.
@@ -25415,6 +25419,10 @@ impl<'r> PortableOrdinarySession<'r> {
                         })?;
                         Ok(Some(plan.ordinary_count_full_unmetered(tail)))
                     }
+                    PortablePlan::BoundedByteClassSequence(plan) => plan
+                        .ordinary_count_selected_ends_at(haystack, start)
+                        .map(Some)
+                        .map_err(SearchError::BoundedByteClassSequence),
                     _ => Ok(None),
                 }
             }
