@@ -24878,8 +24878,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// their ordered endpoints.
     ///
     /// `Ok(Some(count))` is returned for a positive exact literal, a
-    /// positive-width K0 plan, a legacy literal/class-run plan over a full or
-    /// unguarded tail window, or a packed, ordinary non-uniform, or
+    /// positive-width K0 plan, a reverse-inner plan over an exact tail window,
+    /// a legacy literal/class-run plan over a full or unguarded tail window,
+    /// or a packed, ordinary non-uniform, or
     /// uniform-standard literal-set plan. Each construction seals nonempty
     /// selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
@@ -25008,30 +25009,57 @@ impl<'r> PortableOrdinarySession<'r> {
                 Ok(Some(count))
             }
             PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex)) => {
-                let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan else {
-                    return Ok(None);
-                };
-                if start != 0
-                    && plan.boundary_semantics()
-                        != LiteralClassRunLiteralBoundarySemantics::Unguarded
-                {
-                    return Ok(None);
+                match &regex.plan {
+                    PortablePlan::LiteralClassRunLiteral(plan) => {
+                        if start != 0
+                            && plan.boundary_semantics()
+                                != LiteralClassRunLiteralBoundarySemantics::Unguarded
+                        {
+                            return Ok(None);
+                        }
+                        let tail = haystack.get(start..).ok_or_else(|| {
+                            SearchError::from(
+                                LiteralClassRunLiteralSearchError::InvalidWindow {
+                                    start,
+                                    end: haystack.len(),
+                                    haystack_len: haystack.len(),
+                                },
+                            )
+                        })?;
+                        plan.count(
+                            tail,
+                            LiteralClassRunLiteralReduceLimits::unlimited(),
+                        )
+                        .map(|result| Some(result.count))
+                        .map_err(LiteralClassRunLiteralSearchError::from)
+                        .map_err(SearchError::from)
+                    }
+                    PortablePlan::ReverseInner(plan) => {
+                        count_ordinary_reverse_inner_selected_ends_at(
+                            plan, haystack, start,
+                        )
+                    }
+                    _ => Ok(None),
                 }
-                let tail = haystack.get(start..).ok_or_else(|| {
-                    SearchError::from(LiteralClassRunLiteralSearchError::InvalidWindow {
-                        start,
-                        end: haystack.len(),
-                        haystack_len: haystack.len(),
-                    })
-                })?;
-                plan.count(tail, LiteralClassRunLiteralReduceLimits::unlimited())
-                    .map(|result| Some(result.count))
-                    .map_err(LiteralClassRunLiteralSearchError::from)
-                    .map_err(SearchError::from)
             }
             _ => Ok(None),
         }
     }
+}
+
+#[inline(never)]
+fn count_ordinary_reverse_inner_selected_ends_at(
+    plan: &ReverseInnerPlan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<u64>, SearchError> {
+    plan.count_in(
+        haystack,
+        LiteralWindow::new(start, haystack.len()),
+        ReverseInnerReduceLimits::unlimited(),
+    )
+    .map(|result| Some(result.count))
+    .map_err(SearchError::from)
 }
 
 fn try_visit_ordinary_spans_at<F, E, S>(
@@ -47771,6 +47799,51 @@ mod tests {
             ))
         ));
         assert!(!invalid_callback);
+    }
+
+    #[test]
+    fn ordinary_reverse_inner_binding_counts_every_exact_tail_once() {
+        let pattern = r"[abλ]+aa[abλ]+";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        let haystack = b"!baaab!abbbaabbb!bbbb!baaab!";
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::Native(bound_regex)
+            ) if core::ptr::eq(*bound_regex, &regex)
+        ));
+
+        for start in 0..=haystack.len() {
+            let mut cursor = start;
+            let mut expected = 0_u64;
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                expected = expected.checked_add(1).unwrap();
+            }
+            assert_eq!(
+                ordinary.count_positive_width_selected_ends_at(haystack, start),
+                Ok(Some(expected)),
+                "start={start}",
+            );
+        }
+        assert!(matches!(
+            ordinary.count_positive_width_selected_ends_at(
+                haystack,
+                haystack.len() + 1,
+            ),
+            Err(SearchError::ReverseInner(
+                fre_kernels::ReverseInnerReduceError::InvalidWindow { .. }
+            )),
+        ));
     }
 
     #[test]
