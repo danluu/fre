@@ -294,7 +294,8 @@ pub struct LiteralSetOrdinaryExecutor<'a> {
 ///
 /// Identity and direct-DFA capabilities are sealed once when the worker
 /// constructs this projection. Exists and first acceptance lazily prepare one
-/// exact ASCII root on their first call. This type deliberately exposes no
+/// exact ASCII root only when a call reaches the branch that can use it. This
+/// type deliberately exposes no
 /// selected-span executor: the ordinary facade retains the original compact
 /// executor beside this optional projection, so find, visit and count keep
 /// their established direct route. Finite, accounted and explicit
@@ -573,7 +574,10 @@ fn direct_dfa_set4_members_from_buckets(
 /// Derive one exact arbitrary ASCII root set for the ordinary-session engine.
 ///
 /// Set4 and contiguous-range roots retain their smaller existing bindings.
-/// The construction marker limits this wider route to 5..=16 exact roots.
+/// The construction marker proves that this wider route has 5..=16 exact
+/// roots and that every one is ASCII. Replaying only the ASCII half of the
+/// DFA alphabet therefore reconstructs the complete set without revisiting
+/// 128 transitions that construction already proved cannot be roots.
 /// Sixteen roots occupy at most one sixteenth of the complete byte domain, so
 /// one 16-byte classifier block has at most one expected candidate under a
 /// uniform byte distribution before the exact DFA verifies it.
@@ -589,13 +593,12 @@ fn direct_dfa_ascii_root_set(
     let anchored = Anchored::No;
     let mut words = [0_u64; 2];
     let mut members = 0_usize;
-    for byte in u8::MIN..=u8::MAX {
+    for byte in u8::MIN..=0x7f_u8 {
+        #[cfg(test)]
+        ordinary_direct_probe::record_root_ascii_preparation_transition();
         let next = automaton.next_state(anchored, start_state, byte);
         if automaton.is_start(next) || automaton.is_dead(next) {
             continue;
-        }
-        if !byte.is_ascii() {
-            return None;
         }
         let word = usize::from(byte / 64);
         let bit = u32::from(byte % 64);
@@ -751,6 +754,7 @@ mod ordinary_direct_probe {
         static ROOT_SET4_CALLS: Cell<usize> = const { Cell::new(0) };
         static ROOT_SET4_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_PREPARATIONS: Cell<usize> = const { Cell::new(0) };
+        static ROOT_ASCII_PREPARATION_TRANSITIONS: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_CALLS: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
     }
@@ -766,6 +770,7 @@ mod ordinary_direct_probe {
         ROOT_SET4_CALLS.set(0);
         ROOT_SET4_SKIPPED_BYTES.set(0);
         ROOT_ASCII_PREPARATIONS.set(0);
+        ROOT_ASCII_PREPARATION_TRANSITIONS.set(0);
         ROOT_ASCII_CALLS.set(0);
         ROOT_ASCII_SKIPPED_BYTES.set(0);
     }
@@ -844,6 +849,16 @@ mod ordinary_direct_probe {
 
     pub(super) fn root_ascii_preparations() -> usize {
         ROOT_ASCII_PREPARATIONS.get()
+    }
+
+    pub(super) fn record_root_ascii_preparation_transition() {
+        ROOT_ASCII_PREPARATION_TRANSITIONS.set(
+            ROOT_ASCII_PREPARATION_TRANSITIONS.get().saturating_add(1),
+        );
+    }
+
+    pub(super) fn root_ascii_preparation_transitions() -> usize {
+        ROOT_ASCII_PREPARATION_TRANSITIONS.get()
     }
 
     pub(super) fn record_root_ascii(skipped: usize) {
@@ -2402,15 +2417,16 @@ fn ordinary_direct_dfa_first_acceptance_end(
     )
 }
 
-/// Stop at the first direct-DFA acceptance using one worker-prepared exact
-/// ASCII root classifier. Selected-span operations never enter this path.
+/// Stop at the first direct-DFA acceptance, preparing one exact ASCII root
+/// classifier only if this call reaches the branch that can use it.
+/// Selected-span operations never enter this path.
 #[cold]
 #[inline(never)]
-fn ordinary_direct_dfa_first_acceptance_end_prepared_ascii(
+fn ordinary_direct_dfa_first_acceptance_end_lazy_ascii(
     automaton: &DFA,
     start_state: StateID,
     haystack: &[u8],
-    roots: &AsciiByteSetClassifier,
+    roots: &mut Option<AsciiByteSetClassifier>,
 ) -> Option<usize> {
     debug_assert!(automaton.prefilter().is_none());
     debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
@@ -2435,6 +2451,13 @@ fn ordinary_direct_dfa_first_acceptance_end_prepared_ascii(
     }
     let remaining = &haystack[at..];
     if remaining.len() >= ORDINARY_ROOT_ASCII_MIN_BYTES && state == start_state {
+        let roots = roots.get_or_insert_with(|| {
+            let roots = direct_dfa_ascii_root_set(automaton, start_state)
+                .expect("the construction-sealed sparse ASCII root remains exact");
+            #[cfg(test)]
+            ordinary_direct_probe::record_root_ascii_preparation();
+            AsciiByteSetClassifier::new(roots)
+        });
         return ordinary_direct_dfa_first_acceptance_after_ascii_root(
             automaton,
             start_state,
@@ -2800,25 +2823,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
 }
 
 impl<'a> LiteralSetOrdinaryEngine<'a> {
-    #[cold]
-    #[inline(never)]
-    fn prepare_exists_root(&mut self) {
-        debug_assert!(self.prepared_exists_root.is_none());
-        let identity = self
-            .executor
-            .direct_dfa_identity
-            .expect("an ASCII-root engine retains its direct DFA identity");
-        let roots = direct_dfa_ascii_root_set(
-            self.executor.plan.automaton.as_ref(),
-            identity.start_state(),
-        )
-        .expect("the construction-sealed sparse ASCII root remains exact");
-        #[cfg(test)]
-        ordinary_direct_probe::record_root_ascii_preparation();
-        self.prepared_exists_root = Some(AsciiByteSetClassifier::new(roots));
-    }
-
-    /// Return whether any literal accepts inside `window` through the prepared
+    /// Return whether any literal accepts inside `window` through the lazy
     /// Exists projection.
     ///
     /// # Errors
@@ -2837,8 +2842,8 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
             .map(|endpoint| endpoint.is_some())
     }
 
-    /// Return the first accepting endpoint through the prepared Exists
-    /// projection without selecting a pattern or reconstructing a start.
+    /// Return the first accepting endpoint through the lazy Exists projection
+    /// without selecting a pattern or reconstructing a start.
     ///
     /// # Errors
     ///
@@ -2856,7 +2861,7 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
         let executor = self.executor;
         let identity = executor
             .direct_dfa_identity
-            .expect("a prepared Exists root retains its direct DFA identity");
+            .expect("a lazy Exists root retains its direct DFA identity");
         let base = window.start();
         let window_bytes = window.end().saturating_sub(base);
         let source = &haystack[base..window.end()];
@@ -2865,23 +2870,16 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                 .root()
                 .is_some_and(LiteralSetDfaRoot::is_ascii_sparse),
         );
-        if self.prepared_exists_root.is_none() {
-            self.prepare_exists_root();
-        }
-        let prepared_exists_root = self
-            .prepared_exists_root
-            .as_ref()
-            .expect("the first Exists call prepares its ASCII root");
-        let relative_end = ordinary_direct_dfa_first_acceptance_end_prepared_ascii(
+        let relative_end = ordinary_direct_dfa_first_acceptance_end_lazy_ascii(
             executor.plan.automaton.as_ref(),
             identity.start_state(),
             source,
-            prepared_exists_root,
+            &mut self.prepared_exists_root,
         );
         Ok(relative_end.map(|end| {
             debug_assert!(end <= window_bytes);
             base.checked_add(end)
-                .expect("a prepared relative endpoint inside the window is absolute")
+                .expect("a relative endpoint inside the window is absolute")
         }))
     }
 }
@@ -8035,10 +8033,22 @@ mod tests {
                 prepared.exists_window_value(&[], Window::full(&[])),
                 Ok(false),
             );
+            assert!(prepared.prepared_exists_root.is_none());
+            let long_miss = vec![
+                b'!';
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_ASCII_MIN_BYTES
+            ];
+            assert_eq!(
+                prepared.exists_window_value(
+                    &long_miss,
+                    Window::full(&long_miss),
+                ),
+                Ok(false),
+            );
             let retained_roots = prepared
                 .prepared_exists_root
                 .as_ref()
-                .expect("the first Exists call prepares its classifier")
+                .expect("the first accelerator-eligible Exists call prepares its classifier")
                 .set()
                 .words()
                 .into_iter()
@@ -8080,6 +8090,10 @@ mod tests {
             .expect("sixteen non-contiguous ASCII roots bind a lazy engine");
         assert!(prepared.prepared_exists_root.is_none());
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(
+            ordinary_direct_probe::root_ascii_preparation_transitions(),
+            0,
+        );
         let mut expected_words = [0_u64; 2];
         for root in ROOT_ASCII_16 {
             expected_words[usize::from(root / 64)] |= 1_u64 << u32::from(root % 64);
@@ -8114,11 +8128,15 @@ mod tests {
             Ok(1),
         );
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(
+            ordinary_direct_probe::root_ascii_preparation_transitions(),
+            0,
+        );
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
 
-        // The first Exists call prepares once, even when its short suffix does
-        // not yet amortize an ASCII classifier scan. Repeated Exists calls
-        // reuse precisely that preparation.
+        // An Exists call that cannot reach the accelerator leaves it
+        // unprepared. Repeated short calls therefore pay neither classifier
+        // dispatch nor a replay of the DFA's proved-nonroot non-ASCII half.
         let short_suffix = ORDINARY_ROOT_ASCII_MIN_BYTES.saturating_sub(1);
         let short_miss = vec![
             b'!';
@@ -8130,22 +8148,39 @@ mod tests {
             prepared.exists_window_value(&short_miss, Window::full(&short_miss)),
             Ok(false),
         );
-        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(
+            ordinary_direct_probe::root_ascii_preparation_transitions(),
+            0,
+        );
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
         assert_eq!(
             prepared.exists_window_value(&short_miss, Window::full(&short_miss)),
             Ok(false),
         );
-        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
-        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         assert_eq!(
-            prepared
-                .prepared_exists_root
-                .as_ref()
-                .expect("the first Exists call retains its classifier")
-                .set()
-                .words(),
-            expected_words,
+            ordinary_direct_probe::root_ascii_preparation_transitions(),
+            0,
+        );
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+        assert!(prepared.prepared_exists_root.is_none());
+
+        // Source length alone does not trigger preparation: an acceptance in
+        // the native prefix returns before the idle-root accelerator branch.
+        let mut early_hit = vec![
+            b'!';
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_ASCII_MIN_BYTES
+        ];
+        early_hit[..patterns[0].len()].copy_from_slice(&patterns[0]);
+        assert_eq!(
+            prepared.exists_window_value(&early_hit, Window::full(&early_hit)),
+            Ok(true),
+        );
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(
+            ordinary_direct_probe::root_ascii_preparation_transitions(),
+            0,
         );
 
         let long_suffix = ORDINARY_ROOT_ASCII_MIN_BYTES;
@@ -8160,8 +8195,21 @@ mod tests {
             Ok(false),
         );
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+        assert_eq!(
+            ordinary_direct_probe::root_ascii_preparation_transitions(),
+            128,
+        );
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 1);
         assert_eq!(ordinary_direct_probe::root_ascii_skipped_bytes(), long_suffix);
+        assert_eq!(
+            prepared
+                .prepared_exists_root
+                .as_ref()
+                .expect("the first accelerator-eligible Exists call retains its classifier")
+                .set()
+                .words(),
+            expected_words,
+        );
 
         assert_eq!(
             prepared.first_acceptance_window_value(
@@ -8171,6 +8219,10 @@ mod tests {
             Ok(Some(root_offset + patterns[0].len())),
         );
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+        assert_eq!(
+            ordinary_direct_probe::root_ascii_preparation_transitions(),
+            128,
+        );
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 2);
         assert_eq!(
             ordinary_direct_probe::root_ascii_skipped_bytes(),

@@ -14491,8 +14491,8 @@ impl PortableRegex {
     /// the already-proven native regex owner for spans. An attachment-free,
     /// positive-width leftmost-first literal set binds its immutable span
     /// executor and, on AArch64, may retain a wider exact ASCII-root
-    /// capability whose classifier is prepared only by its first Exists
-    /// projection. A
+    /// capability whose classifier is prepared only when an Exists projection
+    /// reaches the branch that can use it. A
     /// uniform-standard literal set additionally starts with one cleared
     /// performance-only route bit; near acceptances may spend that bit on one
     /// bounded direct same-DFA probe. Other selected plan families bind
@@ -18495,8 +18495,9 @@ pub struct PortableSearchSession<'a> {
 /// projection once while retaining the native regex owner for spans.
 /// A positive leftmost-first literal set similarly binds one compact span
 /// executor and, when proved by its immutable direct-DFA identity, may lazily
-/// prepare a qualified AArch64 ASCII root on the first endpoint-only Exists
-/// call. Span visitation and count-only use leave that projection unprepared.
+/// prepare a qualified AArch64 ASCII root when an endpoint-only Exists call
+/// first reaches the branch that can use it. Span visitation, count-only and
+/// shorter Exists calls leave that projection unprepared.
 /// Other matcher families retain only their compact binding. No method on this
 /// type accepts finite limits or publishes accounting; callers that need
 /// either contract should use [`PortableSearchSession`] instead.
