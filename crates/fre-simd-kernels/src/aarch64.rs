@@ -3,15 +3,15 @@ use core::arch::aarch64::{
     vld1q_u8, vminvq_u8, vmulq_u8, vqtbl1q_u8, vshrq_n_u8,
 };
 
+#[cfg(any(not(feature = "static-dispatch"), target_feature = "neon"))]
+use super::AsciiByteSet;
 use super::{
     ASCII_NARROW_BYTES, AsciiMasks16, AsciiRunResult, AsciiRunTables, HIGH_NIBBLE_BITS,
     LANE_WEIGHTS, scalar,
 };
 #[cfg(any(not(feature = "static-dispatch"), target_feature = "neon"))]
-use super::AsciiByteSet;
-use crate::{BYTE_SET_BLOCK_BYTES, ByteSetMask16};
-#[cfg(any(not(feature = "static-dispatch"), target_feature = "neon"))]
 use crate::BYTE_SET_WIDE_BLOCK_BYTES;
+use crate::{BYTE_SET_BLOCK_BYTES, ByteSetMask16};
 
 #[allow(
     unsafe_code,
@@ -117,12 +117,8 @@ pub(super) unsafe fn find_byte_delta_neon(
             .try_into()
             .expect("a wide group has one exact second NEON block");
         // SAFETY: both array references prove their exact load extents.
-        let (first_input, second_input) = unsafe {
-            (
-                vld1q_u8(first.as_ptr()),
-                vld1q_u8(second.as_ptr()),
-            )
-        };
+        let (first_input, second_input) =
+            unsafe { (vld1q_u8(first.as_ptr()), vld1q_u8(second.as_ptr())) };
         if vmaxvq_u8(vorrq_u8(classify(first_input), classify(second_input))) != 0 {
             return group
                 .iter()
@@ -300,10 +296,7 @@ pub(super) unsafe fn classify_byte_set4_16_neon(
     unsafe_code,
     reason = "compiler target features prove NEON once around the whole-slice four-value loop"
 )]
-#[cfg(all(
-    target_feature = "neon",
-    not(feature = "static-dispatch-arm-41-d84")
-))]
+#[cfg(all(target_feature = "neon", not(feature = "static-dispatch-arm-41-d84")))]
 #[allow(
     clippy::too_many_lines,
     reason = "one leaf keeps the exact-density prelude, coarse groups, retained exact recovery, and bounded tails under the same preloaded four-value classifier"
@@ -522,33 +515,68 @@ pub(super) unsafe fn find_ascii_members_neon(
         )
     };
     let scalar_find = |slice: &[u8]| slice.iter().position(|&byte| set.contains(byte));
+    const GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
+
     let mut block_start = 0_usize;
-    let mut groups = bytes.chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES);
+    let mut groups = bytes.chunks_exact(GROUP_BYTES);
     for group in &mut groups {
         let first: &[u8; BYTE_SET_BLOCK_BYTES] = group[..BYTE_SET_BLOCK_BYTES]
             .try_into()
-            .expect("a wide group has one exact first NEON block");
+            .expect("a four-block group has one exact first NEON block");
         let second: &[u8; BYTE_SET_BLOCK_BYTES] = group[BYTE_SET_BLOCK_BYTES..]
+            [..BYTE_SET_BLOCK_BYTES]
             .try_into()
-            .expect("a wide group has one exact second NEON block");
-        // SAFETY: both array references prove their exact load extents.
-        let (first_input, second_input) = unsafe {
+            .expect("a four-block group has one exact second NEON block");
+        let third_start = BYTE_SET_WIDE_BLOCK_BYTES;
+        let third: &[u8; BYTE_SET_BLOCK_BYTES] = group
+            [third_start..third_start + BYTE_SET_BLOCK_BYTES]
+            .try_into()
+            .expect("a four-block group has one exact third NEON block");
+        let fourth: &[u8; BYTE_SET_BLOCK_BYTES] = group[third_start + BYTE_SET_BLOCK_BYTES..]
+            .try_into()
+            .expect("a four-block group has one exact fourth NEON block");
+        // SAFETY: all four array references prove their exact load extents.
+        let (first_input, second_input, third_input, fourth_input) = unsafe {
             (
                 vld1q_u8(first.as_ptr()),
                 vld1q_u8(second.as_ptr()),
+                vld1q_u8(third.as_ptr()),
+                vld1q_u8(fourth.as_ptr()),
             )
         };
-        if vmaxvq_u8(vorrq_u8(classify(first_input), classify(second_input))) != 0 {
+        let first_pair = vorrq_u8(classify(first_input), classify(second_input));
+        let second_pair = vorrq_u8(classify(third_input), classify(fourth_input));
+        if vmaxvq_u8(vorrq_u8(first_pair, second_pair)) != 0 {
             return scalar_find(group).and_then(|relative| block_start.checked_add(relative));
         }
         block_start = block_start
-            .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
+            .checked_add(GROUP_BYTES)
             .expect("a complete group stays within its source slice");
     }
     let remainder = groups.remainder();
     let mut tail = remainder;
-    if remainder.len() >= BYTE_SET_BLOCK_BYTES {
-        let block: &[u8; BYTE_SET_BLOCK_BYTES] = remainder[..BYTE_SET_BLOCK_BYTES]
+    if remainder.len() >= BYTE_SET_WIDE_BLOCK_BYTES {
+        let first: &[u8; BYTE_SET_BLOCK_BYTES] = remainder[..BYTE_SET_BLOCK_BYTES]
+            .try_into()
+            .expect("a wide remainder has one exact first NEON block");
+        let second: &[u8; BYTE_SET_BLOCK_BYTES] = remainder
+            [BYTE_SET_BLOCK_BYTES..BYTE_SET_WIDE_BLOCK_BYTES]
+            .try_into()
+            .expect("a wide remainder has one exact second NEON block");
+        // SAFETY: both array references prove their exact load extents.
+        let (first_input, second_input) =
+            unsafe { (vld1q_u8(first.as_ptr()), vld1q_u8(second.as_ptr())) };
+        if vmaxvq_u8(vorrq_u8(classify(first_input), classify(second_input))) != 0 {
+            return scalar_find(&remainder[..BYTE_SET_WIDE_BLOCK_BYTES])
+                .and_then(|relative| block_start.checked_add(relative));
+        }
+        block_start = block_start
+            .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
+            .expect("a trailing vector pair stays within its source slice");
+        tail = &remainder[BYTE_SET_WIDE_BLOCK_BYTES..];
+    }
+    if tail.len() >= BYTE_SET_BLOCK_BYTES {
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = tail[..BYTE_SET_BLOCK_BYTES]
             .try_into()
             .expect("a wide remainder has one exact NEON block");
         // SAFETY: the array reference proves the exact load extent.
@@ -559,7 +587,7 @@ pub(super) unsafe fn find_ascii_members_neon(
         block_start = block_start
             .checked_add(BYTE_SET_BLOCK_BYTES)
             .expect("a trailing vector block stays within its source slice");
-        tail = &remainder[BYTE_SET_BLOCK_BYTES..];
+        tail = &tail[BYTE_SET_BLOCK_BYTES..];
     }
     scalar_find(tail).and_then(|relative| block_start.checked_add(relative))
 }
