@@ -18498,7 +18498,9 @@ pub struct PortableSearchSession<'a> {
 /// their ordinary report-free span searches on each remaining tail. Their
 /// construction proofs establish positive width and the absence of discarded
 /// prefix context. Literal/class-run also retains its direct reducer for
-/// exhaustive positive-width counts.
+/// exhaustive positive-width counts. A Unicode word-run binding reuses its
+/// aggregate reducer only for an exact full-source count; a nonzero start
+/// retains the canonical context-aware fallback.
 /// A positive leftmost-first literal set similarly binds one compact span
 /// executor and leaves its endpoint-only sidecar unbound. The first Exists
 /// call settles that sidecar once, caching both a qualified AArch64 ASCII-root
@@ -24933,11 +24935,12 @@ impl<'r> PortableOrdinarySession<'r> {
     /// their ordered endpoints.
     ///
     /// `Ok(Some(count))` is returned for a positive exact literal, a
-    /// positive-width K0 plan, a reverse-inner or Unicode scalar-run plan over
-    /// an exact tail window, a legacy literal/class-run plan over a full or
-    /// unguarded tail window, a pure byte-class repeat, a packed literal set,
-    /// or an ordinary non-uniform or uniform-standard literal-set plan. Each
-    /// construction seals nonempty selected spans.
+    /// positive-width K0 plan, a Unicode word-run over the exact full window,
+    /// a reverse-inner or Unicode scalar-run plan over an exact tail window, a
+    /// legacy literal/class-run plan over a full or unguarded tail window, a
+    /// pure byte-class repeat, a packed literal set, or an ordinary non-uniform
+    /// or uniform-standard literal-set plan. Each construction seals nonempty
+    /// selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25094,6 +25097,11 @@ impl<'r> PortableOrdinarySession<'r> {
                             plan, haystack, start,
                         )
                     }
+                    PortablePlan::UnicodeWordRun(plan) => {
+                        count_ordinary_unicode_word_selected_ends_at(
+                            *plan, haystack, start,
+                        )
+                    }
                     PortablePlan::UnicodeScalarRun(plan) => {
                         count_ordinary_unicode_scalar_selected_ends_at(
                             plan, haystack, start,
@@ -25128,6 +25136,41 @@ fn count_ordinary_reverse_inner_selected_ends_at(
     )
     .map(|result| Some(result.count))
     .map_err(SearchError::from)
+}
+
+#[inline(never)]
+fn count_ordinary_unicode_word_selected_ends_at(
+    plan: unicode_word_run::Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<u64>, SearchError> {
+    // A nonzero start can lie inside context that Unicode reverse decoding
+    // observes through as many as three malformed continuation bytes. Do not
+    // reset that context by slicing; decline before inspecting the source so
+    // the embedding can retain canonical iteration.
+    if start != 0 {
+        return Ok(None);
+    }
+    let identity = plan.aggregate_count_identity();
+    debug_assert!(identity.minimum_scalars > 0);
+    debug_assert!(identity.unicode);
+    debug_assert!(identity.complete_word_boundaries);
+    plan.aggregate_count(haystack, WordRunReduceLimits::unlimited())
+        .map_err(|error| {
+            // Unlimited reduction cannot refuse a resource envelope. Its
+            // arithmetic and accounting failures share the established
+            // word-run search overflow representation.
+            debug_assert!(matches!(
+                error,
+                WordRunReduceError::ArithmeticOverflow { .. }
+                    | WordRunReduceError::AccountingInvariant { .. }
+            ));
+            SearchError::from(UnicodeWordRunError::WorkLimitExceeded {
+                needed: u64::MAX,
+                limit: u64::MAX,
+            })
+        })
+        .map(|result| Some(result.count))
 }
 
 #[inline(never)]
@@ -47697,6 +47740,117 @@ mod tests {
                 ..
             } if core::ptr::eq(*bound, &required)
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive test closes plan identity, malformed UTF-8, ranged decline, compact binding, and ASCII isolation"
+    )]
+    fn ordinary_unicode_word_binding_counts_only_the_exact_full_window() {
+        fn selected_count(
+            baseline: &regex::bytes::Regex,
+            haystack: &[u8],
+            start: usize,
+        ) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = baseline.find_at(haystack, cursor) {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        fn exhaust_sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
+            let mut sources = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..maximum_len {
+                let mut next = Vec::new();
+                for prefix in &level {
+                    for &byte in alphabet {
+                        let mut source = prefix.clone();
+                        source.push(byte);
+                        sources.push(source.clone());
+                        next.push(source);
+                    }
+                }
+                level = next;
+            }
+            sources
+        }
+
+        let mut haystacks = exhaust_sources(&[b'a', b'!', 0xCE, 0x91, 0x80, 0xFF], 4);
+        haystacks.extend([
+            b"plain ASCII words 123".to_vec(),
+            "xαβ!γδyΩω".as_bytes().to_vec(),
+            // Reverse Unicode context sees through this stray continuation
+            // byte, so start 1 must decline rather than slicing after 1..2.
+            vec![b'!', b'a', 0x80, b'a'],
+            vec![
+                0xCE, 0xB1, 0xCE, 0xB2, 0x80, b'!', 0xFF, b'a', b'b', 0xF4,
+                0x90, 0x80, 0x80, 0xCF, 0x89,
+            ],
+        ]);
+
+        for pattern in [r"\b\w+\b", r"\b\w{2,}\b", r"\b\w{4,}\b"] {
+            let baseline = regex::bytes::Regex::new(pattern).unwrap();
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::UnicodeWordRun);
+            let PortablePlan::UnicodeWordRun(plan) = &regex.plan else {
+                panic!("Unicode word fixture selected its ASCII sibling")
+            };
+            let identity = plan.aggregate_count_identity();
+            assert!(identity.minimum_scalars > 0);
+            assert!(identity.unicode);
+            assert_eq!(
+                identity.topology,
+                super::WordRunTopology::CompleteWordBoundaries,
+            );
+
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(bound_regex)
+                ) if core::ptr::eq(*bound_regex, &regex)
+            ));
+            assert!(
+                core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>()
+                    <= 2 * core::mem::size_of::<usize>()
+            );
+
+            for haystack in &haystacks {
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(haystack, 0),
+                    Ok(Some(selected_count(&baseline, haystack, 0))),
+                    "pattern={pattern:?}, haystack={haystack:?}",
+                );
+                for start in (1..=haystack.len())
+                    .chain([haystack.len().saturating_add(1), usize::MAX])
+                {
+                    assert_eq!(
+                        ordinary.count_positive_width_selected_ends_at(haystack, start),
+                        Ok(None),
+                        "ranged Unicode word count must decline before source inspection: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                    );
+                }
+            }
+        }
+
+        let ascii = PortableBuilder::new(r"(?-u:\b\w+\b)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert!(matches!(&ascii.plan, PortablePlan::AsciiWordRun(_)));
+        assert_eq!(
+            ascii
+                .ordinary_session()
+                .unwrap()
+                .count_positive_width_selected_ends_at(b"ascii words", 0),
+            Ok(None),
+        );
     }
 
     #[test]
