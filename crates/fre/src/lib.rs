@@ -18599,11 +18599,6 @@ pub(crate) enum PortableOrdinaryCanonical<'a> {
     Native(&'a PortableRegex),
     ExactLiteral(&'a LiteralPlan),
     FixedPredicateWord64(&'a FixedPredicateWord64Plan),
-    /// Appended to preserve every established compact-binding discriminant.
-    LiteralClassRunLiteral {
-        regex: &'a PortableRegex,
-        plan: &'a LiteralClassRunLiteralPlan,
-    },
 }
 
 impl<'a> PortableOrdinaryCanonical<'a> {
@@ -18614,9 +18609,6 @@ impl<'a> PortableOrdinaryCanonical<'a> {
             })),
             PortablePlan::ExactLiteral(plan) => Ok(Self::ExactLiteral(plan)),
             PortablePlan::FixedPredicateWord64(plan) => Ok(Self::FixedPredicateWord64(plan)),
-            PortablePlan::LiteralClassRunLiteral(plan) => {
-                Ok(Self::LiteralClassRunLiteral { regex, plan })
-            }
             _ => Ok(Self::Native(regex)),
         }
     }
@@ -18651,9 +18643,7 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     SearchAccounting::FixedPredicateWord64(accounting),
                 ))
             }
-            Self::Native(regex) | Self::LiteralClassRunLiteral { regex, .. } => {
-                regex.is_match_window(haystack, window, limits)
-            }
+            Self::Native(regex) => regex.is_match_window(haystack, window, limits),
         }
     }
 
@@ -18685,9 +18675,7 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     fixed_predicate_word64_search_limits(limits),
                 )
                 .map_err(SearchError::from),
-            Self::Native(regex) | Self::LiteralClassRunLiteral { regex, .. } => {
-                regex.is_match_window_value(haystack, window, limits)
-            }
+            Self::Native(regex) => regex.is_match_window_value(haystack, window, limits),
         }
     }
 
@@ -18715,8 +18703,11 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|(end, _)| end)
                 .map_err(SearchError::from),
-            Self::Native(regex) | Self::LiteralClassRunLiteral { regex, .. } => regex
-                .shortest_match_window_value(haystack, window, SearchLimits::unlimited()),
+            Self::Native(regex) => regex.shortest_match_window_value(
+                haystack,
+                window,
+                SearchLimits::unlimited(),
+            ),
         }
     }
 
@@ -18744,7 +18735,7 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
-            Self::Native(regex) | Self::LiteralClassRunLiteral { regex, .. } => {
+            Self::Native(regex) => {
                 regex.find_window_value(haystack, window, SearchLimits::unlimited())
             }
         }
@@ -24951,12 +24942,16 @@ impl<'r> PortableOrdinarySession<'r> {
                 }
                 Ok(Some(count))
             }
-            PortableOrdinarySessionPlan::Canonical(
-                PortableOrdinaryCanonical::LiteralClassRunLiteral { plan, .. },
-            ) if start == 0
-                || plan.boundary_semantics()
-                    == LiteralClassRunLiteralBoundarySemantics::Unguarded =>
-            {
+            PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex)) => {
+                let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan else {
+                    return Ok(None);
+                };
+                if start != 0
+                    && plan.boundary_semantics()
+                        != LiteralClassRunLiteralBoundarySemantics::Unguarded
+                {
+                    return Ok(None);
+                }
                 let tail = haystack.get(start..).ok_or_else(|| {
                     SearchError::from(LiteralClassRunLiteralSearchError::InvalidWindow {
                         start,
@@ -47540,18 +47535,12 @@ mod tests {
                 .build()
                 .unwrap();
             assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
-            let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan else {
-                unreachable!("literal/class-run fixture changed plan")
-            };
             let mut ordinary = regex.ordinary_session().unwrap();
             assert!(matches!(
                 &ordinary.plan,
                 super::PortableOrdinarySessionPlan::Canonical(
-                    super::PortableOrdinaryCanonical::LiteralClassRunLiteral {
-                        regex: bound_regex,
-                        plan: bound_plan,
-                    }
-                ) if core::ptr::eq(*bound_regex, &regex) && core::ptr::eq(*bound_plan, plan)
+                    super::PortableOrdinaryCanonical::Native(bound_regex)
+                ) if core::ptr::eq(*bound_regex, &regex)
             ));
 
             for start in 0..=haystack.len() {
