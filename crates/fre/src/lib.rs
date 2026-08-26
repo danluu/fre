@@ -15897,6 +15897,10 @@ impl PortableRegex {
                 .find_window_value(haystack, window, limits)
                 .map(|matched| matched.map(Match::end))
                 .map_err(SearchError::from),
+            PortablePlan::BoundedDelimitedSegmentRepeat(plan) => plan
+                .find_window_value(haystack, window, required_literal_limits(limits))
+                .map(|matched| matched.map(|(_start, end)| end))
+                .map_err(SearchError::from),
             PortablePlan::NullableOptionalChain(plan) => plan
                 .earliest_end_window_value(haystack, window, limits)
                 .map_err(SearchError::NullableOptionalChain),
@@ -44069,6 +44073,157 @@ mod tests {
                 .unwrap(),
             expected_after_mutation,
         );
+    }
+
+    #[test]
+    fn bounded_delimited_shortest_value_uses_find_window_value() {
+        const PATTERN: &str = r"(?-u:(?:[a-z]{1,16}/){1,4}DONE)";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("native bounded-delimited segment builds");
+        assert!(matches!(
+            &regex.plan,
+            PortablePlan::BoundedDelimitedSegmentRepeat(_)
+        ));
+
+        let haystack = b"DONE!b/DONE!cc/dd/DONE";
+        let window = SearchWindow::full(haystack);
+        super::universal_finite_greedy_corridor::value_path_probe::reset();
+        assert_eq!(
+            regex.shortest_match_window_value(
+                haystack,
+                window,
+                SearchLimits::unlimited(),
+            ),
+            Ok(Some(11)),
+        );
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 1),
+        );
+
+        let (accounted, accounting) = regex
+            .shortest_match_window(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(accounted, Some(11));
+        assert!(matches!(
+            accounting,
+            SearchAccounting::RequiredLiteral(_)
+        ));
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 1),
+        );
+    }
+
+    #[test]
+    fn bounded_delimited_shortest_value_matches_accounted_exhaustively() {
+        const ALPHABET: [u8; 4] = [b'a', b'/', b'X', b'!'];
+        const PATTERN: &str = r"(?-u:(?:[ab]{1,2}/){1,2}X)";
+
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("native bounded-delimited segment builds");
+        assert!(matches!(
+            &regex.plan,
+            PortablePlan::BoundedDelimitedSegmentRepeat(_)
+        ));
+
+        for len in 0_usize..=7 {
+            let case_count = (0..len).fold(1_usize, |count, _| count * ALPHABET.len());
+            for ordinal in 0..case_count {
+                let mut code = ordinal;
+                let mut haystack = vec![0; len];
+                for byte in &mut haystack {
+                    *byte = ALPHABET[code % ALPHABET.len()];
+                    code /= ALPHABET.len();
+                }
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let (expected, accounting) = regex
+                            .shortest_match_window(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            regex.shortest_match_window_value(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            Ok(expected),
+                            "haystack={haystack:?}, window={start}..{end}, unlimited",
+                        );
+
+                        let SearchAccounting::RequiredLiteral(accounting) = accounting else {
+                            panic!("bounded-delimited route returned another accounting family");
+                        };
+                        let exact_limits = SearchLimits {
+                            max_work: accounting.work_upper_bound,
+                            max_scratch_bytes: accounting.scratch_bytes,
+                        };
+                        let expected_exact = regex
+                            .shortest_match_window(&haystack, window, exact_limits)
+                            .map(|(matched, _)| matched);
+                        assert_eq!(
+                            regex.shortest_match_window_value(
+                                &haystack,
+                                window,
+                                exact_limits,
+                            ),
+                            expected_exact,
+                            "haystack={haystack:?}, window={start}..{end}, exact limit",
+                        );
+
+                        let refused_limits = SearchLimits {
+                            max_work: accounting.work_upper_bound.checked_sub(1).unwrap(),
+                            ..exact_limits
+                        };
+                        let expected_refusal = regex
+                            .shortest_match_window(&haystack, window, refused_limits)
+                            .map(|(matched, _)| matched);
+                        assert!(
+                            expected_refusal.is_err(),
+                            "bounded-delimited one-below work limit unexpectedly succeeded",
+                        );
+                        assert_eq!(
+                            regex.shortest_match_window_value(
+                                &haystack,
+                                window,
+                                refused_limits,
+                            ),
+                            expected_refusal,
+                            "haystack={haystack:?}, window={start}..{end}, refused limit",
+                        );
+                    }
+                }
+            }
+        }
+
+        let haystack = b"a/X";
+        let zero_limits = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        for window in [
+            SearchWindow::new(1, 0),
+            SearchWindow::new(0, haystack.len() + 1),
+        ] {
+            let expected = regex
+                .shortest_match_window(haystack, window, zero_limits)
+                .map(|(matched, _)| matched);
+            assert!(expected.is_err(), "invalid window unexpectedly succeeded");
+            assert_eq!(
+                regex.shortest_match_window_value(haystack, window, zero_limits),
+                expected,
+                "invalid window {window:?}",
+            );
+        }
     }
 
     #[test]
