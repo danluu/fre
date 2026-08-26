@@ -458,7 +458,7 @@ fn delimited_iterations_and_sessions_are_source_and_plan_local() {
 }
 
 #[test]
-fn optional_delimited_plan_closes_planner_and_persistent_boundaries() {
+fn optional_delimited_plan_replays_cumulative_planner_receipt_and_closes_persistent_boundaries() {
     let builder = PortableBuilder::new(PATTERN).unicode(false);
     let automatic = builder.clone().build().expect("automatic K0 probe");
     let forced = builder
@@ -476,28 +476,33 @@ fn optional_delimited_plan_closes_planner_and_persistent_boundaries() {
     let exact_planner = automatic.build_report().planner_work;
     let mut limits = BuildLimits {
         max_planner_work: exact_planner,
+        max_persistent_bytes: automatic.build_report().persistent_byte_limit,
         ..BuildLimits::default()
     };
     let exact = builder
         .clone()
         .limits(limits)
         .build()
-        .expect("exact optional planner boundary");
-    assert_eq!(
-        exact.build_report().plan_storage_bytes,
-        automatic.build_report().plan_storage_bytes,
-    );
+        .expect("exact cumulative planner receipt");
+    assert_eq!(exact.build_report(), automatic.build_report());
     limits.max_planner_work = exact_planner.checked_sub(1).unwrap();
     let declined = builder
         .clone()
         .limits(limits)
         .build()
-        .expect("one-below optional planner boundary preserves K0");
+        .expect("one-below cumulative planner receipt preserves K0");
     assert_eq!(declined.build_report().plan, PlanKind::K0);
     assert!(declined.build_report().planner_work <= limits.max_planner_work);
-    assert!(
-        declined.build_report().plan_storage_bytes
-            < automatic.build_report().plan_storage_bytes,
+    // The cumulative receipt includes later ineligible inspections. Refusing
+    // their final work unit does not revoke the correlated owner admitted
+    // earlier in the same transaction.
+    assert_eq!(
+        declined.build_report().plan_storage_bytes,
+        automatic.build_report().plan_storage_bytes,
+    );
+    assert_eq!(
+        declined.build_report().charged_persistent_bytes,
+        automatic.build_report().charged_persistent_bytes,
     );
 
     let admitted_bytes = automatic.build_report().charged_persistent_bytes;
@@ -541,7 +546,7 @@ fn optional_delimited_plan_closes_planner_and_persistent_boundaries() {
 }
 
 #[test]
-fn wide_delimited_planner_and_storage_boundaries_are_exact() {
+fn wide_delimited_cumulative_planner_receipts_and_storage_boundaries_are_exact() {
     for pattern in WIDE_TERMINAL_PATTERNS {
         let builder = PortableBuilder::new(pattern).unicode(false);
         let automatic = builder
@@ -564,16 +569,17 @@ fn wide_delimited_planner_and_storage_boundaries_are_exact() {
         let exact_planner = automatic.build_report().planner_work;
         let mut limits = BuildLimits {
             max_planner_work: exact_planner,
+            max_persistent_bytes: automatic.build_report().persistent_byte_limit,
             ..BuildLimits::default()
         };
         let exact = builder
             .clone()
             .limits(limits)
             .build()
-            .expect("exact wide planner boundary");
+            .expect("exact wide cumulative planner receipt");
         assert_eq!(
-            exact.build_report().plan_storage_bytes,
-            automatic.build_report().plan_storage_bytes,
+            exact.build_report(),
+            automatic.build_report(),
             "pattern={pattern:?}",
         );
         limits.max_planner_work = exact_planner
@@ -583,12 +589,19 @@ fn wide_delimited_planner_and_storage_boundaries_are_exact() {
             .clone()
             .limits(limits)
             .build()
-            .expect("one-below wide optional planner boundary preserves K0");
+            .expect("one-below wide cumulative planner receipt preserves K0");
         assert_eq!(declined.build_report().plan, PlanKind::K0);
         assert!(declined.build_report().planner_work <= limits.max_planner_work);
-        assert!(
-            declined.build_report().plan_storage_bytes
-                < automatic.build_report().plan_storage_bytes,
+        // The wide correlated owner is already admitted before the later
+        // ineligible inspections spend the tail of the cumulative receipt.
+        assert_eq!(
+            declined.build_report().plan_storage_bytes,
+            automatic.build_report().plan_storage_bytes,
+            "pattern={pattern:?}",
+        );
+        assert_eq!(
+            declined.build_report().charged_persistent_bytes,
+            automatic.build_report().charged_persistent_bytes,
             "pattern={pattern:?}",
         );
 

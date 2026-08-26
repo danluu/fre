@@ -398,15 +398,18 @@ fn nullable_iterator_sessions_use_tight_source_free_setup_and_preserve_public_fa
         assert_eq!(actual, expected, "{pattern:?}: unlimited offsets");
         assert!(probe.next().is_none(), "{pattern:?}: fused offsets");
 
-        let exact_limits = PortableFindIterLimits {
+        // Adaptive setup accounting reports the live seed payload, while
+        // session admission reserves the larger possible growth ceiling. Keep
+        // the work boundary exact without mistaking the seed for that ceiling.
+        let exact_work_limits = PortableFindIterLimits {
             session: SearchSessionLimits {
                 max_setup_work: setup.work(),
-                max_scratch_bytes: setup.retained_bytes(),
+                max_scratch_bytes: usize::MAX,
             },
             ..PortableFindIterLimits::unlimited()
         };
         let mut exact = regex
-            .find_iter_borrowed(haystack, exact_limits)
+            .find_iter_borrowed(haystack, exact_work_limits)
             .unwrap_or_else(|error| panic!("exact nullable setup failed for {pattern:?}: {error}"));
         assert_eq!(exact.workspace_setup_accounting(), Some(setup));
         let exact_matches = exact

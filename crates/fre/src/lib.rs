@@ -6292,13 +6292,14 @@ fn ripgrep_flat_literal_build_report(
     builder: &PortableBuilder,
     planner_work: u64,
     publication: &RipgrepFlatLiteralPublication,
+    plan: PlanKind,
     plan_storage_bytes: usize,
 ) -> Result<BuildReport, BuildError> {
     BuildReport {
         profile: publication.profile.clone(),
         admission: publication.admission,
         syntax: publication.syntax.clone(),
-        plan: PlanKind::LiteralSetDfa,
+        plan,
         planner_work,
         lowering: None,
         states: 0,
@@ -6316,6 +6317,77 @@ fn ripgrep_flat_literal_build_report(
         forward_anchored: None,
     }
     .enforce_persistent_limit(builder.limits.max_persistent_bytes)
+}
+
+fn try_build_portable_packed_literal_set<P: AsRef<[u8]>>(
+    builder: &PortableBuilder,
+    patterns: &[P],
+    guarded_plan_persistent_bytes: usize,
+    finite_work: u64,
+) -> Result<Option<(PackedLiteralSetPlan, u64)>, BuildError> {
+    #[cfg(not(feature = "static-dispatch"))]
+    let packed_limits = PackedLiteralSetBuildLimits {
+        max_persistent_bytes: builder
+            .limits
+            .packed_literal_set
+            .max_persistent_bytes
+            .min(guarded_plan_persistent_bytes),
+        ..builder.limits.packed_literal_set
+    };
+    #[cfg(feature = "static-dispatch")]
+    let packed_limits = builder.limits.packed_literal_set;
+    #[cfg(not(feature = "static-dispatch"))]
+    let packed = {
+        if builder.retained_find_iter {
+            let remaining_planner_work =
+                builder.limits.max_planner_work.saturating_sub(finite_work);
+            PackedLiteralSetPlan::new_retained_iter(
+                patterns,
+                packed_limits,
+                usize::try_from(remaining_planner_work).unwrap_or(usize::MAX),
+            )
+        } else {
+            PackedLiteralSetPlan::new(patterns, packed_limits)
+        }
+    };
+    #[cfg(feature = "static-dispatch")]
+    let packed = PackedLiteralSetPlan::new(patterns, packed_limits);
+    let Ok(packed) = packed else {
+        return Ok(None);
+    };
+    #[cfg(not(feature = "static-dispatch"))]
+    let packed_planner_work = match (
+        packed.retained_iter_build_capability_id(),
+        packed.retained_iter_additional_build_work(),
+    ) {
+        (Some(capability), Some(additional_work))
+            if capability == PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID =>
+        {
+            finite_work
+                .checked_add(u64::try_from(additional_work).map_err(|_| {
+                    BuildError::InternalInvariant(
+                        "retained packed iterator build work does not fit u64",
+                    )
+                })?)
+                .ok_or(BuildError::InternalInvariant(
+                    "retained packed iterator planner work overflowed",
+                ))?
+        }
+        (None, None) => finite_work,
+        _ => {
+            return Err(BuildError::InternalInvariant(
+                "retained packed iterator capability receipt is inconsistent",
+            ));
+        }
+    };
+    #[cfg(feature = "static-dispatch")]
+    let packed_planner_work = finite_work;
+    if packed_planner_work > builder.limits.max_planner_work {
+        return Err(BuildError::InternalInvariant(
+            "retained packed iterator exceeded its pre-admitted planner work",
+        ));
+    }
+    Ok(Some((packed, packed_planner_work)))
 }
 
 #[cold]
@@ -6379,7 +6451,13 @@ fn publish_ripgrep_borrowed_flat_literal_set<P: LiteralSetStablePattern>(
             (PortablePlan::LiteralSetDfa(literal_set.into()), storage)
         }
     };
-    let report = ripgrep_flat_literal_build_report(builder, planner_work, &publication, storage)?;
+    let report = ripgrep_flat_literal_build_report(
+        builder,
+        planner_work,
+        &publication,
+        PlanKind::LiteralSetDfa,
+        storage,
+    )?;
     Ok(PortableRegex {
         source: publication.source,
         capture_names: publication.capture_names,
@@ -6399,8 +6477,13 @@ fn publish_ripgrep_canonical_flat_literal_set(
     literal_set: LiteralSetPlan,
 ) -> Result<RipgrepStandardLiteralsBuild, BuildError> {
     let storage = literal_set.build_accounting().persistent_bytes;
-    let report =
-        ripgrep_flat_literal_build_report(builder, planner_work, &publication, storage)?;
+    let report = ripgrep_flat_literal_build_report(
+        builder,
+        planner_work,
+        &publication,
+        PlanKind::LiteralSetDfa,
+        storage,
+    )?;
     Ok(RipgrepStandardLiteralsBuild::Portable(PortableRegex {
         source: publication.source,
         capture_names: publication.capture_names,
@@ -6415,7 +6498,7 @@ fn publish_ripgrep_canonical_flat_literal_set(
 
 #[cold]
 #[inline(never)]
-fn publish_ripgrep_borrowed_flat_literal_set_ordinary(
+fn publish_ripgrep_borrowed_large_flat_literal_set_ordinary(
     builder: &PortableBuilder,
     patterns: &[&str],
     planner_work: u64,
@@ -6449,8 +6532,13 @@ fn publish_ripgrep_borrowed_flat_literal_set_ordinary(
                 );
             }
             let literal_set = candidate.into_ordinary();
-            let report =
-                ripgrep_flat_literal_build_report(builder, planner_work, &publication, storage)?;
+            let report = ripgrep_flat_literal_build_report(
+                builder,
+                planner_work,
+                &publication,
+                PlanKind::LiteralSetDfa,
+                storage,
+            )?;
             Ok(RipgrepStandardLiteralsBuild::Ordinary(
                 RipgrepOrdinaryRegex {
                     source: publication.source,
@@ -6478,6 +6566,97 @@ fn publish_ripgrep_borrowed_flat_literal_set_ordinary(
                 literal_set,
             )
         }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn publish_ripgrep_borrowed_small_flat_literal_set_ordinary(
+    builder: &PortableBuilder,
+    patterns: &[&str],
+    planner_work: u64,
+    publication: RipgrepFlatLiteralPublication,
+) -> Result<RipgrepStandardLiteralsBuild, BuildError> {
+    if builder.selection != PlanSelection::Auto
+        || patterns.len() < 2
+        || patterns.len() > PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+        || publication.syntax.class_ranges != 0
+    {
+        return Err(BuildError::InternalInvariant(
+            "borrowed ripgrep small literal set reached another planner terminal",
+        ));
+    }
+    let retained_facade_bytes = publication
+        .source_storage_bytes
+        .checked_add(publication.capture_name_storage_bytes)
+        .ok_or(BuildError::PersistentBytesOverflow)?;
+    let guarded_plan_persistent_bytes = builder
+        .limits
+        .max_persistent_bytes
+        .saturating_sub(retained_facade_bytes);
+    let (plan, plan_kind, planner_work, storage) = if let Some((packed, packed_planner_work)) =
+        try_build_portable_packed_literal_set(
+            builder,
+            patterns,
+            guarded_plan_persistent_bytes,
+            planner_work,
+        )? {
+        let storage = packed.build_accounting().persistent_bytes;
+        (
+            PortablePlan::PackedLiteralSet(packed),
+            PlanKind::PackedLiteralSet,
+            packed_planner_work,
+            storage,
+        )
+    } else {
+        let literal_set = LiteralSetPlan::new(patterns, builder.limits.literal_set)?;
+        let storage = literal_set.build_accounting().persistent_bytes;
+        (
+            PortablePlan::LiteralSetDfa(PortableLiteralSetDfaPlan::with_ordinary_ascii_folded(
+                literal_set,
+                None,
+            )),
+            PlanKind::LiteralSetDfa,
+            planner_work,
+            storage,
+        )
+    };
+    let report =
+        ripgrep_flat_literal_build_report(builder, planner_work, &publication, plan_kind, storage)?;
+    Ok(RipgrepStandardLiteralsBuild::Portable(PortableRegex {
+        source: publication.source,
+        capture_names: publication.capture_names,
+        line_total_grep_plan: publication.line_total_grep_plan,
+        plan,
+        profile: publication.profile,
+        limits: builder.limits,
+        selection: builder.selection,
+        report,
+    }))
+}
+
+#[cold]
+#[inline(never)]
+fn publish_ripgrep_borrowed_flat_literal_set_ordinary(
+    builder: &PortableBuilder,
+    patterns: &[&str],
+    planner_work: u64,
+    publication: RipgrepFlatLiteralPublication,
+) -> Result<RipgrepStandardLiteralsBuild, BuildError> {
+    if patterns.len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS {
+        publish_ripgrep_borrowed_small_flat_literal_set_ordinary(
+            builder,
+            patterns,
+            planner_work,
+            publication,
+        )
+    } else {
+        publish_ripgrep_borrowed_large_flat_literal_set_ordinary(
+            builder,
+            patterns,
+            planner_work,
+            publication,
+        )
     }
 }
 
@@ -7571,9 +7750,11 @@ impl PortableBuilder {
         .map(|built| built.map(|(regex, _census)| regex))
     }
 
-    /// Build the same authenticated literal handoff for ripgrep's ordinary
-    /// worker surface, omitting the checked DFA only when the compact owner is
-    /// admitted. Every decline publishes the established portable owner.
+    /// Build an authenticated literal handoff for ripgrep's ordinary worker
+    /// surface. Small sets publish the same portable packed/DFA terminal as
+    /// configured-HIR construction; large sets omit the checked DFA only when
+    /// the compact owner is admitted. Every decline preserves the established
+    /// configured-HIR fallback.
     #[doc(hidden)]
     pub fn build_ripgrep_standard_literals_ordinary(
         self,
@@ -7607,7 +7788,7 @@ impl PortableBuilder {
         )>,
         BuildError,
     > {
-        if patterns.len() <= PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
+        if patterns.len() < 2
             || patterns.len() > finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS
             || !matches!(forbidden_byte, None | Some(b'\x00'))
         {
@@ -9268,69 +9449,14 @@ impl PortableBuilder {
         }
         if let Some(words) = finite_words {
             if words.len() > 1 {
-                #[cfg(not(feature = "static-dispatch"))]
-                let packed_limits = PackedLiteralSetBuildLimits {
-                    max_persistent_bytes: self
-                        .limits
-                        .packed_literal_set
-                        .max_persistent_bytes
-                        .min(guarded_plan_persistent_bytes),
-                    ..self.limits.packed_literal_set
-                };
-                #[cfg(feature = "static-dispatch")]
-                let packed_limits = self.limits.packed_literal_set;
-                #[cfg(not(feature = "static-dispatch"))]
-                let packed = {
-                    if self.retained_find_iter {
-                        let remaining_planner_work = self
-                            .limits
-                            .max_planner_work
-                            .saturating_sub(finite_work);
-                        PackedLiteralSetPlan::new_retained_iter(
-                            &words,
-                            packed_limits,
-                            usize::try_from(remaining_planner_work).unwrap_or(usize::MAX),
-                        )
-                    } else {
-                        PackedLiteralSetPlan::new(&words, packed_limits)
-                    }
-                };
-                #[cfg(feature = "static-dispatch")]
-                let packed = PackedLiteralSetPlan::new(&words, packed_limits);
-                if let Ok(packed) = packed {
-                    #[cfg(not(feature = "static-dispatch"))]
-                    let packed_planner_work = match (
-                        packed.retained_iter_build_capability_id(),
-                        packed.retained_iter_additional_build_work(),
-                    ) {
-                        (Some(capability), Some(additional_work))
-                            if capability
-                                == PACKED_LITERAL_SET_RETAINED_ITER_BUILD_CAPABILITY_ID =>
-                        {
-                            finite_work
-                                .checked_add(u64::try_from(additional_work).map_err(|_| {
-                                    BuildError::InternalInvariant(
-                                        "retained packed iterator build work does not fit u64",
-                                    )
-                                })?)
-                                .ok_or(BuildError::InternalInvariant(
-                                    "retained packed iterator planner work overflowed",
-                                ))?
-                        }
-                        (None, None) => finite_work,
-                        _ => {
-                            return Err(BuildError::InternalInvariant(
-                                "retained packed iterator capability receipt is inconsistent",
-                            ));
-                        }
-                    };
-                    #[cfg(feature = "static-dispatch")]
-                    let packed_planner_work = finite_work;
-                    if packed_planner_work > self.limits.max_planner_work {
-                        return Err(BuildError::InternalInvariant(
-                            "retained packed iterator exceeded its pre-admitted planner work",
-                        ));
-                    }
+                if let Some((packed, packed_planner_work)) =
+                    try_build_portable_packed_literal_set(
+                        &self,
+                        &words,
+                        guarded_plan_persistent_bytes,
+                        finite_work,
+                    )?
+                {
                     let storage = packed.build_accounting().persistent_bytes;
                     return Ok(PortableRegex {
                         source,
@@ -14513,7 +14639,13 @@ impl PortableRegex {
         let plan = match &self.plan {
             PortablePlan::ExactLiteral(literal) => {
                 if let Some(executor) = literal.ordinary_executor() {
-                    PortableOrdinarySessionPlan::ExactLiteral { executor }
+                    if executor.retained_count_eligible() {
+                        PortableOrdinarySessionPlan::ExactLiteralRetainedCount {
+                            executor,
+                        }
+                    } else {
+                        PortableOrdinarySessionPlan::ExactLiteral { executor }
+                    }
                 } else {
                     PortableOrdinarySessionPlan::Canonical(
                         PortableOrdinaryCanonical::try_new(self)?,
@@ -15896,6 +16028,10 @@ impl PortableRegex {
             PortablePlan::GuardedLiteralSet(plan) => plan
                 .find_window_value(haystack, window, limits)
                 .map(|matched| matched.map(Match::end))
+                .map_err(SearchError::from),
+            PortablePlan::BoundedDelimitedSegmentRepeat(plan) => plan
+                .find_window_value(haystack, window, required_literal_limits(limits))
+                .map(|matched| matched.map(|(_start, end)| end))
                 .map_err(SearchError::from),
             PortablePlan::NullableOptionalChain(plan) => plan
                 .earliest_end_window_value(haystack, window, limits)
@@ -18598,6 +18734,11 @@ enum PortableOrdinarySessionPlan<'a> {
     /// Appended to preserve every established ordinary-session discriminant.
     LiteralSetCompact {
         executor: LiteralSetCompactOrdinaryExecutor<'a>,
+    },
+    /// Appended so the incumbent exact-literal variant and every preceding
+    /// ordinary-session discriminant retain their established representation.
+    ExactLiteralRetainedCount {
+        executor: ExactLiteralOrdinaryExecutor<'a>,
     },
 }
 
@@ -24613,6 +24754,49 @@ fn count_ordinary_literal_set_dfa_with_selected_seed(
         })
 }
 
+#[cold]
+#[inline(never)]
+fn fixed_predicate_word64_unlimited_count_error(
+    error: FixedPredicateWord64ReduceError,
+) -> SearchError {
+    let error = match error {
+        FixedPredicateWord64ReduceError::ArithmeticOverflow { computation } => {
+            FixedPredicateWord64SearchError::ArithmeticOverflow { computation }
+        }
+        FixedPredicateWord64ReduceError::InternalInvariant(detail) => {
+            FixedPredicateWord64SearchError::InternalInvariant(detail)
+        }
+        _ => FixedPredicateWord64SearchError::InternalInvariant(
+            "unlimited fixed-predicate count unexpectedly refused its resource envelope",
+        ),
+    };
+    SearchError::from(error)
+}
+
+#[inline(never)]
+fn count_ordinary_fixed_predicate_selected_ends_at(
+    plan: &FixedPredicateWord64Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<u64>, SearchError> {
+    // This plan contains only fixed byte predicates: no assertion can observe
+    // the discarded prefix, and Count publishes no offsets that need rebasing.
+    let tail = haystack.get(start..).ok_or_else(|| {
+        SearchError::from(FixedPredicateWord64SearchError::InvalidWindow {
+            start,
+            end: haystack.len(),
+            haystack_len: haystack.len(),
+        })
+    })?;
+    let limits = FixedPredicateWord64ReduceLimits::unlimited();
+    if let Some(count) = plan.count_value_success(tail, limits) {
+        return Ok(Some(count));
+    }
+    plan.count(tail, limits)
+        .map(|result| Some(result.count))
+        .map_err(fixed_predicate_word64_unlimited_count_error)
+}
+
 impl<'r> PortableOrdinarySession<'r> {
     /// Whether a match exists anywhere in `haystack`.
     ///
@@ -24655,7 +24839,8 @@ impl<'r> PortableOrdinarySession<'r> {
     #[inline]
     pub fn is_match_at(&mut self, haystack: &[u8], start: usize) -> Result<bool, SearchError> {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => executor
                 .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
@@ -24727,7 +24912,8 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<usize>, SearchError> {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => executor
                 .first_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
@@ -24815,7 +25001,8 @@ impl<'r> PortableOrdinarySession<'r> {
         start: usize,
     ) -> Result<Option<Match>, SearchError> {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => executor
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
@@ -24921,7 +25108,8 @@ impl<'r> PortableOrdinarySession<'r> {
         F: FnMut(Match) -> Result<bool, E>,
     {
         match &mut self.plan {
-            PortableOrdinarySessionPlan::ExactLiteral { executor } => {
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => {
                 let mut visitor = visitor;
                 executor
                     .try_visit_spans_window_value(
@@ -25028,11 +25216,12 @@ impl<'r> PortableOrdinarySession<'r> {
     /// their ordered endpoints.
     ///
     /// `Ok(Some(count))` is returned for a positive exact literal, a
-    /// positive-width K0 plan, a Unicode word-run over the exact full window,
-    /// a reverse-inner or Unicode scalar-run plan over an exact tail window, a
-    /// legacy literal/class-run plan over a full or unguarded tail window, a
-    /// pure byte-class repeat, a packed literal set, or an ordinary non-uniform
-    /// or uniform-standard literal-set plan. Each construction seals nonempty
+    /// positive-width K0 plan, a fixed-predicate word over an exact tail, a
+    /// Unicode word-run over the exact full window, a reverse-inner or Unicode
+    /// scalar-run plan over an exact tail window, a legacy literal/class-run
+    /// plan over a full or unguarded tail window, a pure or bounded byte-class
+    /// repeat, a packed literal set, or an ordinary non-uniform or
+    /// uniform-standard literal-set plan. Each construction seals nonempty
     /// selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
@@ -25065,6 +25254,13 @@ impl<'r> PortableOrdinarySession<'r> {
         match &mut self.plan {
             PortableOrdinarySessionPlan::ExactLiteral { executor } => executor
                 .count_spans_window_value(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                )
+                .map(Some)
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => executor
+                .count_spans_window_value_retained(
                     haystack,
                     LiteralWindow::new(start, haystack.len()),
                 )
@@ -25159,6 +25355,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 }
                 Ok(Some(count))
             }
+            PortableOrdinarySessionPlan::Canonical(
+                PortableOrdinaryCanonical::FixedPredicateWord64(plan),
+            ) => count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start),
             PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex)) => {
                 match &regex.plan {
                     PortablePlan::LiteralClassRunLiteral(plan) => {
@@ -25201,6 +25400,14 @@ impl<'r> PortableOrdinarySession<'r> {
                         )
                     }
                     PortablePlan::PureByteClassRepeat(plan) => {
+                        let tail = haystack.get(start..).ok_or_else(|| {
+                            SearchError::from(
+                                PureByteClassRepeatSearchError::InvalidWindow,
+                            )
+                        })?;
+                        Ok(Some(plan.ordinary_count_full_unmetered(tail)))
+                    }
+                    PortablePlan::BoundedByteClassRepeat(plan) => {
                         let tail = haystack.get(start..).ok_or_else(|| {
                             SearchError::from(
                                 PureByteClassRepeatSearchError::InvalidWindow,
@@ -31015,6 +31222,181 @@ mod tests {
             .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX)
             .expect("public ordinary literal construction completes")
             .expect("public ordinary literal shape is admitted")
+    }
+
+    #[test]
+    fn ripgrep_small_typed_ordinary_matches_the_owned_hir_terminal() {
+        for count in [2, 3, 16, 64, 128] {
+            let mut patterns = public_uniform_ripgrep_literals(count, 16);
+            patterns[0] = "ab".to_owned();
+            patterns[1] = "a".to_owned();
+            let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+
+            let typed = PortableBuilder::new("")
+                .multi_line(true)
+                .retained_find_iter(true)
+                .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX)
+                .expect("typed small literal construction completes")
+                .expect("typed small literal set is admitted");
+            let RipgrepStandardLiteralsBuild::Portable(typed) = typed else {
+                panic!("small typed literals retained an ordinary-only owner");
+            };
+
+            let hir = Hir::alternation(
+                patterns
+                    .iter()
+                    .map(|pattern| Hir::literal(pattern.as_bytes()))
+                    .collect(),
+            );
+            let owned = PortableBuilder::new("")
+                .multi_line(true)
+                .retained_find_iter(true)
+                .build_ripgrep_standard_literal_hir_owned(hir, usize::MAX)
+                .expect("owned small literal HIR construction completes");
+            let super::RipgrepStandardLiteralHirBuild::Built(owned) = owned else {
+                panic!("owned small literal HIR was refused");
+            };
+
+            assert_eq!(typed.as_str(), owned.as_str(), "count={count}");
+            assert_eq!(typed.build_report(), owned.build_report(), "count={count}");
+            assert_eq!(
+                typed.runtime_implementation_id(),
+                owned.runtime_implementation_id(),
+                "count={count}",
+            );
+            for haystack in [
+                b"ab".as_slice(),
+                b"za".as_slice(),
+                b"no public literal".as_slice(),
+                patterns[count - 1].as_bytes(),
+            ] {
+                assert_eq!(typed.find(haystack), owned.find(haystack), "count={count}");
+                assert_eq!(
+                    typed.shortest_match(haystack, SearchLimits::unlimited()),
+                    owned.shortest_match(haystack, SearchLimits::unlimited()),
+                    "count={count}",
+                );
+            }
+
+            let haystack = format!("xxab/{}yy", patterns[count - 1]).into_bytes();
+            let mut typed_spans = Vec::new();
+            let mut typed_session = typed
+                .ordinary_session()
+                .expect("typed ordinary session binds");
+            typed_session
+                .try_visit_spans(&haystack, |matched| {
+                    typed_spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .expect("typed span visit runs")
+                .expect("typed visitor completes");
+            let mut owned_spans = Vec::new();
+            let mut owned_session = owned
+                .ordinary_session()
+                .expect("owned ordinary session binds");
+            owned_session
+                .try_visit_spans(&haystack, |matched| {
+                    owned_spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .expect("owned span visit runs")
+                .expect("owned visitor completes");
+            assert_eq!(typed_spans, owned_spans, "count={count}");
+            assert_eq!(
+                typed_session.count_positive_width_selected_ends_at(&haystack, 0),
+                owned_session.count_positive_width_selected_ends_at(&haystack, 0),
+                "count={count}",
+            );
+        }
+    }
+
+    #[test]
+    fn ripgrep_small_typed_ordinary_closes_planner_and_persistent_limits() {
+        let patterns = public_uniform_ripgrep_literals(64, 16);
+        let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let baseline = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX)
+            .expect("baseline typed small construction completes")
+            .expect("baseline typed small literals are admitted");
+        let RipgrepStandardLiteralsBuild::Portable(baseline) = baseline else {
+            panic!("small typed literals retained an ordinary-only owner");
+        };
+        let report = baseline.build_report();
+        let exact_work = report.planner_work;
+        let exact_bytes = report.charged_persistent_bytes;
+
+        let exact = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(BuildLimits {
+                max_planner_work: exact_work,
+                max_persistent_bytes: exact_bytes,
+                ..BuildLimits::default()
+            })
+            .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX)
+            .expect("exact typed small resource limits complete")
+            .expect("exact typed small resource limits admit");
+        let RipgrepStandardLiteralsBuild::Portable(exact) = exact else {
+            panic!("exact small resource limits retained an ordinary-only owner");
+        };
+        assert_eq!(exact.build_report().plan, report.plan);
+        assert_eq!(exact.build_report().planner_work, exact_work);
+        assert_eq!(
+            exact.build_report().plan_storage_bytes,
+            report.plan_storage_bytes,
+        );
+        assert_eq!(exact.build_report().charged_persistent_bytes, exact_bytes);
+
+        let one_below_work = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(BuildLimits {
+                max_planner_work: exact_work - 1,
+                ..BuildLimits::default()
+            })
+            .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX)
+            .expect("one-below typed planner refusal completes");
+        assert!(one_below_work.is_none());
+
+        let tight_limits = BuildLimits {
+            max_persistent_bytes: exact_bytes - 1,
+            ..BuildLimits::default()
+        };
+        let typed_tight = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(tight_limits)
+            .build_ripgrep_standard_literals_ordinary(&borrowed, usize::MAX);
+        let hir = Hir::alternation(
+            patterns
+                .iter()
+                .map(|pattern| Hir::literal(pattern.as_bytes()))
+                .collect(),
+        );
+        let owned_tight = PortableBuilder::new("")
+            .multi_line(true)
+            .limits(tight_limits)
+            .build_ripgrep_standard_literal_hir_owned(hir, usize::MAX);
+        match (typed_tight, owned_tight) {
+            (
+                Ok(Some(RipgrepStandardLiteralsBuild::Portable(typed))),
+                Ok(super::RipgrepStandardLiteralHirBuild::Built(owned)),
+            ) => assert_eq!(typed.build_report(), owned.build_report()),
+            (
+                Err(BuildError::PersistentBytesLimit {
+                    needed: typed_needed,
+                    limit: typed_limit,
+                }),
+                Err(BuildError::PersistentBytesLimit {
+                    needed: owned_needed,
+                    limit: owned_limit,
+                }),
+            ) => {
+                assert_eq!(typed_needed, owned_needed);
+                assert_eq!(typed_limit, owned_limit);
+            }
+            (typed, owned) => panic!(
+                "tight typed/owned resource outcomes differ: typed={typed:?}, owned={owned:?}",
+            ),
+        }
     }
 
     #[test]
@@ -44072,6 +44454,157 @@ mod tests {
     }
 
     #[test]
+    fn bounded_delimited_shortest_value_uses_find_window_value() {
+        const PATTERN: &str = r"(?-u:(?:[a-z]{1,16}/){1,4}DONE)";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("native bounded-delimited segment builds");
+        assert!(matches!(
+            &regex.plan,
+            PortablePlan::BoundedDelimitedSegmentRepeat(_)
+        ));
+
+        let haystack = b"DONE!b/DONE!cc/dd/DONE";
+        let window = SearchWindow::full(haystack);
+        super::universal_finite_greedy_corridor::value_path_probe::reset();
+        assert_eq!(
+            regex.shortest_match_window_value(
+                haystack,
+                window,
+                SearchLimits::unlimited(),
+            ),
+            Ok(Some(11)),
+        );
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 1),
+        );
+
+        let (accounted, accounting) = regex
+            .shortest_match_window(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(accounted, Some(11));
+        assert!(matches!(
+            accounting,
+            SearchAccounting::RequiredLiteral(_)
+        ));
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 1),
+        );
+    }
+
+    #[test]
+    fn bounded_delimited_shortest_value_matches_accounted_exhaustively() {
+        const ALPHABET: [u8; 4] = [b'a', b'/', b'X', b'!'];
+        const PATTERN: &str = r"(?-u:(?:[ab]{1,2}/){1,2}X)";
+
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("native bounded-delimited segment builds");
+        assert!(matches!(
+            &regex.plan,
+            PortablePlan::BoundedDelimitedSegmentRepeat(_)
+        ));
+
+        for len in 0_usize..=7 {
+            let case_count = (0..len).fold(1_usize, |count, _| count * ALPHABET.len());
+            for ordinal in 0..case_count {
+                let mut code = ordinal;
+                let mut haystack = vec![0; len];
+                for byte in &mut haystack {
+                    *byte = ALPHABET[code % ALPHABET.len()];
+                    code /= ALPHABET.len();
+                }
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let (expected, accounting) = regex
+                            .shortest_match_window(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            regex.shortest_match_window_value(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            Ok(expected),
+                            "haystack={haystack:?}, window={start}..{end}, unlimited",
+                        );
+
+                        let SearchAccounting::RequiredLiteral(accounting) = accounting else {
+                            panic!("bounded-delimited route returned another accounting family");
+                        };
+                        let exact_limits = SearchLimits {
+                            max_work: accounting.work_upper_bound,
+                            max_scratch_bytes: accounting.scratch_bytes,
+                        };
+                        let expected_exact = regex
+                            .shortest_match_window(&haystack, window, exact_limits)
+                            .map(|(matched, _)| matched);
+                        assert_eq!(
+                            regex.shortest_match_window_value(
+                                &haystack,
+                                window,
+                                exact_limits,
+                            ),
+                            expected_exact,
+                            "haystack={haystack:?}, window={start}..{end}, exact limit",
+                        );
+
+                        let refused_limits = SearchLimits {
+                            max_work: accounting.work_upper_bound.checked_sub(1).unwrap(),
+                            ..exact_limits
+                        };
+                        let expected_refusal = regex
+                            .shortest_match_window(&haystack, window, refused_limits)
+                            .map(|(matched, _)| matched);
+                        assert!(
+                            expected_refusal.is_err(),
+                            "bounded-delimited one-below work limit unexpectedly succeeded",
+                        );
+                        assert_eq!(
+                            regex.shortest_match_window_value(
+                                &haystack,
+                                window,
+                                refused_limits,
+                            ),
+                            expected_refusal,
+                            "haystack={haystack:?}, window={start}..{end}, refused limit",
+                        );
+                    }
+                }
+            }
+        }
+
+        let haystack = b"a/X";
+        let zero_limits = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        for window in [
+            SearchWindow::new(1, 0),
+            SearchWindow::new(0, haystack.len() + 1),
+        ] {
+            let expected = regex
+                .shortest_match_window(haystack, window, zero_limits)
+                .map(|(matched, _)| matched);
+            assert!(expected.is_err(), "invalid window unexpectedly succeeded");
+            assert_eq!(
+                regex.shortest_match_window_value(haystack, window, zero_limits),
+                expected,
+                "invalid window {window:?}",
+            );
+        }
+    }
+
+    #[test]
     fn native_universal_corridor_multi_byte_suffix_falls_through_to_k0() {
         const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}aa)";
         let regex = PortableBuilder::new(PATTERN)
@@ -47866,7 +48399,10 @@ mod tests {
                 super::PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa { .. } => {
                     "literal-set-uniform-standard-dfa"
                 }
-                super::PortableOrdinarySessionPlan::ExactLiteral { .. } => "exact-literal",
+                super::PortableOrdinarySessionPlan::ExactLiteral { .. }
+                | super::PortableOrdinarySessionPlan::ExactLiteralRetainedCount { .. } => {
+                    "exact-literal"
+                }
                 super::PortableOrdinarySessionPlan::LiteralSetCompact { .. } => {
                     "literal-set-compact"
                 }
@@ -48886,6 +49422,117 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_fixed_predicate_count_exhaustively_matches_selected_span_iteration() {
+        let regex = fixed_predicate_regex(r"[ab][cd][ef]");
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
+            )
+        ));
+
+        for haystack in byte_words(b"acefx", 6) {
+            for start in 0..=haystack.len() {
+                let mut cursor = start;
+                let mut expected = 0_u64;
+                while let Some(matched) = regex
+                    .find_at_value(&haystack, cursor, SearchLimits::unlimited())
+                    .unwrap()
+                {
+                    assert!(matched.end() > cursor);
+                    cursor = matched.end();
+                    expected = expected.checked_add(1).unwrap();
+                }
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(&haystack, start),
+                    Ok(Some(expected)),
+                    "haystack={haystack:?}, start={start}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_fixed_predicate_count_routes_exact_tails_and_preserves_errors() {
+        fn selected_count(regex: &PortableRegex, haystack: &[u8], start: usize) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        for (pattern, haystack) in [
+            (r"[ab][cd][ef]", &b"!ace-acf-xxx-aceacf?"[..]),
+            (r"[A-D][\x00-\x7F]Q", &b"\xff!Q-A!Q-B\x7fQ-\xff!Q-C0Q"[..]),
+            (
+                r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
+                &b"Qacegikmortvx0-Qbdfhjlnpsuwy1-Qacegikmortvx2-Qacegikmortvx0"[..],
+            ),
+        ] {
+            let regex = fixed_predicate_regex(pattern);
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
+                )
+            ));
+            for start in 0..=haystack.len() {
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(haystack, start),
+                    Ok(Some(selected_count(&regex, haystack, start))),
+                    "pattern={pattern:?}, start={start}",
+                );
+            }
+            assert_eq!(
+                ordinary.count_positive_width_selected_ends_at(haystack, haystack.len() + 1),
+                Err(SearchError::FixedPredicateWord64(
+                    fre_kernels::FixedPredicateWord64SearchError::InvalidWindow {
+                        start: haystack.len() + 1,
+                        end: haystack.len(),
+                        haystack_len: haystack.len(),
+                    }
+                )),
+                "pattern={pattern:?}",
+            );
+        }
+
+        assert_eq!(
+            super::fixed_predicate_word64_unlimited_count_error(
+                fre_kernels::FixedPredicateWord64ReduceError::ArithmeticOverflow {
+                    computation: "injected count overflow",
+                },
+            ),
+            SearchError::FixedPredicateWord64(
+                fre_kernels::FixedPredicateWord64SearchError::ArithmeticOverflow {
+                    computation: "injected count overflow",
+                }
+            ),
+        );
+        assert_eq!(
+            super::fixed_predicate_word64_unlimited_count_error(
+                fre_kernels::FixedPredicateWord64ReduceError::WorkLimit {
+                    needed: 2,
+                    limit: 1,
+                },
+            ),
+            SearchError::FixedPredicateWord64(
+                fre_kernels::FixedPredicateWord64SearchError::InternalInvariant(
+                    "unlimited fixed-predicate count unexpectedly refused its resource envelope",
+                )
+            ),
+        );
+    }
+
+    #[test]
     fn ordinary_positive_selected_end_count_preserves_order_progress_and_offsets() {
         for (pattern, haystack, start, expected) in [
             ("a+", &b"zaaa aa"[..], 0, 2),
@@ -49055,6 +49702,45 @@ mod tests {
             &empty.plan,
             super::PortableOrdinarySessionPlan::Canonical(_)
         ));
+    }
+
+    #[test]
+    fn ordinary_session_routes_only_eligible_exact_literals_to_retained_count() {
+        fn retained_route(pattern: &str) -> bool {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+            let ordinary = regex.ordinary_session().unwrap();
+            matches!(
+                ordinary.plan,
+                super::PortableOrdinarySessionPlan::ExactLiteralRetainedCount { .. }
+            )
+        }
+
+        assert!(!retained_route("needle"));
+        assert!(!retained_route("abcdabcd"));
+        assert!(!retained_route("aaaaaaaaa"));
+        assert!(!retained_route("0123456789abcdef0123456789ABCDEFG"));
+        assert_eq!(retained_route("needleXYZ"), cfg!(target_arch = "aarch64"));
+        assert_eq!(
+            retained_route("0123456789abcdef0123456789ABCDEF"),
+            cfg!(target_arch = "aarch64"),
+        );
+
+        let regex = PortableBuilder::new("needleXYZ")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(
+                b"xxneedleXYZ,needleXYZ,needleXYZy",
+                0,
+            ),
+            Ok(Some(3)),
+        );
     }
 
     #[test]

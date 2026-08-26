@@ -1,6 +1,6 @@
 use fre::{
-    BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableRegex, SearchLimits,
-    SearchSessionLimits, SearchWindow,
+    BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableRegex, SearchAccounting,
+    SearchLimits, SearchSessionLimits, SearchWindow,
 };
 
 const PATTERN: &str = r"(?-u:[A-Za-z0-9_]+).*MANDATORY.*z";
@@ -23,6 +23,71 @@ fn forced(pattern: &str) -> PortableRegex {
 
 fn put(haystack: &mut [u8], start: usize, bytes: &[u8]) {
     haystack[start..start + bytes.len()].copy_from_slice(bytes);
+}
+
+fn assert_k0_accounting_differs_only_by_optional_owner(
+    automatic: SearchAccounting,
+    forced: SearchAccounting,
+) -> usize {
+    let (SearchAccounting::K0(automatic), SearchAccounting::K0(forced)) = (automatic, forced)
+    else {
+        panic!("automatic and forced searches must both report K0 accounting");
+    };
+    assert_eq!(automatic.work(), forced.work());
+    assert_eq!(automatic.setup_work(), forced.setup_work());
+    assert_eq!(automatic.transition_work(), forced.transition_work());
+    assert_eq!(automatic.boundaries(), forced.boundaries());
+
+    let automatic_setup = automatic.setup();
+    let forced_setup = forced.setup();
+    assert_eq!(
+        automatic_setup.allocated_bytes(),
+        forced_setup.allocated_bytes()
+    );
+    assert_eq!(
+        automatic_setup.initialized_bytes(),
+        forced_setup.initialized_bytes()
+    );
+    assert_eq!(automatic_setup.reused(), forced_setup.reused());
+    let optional_owner_bytes = automatic_setup
+        .retained_bytes()
+        .checked_sub(forced_setup.retained_bytes())
+        .expect("automatic optional owner must not reduce retained setup storage");
+    assert!(optional_owner_bytes > 0);
+    assert_eq!(
+        automatic
+            .scratch_bytes()
+            .checked_sub(forced.scratch_bytes()),
+        Some(optional_owner_bytes),
+    );
+
+    let automatic_growth = automatic.cache_growth();
+    let forced_growth = forced.cache_growth();
+    assert_eq!(automatic_growth.events(), forced_growth.events());
+    assert_eq!(
+        automatic_growth.allocated_bytes(),
+        forced_growth.allocated_bytes()
+    );
+    assert_eq!(
+        automatic_growth.initialized_bytes(),
+        forced_growth.initialized_bytes()
+    );
+    assert_eq!(
+        automatic_growth.retained_delta(),
+        forced_growth.retained_delta()
+    );
+    if automatic_growth.events() == 0 {
+        assert_eq!(automatic_growth.peak_scratch_bytes(), 0);
+        assert_eq!(forced_growth.peak_scratch_bytes(), 0);
+    } else {
+        assert_eq!(
+            automatic_growth
+                .peak_scratch_bytes()
+                .checked_sub(forced_growth.peak_scratch_bytes()),
+            Some(optional_owner_bytes),
+        );
+    }
+    optional_owner_bytes
 }
 
 #[test]
@@ -121,7 +186,7 @@ fn reusable_values_match_forced_k0_across_negative_positive_and_windows() {
 }
 
 #[test]
-fn errors_accounting_and_reuse_remain_plain_k0() {
+fn errors_accounting_and_reuse_preserve_exact_optional_owner_delta() {
     let optimized = auto(PATTERN);
     let oracle = forced(PATTERN);
     let mut optimized_session = optimized
@@ -161,14 +226,30 @@ fn errors_accounting_and_reuse_remain_plain_k0() {
     let mut oracle_accounted = oracle
         .search_session(SearchSessionLimits::unlimited())
         .expect("oracle accounted session");
-    assert_eq!(
-        optimized_accounted.is_match(&absent, SearchLimits::unlimited()),
-        oracle_accounted.is_match(&absent, SearchLimits::unlimited())
+    let (optimized_matched, optimized_is_match_accounting) = optimized_accounted
+        .is_match(&absent, SearchLimits::unlimited())
+        .expect("automatic accounted is-match");
+    let (oracle_matched, oracle_is_match_accounting) = oracle_accounted
+        .is_match(&absent, SearchLimits::unlimited())
+        .expect("forced accounted is-match");
+    assert_eq!(optimized_matched, oracle_matched);
+    let is_match_optional_owner_bytes = assert_k0_accounting_differs_only_by_optional_owner(
+        optimized_is_match_accounting,
+        oracle_is_match_accounting,
     );
-    assert_eq!(
-        optimized_accounted.find(&absent, SearchLimits::unlimited()),
-        oracle_accounted.find(&absent, SearchLimits::unlimited())
+
+    let (optimized_match, optimized_find_accounting) = optimized_accounted
+        .find(&absent, SearchLimits::unlimited())
+        .expect("automatic accounted find");
+    let (oracle_match, oracle_find_accounting) = oracle_accounted
+        .find(&absent, SearchLimits::unlimited())
+        .expect("forced accounted find");
+    assert_eq!(optimized_match, oracle_match);
+    let find_optional_owner_bytes = assert_k0_accounting_differs_only_by_optional_owner(
+        optimized_find_accounting,
+        oracle_find_accounting,
     );
+    assert_eq!(is_match_optional_owner_bytes, find_optional_owner_bytes);
 
     let mut reused = absent;
     let address = reused.as_ptr();

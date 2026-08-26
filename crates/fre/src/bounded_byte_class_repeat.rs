@@ -81,6 +81,36 @@ struct SearchState {
     run_scans: usize,
 }
 
+#[cfg(test)]
+mod ordinary_count_mode_probe {
+    use core::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Mode {
+        None,
+        LazyAggregate,
+        GreedyEmpty,
+        GreedySelected,
+        GreedyAggregate,
+    }
+
+    std::thread_local! {
+        static LAST: Cell<Mode> = const { Cell::new(Mode::None) };
+    }
+
+    pub(super) fn reset() {
+        LAST.set(Mode::None);
+    }
+
+    pub(super) fn record(mode: Mode) {
+        LAST.set(mode);
+    }
+
+    pub(super) fn last() -> Mode {
+        LAST.get()
+    }
+}
+
 #[derive(Clone, Copy)]
 enum MemberMaskMode<'a> {
     Range {
@@ -200,6 +230,181 @@ impl Plan {
         core::mem::size_of::<Self>()
             .checked_add(core::mem::size_of::<Owner>())
             .expect("the fixed bounded byte-class repeat layouts fit usize")
+    }
+
+    /// Count non-overlapping selected matches in one ordinary full-tail
+    /// projection without constructing spans, windows, or accounting.
+    ///
+    /// Lazy selection partitions every maximal member run into
+    /// `minimum`-byte words in one pass. Greedy selection inspects its first
+    /// qualifying maximal run once. A run no wider than `maximum` seeds
+    /// authoritative selected-span iteration at that run's end; a wider run
+    /// seeds maximal-run aggregation and continues after its separator.
+    /// Neither route scans or counts the first run twice.
+    #[must_use]
+    #[inline(never)]
+    pub(crate) fn ordinary_count_full_unmetered(&self, haystack: &[u8]) -> u64 {
+        let owner = self.owner();
+        let minimum = usize::try_from(owner.minimum)
+            .expect("one repetition minimum fits the target index width");
+        let maximum = usize::try_from(owner.maximum)
+            .expect("one repetition maximum fits the target index width");
+        debug_assert!(minimum > 0 && maximum >= minimum);
+
+        if !owner.greedy {
+            #[cfg(test)]
+            ordinary_count_mode_probe::record(
+                ordinary_count_mode_probe::Mode::LazyAggregate,
+            );
+            let mut position = 0_usize;
+            let mut count = 0_u64;
+            while let Some(start) = owner.member_seek.seek_unmetered(
+                haystack,
+                position,
+                haystack.len(),
+                owner.classifier.as_ref(),
+            ) {
+                let after_first = start
+                    .checked_add(1)
+                    .expect("a selected byte before the slice end can advance once");
+                let run_end = owner
+                    .run_end_seek
+                    .seek_unmetered(
+                        haystack,
+                        after_first,
+                        haystack.len(),
+                        owner.classifier.as_ref(),
+                    )
+                    .unwrap_or(haystack.len());
+                let run_bytes = run_end
+                    .checked_sub(start)
+                    .expect("a maximal member run ends after its start");
+                let run_matches = if run_bytes < minimum {
+                    0
+                } else if minimum == 1 {
+                    run_bytes
+                } else {
+                    run_bytes / minimum
+                };
+                count = count
+                    .checked_add(
+                        u64::try_from(run_matches)
+                            .expect("a slice-bounded match count fits u64"),
+                    )
+                    .expect("positive-width slice matches fit u64");
+                position = if run_end < haystack.len() {
+                    run_end
+                        .checked_add(1)
+                        .expect("a run-ending byte before the slice end can advance once")
+                } else {
+                    run_end
+                };
+            }
+            return count;
+        }
+
+        let Some(first) = self.qualifying_search_value(
+            haystack,
+            SearchWindow::new(0, haystack.len()),
+        ) else {
+            #[cfg(test)]
+            ordinary_count_mode_probe::record(
+                ordinary_count_mode_probe::Mode::GreedyEmpty,
+            );
+            return 0;
+        };
+        let first_run_end = owner
+            .run_end_seek
+            .seek_unmetered(
+                haystack,
+                first.minimum_end,
+                haystack.len(),
+                owner.classifier.as_ref(),
+            )
+            .unwrap_or(haystack.len());
+        let first_run_bytes = first_run_end
+            .checked_sub(first.start)
+            .expect("the first qualifying run ends after its start");
+        debug_assert!(first_run_bytes >= minimum);
+
+        if first_run_bytes <= maximum {
+            #[cfg(test)]
+            ordinary_count_mode_probe::record(
+                ordinary_count_mode_probe::Mode::GreedySelected,
+            );
+            let mut cursor = first_run_end;
+            let mut count = 1_u64;
+            while let Some((_, selected_end)) = self.selected_search_value(
+                haystack,
+                SearchWindow::new(cursor, haystack.len()),
+            ) {
+                debug_assert!(selected_end > cursor);
+                cursor = selected_end;
+                count = count
+                    .checked_add(1)
+                    .expect("positive-width slice matches fit u64");
+            }
+            return count;
+        }
+
+        #[cfg(test)]
+        ordinary_count_mode_probe::record(
+            ordinary_count_mode_probe::Mode::GreedyAggregate,
+        );
+        let greedy_run_matches = |run_bytes: usize| {
+            debug_assert!(run_bytes >= minimum);
+            let complete = run_bytes / maximum;
+            complete
+                .checked_add(usize::from(run_bytes % maximum >= minimum))
+                .expect("one run cannot contain more matches than bytes")
+        };
+        let mut count = u64::try_from(greedy_run_matches(first_run_bytes))
+            .expect("a slice-bounded match count fits u64");
+        let mut position = if first_run_end < haystack.len() {
+            first_run_end
+                .checked_add(1)
+                .expect("a run-ending byte before the slice end can advance once")
+        } else {
+            first_run_end
+        };
+        while let Some(start) = owner.member_seek.seek_unmetered(
+            haystack,
+            position,
+            haystack.len(),
+            owner.classifier.as_ref(),
+        ) {
+            let after_first = start
+                .checked_add(1)
+                .expect("a selected byte before the slice end can advance once");
+            let run_end = owner
+                .run_end_seek
+                .seek_unmetered(
+                    haystack,
+                    after_first,
+                    haystack.len(),
+                    owner.classifier.as_ref(),
+                )
+                .unwrap_or(haystack.len());
+            let run_bytes = run_end
+                .checked_sub(start)
+                .expect("a maximal member run ends after its start");
+            if run_bytes >= minimum {
+                count = count
+                    .checked_add(
+                        u64::try_from(greedy_run_matches(run_bytes))
+                            .expect("a slice-bounded match count fits u64"),
+                    )
+                    .expect("positive-width slice matches fit u64");
+            }
+            position = if run_end < haystack.len() {
+                run_end
+                    .checked_add(1)
+                    .expect("a run-ending byte before the slice end can advance once")
+            } else {
+                run_end
+            };
+        }
+        count
     }
 
     pub(crate) fn is_match_window(
@@ -916,7 +1121,8 @@ fn charge_planner(work: &mut u64, additional: u64, limit: u64) -> Result<(), Ins
 mod tests {
     use super::{
         BYTE_SET_BLOCK_BYTES, MemberMaskMode, PLAN_ID, Qualified, RunCarry,
-        consume_member_mask,
+        consume_member_mask, ordinary_count_mode_probe,
+        ordinary_count_mode_probe::Mode as OrdinaryCountMode,
     };
     use crate::pure_byte_class_repeat::SetSeek;
     use crate::{
@@ -1077,6 +1283,163 @@ mod tests {
         );
         assert!(plan.owner().classifier.is_some());
         assert!(MemberMaskMode::from_owner(plan.owner()).is_none());
+    }
+
+    #[test]
+    fn ordinary_count_matches_selected_end_iteration_for_every_tail() {
+        fn selected_count(
+            regex: &crate::PortableRegex,
+            haystack: &[u8],
+            start: usize,
+        ) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        let patterns = [
+            ("a{2,5}", b'a', b'b'),
+            ("a{2,5}?", b'a', b'b'),
+            ("(?-u:[ab]){1,4}", b'a', b'!'),
+            ("(?-u:[ab]){1,4}?", b'a', b'!'),
+            ("(?-u:[^a]){3,7}", b'b', b'a'),
+            ("(?-u:[^a]){3,7}?", b'b', b'a'),
+            ("(?-u:[aceg]){2,5}", b'a', b'b'),
+            ("(?-u:[aceg]){2,5}?", b'a', b'b'),
+        ];
+        let alphabet = [b'a', b'b', b'!'];
+        for (pattern, member, separator) in patterns {
+            let regex = build(pattern);
+            let PortablePlan::BoundedByteClassRepeat(plan) = &regex.plan else {
+                panic!("expected bounded plan for {pattern:?}");
+            };
+            let mut ordinary = regex.ordinary_session().unwrap();
+            for length in 0_u32..=6 {
+                let cases = alphabet.len().pow(length);
+                for encoded in 0..cases {
+                    let mut value = encoded;
+                    let mut haystack = vec![0_u8; usize::try_from(length).unwrap()];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    for start in 0..=haystack.len() {
+                        let expected = selected_count(&regex, &haystack, start);
+                        assert_eq!(
+                            plan.ordinary_count_full_unmetered(&haystack[start..]),
+                            expected,
+                            "direct count: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                        assert_eq!(
+                            ordinary.count_positive_width_selected_ends_at(
+                                &haystack,
+                                start,
+                            ),
+                            Ok(Some(expected)),
+                            "facade count: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                    }
+                }
+            }
+
+            for run_bytes in [7, 10, 11, 12, 14, 15, 16, 31] {
+                let mut haystack = vec![separator; 2];
+                haystack.extend(core::iter::repeat_n(member, run_bytes));
+                haystack.push(separator);
+                haystack.extend(core::iter::repeat_n(member, run_bytes / 2));
+                haystack.push(separator);
+                for start in 0..=haystack.len() {
+                    let expected = selected_count(&regex, &haystack, start);
+                    assert_eq!(
+                        plan.ordinary_count_full_unmetered(&haystack[start..]),
+                        expected,
+                        "long direct count: pattern={pattern:?}, run_bytes={run_bytes}, start={start}",
+                    );
+                    assert_eq!(
+                        ordinary.count_positive_width_selected_ends_at(
+                            &haystack,
+                            start,
+                        ),
+                        Ok(Some(expected)),
+                        "long facade count: pattern={pattern:?}, run_bytes={run_bytes}, start={start}",
+                    );
+                }
+            }
+            assert!(matches!(
+                ordinary.count_positive_width_selected_ends_at(
+                    b"a",
+                    usize::MAX,
+                ),
+                Err(FacadeSearchError::PureByteClassRepeat(
+                    Error::InvalidWindow
+                )),
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_count_adaptive_modes_seed_each_first_run_once() {
+        fn check(
+            pattern: &str,
+            haystack: &[u8],
+            expected: u64,
+            expected_mode: OrdinaryCountMode,
+        ) {
+            let regex = build(pattern);
+            let PortablePlan::BoundedByteClassRepeat(plan) = &regex.plan else {
+                panic!("expected bounded plan for {pattern:?}");
+            };
+            ordinary_count_mode_probe::reset();
+            assert_eq!(
+                plan.ordinary_count_full_unmetered(haystack),
+                expected,
+                "pattern={pattern:?}, haystack={haystack:?}",
+            );
+            assert_eq!(ordinary_count_mode_probe::last(), expected_mode);
+        }
+
+        check(
+            "a{2,5}?",
+            b"aaaaaa!aa",
+            4,
+            OrdinaryCountMode::LazyAggregate,
+        );
+        check(
+            "a{2,5}",
+            b"a!b!",
+            0,
+            OrdinaryCountMode::GreedyEmpty,
+        );
+        // The selected route seeds `aa` once, then transitions through a run
+        // wider than the maximum and its rejected one-byte residue.
+        check(
+            "a{2,5}",
+            b"aa!aaaaaa!aa",
+            3,
+            OrdinaryCountMode::GreedySelected,
+        );
+        // The aggregate route seeds the first six-byte run once, skips the
+        // following sub-minimum run, and resumes on the final qualifying run.
+        check(
+            "a{2,5}",
+            b"aaaaaa!a!aa",
+            2,
+            OrdinaryCountMode::GreedyAggregate,
+        );
+        check(
+            "a{2,5}",
+            b"aaaaaa!aaaaaaaaaaa!aa",
+            4,
+            OrdinaryCountMode::GreedyAggregate,
+        );
     }
 
     #[test]

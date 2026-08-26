@@ -29,6 +29,13 @@ const EXACT_FINITE_TEDDY_ASIMD_OVERLAP_MIN_RESIDUE: u16 = 5;
 /// predicates are materialized only after the batch is known to contain a hit.
 const EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS: u8 = 4;
 const EXACT_FINITE_TEDDY_UNBATCHED_VECTORS: u8 = 1;
+const _: () = assert!(
+    EXACT_FINITE_PREFIX_MIN_INPUT_BYTES
+        >= EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS as usize
+            * AARCH64_SVE_MAX_VECTOR_BYTES as usize
+            + mandatory_teddy::MAX_MANDATORY_TEDDY_COLUMNS
+            - 1
+);
 /// P1..P4 retain a four-vector batch, so the exact leaf must not use the
 /// generic first-candidate helper's P2 scratch.
 const EXACT_FINITE_TEDDY_SVE_LANE_SCRATCH: u8 = 10;
@@ -1397,25 +1404,14 @@ fn aarch64_emit_exact_teddy_sve_batch_route(
     vector: Aarch64Label,
     single: Aarch64Label,
     batch_candidate: Aarch64Label,
-    exhausted: Aarch64Label,
     single_prefix: bool,
 ) -> Result<(), ObjectError> {
     assembler.bind(vector)?;
-    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-    assembler.instruction(aarch64_cmp_x_imm(12, u16::from(teddy.plan.columns()))?)?;
-    assembler.branch_cond(AARCH64_LO, exhausted)?;
-    let maximum_offset = teddy
-        .plan
-        .columns()
-        .checked_sub(1)
-        .ok_or(ObjectError::InvalidModule(
-            "AArch64 exact finite SelectedEnd Teddy has no columns",
-        ))?;
-    assembler.instruction(aarch64_sub_x_imm(10, 3, u16::from(maximum_offset))?)?;
-    assembler.instruction(aarch64_sub_x_reg(12, 10, 2)?)?;
-
-    assembler.instruction(aarch64_cmp_x_lsl(12, 6, 2)?)?;
-    assembler.branch_cond(AARCH64_LO, single)?;
+    // Retry setup retains the last base with a complete four-vector batch in
+    // X9. The steady-state miss loop needs only this unsigned cursor test;
+    // X10 separately retains the exclusive end of all valid candidate bases.
+    assembler.instruction(aarch64_cmp_x(2, 9)?)?;
+    assembler.branch_cond(AARCH64_HI, single)?;
     aarch64_emit_mandatory_teddy_sve_batch4_candidates(
         assembler,
         teddy,
@@ -1580,6 +1576,29 @@ fn lower_aarch64_wrapper(
             assembler.instruction(aarch64_sve_ptrue_b())?;
             assembler.instruction(aarch64_sve_dup_b_imm(26, 0x0f)?)?;
             assembler.instruction(aarch64_sve_cntb(6)?)?;
+            let maximum_offset = teddy
+                .plan
+                .columns()
+                .checked_sub(1)
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 exact finite SelectedEnd Teddy has no columns",
+                ))?;
+            // X10 is the exclusive candidate-base end. X9 is the last base
+            // from which four complete runtime vectors can be read. Exact
+            // verification may clobber both, so every retry rematerializes
+            // them together with the predicate and vector-length invariants.
+            assembler.instruction(aarch64_sub_x_imm(10, 3, u16::from(maximum_offset))?)?;
+            let backward_batch_vectors = i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS)
+                .ok()
+                .and_then(i8::checked_neg)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 exact finite SelectedEnd Teddy batch frontier",
+                ))?;
+            assembler.instruction(aarch64_sve_addvl_signed(
+                9,
+                10,
+                backward_batch_vectors,
+            )?)?;
             if let (Some(single_prefix_vector), Some(maximum_vector_bytes)) = (
                 single_prefix_vector,
                 batch_plan.single_prefix_max_vector_bytes,
@@ -1600,7 +1619,6 @@ fn lower_aarch64_wrapper(
                 vector,
                 single,
                 batch_candidate,
-                exhausted,
                 false,
             )?;
             if let Some(single_prefix_vector) = single_prefix_vector {
@@ -1610,7 +1628,6 @@ fn lower_aarch64_wrapper(
                     single_prefix_vector,
                     single,
                     batch_candidate,
-                    exhausted,
                     true,
                 )?;
             }
@@ -1664,6 +1681,11 @@ fn lower_aarch64_wrapper(
             }
 
             assembler.bind(single)?;
+            // The batch frontier deliberately permits the cursor to reach the
+            // exclusive candidate end. Reject that terminal state before the
+            // existing one-vector/partial split subtracts candidate bases.
+            assembler.instruction(aarch64_cmp_x(2, 10)?)?;
+            assembler.branch_cond(AARCH64_HS, exhausted)?;
             assembler.instruction(aarch64_sub_x_reg(12, 10, 2)?)?;
             assembler.instruction(aarch64_cmp_x(12, 6)?)?;
             assembler.branch_cond(AARCH64_LO, partial)?;
@@ -4691,6 +4713,51 @@ mod tests {
     }
 
     #[test]
+    fn sve_batch_frontier_preserves_every_runtime_vl_boundary() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Route {
+            Exhausted,
+            Single,
+            Batch,
+        }
+
+        let cursor = 0x1_0000_usize;
+        for columns in [3_usize, 4] {
+            for vector_bytes in (AARCH64_SVE_MIN_VECTOR_BYTES
+                ..=AARCH64_SVE_MAX_VECTOR_BYTES)
+                .step_by(usize::from(AARCH64_SVE_MIN_VECTOR_BYTES))
+            {
+                let batch_bytes = usize::from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS)
+                    .checked_mul(usize::from(vector_bytes))
+                    .unwrap();
+                for remaining in 0..=batch_bytes + columns + 2 {
+                    let end = cursor + remaining;
+                    let old = if remaining < columns {
+                        Route::Exhausted
+                    } else if end - (columns - 1) - cursor < batch_bytes {
+                        Route::Single
+                    } else {
+                        Route::Batch
+                    };
+                    let candidate_end = end - (columns - 1);
+                    let batch_frontier = candidate_end - batch_bytes;
+                    let new = if cursor <= batch_frontier {
+                        Route::Batch
+                    } else if cursor >= candidate_end {
+                        Route::Exhausted
+                    } else {
+                        Route::Single
+                    };
+                    assert_eq!(
+                        new, old,
+                        "columns={columns} vector_bytes={vector_bytes} remaining={remaining}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sve_single_prefix_wrapper_hoists_runtime_vl_dispatch() {
         let pattern = sparse_single_prefix_pattern();
         let target = Target::aarch64_linux()
@@ -4727,13 +4794,34 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
+        let conditional_target = |index: usize| {
+            let immediate =
+                (i32::try_from((words[index] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            isize::try_from(index)
+                .unwrap()
+                .checked_add(isize::try_from(immediate).unwrap())
+                .and_then(|target| usize::try_from(target).ok())
+        };
+        let maximum_offset = u16::from(report.columns - 1);
+        let retry_setup = [
+            aarch64_sve_ptrue_b(),
+            aarch64_sve_dup_b_imm(26, 0x0f).unwrap(),
+            aarch64_sve_cntb(6).unwrap(),
+            aarch64_sub_x_imm(10, 3, maximum_offset).unwrap(),
+            aarch64_sve_addvl_signed(
+                9,
+                10,
+                -i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+            )
+            .unwrap(),
+            aarch64_cmp_x_imm(6, maximum_vector_bytes).unwrap(),
+        ];
         let dispatch_matches = words
-            .windows(3)
+            .windows(retry_setup.len() + 1)
             .enumerate()
             .filter(|(_, window)| {
-                window[0] == aarch64_sve_cntb(6).unwrap()
-                    && window[1] == aarch64_cmp_x_imm(6, maximum_vector_bytes).unwrap()
-                    && window[2] & 0xff00_001f
+                window[..retry_setup.len()] == retry_setup
+                    && window[retry_setup.len()] & 0xff00_001f
                         == 0x5400_0000 | u32::from(AARCH64_LS)
             })
             .map(|(index, _)| index)
@@ -4744,24 +4832,42 @@ mod tests {
             "the runtime VL choice must be hoisted out of both batch loops",
         );
         let dispatch = dispatch_matches[0];
+        let wide_route = dispatch + retry_setup.len() + 1;
         assert_eq!(
-            words[dispatch + 3],
-            aarch64_sub_x_reg(12, 3, 2).unwrap(),
-            "the fall-through route is the unchanged wide-vector loop",
+            words[wide_route],
+            aarch64_cmp_x(2, 9).unwrap(),
+            "the fall-through route must use the retained four-vector frontier",
+        );
+        assert_eq!(
+            words[wide_route + 1] & 0xff00_001f,
+            0x5400_0000 | u32::from(AARCH64_HI),
         );
         let immediate =
-            (i32::try_from((words[dispatch + 2] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
-        let sparse_route = isize::try_from(dispatch + 2)
+            (i32::try_from((words[dispatch + retry_setup.len()] >> 5) & 0x7_ffff).unwrap()
+                << 13)
+                >> 13;
+        let sparse_route = isize::try_from(dispatch + retry_setup.len())
             .unwrap()
             .checked_add(isize::try_from(immediate).unwrap())
             .and_then(|index| usize::try_from(index).ok())
             .unwrap();
         assert_eq!(
             words[sparse_route],
-            aarch64_sub_x_reg(12, 3, 2).unwrap(),
-            "the taken route is the separately emitted singleton loop",
+            aarch64_cmp_x(2, 9).unwrap(),
+            "the taken route must reuse the retained four-vector frontier",
         );
-        assert!(sparse_route > dispatch + 3);
+        assert_eq!(
+            words[sparse_route + 1] & 0xff00_001f,
+            0x5400_0000 | u32::from(AARCH64_HI),
+        );
+        let single = conditional_target(wide_route + 1).unwrap();
+        assert_eq!(conditional_target(sparse_route + 1), Some(single));
+        assert_eq!(words[single], aarch64_cmp_x(2, 10).unwrap());
+        assert_eq!(
+            words[single + 1] & 0xff00_001f,
+            0x5400_0000 | u32::from(AARCH64_HS),
+        );
+        assert!(sparse_route > wide_route);
         let existence = [
             aarch64_sve_orr_z(4, 24, 25).unwrap(),
             aarch64_sve_orr_z(5, 27, 28).unwrap(),
@@ -4778,7 +4884,7 @@ mod tests {
             "ordinary pair/final checks plus singleton pair/final checks",
         );
         assert_eq!(
-            words[dispatch + 3..sparse_route]
+            words[wide_route..sparse_route]
                 .windows(existence.len())
                 .filter(|window| *window == existence)
                 .count(),
@@ -4793,14 +4899,6 @@ mod tests {
             3,
             "the admitted route must add its singleton check before pair and final checks",
         );
-        let conditional_target = |index: usize| {
-            let immediate =
-                (i32::try_from((words[index] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
-            isize::try_from(index)
-                .unwrap()
-                .checked_add(isize::try_from(immediate).unwrap())
-                .and_then(|target| usize::try_from(target).ok())
-        };
         let unconditional_target = |index: usize| {
             let immediate = (i32::try_from(words[index] & 0x03ff_ffff).unwrap() << 6) >> 6;
             isize::try_from(index)
@@ -4809,7 +4907,7 @@ mod tests {
                 .and_then(|target| usize::try_from(target).ok())
         };
         for (route, end, expected_checks) in [
-            (dispatch + 3, sparse_route, 2_usize),
+            (wide_route, sparse_route, 2_usize),
             (sparse_route, words.len(), 3),
         ] {
             let checks = words[route..end]
@@ -4863,18 +4961,54 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
+        let retry_setup = [
+            aarch64_sve_ptrue_b(),
+            aarch64_sve_dup_b_imm(26, 0x0f).unwrap(),
+            aarch64_sve_cntb(6).unwrap(),
+            aarch64_sub_x_imm(10, 3, u16::from(report.lowering.columns - 1)).unwrap(),
+            aarch64_sve_addvl_signed(
+                9,
+                10,
+                -i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+            )
+            .unwrap(),
+            aarch64_cmp_x_imm(6, 16).unwrap(),
+        ];
         assert_eq!(
             words
-                .windows(3)
+                .windows(retry_setup.len() + 1)
                 .filter(|window| {
-                    window[0] == aarch64_sve_cntb(6).unwrap()
-                        && window[1] == aarch64_cmp_x_imm(6, 16).unwrap()
-                        && window[2] & 0xff00_001f
+                    window[..retry_setup.len()] == retry_setup
+                        && window[retry_setup.len()] & 0xff00_001f
                             == 0x5400_0000 | u32::from(AARCH64_LS)
                 })
                 .count(),
             1,
             "the forced three-column SVE2 wrapper must retain one hoisted VL dispatch",
+        );
+        assert_eq!(
+            words
+                .windows(2)
+                .filter(|window| {
+                    window[0] == aarch64_cmp_x(2, 9).unwrap()
+                        && window[1] & 0xff00_001f
+                            == 0x5400_0000 | u32::from(AARCH64_HI)
+                })
+                .count(),
+            2,
+            "both SVE2 batch routes must use the shared retained frontier",
+        );
+        assert_eq!(
+            words
+                .windows(2)
+                .filter(|window| {
+                    window[0] == aarch64_cmp_x(2, 10).unwrap()
+                        && window[1] & 0xff00_001f
+                            == 0x5400_0000 | u32::from(AARCH64_HS)
+                })
+                .count(),
+            1,
+            "the common single-vector path must reject the exclusive candidate end",
         );
     }
 
@@ -5128,7 +5262,47 @@ mod tests {
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Vec<_>>();
 
-            assert!(words.contains(&aarch64_cmp_x_lsl(12, 6, 2).unwrap()));
+            let frontier = [
+                aarch64_sve_ptrue_b(),
+                aarch64_sve_dup_b_imm(26, 0x0f).unwrap(),
+                aarch64_sve_cntb(6).unwrap(),
+                aarch64_sub_x_imm(10, 3, u16::from(report.columns - 1)).unwrap(),
+                aarch64_sve_addvl_signed(
+                    9,
+                    10,
+                    -i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+                )
+                .unwrap(),
+                aarch64_cmp_x(2, 9).unwrap(),
+            ];
+            assert_eq!(
+                words
+                    .windows(frontier.len() + 1)
+                    .filter(|window| {
+                        window[..frontier.len()] == frontier
+                            && window[frontier.len()] & 0xff00_001f
+                                == 0x5400_0000 | u32::from(AARCH64_HI)
+                    })
+                    .count(),
+                1,
+                "retry setup and the dense batch loop must share one exact frontier: {target:?}",
+            );
+            assert_eq!(
+                words
+                    .windows(2)
+                    .filter(|window| {
+                        window[0] == aarch64_cmp_x(2, 10).unwrap()
+                            && window[1] & 0xff00_001f
+                                == 0x5400_0000 | u32::from(AARCH64_HS)
+                    })
+                    .count(),
+                1,
+                "the common single-vector path must reject the exclusive candidate end: {target:?}",
+            );
+            assert!(
+                !words.contains(&aarch64_cmp_x_lsl(12, 6, 2).unwrap()),
+                "the old per-batch shifted runtime bound must be absent: {target:?}",
+            );
             let (_, baseline) = complete_dfa_baseline(&compiled, target);
             let selection = select_exact_finite_selected_end_teddy(
                 compiled

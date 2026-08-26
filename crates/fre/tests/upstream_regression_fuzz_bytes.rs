@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use fre::{BuildFailureClass, PlanKind, PortableBuilder, PortableFindIterLimits, RustProfile};
+use fre::{PlanKind, PortableBuilder, PortableFindIterLimits, RustProfile};
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
 const UPSTREAM_PACKAGE_SHA256: &str =
@@ -68,22 +68,35 @@ fn empty_any_class_builds_as_an_exact_never_match() {
 }
 
 #[test]
-fn oversized_unicode_class_repetition_is_a_typed_constructor_refusal() {
+fn upstream_size_threshold_is_a_compact_native_scalar_run() {
+    const REPETITIONS: usize = 971_158;
     let pattern = "[\u{0}\u{e}\u{2}\\w~~>[l\t\u{0}]p?<]{971158}";
     assert!(
         regex::bytes::Regex::new(pattern).is_err(),
-        "pinned bytes constructor unexpectedly accepted the oversized regression"
+        "pinned bytes constructor no longer enforced its NFA-size threshold"
     );
 
-    let error = PortableBuilder::new(pattern)
+    // Upstream's representation threshold is not FRE's native-size contract.
+    // This owner retains the exact repetition bound symbolically.
+    let regex = PortableBuilder::new(pattern)
+        .profile(RustProfile::regex_1_12_4())
         .build()
-        .expect_err("FRE unexpectedly admitted the oversized regression");
-    assert!(
-        matches!(
-            error.failure_class(),
-            BuildFailureClass::ExpectedInvalid | BuildFailureClass::ResourceLimit
-        ),
-        "oversized regression was not a constructor/resource refusal: {error:?}"
+        .expect("FRE compact scalar-run construction");
+    let report = regex.build_report();
+    assert_eq!(report.plan, PlanKind::UnicodeScalarRun);
+    assert_eq!(report.persistent_byte_limit, 10 * (1 << 20));
+    assert!(report.charged_persistent_bytes <= report.persistent_byte_limit);
+    assert_eq!(report.syntax.largest_finite_repeat, Some(971_158));
+    assert_eq!(report.minimum_match_bytes, Some(REPETITIONS));
+    assert_eq!((report.states, report.edges), (0, 0));
+
+    let mut haystack = Vec::with_capacity(REPETITIONS);
+    haystack.resize(REPETITIONS - 1, b'a');
+    assert_eq!(regex.find(&haystack), None);
+    haystack.push(b'a');
+    assert_eq!(
+        regex.find(&haystack).map(|matched| matched.range()),
+        Some(0..REPETITIONS),
     );
 }
 

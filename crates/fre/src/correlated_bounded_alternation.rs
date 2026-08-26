@@ -1714,6 +1714,8 @@ mod tests {
             TARGET,
             CLASSIFIED_TERMINALS,
             FIVE_TERMINALS,
+            SIX_TERMINALS,
+            SEVEN_TERMINALS,
             EIGHT_TERMINALS,
         ] {
             let hir = parse(pattern);

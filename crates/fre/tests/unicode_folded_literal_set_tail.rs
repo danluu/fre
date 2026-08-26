@@ -138,7 +138,7 @@ fn finite_extraction_order_controls_equal_start_tail_priority() {
 }
 
 #[test]
-fn optional_tail_resource_refusal_preserves_exact_planner_work() {
+fn optional_tail_resource_refusal_reports_cumulative_planner_work() {
     let baseline = PortableRegex::new(SOURCE).unwrap();
     let required_work = baseline.build_report().planner_work;
     let required_bytes = baseline.build_report().charged_persistent_bytes;
@@ -174,28 +174,43 @@ fn optional_tail_resource_refusal_preserves_exact_planner_work() {
         .build()
         .unwrap();
     assert_eq!(refused_tail.build_report().plan, PlanKind::LiteralSetDfa);
-    assert_eq!(refused_tail.build_report().planner_work, required_work);
+    assert_eq!(
+        refused_tail.build_report().planner_work,
+        required_work.checked_add(1).unwrap(),
+        "the refused folded tail exposes one later ineligible ASCII-sidecar root inspection",
+    );
     assert!(
         refused_tail.build_report().plan_storage_bytes < baseline.build_report().plan_storage_bytes
     );
 
+    // A higher outer envelope admits one root read by the later ineligible
+    // ASCII-sidecar inspection. The incumbent's local exact boundary excludes
+    // that optional cumulative work.
+    let exact_incumbent_work = incumbent_work.checked_sub(1).unwrap();
+    assert_eq!(
+        incumbent_work,
+        exact_incumbent_work.checked_add(1).unwrap()
+    );
     let exact_incumbent = PortableBuilder::new(SOURCE)
         .limits(BuildLimits {
-            max_planner_work: incumbent_work,
+            max_planner_work: exact_incumbent_work,
             ..BuildLimits::default()
         })
         .build()
         .unwrap();
     assert_eq!(exact_incumbent.build_report().plan, PlanKind::LiteralSetDfa);
-    assert_eq!(exact_incumbent.build_report().planner_work, incumbent_work);
+    assert_eq!(
+        exact_incumbent.build_report().planner_work,
+        exact_incumbent_work
+    );
     assert!(matches!(
         PortableBuilder::new(SOURCE)
             .limits(BuildLimits {
-                max_planner_work: incumbent_work - 1,
+                max_planner_work: exact_incumbent_work - 1,
                 ..BuildLimits::default()
             })
             .build(),
         Err(BuildError::PlannerWorkLimit { needed, limit })
-            if needed == incumbent_work && limit == incumbent_work - 1
+            if needed == exact_incumbent_work && limit == exact_incumbent_work - 1
     ));
 }

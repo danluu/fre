@@ -2,8 +2,10 @@
 
 use std::{alloc::System, hint::black_box};
 
-use fre::{BuildError, PlanKind, PortableBuilder, SearchAccounting, SearchError, SearchLimits};
-use fre_kernels::PackedLiteralSetError;
+use fre::{
+    BuildError, BuildLimits, PlanKind, PortableBuilder, SearchAccounting, SearchError, SearchLimits,
+};
+use fre_kernels::{PackedLiteralSetBuildLimits, PackedLiteralSetError};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
 #[global_allocator]
@@ -154,13 +156,54 @@ fn factored_route_has_exact_persistent_and_search_work_boundaries() {
         .build()
         .unwrap();
     assert_eq!(exact.build_report().charged_persistent_bytes, persistent);
+    let fallback_limits = BuildLimits {
+        packed_literal_set: PackedLiteralSetBuildLimits {
+            max_persistent_bytes: 0,
+            ..PackedLiteralSetBuildLimits::default()
+        },
+        ..BuildLimits::default()
+    };
+    let fallback = PortableBuilder::new(&source)
+        .unicode(false)
+        .limits(fallback_limits)
+        .build()
+        .expect("optional packed-owner refusal keeps the canonical DFA");
+    assert_eq!(fallback.build_report().plan, PlanKind::LiteralSetDfa);
+    let fallback_persistent = fallback.build_report().charged_persistent_bytes;
+    assert!(fallback_persistent > persistent);
+
+    let fallback_exact = PortableBuilder::new(&source)
+        .unicode(false)
+        .limits(BuildLimits {
+            max_persistent_bytes: fallback_persistent,
+            ..fallback_limits
+        })
+        .build()
+        .expect("canonical DFA admits its exact persistent boundary");
+    assert_eq!(fallback_exact.build_report().plan, PlanKind::LiteralSetDfa);
+    assert_eq!(
+        fallback_exact.build_report().charged_persistent_bytes,
+        fallback_persistent
+    );
+    assert!(matches!(
+        PortableBuilder::new(&source)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_persistent_bytes: fallback_persistent - 1,
+                ..fallback_limits
+            })
+            .build(),
+        Err(BuildError::PersistentBytesLimit { needed, limit })
+            if needed == fallback_persistent && limit == fallback_persistent - 1
+    ));
+
     assert!(matches!(
         PortableBuilder::new(&source)
             .unicode(false)
             .max_persistent_bytes(persistent - 1)
             .build(),
         Err(BuildError::PersistentBytesLimit { needed, limit })
-            if needed == persistent && limit == persistent - 1
+            if needed == fallback_persistent && limit == persistent - 1
     ));
 
     let haystack = b"a long miss exercises the retained factored column owner";

@@ -62,7 +62,12 @@ fn plan_cases() -> Vec<(&'static str, PortableBuilder, PlanKind)> {
 
 #[test]
 fn total_persistent_limit_is_exact_across_every_portable_plan() {
+    let configured_limit = BuildLimits::default().max_persistent_bytes;
     for (name, builder, expected_plan) in plan_cases() {
+        // A fresh Rust-compatible portable builder uses the profile's 10 MiB
+        // size limit. This cross-plan test deliberately exercises the larger
+        // engine-wide envelope, so configure it explicitly for every case.
+        let builder = builder.max_persistent_bytes(configured_limit);
         let probe = builder
             .clone()
             .build()
@@ -76,11 +81,7 @@ fn total_persistent_limit_is_exact_across_every_portable_plan() {
             .expect("small test accounting fits usize");
         assert!(needed > 0, "{name}");
         assert_eq!(report.charged_persistent_bytes, needed, "{name}");
-        assert_eq!(
-            report.persistent_byte_limit,
-            BuildLimits::default().max_persistent_bytes,
-            "{name}"
-        );
+        assert_eq!(report.persistent_byte_limit, configured_limit, "{name}");
 
         let exact = builder
             .clone()
@@ -93,24 +94,51 @@ fn total_persistent_limit_is_exact_across_every_portable_plan() {
             "{name}"
         );
         assert_eq!(exact.build_report().persistent_byte_limit, needed, "{name}");
+        assert_eq!(exact.build_report().plan, expected_plan, "{name}");
+        assert_eq!(
+            exact.build_report().plan_storage_bytes,
+            report.plan_storage_bytes,
+            "{name}"
+        );
 
         let cloned = exact.clone();
         assert_eq!(cloned.build_report(), exact.build_report(), "{name}");
 
-        let error = builder
-            .max_persistent_bytes(needed - 1)
-            .build()
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                BuildError::PersistentBytesLimit {
-                    needed: actual_needed,
-                    limit,
-                } if actual_needed == needed && limit == needed - 1
+        let one_below = needed - 1;
+        match builder.max_persistent_bytes(one_below).build() {
+            Ok(fallback) if expected_plan == PlanKind::PackedLiteralSet => {
+                let fallback_report = fallback.build_report();
+                assert_eq!(fallback_report.persistent_byte_limit, one_below, "{name}");
+                assert!(
+                    fallback_report.charged_persistent_bytes <= one_below,
+                    "{name}"
+                );
+                assert!(
+                    fallback_report.plan != expected_plan
+                        || fallback_report.plan_storage_bytes < report.plan_storage_bytes,
+                    "one-below packed construction must change or reduce the selected plan"
+                );
+            }
+            Ok(fallback) => panic!(
+                "one-below persistent limit unexpectedly built {name}: {:?}",
+                fallback.build_report()
             ),
-            "unexpected one-below refusal for {name}: {error}"
-        );
+            Err(BuildError::PersistentBytesLimit {
+                needed: actual_needed,
+                limit,
+            }) if expected_plan == PlanKind::PackedLiteralSet => {
+                assert_eq!(limit, one_below, "{name}");
+                assert!(actual_needed > limit, "{name}");
+            }
+            Err(BuildError::PersistentBytesLimit {
+                needed: actual_needed,
+                limit,
+            }) => {
+                assert_eq!(actual_needed, needed, "{name}");
+                assert_eq!(limit, one_below, "{name}");
+            }
+            Err(error) => panic!("unexpected one-below refusal for {name}: {error}"),
+        }
     }
 }
 
