@@ -14490,8 +14490,9 @@ impl PortableRegex {
     /// required-literal matchers bind their value-only projection alongside
     /// the already-proven native regex owner for spans. An attachment-free,
     /// positive-width leftmost-first literal set binds its immutable span
-    /// executor and, on AArch64, may prepare one wider exact ASCII root once
-    /// for the Exists projection. A
+    /// executor and, on AArch64, may retain a wider exact ASCII-root
+    /// capability whose classifier is prepared only by its first Exists
+    /// projection. A
     /// uniform-standard literal set additionally starts with one cleared
     /// performance-only route bit; near acceptances may spend that bit on one
     /// bounded direct same-DFA probe. Other selected plan families bind
@@ -18492,8 +18493,9 @@ pub struct PortableSearchSession<'a> {
 /// constructed. Unanchored required-literal matchers bind their value-only
 /// projection once while retaining the native regex owner for spans.
 /// A positive leftmost-first literal set similarly binds one compact span
-/// executor and, when proved by its immutable direct-DFA identity, may prepare
-/// a qualified AArch64 ASCII root for endpoint-only Exists calls.
+/// executor and, when proved by its immutable direct-DFA identity, may lazily
+/// prepare a qualified AArch64 ASCII root on the first endpoint-only Exists
+/// call. Span visitation and count-only use leave that projection unprepared.
 /// Other matcher families retain only their compact binding. No method on this
 /// type accepts finite limits or publishes accounting; callers that need
 /// either contract should use [`PortableSearchSession`] instead.
@@ -48809,11 +48811,8 @@ mod tests {
         let matched_start = 32 + 19;
         let mut haystack = vec![b'!'; 32 + 128 + 16];
         haystack[matched_start..matched_start + 4].copy_from_slice(b"AAAA");
-        assert_eq!(ordinary.is_match_at(&haystack, 0), Ok(true));
-        assert_eq!(
-            ordinary.first_acceptance_at(&haystack, 0),
-            Ok(Some(matched_start + 4)),
-        );
+        // Selected-span and count projections work before Exists has prepared
+        // the qualified root classifier.
         assert_eq!(
             ordinary.find_at(&haystack, 0),
             Ok(Some(Match {
@@ -48824,6 +48823,11 @@ mod tests {
         assert_eq!(
             ordinary.count_positive_width_selected_ends_at(&haystack, 0),
             Ok(Some(1)),
+        );
+        assert_eq!(ordinary.is_match_at(&haystack, 0), Ok(true));
+        assert_eq!(
+            ordinary.first_acceptance_at(&haystack, 0),
+            Ok(Some(matched_start + 4)),
         );
     }
 

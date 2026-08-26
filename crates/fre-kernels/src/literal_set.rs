@@ -292,16 +292,17 @@ pub struct LiteralSetOrdinaryExecutor<'a> {
 
 /// Worker-bound ordinary literal-set execution substrate.
 ///
-/// Identity, direct-DFA capabilities and one exact ASCII Exists root are bound
-/// once when the worker constructs this engine. Exists and first acceptance
-/// use the prepared projection; selected-span, visit and count operations
-/// recover the unchanged compact executor. Finite, accounted and explicit
-/// search-session entry points do not construct or use this type.
+/// Identity and direct-DFA capabilities are bound once when the worker
+/// constructs this engine. Exists and first acceptance lazily prepare one
+/// exact ASCII root on their first call; selected-span, visit and count
+/// operations recover the unchanged compact executor without preparing that
+/// projection. Finite, accounted and explicit search-session entry points do
+/// not construct or use this type.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct LiteralSetOrdinaryEngine<'a> {
     executor: LiteralSetOrdinaryExecutor<'a>,
-    prepared_exists_root: AsciiByteSetClassifier,
+    prepared_exists_root: Option<AsciiByteSetClassifier>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -748,6 +749,7 @@ mod ordinary_direct_probe {
         static ROOT_RANGE_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
         static ROOT_SET4_CALLS: Cell<usize> = const { Cell::new(0) };
         static ROOT_SET4_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
+        static ROOT_ASCII_PREPARATIONS: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_CALLS: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
     }
@@ -762,6 +764,7 @@ mod ordinary_direct_probe {
         ROOT_RANGE_SKIPPED_BYTES.set(0);
         ROOT_SET4_CALLS.set(0);
         ROOT_SET4_SKIPPED_BYTES.set(0);
+        ROOT_ASCII_PREPARATIONS.set(0);
         ROOT_ASCII_CALLS.set(0);
         ROOT_ASCII_SKIPPED_BYTES.set(0);
     }
@@ -832,6 +835,14 @@ mod ordinary_direct_probe {
 
     pub(super) fn root_set4_skipped_bytes() -> usize {
         ROOT_SET4_SKIPPED_BYTES.get()
+    }
+
+    pub(super) fn record_root_ascii_preparation() {
+        ROOT_ASCII_PREPARATIONS.set(ROOT_ASCII_PREPARATIONS.get().saturating_add(1));
+    }
+
+    pub(super) fn root_ascii_preparations() -> usize {
+        ROOT_ASCII_PREPARATIONS.get()
     }
 
     pub(super) fn record_root_ascii(skipped: usize) {
@@ -2441,12 +2452,15 @@ fn ordinary_direct_dfa_first_acceptance_end_prepared_ascii(
 }
 
 impl<'a> LiteralSetOrdinaryExecutor<'a> {
-    /// Bind one worker-owned ordinary engine and prepare its exact ASCII
-    /// Exists root against this executor's immutable direct-DFA identity.
+    /// Bind one worker-owned ordinary engine whose exact ASCII Exists root can
+    /// be prepared lazily against this executor's immutable direct-DFA
+    /// identity.
     ///
     /// AArch64 retains one exact 5..=16-member ASCII classifier only when its
     /// direct-DFA identity carries the construction marker. Other targets and
-    /// root shapes retain the unchanged executor alone.
+    /// root shapes retain the unchanged executor alone. Binding performs no
+    /// classifier construction, so selected-span and count-only workers do not
+    /// pay for the unused Exists projection.
     #[doc(hidden)]
     #[must_use]
     pub fn bind_engine(self) -> Option<LiteralSetOrdinaryEngine<'a>> {
@@ -2460,14 +2474,9 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
             if !identity.root().is_some_and(LiteralSetDfaRoot::is_ascii_sparse) {
                 return None;
             }
-            let prepared_exists_root = direct_dfa_ascii_root_set(
-                self.plan.automaton.as_ref(),
-                identity.start_state(),
-            )
-            .map(AsciiByteSetClassifier::new)?;
             Some(LiteralSetOrdinaryEngine {
                 executor: self,
-                prepared_exists_root,
+                prepared_exists_root: None,
             })
         }
     }
@@ -2790,6 +2799,24 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
 }
 
 impl<'a> LiteralSetOrdinaryEngine<'a> {
+    #[cold]
+    #[inline(never)]
+    fn prepare_exists_root(&mut self) {
+        debug_assert!(self.prepared_exists_root.is_none());
+        let identity = self
+            .executor
+            .direct_dfa_identity
+            .expect("an ASCII-root engine retains its direct DFA identity");
+        let roots = direct_dfa_ascii_root_set(
+            self.executor.plan.automaton.as_ref(),
+            identity.start_state(),
+        )
+        .expect("the construction-sealed sparse ASCII root remains exact");
+        #[cfg(test)]
+        ordinary_direct_probe::record_root_ascii_preparation();
+        self.prepared_exists_root = Some(AsciiByteSetClassifier::new(roots));
+    }
+
     /// Return whether any literal accepts inside `window` through the prepared
     /// Exists projection.
     ///
@@ -2801,7 +2828,7 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
     #[cold]
     #[inline(never)]
     pub fn exists_window_value(
-        &self,
+        &mut self,
         haystack: &[u8],
         window: Window,
     ) -> Result<bool, LiteralSetError> {
@@ -2820,13 +2847,13 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
     #[cold]
     #[inline(never)]
     pub fn first_acceptance_window_value(
-        &self,
+        &mut self,
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<usize>, LiteralSetError> {
         validate_window(window, haystack.len())?;
-        let identity = self
-            .executor
+        let executor = self.executor;
+        let identity = executor
             .direct_dfa_identity
             .expect("a prepared Exists root retains its direct DFA identity");
         let base = window.start();
@@ -2837,11 +2864,18 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                 .root()
                 .is_some_and(LiteralSetDfaRoot::is_ascii_sparse),
         );
+        if self.prepared_exists_root.is_none() {
+            self.prepare_exists_root();
+        }
+        let prepared_exists_root = self
+            .prepared_exists_root
+            .as_ref()
+            .expect("the first Exists call prepares its ASCII root");
         let relative_end = ordinary_direct_dfa_first_acceptance_end_prepared_ascii(
-            self.executor.plan.automaton.as_ref(),
+            executor.plan.automaton.as_ref(),
             identity.start_state(),
             source,
-            &self.prepared_exists_root,
+            prepared_exists_root,
         );
         Ok(relative_end.map(|end| {
             debug_assert!(end <= window_bytes);
@@ -8001,11 +8035,18 @@ mod tests {
                 .direct_dfa_identity
                 .and_then(LiteralSetDirectDfaIdentity::root)
                 .is_some_and(LiteralSetDfaRoot::is_ascii_sparse));
-            let prepared = ordinary
+            let mut prepared = ordinary
                 .bind_engine()
-                .expect("an admitted sparse ASCII root prepares its classifier");
+                .expect("an admitted sparse ASCII root binds its lazy engine");
+            assert!(prepared.prepared_exists_root.is_none());
+            assert_eq!(
+                prepared.exists_window_value(&[], Window::full(&[])),
+                Ok(false),
+            );
             let retained_roots = prepared
                 .prepared_exists_root
+                .as_ref()
+                .expect("the first Exists call prepares its classifier")
                 .set()
                 .words()
                 .into_iter()
@@ -8018,6 +8059,11 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ordinary_direct_dfa_ascii_root_prepares_once_for_exists_only() {
+        #[cfg(not(feature = "static-dispatch"))]
+        assert_eq!(
+            core::mem::size_of::<Option<super::AsciiByteSetClassifier>>(),
+            core::mem::size_of::<super::AsciiByteSetClassifier>(),
+        );
         let patterns = root_ascii_patterns();
         let plan = LiteralSetPlan::new_stable(
             &patterns,
@@ -8036,15 +8082,16 @@ mod tests {
         assert_eq!(root.as_range(), None);
         assert_eq!(root.set4_bucket_mask(), None);
 
-        let prepared = ordinary
+        ordinary_direct_probe::reset();
+        let mut prepared = ordinary
             .bind_engine()
-            .expect("sixteen non-contiguous ASCII roots prepare a classifier");
-        let roots = &prepared.prepared_exists_root;
+            .expect("sixteen non-contiguous ASCII roots bind a lazy engine");
+        assert!(prepared.prepared_exists_root.is_none());
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         let mut expected_words = [0_u64; 2];
         for root in ROOT_ASCII_16 {
             expected_words[usize::from(root / 64)] |= 1_u64 << u32::from(root % 64);
         }
-        assert_eq!(roots.set().words(), expected_words);
         assert!(core::ptr::eq(
             prepared.span_executor().plan,
             ordinary.plan,
@@ -8054,26 +8101,6 @@ mod tests {
             ordinary.direct_dfa_identity,
         );
 
-        for (suffix_bytes, expected_calls) in [
-            (ORDINARY_ROOT_ASCII_MIN_BYTES.saturating_sub(1), 0),
-            (ORDINARY_ROOT_ASCII_MIN_BYTES, 1),
-        ] {
-            let miss_bytes = ORDINARY_DIRECT_DFA_NATIVE_BYTES
-                .checked_add(suffix_bytes)
-                .expect("the fixed ASCII-root threshold fits usize");
-            let miss = vec![b'!'; miss_bytes];
-            ordinary_direct_probe::reset();
-            assert_eq!(
-                prepared.exists_window_value(&miss, Window::full(&miss)),
-                Ok(false),
-            );
-            assert_eq!(ordinary_direct_probe::root_ascii_calls(), expected_calls);
-            assert_eq!(
-                ordinary_direct_probe::root_ascii_skipped_bytes(),
-                if expected_calls == 0 { 0 } else { suffix_bytes },
-            );
-        }
-
         let root_offset = ORDINARY_DIRECT_DFA_NATIVE_BYTES + 19;
         let mut haystack = vec![
             b'!';
@@ -8081,7 +8108,71 @@ mod tests {
         ];
         haystack[root_offset..root_offset + patterns[0].len()]
             .copy_from_slice(&patterns[0]);
-        ordinary_direct_probe::reset();
+
+        // Binding and span/count-only execution never construct the Exists
+        // classifier, even for a window that would use it if asked.
+        assert_eq!(
+            prepared
+                .span_executor()
+                .find_window_value(&haystack, Window::full(&haystack)),
+            Ok(Some((root_offset, root_offset + patterns[0].len()))),
+        );
+        assert_eq!(
+            prepared
+                .span_executor()
+                .count_spans_window_value(&haystack, Window::full(&haystack)),
+            Ok(1),
+        );
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+
+        // The first Exists call prepares once, even when its short suffix does
+        // not yet amortize an ASCII classifier scan. Repeated Exists calls
+        // reuse precisely that preparation.
+        let short_suffix = ORDINARY_ROOT_ASCII_MIN_BYTES.saturating_sub(1);
+        let short_miss = vec![
+            b'!';
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                .checked_add(short_suffix)
+                .expect("the fixed ASCII-root threshold fits usize")
+        ];
+        assert_eq!(
+            prepared.exists_window_value(&short_miss, Window::full(&short_miss)),
+            Ok(false),
+        );
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+        assert_eq!(
+            prepared.exists_window_value(&short_miss, Window::full(&short_miss)),
+            Ok(false),
+        );
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+        assert_eq!(
+            prepared
+                .prepared_exists_root
+                .as_ref()
+                .expect("the first Exists call retains its classifier")
+                .set()
+                .words(),
+            expected_words,
+        );
+
+        let long_suffix = ORDINARY_ROOT_ASCII_MIN_BYTES;
+        let long_miss = vec![
+            b'!';
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                .checked_add(long_suffix)
+                .expect("the fixed ASCII-root threshold fits usize")
+        ];
+        assert_eq!(
+            prepared.exists_window_value(&long_miss, Window::full(&long_miss)),
+            Ok(false),
+        );
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_ascii_skipped_bytes(), long_suffix);
+
         assert_eq!(
             prepared.first_acceptance_window_value(
                 &haystack,
@@ -8089,26 +8180,12 @@ mod tests {
             ),
             Ok(Some(root_offset + patterns[0].len())),
         );
-        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 1);
-        assert_eq!(ordinary_direct_probe::root_ascii_skipped_bytes(), 19);
-
-        // Recovering the ordinary executor proves span and count retain their
-        // incumbent direct scanner without consulting the ASCII classifier.
-        ordinary_direct_probe::reset();
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 2);
         assert_eq!(
-            prepared
-                .span_executor()
-                .find_window_value(&haystack, Window::full(&haystack)),
-            Ok(Some((root_offset, root_offset + patterns[0].len()))),
+            ordinary_direct_probe::root_ascii_skipped_bytes(),
+            long_suffix + 19,
         );
-        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
-        assert_eq!(
-            prepared
-                .span_executor()
-                .count_spans_window_value(&haystack, Window::full(&haystack)),
-            Ok(1),
-        );
-        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -8121,9 +8198,9 @@ mod tests {
         )
         .unwrap();
         let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
-        let prepared = ordinary
+        let mut prepared = ordinary
             .bind_engine()
-            .expect("sixteen non-contiguous ASCII roots prepare a classifier");
+            .expect("sixteen non-contiguous ASCII roots bind a lazy engine");
 
         let mut haystack = vec![b'!'; ORDINARY_ROOT_ASCII_MIN_BYTES + 11];
         for (index, root) in ROOT_ASCII_16.into_iter().enumerate() {
