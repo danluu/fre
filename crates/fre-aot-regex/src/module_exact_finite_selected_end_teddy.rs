@@ -23,6 +23,7 @@ const EXACT_FINITE_LITERAL_BYTE_VERIFICATION_UNITS: u128 = 11;
 const EXACT_FINITE_LITERAL_DISPATCH_UNITS: u128 = 8;
 const EXACT_FINITE_TEDDY_RUNTIME_VERIFICATION_BUDGET: u16 = 64;
 const EXACT_FINITE_TEDDY_ASIMD_VERIFIER_BYTES: u16 = 16;
+const EXACT_FINITE_TEDDY_ASIMD_OVERLAP_MIN_RESIDUE: u16 = 5;
 /// Frozen before timing: the scalable Teddy miss path scans four complete
 /// runtime vectors while retaining each block's bucket vector. Candidate
 /// predicates are materialized only after the batch is known to contain a hit.
@@ -1339,6 +1340,22 @@ fn aarch64_exact_load_q_post_imm(
         | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_exact_load_q_unscaled_imm(
+    destination: u8,
+    base: u8,
+    byte_offset: i16,
+) -> Result<u32, ObjectError> {
+    if !(-256..=255).contains(&byte_offset) {
+        return Err(ObjectError::InvalidModule("AArch64 LDUR Q offset"));
+    }
+    Ok(0x3cc0_0000
+        | (u32::try_from(i32::from(byte_offset) & 0x01ff)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 LDUR Q offset"))?
+            << 12)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_emit_exact_teddy_sve_first_candidate(
     assembler: &mut Aarch64Assembler,
     candidates: u8,
@@ -1443,9 +1460,13 @@ fn lower_aarch64_wrapper(
     let retry_retained = assembler.label()?;
     let ordinal_failed = assembler.label()?;
     let next_ordinal = assembler.label()?;
-    let exact_loop = assembler.label()?;
     let runtime_fallback = assembler.label()?;
     let matched = assembler.label()?;
+    let scalar_residue_loop = if use_asimd_exact_verifier {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
     let exhausted = assembler.label()?;
     let tail = assembler.label()?;
 
@@ -1737,8 +1758,10 @@ fn lower_aarch64_wrapper(
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 exact verifier vector width"))?;
         // Every selected literal is at least one complete ASIMD vector. Keep
         // the public width/result registers and Teddy's retained state live;
-        // V0/V1 and W16 are leaf-local scratch. A residue of one through
-        // fifteen falls into the unchanged byte verifier below.
+        // V0/V1 and W16/W17 are leaf-local scratch. An exact multiple branches
+        // directly to `matched`. Residues below the discovery-selected
+        // crossover retain the incumbent scalar verifier; residues at or
+        // above it reach the overlapping final vector verifier below.
         assembler.bind(wide_exact_loop)?;
         assembler.instruction(aarch64_exact_load_q_post_imm(0, 13, vector_byte_offset)?)?;
         assembler.instruction(aarch64_exact_load_q_post_imm(1, 14, vector_byte_offset)?)?;
@@ -1757,15 +1780,55 @@ fn lower_aarch64_wrapper(
             EXACT_FINITE_TEDDY_ASIMD_VERIFIER_BYTES,
         )?)?;
         assembler.branch_cond(AARCH64_HS, wide_exact_loop)?;
+        assembler.instruction(aarch64_cmp_w_imm(
+            10,
+            EXACT_FINITE_TEDDY_ASIMD_OVERLAP_MIN_RESIDUE,
+        )?)?;
+        assembler.branch_cond(
+            AARCH64_LO,
+            scalar_residue_loop.ok_or(ObjectError::InvalidModule(
+                "AArch64 exact verifier scalar residue loop label",
+            ))?,
+        )?;
+
+        // X13/X14 now point just past the last complete vector and W10 is a
+        // five-through-fifteen-byte residue. Advance both pointers to their
+        // proved ends, then compare the final sixteen bytes with an overlapping
+        // unscaled load. The selected width already proved both windows in
+        // bounds, and every selected literal is at least sixteen bytes, so
+        // neither -16 address can precede its source. This removes the larger
+        // residues' byte-at-a-time loop without touching retained Teddy vector
+        // or predicate state.
+        assembler.instruction(aarch64_add_x_uxtw(13, 13, 10, 0)?)?;
+        assembler.instruction(aarch64_add_x_uxtw(14, 14, 10, 0)?)?;
+        assembler.instruction(aarch64_exact_load_q_unscaled_imm(
+            0,
+            13,
+            -vector_byte_offset,
+        )?)?;
+        assembler.instruction(aarch64_exact_load_q_unscaled_imm(
+            1,
+            14,
+            -vector_byte_offset,
+        )?)?;
+        assembler.instruction(aarch64_eor_16b(0, 0, 1)?)?;
+        assembler.instruction(aarch64_umaxv_16b(0, 0)?)?;
+        assembler.instruction(aarch64_umov_b0(16, 0)?)?;
+        // A mismatch falls through directly into `ordinal_failed`; only the
+        // success edge needs a branch. The fixed overlap block replaces the
+        // scalar residue loop in a wide module.
+        assembler.branch_zero_w(16, matched)?;
+    } else {
+        let exact_loop = assembler.label()?;
+        assembler.bind(exact_loop)?;
+        assembler.instruction(aarch64_load_byte_post_imm(16, 13, 1)?)?;
+        assembler.instruction(aarch64_load_byte_post_imm(17, 14, 1)?)?;
+        assembler.instruction(aarch64_cmp_w(16, 17)?)?;
+        assembler.branch_cond(AARCH64_NE, ordinal_failed)?;
+        assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
+        assembler.branch_nonzero_w(10, exact_loop)?;
+        assembler.branch(matched)?;
     }
-    assembler.bind(exact_loop)?;
-    assembler.instruction(aarch64_load_byte_post_imm(16, 13, 1)?)?;
-    assembler.instruction(aarch64_load_byte_post_imm(17, 14, 1)?)?;
-    assembler.instruction(aarch64_cmp_w(16, 17)?)?;
-    assembler.branch_cond(AARCH64_NE, ordinal_failed)?;
-    assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
-    assembler.branch_nonzero_w(10, exact_loop)?;
-    assembler.branch(matched)?;
 
     assembler.bind(ordinal_failed)?;
     assembler.branch_nonzero_x(11, next_ordinal)?;
@@ -1908,6 +1971,19 @@ fn lower_aarch64_wrapper(
     assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
     assembler.branch(tail)?;
 
+    if let Some(scalar_residue_loop) = scalar_residue_loop {
+        assembler.bind(scalar_residue_loop)?;
+        // Retain the incumbent byte verifier for residues one through four.
+        // The post-indexed loop preserves its exact pointer/count evolution
+        // and X11's remaining source-ordinal mask for the mismatch edge.
+        assembler.instruction(aarch64_load_byte_post_imm(16, 13, 1)?)?;
+        assembler.instruction(aarch64_load_byte_post_imm(17, 14, 1)?)?;
+        assembler.instruction(aarch64_cmp_w(16, 17)?)?;
+        assembler.branch_cond(AARCH64_NE, ordinal_failed)?;
+        assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
+        assembler.branch_nonzero_w(10, scalar_residue_loop)?;
+        assembler.branch(matched)?;
+    }
     assembler.bind(matched)?;
     assembler.instruction(aarch64_add_x_reg(6, 2, 1)?)?;
     assembler.instruction(aarch64_store_x(6, 4, 0)?)?;
@@ -3131,13 +3207,48 @@ mod tests {
         pattern
     }
 
+    fn exact_verifier_residue_pattern(first_residue: usize) -> (String, Vec<Vec<u8>>) {
+        assert!(matches!(first_residue, 0 | 8));
+        let literals = (first_residue..first_residue + 8)
+            .enumerate()
+            .map(|(ordinal, residue)| {
+                (0..16 + residue)
+                    .map(|index| {
+                        if index == 0 {
+                            SCANNER_FREE_BYTES[ordinal]
+                        } else {
+                            let value = first_residue
+                                .checked_mul(71)
+                                .and_then(|value| value.checked_add(ordinal * 53))
+                                .and_then(|value| value.checked_add(index * 29))
+                                .unwrap()
+                                % 251;
+                            u8::try_from(value).unwrap()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, literal) in literals.iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for byte in literal {
+                pattern.push_str(&format!("\\x{byte:02x}"));
+            }
+        }
+        pattern.push(')');
+        (pattern, literals)
+    }
+
     fn exact_verifier_late_ordinal_pattern() -> (String, Vec<u8>) {
         let mut literals = exact_verifier_boundary_literals(16);
-        literals[0] = (0_u8..32)
-            .map(|index| if index < 20 { 0x42 } else { 0x11 })
+        literals[0] = (0_u8..17)
+            .map(|index| if index < 16 { 0x42 } else { 0x11 })
             .collect();
-        literals[1] = (0_u8..32)
-            .map(|index| if index < 20 { 0x42 } else { 0x22 })
+        literals[1] = (0_u8..17)
+            .map(|index| if index < 16 { 0x42 } else { 0x22 })
             .collect();
         let expected = literals[1].clone();
         let mut pattern = String::from("(?-u:");
@@ -5314,7 +5425,7 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_exact_q_post_index_encoder_matches_oracle_and_rejects_invalid_inputs() {
+    fn aarch64_exact_q_load_encoders_match_oracles_and_reject_invalid_inputs() {
         assert_eq!(
             aarch64_exact_load_q_post_imm(0, 13, 16).unwrap(),
             0x3cc1_05a0,
@@ -5329,6 +5440,21 @@ mod tests {
         assert!(aarch64_exact_load_q_post_imm(0, 0, 256).is_err());
         assert!(aarch64_exact_load_q_post_imm(32, 0, 16).is_err());
         assert!(aarch64_exact_load_q_post_imm(0, 32, 16).is_err());
+
+        assert_eq!(
+            aarch64_exact_load_q_unscaled_imm(0, 13, -16).unwrap(),
+            0x3cdf_01a0,
+        );
+        assert_eq!(
+            aarch64_exact_load_q_unscaled_imm(1, 14, -16).unwrap(),
+            0x3cdf_01c1,
+        );
+        assert!(aarch64_exact_load_q_unscaled_imm(0, 0, -256).is_ok());
+        assert!(aarch64_exact_load_q_unscaled_imm(31, 31, 255).is_ok());
+        assert!(aarch64_exact_load_q_unscaled_imm(0, 0, -257).is_err());
+        assert!(aarch64_exact_load_q_unscaled_imm(0, 0, 256).is_err());
+        assert!(aarch64_exact_load_q_unscaled_imm(32, 0, -16).is_err());
+        assert!(aarch64_exact_load_q_unscaled_imm(0, 32, -16).is_err());
     }
 
     #[test]
@@ -5336,9 +5462,8 @@ mod tests {
         let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
         let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
         let sve2 = sve.with(CpuFeature::Aarch64Sve2);
-        let mixed = asimd
-            .with(CpuFeature::Aarch64Sve)
-            .with(CpuFeature::Aarch64Sve2);
+        let mixed_sve = asimd.with(CpuFeature::Aarch64Sve);
+        let mixed = mixed_sve.with(CpuFeature::Aarch64Sve2);
         let pattern16 = exact_verifier_boundary_pattern(16);
         let pattern15 = exact_verifier_boundary_pattern(15);
 
@@ -5349,7 +5474,21 @@ mod tests {
             aarch64_umaxv_16b(0, 0).unwrap(),
             aarch64_umov_b0(16, 0).unwrap(),
         ];
-        for features in [asimd, mixed] {
+        let scalar_head = [
+            aarch64_load_byte_post_imm(16, 13, 1).unwrap(),
+            aarch64_load_byte_post_imm(17, 14, 1).unwrap(),
+            aarch64_cmp_w(16, 17).unwrap(),
+        ];
+        let overlap_tail = [
+            aarch64_add_x_uxtw(13, 13, 10, 0).unwrap(),
+            aarch64_add_x_uxtw(14, 14, 10, 0).unwrap(),
+            aarch64_exact_load_q_unscaled_imm(0, 13, -16).unwrap(),
+            aarch64_exact_load_q_unscaled_imm(1, 14, -16).unwrap(),
+            aarch64_eor_16b(0, 0, 1).unwrap(),
+            aarch64_umaxv_16b(0, 0).unwrap(),
+            aarch64_umov_b0(16, 0).unwrap(),
+        ];
+        for features in [asimd, mixed_sve, mixed] {
             let target = Target::aarch64_linux().with_features(features).unwrap();
             let compiled = force_v2(&pattern16, target);
             let report = compiled
@@ -5390,24 +5529,101 @@ mod tests {
             );
             assert_eq!(words[wide + 6], aarch64_sub_w_imm(10, 10, 16).unwrap(),);
             assert_eq!(words[wide + 7] & 0xff00_001f, 0x3400_000a);
+            let exact_multiple_delta =
+                (i32::try_from((words[wide + 7] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            let exact_multiple_target =
+                isize::try_from(wide + 7).unwrap() + exact_multiple_delta as isize;
             assert_eq!(words[wide + 8], aarch64_cmp_w_imm(10, 16).unwrap());
             assert_eq!(words[wide + 9] & 0xff00_001f, 0x5400_0002);
+            assert_eq!(
+                words[wide + 10],
+                aarch64_cmp_w_imm(10, EXACT_FINITE_TEDDY_ASIMD_OVERLAP_MIN_RESIDUE)
+                    .unwrap(),
+                "the overlap crossover must be the discovery-selected residue: {target:?}",
+            );
+            assert_eq!(
+                words[wide + 11] & 0xff00_001f,
+                0x5400_0003,
+                "B.LO must select the incumbent scalar residue loop: {target:?}",
+            );
+            let scalar_residue_delta =
+                (i32::try_from((words[wide + 11] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            let scalar_residue = usize::try_from(
+                isize::try_from(wide + 11).unwrap() + scalar_residue_delta as isize,
+            )
+            .unwrap();
+            assert_eq!(
+                &words[wide + 12..wide + 12 + overlap_tail.len()],
+                overlap_tail.as_slice(),
+                "a residue at or above the crossover must compare its overlapping tail: {target:?}",
+            );
+            assert_eq!(
+                words[wide + 19] & 0xff00_001f,
+                0x3400_0010,
+                "CBZ W16 must accept a zero overlapping-tail reduction: {target:?}",
+            );
+            let overlap_match_delta =
+                (i32::try_from((words[wide + 19] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            let overlap_match_target =
+                isize::try_from(wide + 19).unwrap() + overlap_match_delta as isize;
+            assert_eq!(
+                exact_multiple_target, overlap_match_target,
+                "a zero residue must skip the overlap tail and use its same matched edge: {target:?}",
+            );
+            assert_eq!(
+                words[wide + 20] & 0xff00_001f,
+                0xb500_000b,
+                "a nonzero overlapping tail must fall through to ordinal failure: {target:?}",
+            );
+            assert_eq!(
+                &words[scalar_residue..scalar_residue + scalar_head.len()],
+                scalar_head.as_slice(),
+                "residues below the crossover must retain the incumbent byte loop: {target:?}",
+            );
+            assert_eq!(
+                words[scalar_residue + 3] & 0xff00_001f,
+                0x5400_0001,
+                "a scalar-residue mismatch must branch to ordinal failure: {target:?}",
+            );
+            let scalar_miss_delta =
+                (i32::try_from((words[scalar_residue + 3] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            assert_eq!(
+                isize::try_from(scalar_residue + 3).unwrap() + scalar_miss_delta as isize,
+                isize::try_from(wide + 20).unwrap(),
+                "a scalar-residue mismatch must preserve the common ordered-retry edge: {target:?}",
+            );
+            assert_eq!(
+                words[scalar_residue + 4],
+                aarch64_sub_w_imm(10, 10, 1).unwrap(),
+                "the incumbent scalar residue loop must decrement its remaining width: {target:?}",
+            );
+            assert_eq!(
+                words[scalar_residue + 5] & 0xff00_001f,
+                0x3500_000a,
+                "CBNZ W10 must retain the incumbent scalar loop: {target:?}",
+            );
+            let scalar_loop_delta =
+                (i32::try_from((words[scalar_residue + 5] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            assert_eq!(
+                isize::try_from(scalar_residue + 5).unwrap() + scalar_loop_delta as isize,
+                isize::try_from(scalar_residue).unwrap(),
+                "the scalar-residue loop must return to its first post-indexed load: {target:?}",
+            );
+            assert_eq!(
+                isize::try_from(scalar_residue + 6).unwrap(),
+                exact_multiple_target,
+                "a completed scalar residue must fall through to the common matched edge: {target:?}",
+            );
             // The first five exact words above are two Q loads and three
-            // ASIMD operations. The remaining five exact words asserted here
-            // are scalar CBNZ/SUB/CBZ/CMP/B.cond instructions. Thus this
-            // complete inserted block contains no predicate-register write;
-            // in particular, retained P0..P4/P10 remain untouched.
+            // ASIMD operations. The loop-control and overlapping-tail words
+            // asserted here likewise contain no predicate-register write; in
+            // particular, retained P0..P4/P10 remain untouched.
             let loop_delta =
                 (i32::try_from((words[wide + 9] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
             assert_eq!(
                 isize::try_from(wide + 9).unwrap() + loop_delta as isize,
                 isize::try_from(wide).unwrap(),
                 "B.HS must close the vector loop: {target:?}",
-            );
-            assert_eq!(
-                words[wide + 10],
-                aarch64_load_byte_post_imm(16, 13, 1).unwrap(),
-                "a one-through-fifteen-byte residue must enter the scalar verifier",
             );
         }
 
@@ -5435,15 +5651,16 @@ mod tests {
                 "pure SVE/SVE2 and sub-vector minima remain scalar: {target:?}",
             );
             assert!(
-                words.windows(3).any(|window| {
-                    window
-                        == [
-                            aarch64_load_byte_post_imm(16, 13, 1).unwrap(),
-                            aarch64_load_byte_post_imm(17, 14, 1).unwrap(),
-                            aarch64_cmp_w(16, 17).unwrap(),
-                        ]
-                }),
+                words
+                    .windows(scalar_head.len())
+                    .any(|window| window == scalar_head),
                 "scalar verifier must remain present: {target:?}",
+            );
+            assert!(
+                !words
+                    .windows(overlap_tail.len())
+                    .any(|window| window == overlap_tail),
+                "pure SVE/SVE2 and sub-vector modules must remain unchanged without an overlap tail: {target:?}",
             );
         }
     }
@@ -6197,9 +6414,70 @@ mod tests {
                 true,
             ));
 
-            // The first source matches the first vector and fails in the
-            // second; the next source then succeeds. This exercises ordered
-            // retry after vector-local pointer/count mutation.
+            // Two eight-literal modules cover every possible width residue
+            // after a complete sixteen-byte vector. Exercise a true match,
+            // a mismatch at every literal byte, and a match ending at a
+            // nonterminal logical end for each residue zero through fifteen.
+            for first_residue in [0, 8] {
+                let (pattern, literals) = exact_verifier_residue_pattern(first_residue);
+                let mut windows = Vec::new();
+                for literal in &literals {
+                    let base = 64 + literal.len() % 16;
+                    let mut haystack = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+                    haystack[base..base + literal.len()].copy_from_slice(literal);
+                    let end = haystack.len();
+                    windows.push((haystack, 7, end));
+
+                    let logical_start = 64;
+                    let mut at_start = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+                    at_start[logical_start..logical_start + literal.len()].copy_from_slice(literal);
+                    let end = at_start.len();
+                    windows.push((at_start, logical_start, end));
+
+                    let mut before_start = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+                    before_start[logical_start - 1..logical_start - 1 + literal.len()]
+                        .copy_from_slice(literal);
+                    let end = before_start.len();
+                    windows.push((before_start, logical_start, end));
+
+                    for mismatch in 0..literal.len() {
+                        let base = 96 + mismatch % 16;
+                        let mut haystack = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+                        let mut changed = literal.clone();
+                        changed[mismatch] ^= 0x80;
+                        haystack[base..base + changed.len()].copy_from_slice(&changed);
+                        let end = haystack.len();
+                        windows.push((haystack, 7, end));
+                    }
+
+                    let mut eof =
+                        vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + literal.len() + 17];
+                    let end = eof.len() - 17;
+                    let base = end - literal.len();
+                    eof[base..end].copy_from_slice(literal);
+                    windows.push((eof, 7, end));
+
+                    let mut crossing_end =
+                        vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + literal.len() + 17];
+                    let end = crossing_end.len() - 17;
+                    let base = end - literal.len() + 1;
+                    crossing_end[base..base + literal.len()].copy_from_slice(literal);
+                    windows.push((crossing_end, 7, end));
+
+                    let mut physical_eof =
+                        vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + literal.len() + 17];
+                    let base = physical_eof.len() - literal.len();
+                    physical_eof[base..].copy_from_slice(literal);
+                    let end = physical_eof.len();
+                    windows.push((physical_eof, 7, end));
+                }
+                cases.push((wide_target, pattern, windows, true));
+            }
+
+            // The first source matches the complete vector but fails in its
+            // scalar residue; the next source then succeeds. This exercises
+            // ordered retry without mutating the remaining source mask or the
+            // candidate base.
             let (pattern, later_source) = exact_verifier_late_ordinal_pattern();
             let mut haystack = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
             let base = 97;
