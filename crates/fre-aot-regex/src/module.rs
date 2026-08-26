@@ -67210,6 +67210,33 @@ fn aarch64_emit_candidate_batch_any(
     aarch64_emit_candidate_any(assembler, 28)
 }
 
+fn aarch64_emit_direct_filter_batch_probe(
+    assembler: &mut Aarch64Assembler,
+    filter: NativeStartFilter,
+    hit: Aarch64Label,
+    short: Aarch64Label,
+    miss: Aarch64Label,
+) -> Result<u8, ObjectError> {
+    assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, AARCH64_BATCH_BYTES)?)?;
+    assembler.branch_cond(AARCH64_LO, short)?;
+    let first_candidates = aarch64_emit_start_filter_batch_candidates(
+        assembler,
+        filter,
+        AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+    )?;
+    if first_candidates != 0 {
+        return Err(ObjectError::InvalidModule(
+            "finite root direct batch changed its candidate bank",
+        ));
+    }
+    aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
+    assembler.branch_cond(AARCH64_NE, hit)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+    assembler.branch(miss)?;
+    Ok(first_candidates)
+}
+
 fn aarch64_emit_first_candidate_lane(
     assembler: &mut Aarch64Assembler,
     candidates: u8,
@@ -72698,6 +72725,7 @@ fn lower_aarch64_native_finite_language_impl(
             assembler.label()?, // dense backoff reaches the window end
             assembler.label()?, // bounded direct-root scalar backoff
             assembler.label()?, // direct-filter ordinary four-vector batch
+            assembler.label()?, // direct-filter wide sparse-miss loop
             assembler.label()?, // direct-filter wide-batch hit replay
             assembler.label()?, // direct-filter single-vector tail
             assembler.label()?, // direct-filter four-vector hit
@@ -72785,6 +72813,7 @@ fn lower_aarch64_native_finite_language_impl(
             _,
             _,
             _,
+            _,
             root_direct_short_batch,
         ) = root_scanner_labels.ok_or(
             ObjectError::InvalidModule("finite root-scanner labels are absent"),
@@ -72845,6 +72874,7 @@ fn lower_aarch64_native_finite_language_impl(
                 root_vector_hit_backoff_to_end,
                 root_scalar_backoff,
                 root_direct_batch,
+                root_direct_wide,
                 root_direct_wide_hit,
                 root_direct_single,
                 root_direct_batch_hit,
@@ -72858,6 +72888,19 @@ fn lower_aarch64_native_finite_language_impl(
 
             if let Some(filter) = root_scanner.direct_batch_filter {
                 assembler.bind(root_scan)?;
+                let _probation_candidates = aarch64_emit_direct_filter_batch_probe(
+                    &mut assembler,
+                    filter,
+                    root_direct_batch_hit,
+                    root_direct_single,
+                    root_direct_wide,
+                )?;
+
+                // Preserve the incumbent 64-byte path for every newly
+                // entered or rearmed root episode. Only a proven miss enters
+                // the wide sparse loop, so recurring dense inputs retain the
+                // established hit-density and scalar-backoff behavior.
+                assembler.bind(root_direct_wide)?;
                 assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
                 assembler.instruction(aarch64_cmp_x_imm(
                     1,
@@ -72911,7 +72954,7 @@ fn lower_aarch64_native_finite_language_impl(
                     2,
                     AARCH64_BATCH_BYTES,
                 )?)?;
-                assembler.branch(root_scan)?;
+                assembler.branch(root_direct_wide)?;
 
                 assembler.bind(root_direct_wide_hit)?;
                 // Candidate masks are lowering temporaries. Replay the cold
@@ -72925,23 +72968,18 @@ fn lower_aarch64_native_finite_language_impl(
                 assembler.branch(root_direct_batch)?;
 
                 assembler.bind(root_direct_batch)?;
-                assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
-                assembler.instruction(aarch64_cmp_x_imm(1, AARCH64_BATCH_BYTES)?)?;
-                assembler.branch_cond(AARCH64_LO, root_direct_single)?;
-                let first_candidates = aarch64_emit_start_filter_batch_candidates(
+                let replay_candidates = aarch64_emit_direct_filter_batch_probe(
                     &mut assembler,
                     filter,
-                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                    root_direct_batch_hit,
+                    root_direct_single,
+                    root_direct_batch,
                 )?;
-                if first_candidates != 0 {
+                if replay_candidates != first_candidates {
                     return Err(ObjectError::InvalidModule(
-                        "finite root direct batch changed its candidate bank",
+                        "finite root direct replay changed its candidate bank",
                     ));
                 }
-                aarch64_emit_candidate_batch_any(&mut assembler, first_candidates)?;
-                assembler.branch_cond(AARCH64_NE, root_direct_batch_hit)?;
-                assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
-                assembler.branch(root_scan)?;
 
                 assembler.bind(root_direct_batch_hit)?;
                 // Preserve the established per-vector feedback threshold.
@@ -89487,8 +89525,8 @@ mod tests {
                 .iter()
                 .filter(|&&word| word == aarch64_ld1_four_16b(24, 12).unwrap())
                 .count()
-                >= 5,
-            "the sparse-miss loop must cover 256 bytes before replaying the ordinary batch",
+                >= 6,
+            "a probationary and replay batch must surround the 256-byte sparse-miss loop",
         );
         assert!(words.contains(
             &aarch64_cmp_x_imm(1, NATIVE_FINITE_ROOT_SCANNER_WIDE_BATCH_BYTES).unwrap(),
