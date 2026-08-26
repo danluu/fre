@@ -18494,8 +18494,10 @@ pub struct PortableSearchSession<'a> {
 /// immutable capabilities and reusable workspace, when this session is
 /// constructed. Unanchored required-literal matchers bind their value-only
 /// projection once while retaining the native regex owner for spans.
-/// A legacy literal/class-run owner retains its direct reducer beside the
-/// canonical binding so exhaustive positive-width counts need one traversal.
+/// A legacy literal/class-run native binding retains its direct reducer for
+/// exhaustive positive-width counts. An unguarded binding also reuses its
+/// ordinary report-free span search on each remaining tail; construction has
+/// proved that those tails need no discarded prefix context.
 /// A positive leftmost-first literal set similarly binds one compact span
 /// executor and leaves its endpoint-only sidecar unbound. The first Exists
 /// call settles that sidecar once, caching both a qualified AArch64 ASCII-root
@@ -18751,6 +18753,66 @@ impl<'a> PortableOrdinaryCanonical<'a> {
     where
         F: FnMut(Match) -> Result<bool, E>,
     {
+        // Unguarded literal/class-run plans can make every ranged search a
+        // report-free full-tail operation. This retains the compact native
+        // binding while removing the finite/accounted window machinery from
+        // ordinary span iteration. Guarded plans keep the original haystack
+        // so assertions can inspect context before a nonzero start.
+        if let Self::Native(regex) = self
+            && let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan
+            && plan.boundary_semantics()
+                == LiteralClassRunLiteralBoundarySemantics::Unguarded
+        {
+            return try_visit_ordinary_spans_at(
+                haystack.len(),
+                start,
+                |search_start| {
+                    let tail = haystack.get(search_start..).ok_or_else(|| {
+                        PortableFindIterError::Search(SearchError::from(
+                            LiteralClassRunLiteralSearchError::InvalidWindow {
+                                start: search_start,
+                                end: haystack.len(),
+                                haystack_len: haystack.len(),
+                            },
+                        ))
+                    })?;
+                    let Some((relative_start, relative_end)) = plan
+                        .find_full_ordinary_value(tail)
+                        .map_err(SearchError::from)
+                        .map_err(PortableFindIterError::Search)?
+                    else {
+                        return Ok(None);
+                    };
+                    let matched_start = search_start.checked_add(relative_start).ok_or_else(
+                        || {
+                            PortableFindIterError::Search(SearchError::from(
+                                LiteralClassRunLiteralSearchError::from(
+                                    LiteralClassRunLiteralReduceError::ArithmeticOverflow {
+                                        computation:
+                                            "ordinary literal/class-run match start",
+                                    },
+                                ),
+                            ))
+                        },
+                    )?;
+                    let matched_end = search_start.checked_add(relative_end).ok_or_else(|| {
+                        PortableFindIterError::Search(SearchError::from(
+                            LiteralClassRunLiteralSearchError::from(
+                                LiteralClassRunLiteralReduceError::ArithmeticOverflow {
+                                    computation: "ordinary literal/class-run match end",
+                                },
+                            ),
+                        ))
+                    })?;
+                    Ok(Some(Match {
+                        start: matched_start,
+                        end: matched_end,
+                    }))
+                },
+                visitor,
+            );
+        }
+
         // Preserve the construction-selected source cursor when this native
         // plan exposes one. The cursor is bound only for this call, so the
         // compact session remains source-free while repeated matches retain
@@ -24687,8 +24749,11 @@ impl<'r> PortableOrdinarySession<'r> {
     /// retain complete original-haystack context and offsets remain absolute.
     /// Positive exact literals and K0 pass selected items directly to the
     /// callback without an accounting iterator, result buffer, or search-call
-    /// cap. Canonical fallback plans iterate the compact binding with
-    /// unlimited value searches and the ordinary empty-match progress rule.
+    /// cap. Unguarded literal/class-run plans reuse their report-free ordinary
+    /// span search on each remaining tail; guarded plans keep the context-aware
+    /// canonical fallback. Other canonical fallback plans iterate the compact
+    /// binding with unlimited value searches and the ordinary empty-match
+    /// progress rule.
     ///
     /// # Errors
     ///
@@ -47580,6 +47645,132 @@ mod tests {
             ordinary.count_positive_width_selected_ends_at(haystack, usize::MAX),
             Ok(None),
         );
+    }
+
+    #[test]
+    fn ordinary_literal_class_run_binding_visits_unguarded_report_free_tails() {
+        fn selected_spans(
+            regex: &PortableRegex,
+            haystack: &[u8],
+            start: usize,
+        ) -> Vec<(usize, usize)> {
+            let mut cursor = start;
+            let mut spans = Vec::new();
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                spans.push((matched.start(), matched.end()));
+                cursor = matched.end();
+            }
+            spans
+        }
+
+        for (pattern, haystack) in [
+            (
+                r"(?-u:ab[xy]+cd)",
+                b"zabxcd--abyycd--abxyce--abxxxcd".as_slice(),
+            ),
+            (
+                r"(?-u:[ab]+aba)",
+                b"aababa!aba!bbaba!aababa".as_slice(),
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+            let mut ordinary = regex.ordinary_session().unwrap();
+            for start in 0..=haystack.len() {
+                let expected = selected_spans(&regex, haystack, start);
+                let mut actual = Vec::new();
+                assert_eq!(
+                    ordinary
+                        .try_visit_spans_at(haystack, start, |matched| {
+                            actual.push((matched.start(), matched.end()));
+                            Ok::<bool, ()>(true)
+                        })
+                        .unwrap(),
+                    Ok(()),
+                    "pattern={pattern:?}, start={start}",
+                );
+                assert_eq!(actual, expected, "pattern={pattern:?}, start={start}");
+            }
+        }
+
+        let guarded = PortableBuilder::new(r"(?-u:\b\w+ing\b)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(guarded.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        let PortablePlan::LiteralClassRunLiteral(guarded_plan) = &guarded.plan else {
+            unreachable!("guarded literal/class-run fixture changed plan")
+        };
+        assert_ne!(
+            guarded_plan.boundary_semantics(),
+            super::LiteralClassRunLiteralBoundarySemantics::Unguarded,
+        );
+        let guarded_haystack = b"testing singing xing bringing";
+        let guarded_start = 1;
+        let guarded_expected = selected_spans(&guarded, guarded_haystack, guarded_start);
+        let mut guarded_actual = Vec::new();
+        let mut guarded_ordinary = guarded.ordinary_session().unwrap();
+        assert_eq!(
+            guarded_ordinary
+                .try_visit_spans_at(guarded_haystack, guarded_start, |matched| {
+                    guarded_actual.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(guarded_actual, guarded_expected);
+
+        let regex = PortableBuilder::new(r"(?-u:ab[xy]+cd)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let haystack = b"abxcd--abyycd--abxxxcd";
+        let mut ordinary = regex.ordinary_session().unwrap();
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |matched| {
+                    stopped.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(false)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(stopped, [(0, 5)]);
+
+        let mut errored = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |matched| {
+                    errored.push((matched.start(), matched.end()));
+                    Err::<bool, _>("callback")
+                })
+                .unwrap(),
+            Err("callback"),
+        );
+        assert_eq!(errored, [(0, 5)]);
+
+        let mut invalid_callback = false;
+        assert!(matches!(
+            ordinary.try_visit_spans_at(haystack, haystack.len() + 1, |_| {
+                invalid_callback = true;
+                Ok::<bool, ()>(true)
+            }),
+            Err(PortableFindIterError::Search(
+                SearchError::LiteralClassRunLiteral(
+                    fre_kernels::LiteralClassRunLiteralSearchError::InvalidWindow { .. }
+                )
+            ))
+        ));
+        assert!(!invalid_callback);
     }
 
     #[test]
