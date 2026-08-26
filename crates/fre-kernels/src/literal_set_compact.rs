@@ -2,10 +2,10 @@
 //!
 //! The public and generic literal-set surface remains in `literal_set`. This
 //! module supplies only the outlined compact arm selected by the ripgrep
-//! stable-borrowed handoff. Ordinary positive-width find, span iteration and
-//! count may share one direct state scanner when the compact NFA has no
-//! prefilter; every other operation retains aho-corasick's pinned `Automaton`
-//! search.
+//! stable-borrowed handoff. Ordinary positive-width existence, endpoint, find,
+//! span iteration and count may share one direct state scanner when the compact
+//! NFA has no prefilter; every other operation retains aho-corasick's pinned
+//! `Automaton` search.
 
 use aho_corasick::automaton::{Automaton, StateID};
 use aho_corasick::dfa::DFA;
@@ -37,9 +37,10 @@ struct CompactEngine {
 /// Compact admission proves that every pattern has the same positive width
 /// and Standard semantics. The first accepting state is therefore the
 /// selected endpoint, and resetting to the bound unanchored start state after
-/// acceptance exactly implements non-overlapping iteration. Find and count
-/// never construct an Aho `Match`; span iteration recovers each start only
-/// after acceptance. Other one-shot operations retain Aho's incumbent search.
+/// acceptance exactly implements non-overlapping iteration. Existence,
+/// endpoint, find and count never construct an Aho `Match`; span iteration
+/// recovers each start only after acceptance. Prefiltered operations retain
+/// Aho's incumbent search.
 struct CompactOrdinaryScanner<'a, 'h> {
     automaton: &'a NFA,
     haystack: &'h [u8],
@@ -813,6 +814,19 @@ impl CompactEngine {
         Ok(count)
     }
 
+    #[inline(never)]
+    fn first_end_from_reduced_endpoint_nonempty(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Option<usize> {
+        debug_assert!(!self.window_is_too_short(window));
+        debug_assert!(self.automaton.prefilter().is_none());
+        self.reduce_endpoints_window_value_nonempty(haystack, window, true)
+            .expect("an endpoint within a validated slice must permit end + 1 encoding")
+            .checked_sub(1)
+    }
+
     #[inline]
     fn find_window_value_validated(
         &self,
@@ -848,6 +862,9 @@ impl CompactEngine {
     fn first_end_window_value_validated(&self, haystack: &[u8], window: Window) -> Option<usize> {
         if self.window_is_too_short(window) {
             return None;
+        }
+        if self.automaton.prefilter().is_none() {
+            return self.first_end_from_reduced_endpoint_nonempty(haystack, window);
         }
         let input = Input::new(haystack)
             .span(window.start()..window.end())
@@ -1370,6 +1387,11 @@ mod tests {
             Ok(Some(1 + MIN_PATTERN_BYTES)),
             "the impossible root byte must leave the unanchored scanner at start",
         );
+        assert_eq!(
+            compact_ordinary_scanner_probe::binds(),
+            1,
+            "selected endpoints use one whole-window direct reduction",
+        );
         for window in [
             Window::full(&haystack),
             Window::new(1, haystack.len() - 1),
@@ -1399,8 +1421,8 @@ mod tests {
         }
         assert_eq!(
             compact_ordinary_scanner_probe::binds(),
-            5,
-            "nonempty find windows use the reducer while endpoint and exists retain Aho search",
+            16,
+            "each nonempty find, endpoint and exists window uses one direct reduction",
         );
 
         let window = Window::full(&haystack);
@@ -1422,9 +1444,9 @@ mod tests {
             ],
             "overlapping starts are suppressed while adjacent matches remain",
         );
-        assert_eq!(compact_ordinary_scanner_probe::binds(), 6);
+        assert_eq!(compact_ordinary_scanner_probe::binds(), 17);
         assert_eq!(ordinary.count_spans_window_value(&haystack, window), Ok(2));
-        assert_eq!(compact_ordinary_scanner_probe::binds(), 7);
+        assert_eq!(compact_ordinary_scanner_probe::binds(), 18);
         let mut stopped_calls = 0;
         assert_eq!(
             ordinary.try_visit_spans_window_value(&haystack, window, |_| {
@@ -1906,6 +1928,11 @@ mod tests {
         assert_eq!(short_calls, 0);
 
         let full = Window::full(haystack);
+        assert_eq!(ordinary.exists_window_value(haystack, full), Ok(true));
+        assert_eq!(
+            ordinary.selected_end_window_value(haystack, full),
+            Ok(Some(haystack.len())),
+        );
         let mut calls = 0;
         assert_eq!(
             ordinary.try_visit_spans_window_value(haystack, full, |_| {

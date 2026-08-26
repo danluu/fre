@@ -894,8 +894,9 @@ use fre_kernels::{
     LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError,
     LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
     LiteralSetCompactOrdinaryExecutor, LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
-    LiteralSetFoldAttachment, LiteralSetOrdinaryExecutor, LiteralSetPlan, LiteralSetSearchLimits,
-    LiteralSetStablePattern, LiteralSetUniformStandardOrdinaryExecutor,
+    LiteralSetFoldAttachment, LiteralSetOrdinaryEngine, LiteralSetOrdinaryExecutor,
+    LiteralSetPlan, LiteralSetSearchLimits, LiteralSetStablePattern,
+    LiteralSetUniformStandardOrdinaryExecutor,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetOrdinaryExecutor,
     PackedLiteralSetPlan, PackedLiteralSetRetainedIterBuildAccounting, PackedLiteralSetSearchLimits,
@@ -14488,8 +14489,9 @@ impl PortableRegex {
     /// during this call. Unanchored
     /// required-literal matchers bind their value-only projection alongside
     /// the already-proven native regex owner for spans. An attachment-free,
-    /// positive-width leftmost-first literal set binds its immutable direct
-    /// executor. A
+    /// positive-width leftmost-first literal set binds its immutable span
+    /// executor and, on AArch64, may prepare one wider exact ASCII root once
+    /// for the Exists projection. A
     /// uniform-standard literal set additionally starts with one cleared
     /// performance-only route bit; near acceptances may spend that bit on one
     /// bounded direct same-DFA probe. Other selected plan families bind
@@ -14559,6 +14561,8 @@ impl PortableRegex {
                             executor,
                             direct_next: false,
                         }
+                    } else if let Some(engine) = executor.bind_engine() {
+                        PortableOrdinarySessionPlan::LiteralSetDfaAsciiEngine { engine }
                     } else {
                         PortableOrdinarySessionPlan::LiteralSetDfa { executor }
                     }
@@ -18487,9 +18491,12 @@ pub struct PortableSearchSession<'a> {
 /// immutable capabilities and reusable workspace, when this session is
 /// constructed. Unanchored required-literal matchers bind their value-only
 /// projection once while retaining the native regex owner for spans.
-/// Other matcher families retain only that compact binding. No method
-/// on this type accepts finite limits or publishes accounting; callers that
-/// need either contract should use [`PortableSearchSession`] instead.
+/// A positive leftmost-first literal set similarly binds one compact span
+/// executor and, when proved by its immutable direct-DFA identity, may prepare
+/// a qualified AArch64 ASCII root for endpoint-only Exists calls.
+/// Other matcher families retain only their compact binding. No method on this
+/// type accepts finite limits or publishes accounting; callers that need
+/// either contract should use [`PortableSearchSession`] instead.
 ///
 /// A session never retains a haystack. It can therefore be reused across
 /// unrelated sources by one mutable, thread-confined worker. An eligible
@@ -18536,6 +18543,11 @@ enum PortableOrdinarySessionPlan<'a> {
     /// Appended to preserve every established ordinary-session discriminant.
     LiteralSetCompact {
         executor: LiteralSetCompactOrdinaryExecutor<'a>,
+    },
+    /// Appended so existing ordinary-session variants retain their layout and
+    /// dispatch order when no wide ASCII root is prepared.
+    LiteralSetDfaAsciiEngine {
+        engine: LiteralSetOrdinaryEngine<'a>,
     },
 }
 
@@ -24398,6 +24410,9 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
                 .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetDfaAsciiEngine { engine } => engine
+                .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetCompact { executor } => executor
                 .exists_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
@@ -24455,6 +24470,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
+                .first_acceptance_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetDfaAsciiEngine { engine } => engine
                 .first_acceptance_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetCompact { executor } => executor
@@ -24540,6 +24558,11 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => executor
+                .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetDfaAsciiEngine { engine } => engine
+                .span_executor()
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
@@ -24668,7 +24691,18 @@ impl<'r> PortableOrdinarySession<'r> {
             }
             PortableOrdinarySessionPlan::LiteralSetDfa { executor } => {
                 let mut visitor = visitor;
-                executor.try_visit_spans_window_value(
+                executor
+                    .try_visit_spans_window_value(
+                        haystack,
+                        LiteralWindow::new(start, haystack.len()),
+                        |(start, end)| visitor(Match { start, end }),
+                    )
+                    .map_err(SearchError::from)
+                    .map_err(PortableFindIterError::Search)
+            }
+            PortableOrdinarySessionPlan::LiteralSetDfaAsciiEngine { engine } => {
+                let mut visitor = visitor;
+                engine.span_executor().try_visit_spans_window_value(
                     haystack,
                     LiteralWindow::new(start, haystack.len()),
                     |(start, end)| visitor(Match { start, end }),
@@ -24795,6 +24829,24 @@ impl<'r> PortableOrdinarySession<'r> {
                 if executor.direct_count_scanner_supported() {
                     count_ordinary_literal_set_dfa_with_selected_seed(
                         executor, haystack, start,
+                    )
+                    .map(Some)
+                    .map_err(SearchError::from)
+                } else {
+                    executor
+                        .count_spans_window_value(
+                            haystack,
+                            LiteralWindow::new(start, haystack.len()),
+                        )
+                        .map(Some)
+                        .map_err(SearchError::from)
+                }
+            }
+            PortableOrdinarySessionPlan::LiteralSetDfaAsciiEngine { engine } => {
+                let executor = engine.span_executor();
+                if executor.direct_count_scanner_supported() {
+                    count_ordinary_literal_set_dfa_with_selected_seed(
+                        &executor, haystack, start,
                     )
                     .map(Some)
                     .map_err(SearchError::from)
@@ -48726,6 +48778,53 @@ mod tests {
             )),
         ));
         assert!(!direct_next(&ordinary));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ordinary_literal_set_dfa_prepares_arbitrary_ascii_roots_for_exists_only() {
+        let source = ["A", "C", "E", "G", "a", "c", "e", "g"]
+            .into_iter()
+            .flat_map(|root| (4_usize..=20).map(move |width| root.repeat(width)))
+            .collect::<Vec<_>>()
+            .join("|");
+        let regex = PortableBuilder::new(&source)
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfaAsciiEngine { .. }
+        ));
+
+        let matched_start = 32 + 19;
+        let mut haystack = vec![b'!'; 32 + 128 + 16];
+        haystack[matched_start..matched_start + 4].copy_from_slice(b"AAAA");
+        assert_eq!(ordinary.is_match_at(&haystack, 0), Ok(true));
+        assert_eq!(
+            ordinary.first_acceptance_at(&haystack, 0),
+            Ok(Some(matched_start + 4)),
+        );
+        assert_eq!(
+            ordinary.find_at(&haystack, 0),
+            Ok(Some(Match {
+                start: matched_start,
+                end: matched_start + 4,
+            })),
+        );
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(&haystack, 0),
+            Ok(Some(1)),
+        );
     }
 
     #[test]
