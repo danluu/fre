@@ -19099,6 +19099,23 @@ impl PortableOrdinaryRequiredLiteral<'_> {
                 .map_err(SearchError::from),
         }
     }
+
+    #[inline]
+    fn count_selected_ends_at(
+        self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<u64>, SearchError> {
+        let window = LiteralWindow::new(start, haystack.len());
+        match self {
+            Self::Scalar(plan) => plan
+                .ordinary_count_selected_ends_window_value(haystack, window)
+                .map_err(SearchError::from),
+            Self::Dispatched(plan) => plan
+                .ordinary_count_selected_ends_window_value(haystack, window)
+                .map_err(SearchError::from),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -19108,11 +19125,13 @@ mod required_literal_ordinary_session_probe {
     std::thread_local! {
         static CALLS: Cell<usize> = const { Cell::new(0) };
         static ENDPOINT_CALLS: Cell<usize> = const { Cell::new(0) };
+        static COUNT_CALLS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
         CALLS.set(0);
         ENDPOINT_CALLS.set(0);
+        COUNT_CALLS.set(0);
     }
 
     pub(super) fn record() {
@@ -19129,6 +19148,14 @@ mod required_literal_ordinary_session_probe {
 
     pub(super) fn endpoint_calls() -> usize {
         ENDPOINT_CALLS.get()
+    }
+
+    pub(super) fn record_count() {
+        COUNT_CALLS.set(COUNT_CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn count_calls() -> usize {
+        COUNT_CALLS.get()
     }
 }
 
@@ -25224,11 +25251,12 @@ impl<'r> PortableOrdinarySession<'r> {
     /// positive-width K0 plan, a fixed-predicate word over an exact tail, a
     /// Unicode word-run over the exact full window, a positive complete-
     /// boundary ASCII word-run from any validated start, a reverse-inner or
-    /// Unicode scalar-run plan over an exact tail window, a legacy
-    /// literal/class-run plan over a full or unguarded tail window, a pure or
-    /// bounded byte-class repeat, a bounded byte-class sequence, a packed
-    /// literal set, or an ordinary non-uniform or uniform-standard literal-set
-    /// plan. Each construction seals nonempty selected spans.
+    /// Unicode scalar-run plan over an exact tail window, an unanchored
+    /// required literal, a legacy literal/class-run plan over a full or
+    /// unguarded tail window, a pure or bounded byte-class repeat, a bounded
+    /// byte-class sequence, a packed literal set, or an ordinary non-uniform
+    /// or uniform-standard literal-set plan. Each construction seals nonempty
+    /// selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25301,6 +25329,11 @@ impl<'r> PortableOrdinarySession<'r> {
                         },
                     ))?;
                 }
+            }
+            PortableOrdinarySessionPlan::RequiredLiteral { projection, .. } => {
+                #[cfg(test)]
+                required_literal_ordinary_session_probe::record_count();
+                projection.count_selected_ends_at(haystack, start)
             }
             PortableOrdinarySessionPlan::PackedLiteralSet { executor } => executor
                 .count_spans_window_value(
@@ -56202,6 +56235,51 @@ mod tests {
         );
 
         super::required_literal_ordinary_session_probe::reset();
+        for start in [0, 1, 4, 9, haystack.len()] {
+            let mut expected = 0_u64;
+            assert_eq!(
+                ordinary
+                    .try_visit_spans_at(haystack, start, |_| {
+                        expected = expected.checked_add(1).unwrap();
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap(),
+                Ok(()),
+            );
+            assert_eq!(
+                ordinary.count_positive_width_selected_ends_at(haystack, start),
+                Ok(Some(expected)),
+                "start={start}",
+            );
+        }
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::count_calls(),
+            5,
+            "every supported count must use the bound required-literal projection",
+        );
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::calls(),
+            0,
+            "counting must not use the boolean projection",
+        );
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::endpoint_calls(),
+            0,
+            "counting must not repeat endpoint searches",
+        );
+        assert!(matches!(
+            ordinary.count_positive_width_selected_ends_at(haystack, haystack.len() + 1),
+            Err(SearchError::RequiredLiteral(
+                fre_kernels::RequiredLiteralSearchError::InvalidWindow { .. }
+            )),
+        ));
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::count_calls(),
+            6,
+            "a supported invalid range is authoritative",
+        );
+
+        super::required_literal_ordinary_session_probe::reset();
         let anchored = PortableBuilder::new(r"(?-u:\A[a-z]+ZQ)")
             .plan_selection(PlanSelection::ForceRequiredLiteral)
             .build()
@@ -56226,6 +56304,19 @@ mod tests {
             super::required_literal_ordinary_session_probe::endpoint_calls(),
             0,
             "anchored endpoints must retain their canonical span engine",
+        );
+        assert_eq!(
+            anchored_ordinary.count_positive_width_selected_ends_at(
+                b"aaaaZQ",
+                usize::MAX,
+            ),
+            Ok(None),
+            "an unsupported anchored owner must refuse before validating start",
+        );
+        assert_eq!(
+            super::required_literal_ordinary_session_probe::count_calls(),
+            0,
+            "anchored count must not enter the unanchored projection",
         );
     }
 

@@ -783,6 +783,82 @@ impl RequiredLiteralPlan {
         )
     }
 
+    /// Count non-overlapping selected ends for an ordinary unmetered search.
+    ///
+    /// This projection is available only for an unanchored `CLASS+ SUFFIX`
+    /// plan. Unsupported anchored plans return `Ok(None)` before validating
+    /// `window` or inspecting `haystack`. The admitted construction proves
+    /// that suffix occurrences cannot overlap and that the suffix's first
+    /// byte is outside the class. Consequently, every occurrence strictly
+    /// after the current resume boundary whose predecessor belongs to the
+    /// class is exactly one positive-width selected match.
+    ///
+    /// Unlike finite and accounted search, this ordinary path validates the
+    /// window once and retains no prospective or actual-event accounting. It
+    /// does not recover greedy span starts or use a backward run scanner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidWindow`] for a supported plan whose
+    /// window is invalid, or [`SearchError::ArithmeticOverflow`] if the match
+    /// count cannot be represented by `u64`.
+    #[inline]
+    pub fn ordinary_count_selected_ends_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<u64>, SearchError> {
+        if self.anchors != Anchors::default() {
+            return Ok(None);
+        }
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Err(SearchError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            });
+        }
+        self.count_selected_ends_unanchored_window_value_from(haystack, window, 0)
+            .map(Some)
+    }
+
+    #[inline]
+    fn count_selected_ends_unanchored_window_value_from(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        mut count: u64,
+    ) -> Result<u64, SearchError> {
+        debug_assert_eq!(self.anchors, Anchors::default());
+        debug_assert!(window.start() <= window.end());
+        debug_assert!(window.end() <= haystack.len());
+        let slice = &haystack[window.start()..window.end()];
+        let suffix_bytes = self.suffix().len();
+        let mut resume_start = 0_usize;
+        for relative in self.finder.find_iter(slice) {
+            // A candidate at the artificial window start has no class
+            // predecessor inside the search domain. The same is true when a
+            // suffix begins exactly at the preceding selected end, even if
+            // the preceding suffix's final byte belongs to the class. A
+            // rejected boundary occurrence does not move that boundary. The
+            // admitted finder cannot move backward, but retain `<=` so a
+            // violated internal invariant cannot underflow the predecessor.
+            debug_assert!(relative >= resume_start);
+            if relative <= resume_start || !self.class.contains(slice[relative - 1]) {
+                continue;
+            }
+            count = count.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "ordinary selected-end match count",
+            })?;
+            resume_start = relative.checked_add(suffix_bytes).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "ordinary selected-end continuation start",
+                },
+            )?;
+        }
+        Ok(count)
+    }
+
     fn exists_window_with_run_scanner(
         &self,
         haystack: &[u8],
@@ -2162,6 +2238,26 @@ impl DispatchedRequiredLiteralPlan {
             self.backward_scanner.as_ref(),
         )
     }
+
+    /// Count non-overlapping selected ends for an ordinary unmetered search.
+    ///
+    /// This shares the scalar owner's suffix stream because endpoint counting
+    /// does not recover class-run starts. Anchored plans are unsupported and
+    /// return `Ok(None)` before window validation or source inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the scalar owner's checked range or count-overflow failure once
+    /// the unanchored route begins execution.
+    #[inline]
+    pub fn ordinary_count_selected_ends_window_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<u64>, SearchError> {
+        self.plan
+            .ordinary_count_selected_ends_window_value(haystack, window)
+    }
 }
 
 #[allow(
@@ -2471,6 +2567,22 @@ mod tests {
             ("many-decoys-then-success", many_decoys_then_success, 13, 13),
             ("many-decoys-terminal", many_decoys_terminal, 12, 13),
         ]
+    }
+
+    fn selected_end_count_by_spans(
+        window: Window,
+        mut find: impl FnMut(Window) -> Result<Option<(usize, usize)>, SearchError>,
+    ) -> u64 {
+        let mut cursor = window.start();
+        let mut count = 0_u64;
+        loop {
+            let Some((_, end)) = find(Window::new(cursor, window.end())).unwrap() else {
+                return count;
+            };
+            assert!(end > cursor);
+            cursor = end;
+            count = count.checked_add(1).unwrap();
+        }
     }
 
     #[allow(
@@ -3133,6 +3245,205 @@ mod tests {
             ),
             Ok(dispatched_span.0.map(|(_, end)| end))
         );
+    }
+
+    #[test]
+    fn ordinary_selected_end_count_matches_scalar_and_dispatched_span_iteration() {
+        let dispatch = SimdDispatchContext::capture();
+        let boundary_class = ByteClass::from_bytes(b"a");
+        let boundary_suffix = b"ZQa";
+        let boundary_haystack = b"aZQaZQa";
+        let boundary_scalar = RequiredLiteralPlan::build(
+            boundary_class,
+            boundary_suffix,
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let boundary_dispatched = RequiredLiteralPlan::build_with_dispatch(
+            dispatch,
+            boundary_class,
+            boundary_suffix,
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let boundary_window = Window::full(boundary_haystack);
+        let boundary_scalar_expected = selected_end_count_by_spans(boundary_window, |remaining| {
+            boundary_scalar.find_window_value(
+                boundary_haystack,
+                remaining,
+                SearchLimits::unlimited(),
+            )
+        });
+        let boundary_dispatched_expected =
+            selected_end_count_by_spans(boundary_window, |remaining| {
+                boundary_dispatched.find_window_value(
+                    boundary_haystack,
+                    remaining,
+                    SearchLimits::unlimited(),
+                )
+            });
+        assert_eq!(boundary_scalar_expected, 1);
+        assert_eq!(boundary_dispatched_expected, 1);
+        assert_eq!(
+            boundary_scalar.ordinary_count_selected_ends_window_value(
+                boundary_haystack,
+                boundary_window,
+            ),
+            Ok(Some(boundary_scalar_expected)),
+        );
+        assert_eq!(
+            boundary_dispatched.ordinary_count_selected_ends_window_value(
+                boundary_haystack,
+                boundary_window,
+            ),
+            Ok(Some(boundary_dispatched_expected)),
+        );
+
+        // Include the suffix's final byte so a suffix starting exactly at a
+        // preceding selected end looks locally valid but must still be
+        // rejected at the new artificial boundary.
+        let class = ByteClass::from_bytes(b"aQ");
+        for suffix_len in [1_usize, 2, 8, 17] {
+            let suffix = unbordered_suffix(suffix_len);
+            let scalar = RequiredLiteralPlan::build(
+                class,
+                &suffix,
+                Anchors::default(),
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let dispatched = RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                &suffix,
+                Anchors::default(),
+                BuildLimits::default(),
+            )
+            .unwrap();
+
+            // Start with an artificial-edge suffix, then mix accepted and
+            // rejected witnesses, a long greedy run, and adjacent matches.
+            let mut body = suffix.clone();
+            body.extend_from_slice(b"!a");
+            body.extend_from_slice(&suffix);
+            body.extend_from_slice(b"!!");
+            body.extend_from_slice(&suffix);
+            body.extend(core::iter::repeat_n(b'a', 513));
+            body.extend_from_slice(&suffix);
+            body.extend_from_slice(&suffix);
+            body.extend_from_slice(&suffix);
+            body.push(b'a');
+            body.extend_from_slice(&suffix);
+
+            let mut windows = (0..=body.len())
+                .map(|start| Window::new(start, body.len()))
+                .collect::<Vec<_>>();
+            windows.extend([
+                Window::new(0, 0),
+                Window::new(0, body.len() / 2),
+                Window::new(1, body.len() - 1),
+            ]);
+            for window in windows {
+                let scalar_expected = selected_end_count_by_spans(window, |remaining| {
+                    scalar.find_window_value(&body, remaining, SearchLimits::unlimited())
+                });
+                let dispatched_expected = selected_end_count_by_spans(window, |remaining| {
+                    dispatched.find_window_value(&body, remaining, SearchLimits::unlimited())
+                });
+                assert_eq!(
+                    scalar.ordinary_count_selected_ends_window_value(&body, window),
+                    Ok(Some(scalar_expected)),
+                    "scalar suffix_len={suffix_len} window={window:?}",
+                );
+                assert_eq!(
+                    dispatched.ordinary_count_selected_ends_window_value(&body, window),
+                    Ok(Some(dispatched_expected)),
+                    "dispatched suffix_len={suffix_len} window={window:?}",
+                );
+                assert_eq!(scalar_expected, dispatched_expected);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_selected_end_count_preserves_refusal_range_and_overflow_contracts() {
+        let class = ByteClass::from_bytes(b"a");
+        let dispatch = SimdDispatchContext::capture();
+        let scalar = RequiredLiteralPlan::build(
+            class,
+            b"ZQ",
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = RequiredLiteralPlan::build_with_dispatch(
+            dispatch,
+            class,
+            b"ZQ",
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"aZQ";
+        for window in [Window::new(2, 1), Window::new(0, haystack.len() + 1)] {
+            assert!(matches!(
+                scalar.ordinary_count_selected_ends_window_value(haystack, window),
+                Err(SearchError::InvalidWindow { .. })
+            ));
+            assert!(matches!(
+                dispatched.ordinary_count_selected_ends_window_value(haystack, window),
+                Err(SearchError::InvalidWindow { .. })
+            ));
+        }
+        assert_eq!(
+            scalar.count_selected_ends_unanchored_window_value_from(
+                haystack,
+                Window::full(haystack),
+                u64::MAX,
+            ),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "ordinary selected-end match count",
+            })
+        );
+
+        for anchors in [
+            Anchors {
+                start: true,
+                end: false,
+            },
+            Anchors {
+                start: false,
+                end: true,
+            },
+        ] {
+            let anchored = RequiredLiteralPlan::build(
+                class,
+                b"ZQ",
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let dispatched_anchored = RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                b"ZQ",
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let invalid = Window::new(usize::MAX, 0);
+            assert_eq!(
+                anchored.ordinary_count_selected_ends_window_value(b"", invalid),
+                Ok(None),
+            );
+            assert_eq!(
+                dispatched_anchored
+                    .ordinary_count_selected_ends_window_value(b"", invalid),
+                Ok(None),
+            );
+        }
     }
 
     #[test]
