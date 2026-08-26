@@ -565,6 +565,51 @@ impl AsciiPlan {
         &self.owner().run_scanner
     }
 
+    /// Select the exact suffix on which ordinary positive-width counting can
+    /// reuse the whole-input aggregate scanner.
+    ///
+    /// Unsupported ASCII word shapes decline before validating `start` or
+    /// reading `haystack`. The admitted complete word boundaries skip the
+    /// remainder of a run containing `start`; the resulting suffix begins at
+    /// a nonword byte (or EOF), preserving the omitted leading boundary
+    /// context for the aggregate scanner.
+    #[inline]
+    pub(crate) fn ordinary_count_tail_start(
+        &self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<Option<usize>, Error> {
+        if !matches!(
+            self.owner().plan,
+            Plan::Word {
+                minimum_scalars: 1..,
+                mode: WordMode::Ascii,
+                topology: WordRunTopology::CompleteWordBoundaries,
+            }
+        ) {
+            return Ok(None);
+        }
+        validate_window(haystack, SearchWindow::new(start, haystack.len()))?;
+        if start == 0
+            || start == haystack.len()
+            || !is_ascii_word(haystack[start])
+            || !is_ascii_word(haystack[start - 1])
+        {
+            return Ok(Some(start));
+        }
+
+        let continuation = self
+            .run_scanner()
+            .scan_forward(&haystack[start..])
+            .member_run_len();
+        debug_assert!(continuation > 0);
+        let tail_start = start
+            .checked_add(continuation)
+            .expect("the retained scanner cannot cross the validated haystack");
+        debug_assert!(tail_start <= haystack.len());
+        Ok(Some(tail_start))
+    }
+
     pub(crate) fn aggregate_count(
         &self,
         haystack: &[u8],
@@ -3748,6 +3793,46 @@ mod tests {
                 .expect("complete Unicode search")
                 .0,
             None
+        );
+    }
+
+    #[test]
+    fn ordinary_ascii_count_tail_preserves_complete_boundaries_and_declines_other_shapes() {
+        let complete = AsciiPlan::build_auto(Plan::new(3, WordMode::Ascii))
+            .expect("complete ASCII owner");
+        let bare = AsciiPlan::build_auto(Plan::bare_greedy(3, WordMode::Ascii))
+            .expect("bare ASCII owner");
+        let haystack = b"!abcdef!xy!word!";
+
+        assert_eq!(complete.ordinary_count_tail_start(haystack, 0), Ok(Some(0)));
+        assert_eq!(complete.ordinary_count_tail_start(haystack, 1), Ok(Some(1)));
+        assert_eq!(complete.ordinary_count_tail_start(haystack, 3), Ok(Some(7)));
+        assert_eq!(complete.ordinary_count_tail_start(haystack, 7), Ok(Some(7)));
+        assert_eq!(complete.ordinary_count_tail_start(haystack, 9), Ok(Some(10)));
+        assert_eq!(
+            complete.ordinary_count_tail_start(haystack, haystack.len()),
+            Ok(Some(haystack.len())),
+        );
+        assert_eq!(
+            complete.ordinary_count_tail_start(haystack, haystack.len() + 1),
+            Err(Error::InvalidWindow {
+                start: haystack.len() + 1,
+                end: haystack.len(),
+                haystack_len: haystack.len(),
+            }),
+        );
+        assert_eq!(
+            bare.ordinary_count_tail_start(haystack, usize::MAX),
+            Ok(None),
+            "unsupported bare topology must decline before validation",
+        );
+
+        let boundary = AsciiPlan::build_auto(Plan::ascii_boundary_only())
+            .expect("ASCII boundary owner");
+        assert_eq!(
+            boundary.ordinary_count_tail_start(haystack, usize::MAX),
+            Ok(None),
+            "unsupported zero-width topology must decline before validation",
         );
     }
 

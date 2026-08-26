@@ -18646,9 +18646,12 @@ pub struct PortableSearchSession<'a> {
 /// prefix context. Literal/class-run also retains its direct reducer for
 /// exhaustive positive-width counts. A bounded byte-class sequence retains
 /// its report-free selected-end engine across one monotone exhaustive count
-/// while preserving absolute-start context. A Unicode word-run binding reuses
-/// its aggregate reducer only for an exact full-source count; a nonzero start
-/// retains the canonical context-aware fallback.
+/// while preserving absolute-start context. A positive complete-boundary ASCII
+/// word-run binding reuses its aggregate reducer from any validated start,
+/// skipping a word run containing that start to preserve its leading boundary.
+/// A Unicode word-run binding reuses its aggregate reducer only for an exact
+/// full-source count; a nonzero start retains the canonical context-aware
+/// fallback.
 /// A positive leftmost-first literal set similarly binds one compact span
 /// executor and leaves its endpoint-only sidecar unbound. The first Exists
 /// call settles that sidecar once, caching both a qualified AArch64 ASCII-root
@@ -25219,12 +25222,13 @@ impl<'r> PortableOrdinarySession<'r> {
     ///
     /// `Ok(Some(count))` is returned for a positive exact literal, a
     /// positive-width K0 plan, a fixed-predicate word over an exact tail, a
-    /// Unicode word-run over the exact full window, a reverse-inner or Unicode
-    /// scalar-run plan over an exact tail window, a legacy literal/class-run
-    /// plan over a full or unguarded tail window, a pure or bounded byte-class
-    /// repeat, a bounded byte-class sequence, a packed literal set, or an
-    /// ordinary non-uniform or uniform-standard literal-set plan. Each
-    /// construction seals nonempty selected spans.
+    /// Unicode word-run over the exact full window, a positive complete-
+    /// boundary ASCII word-run from any validated start, a reverse-inner or
+    /// Unicode scalar-run plan over an exact tail window, a legacy
+    /// literal/class-run plan over a full or unguarded tail window, a pure or
+    /// bounded byte-class repeat, a bounded byte-class sequence, a packed
+    /// literal set, or an ordinary non-uniform or uniform-standard literal-set
+    /// plan. Each construction seals nonempty selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25244,6 +25248,8 @@ impl<'r> PortableOrdinarySession<'r> {
     /// adaptive span visitor. After exhaustive success that accepts a
     /// current-call span, near final selected-end spacing and a near terminal
     /// gap may recommend one bounded probe for the next session operation.
+    /// A complete-boundary ASCII word run skips the run containing an interior
+    /// `start` before reducing the remaining suffix.
     ///
     /// # Errors
     ///
@@ -25398,6 +25404,11 @@ impl<'r> PortableOrdinarySession<'r> {
                             *plan, haystack, start,
                         )
                     }
+                    PortablePlan::AsciiWordRun(plan) => {
+                        count_ordinary_ascii_word_selected_ends_at(
+                            plan, haystack, start,
+                        )
+                    }
                     PortablePlan::UnicodeScalarRun(plan) => {
                         count_ordinary_unicode_scalar_selected_ends_at(
                             plan, haystack, start,
@@ -25446,6 +25457,23 @@ fn count_ordinary_reverse_inner_selected_ends_at(
     .map_err(SearchError::from)
 }
 
+#[cold]
+#[inline(never)]
+fn ordinary_word_run_unlimited_count_error(error: WordRunReduceError) -> SearchError {
+    // Unlimited reduction cannot refuse a resource envelope. Its arithmetic
+    // and accounting failures share the established word-run search overflow
+    // representation.
+    debug_assert!(matches!(
+        error,
+        WordRunReduceError::ArithmeticOverflow { .. }
+            | WordRunReduceError::AccountingInvariant { .. }
+    ));
+    SearchError::from(UnicodeWordRunError::WorkLimitExceeded {
+        needed: u64::MAX,
+        limit: u64::MAX,
+    })
+}
+
 #[inline(never)]
 fn count_ordinary_unicode_word_selected_ends_at(
     plan: unicode_word_run::Plan,
@@ -25464,20 +25492,29 @@ fn count_ordinary_unicode_word_selected_ends_at(
     debug_assert!(identity.unicode);
     debug_assert!(identity.complete_word_boundaries);
     plan.aggregate_count(haystack, WordRunReduceLimits::unlimited())
-        .map_err(|error| {
-            // Unlimited reduction cannot refuse a resource envelope. Its
-            // arithmetic and accounting failures share the established
-            // word-run search overflow representation.
-            debug_assert!(matches!(
-                error,
-                WordRunReduceError::ArithmeticOverflow { .. }
-                    | WordRunReduceError::AccountingInvariant { .. }
-            ));
-            SearchError::from(UnicodeWordRunError::WorkLimitExceeded {
-                needed: u64::MAX,
-                limit: u64::MAX,
-            })
-        })
+        .map_err(ordinary_word_run_unlimited_count_error)
+        .map(|result| Some(result.count))
+}
+
+#[inline(never)]
+fn count_ordinary_ascii_word_selected_ends_at(
+    plan: &unicode_word_run::AsciiPlan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<u64>, SearchError> {
+    let Some(tail_start) = plan
+        .ordinary_count_tail_start(haystack, start)
+        .map_err(SearchError::from)?
+    else {
+        return Ok(None);
+    };
+    let tail = &haystack[tail_start..];
+    let limits = WordRunReduceLimits::unlimited();
+    if let Some(count) = plan.aggregate_count_value_success(tail, limits) {
+        return Ok(Some(count));
+    }
+    plan.aggregate_count(tail, limits)
+        .map_err(ordinary_word_run_unlimited_count_error)
         .map(|result| Some(result.count))
 }
 
@@ -48692,7 +48729,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one exhaustive test closes plan identity, malformed UTF-8, ranged decline, compact binding, and ASCII isolation"
+        reason = "one exhaustive test closes plan identity, malformed UTF-8, ranged decline, and compact binding"
     )]
     fn ordinary_unicode_word_binding_counts_only_the_exact_full_window() {
         fn selected_count(
@@ -48785,18 +48822,120 @@ mod tests {
                 }
             }
         }
+    }
 
-        let ascii = PortableBuilder::new(r"(?-u:\b\w+\b)")
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive differential closes every ASCII byte category, start offset, positive minimum, and error contract"
+    )]
+    fn ordinary_ascii_complete_word_binding_counts_every_ranged_selected_end() {
+        fn selected_count(
+            baseline: &regex::bytes::Regex,
+            haystack: &[u8],
+            start: usize,
+        ) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = baseline.find_at(haystack, cursor) {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        fn exhaust_sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
+            let mut sources = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..maximum_len {
+                let mut next = Vec::new();
+                for prefix in &level {
+                    for &byte in alphabet {
+                        let mut source = prefix.clone();
+                        source.push(byte);
+                        sources.push(source.clone());
+                        next.push(source);
+                    }
+                }
+                level = next;
+            }
+            sources
+        }
+
+        // Word-run semantics distinguish these five public byte categories:
+        // letter, digit, underscore, ASCII nonword, and arbitrary high byte.
+        let haystacks = exhaust_sources(&[b'a', b'7', b'_', b'!', 0x80], 5);
+        for pattern in [
+            r"(?-u:\b\w+\b)",
+            r"(?-u:\b\w{2,}\b)",
+            r"(?-u:\b\w{4,}\b)",
+        ] {
+            let baseline = regex::bytes::Regex::new(pattern).unwrap();
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                regex.build_report().plan,
+                PlanKind::UnicodeWordRun,
+                "ranged ASCII pattern={pattern:?}",
+            );
+            assert!(
+                matches!(&regex.plan, PortablePlan::AsciiWordRun(_)),
+                "ASCII word fixture selected another runtime plan: pattern={pattern:?}",
+            );
+
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(bound_regex)
+                ) if core::ptr::eq(*bound_regex, &regex)
+            ));
+            assert!(
+                core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>()
+                    <= 2 * core::mem::size_of::<usize>()
+            );
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    assert_eq!(
+                        ordinary.count_positive_width_selected_ends_at(haystack, start),
+                        Ok(Some(selected_count(&baseline, haystack, start))),
+                        "pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                    );
+                }
+            }
+
+            let invalid_haystack = b"!word!";
+            for start in [invalid_haystack.len() + 1, usize::MAX] {
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(invalid_haystack, start),
+                    Err(SearchError::UnicodeWordRun(
+                        super::UnicodeWordRunError::InvalidWindow {
+                            start,
+                            end: invalid_haystack.len(),
+                            haystack_len: invalid_haystack.len(),
+                        }
+                    )),
+                    "supported ASCII word count owns invalid starts: pattern={pattern:?}",
+                );
+            }
+        }
+
+        let complete = PortableBuilder::new(r"(?-u:\b\w{3,}\b)")
             .unicode(false)
             .build()
             .unwrap();
-        assert!(matches!(&ascii.plan, PortablePlan::AsciiWordRun(_)));
+        let haystack = b"!abcdef!xy!word!";
         assert_eq!(
-            ascii
+            complete
                 .ordinary_session()
                 .unwrap()
-                .count_positive_width_selected_ends_at(b"ascii words", 0),
-            Ok(None),
+                .count_positive_width_selected_ends_at(haystack, 3),
+            Ok(Some(1)),
+            "complete boundaries skip the word containing start",
         );
     }
 
@@ -49537,6 +49676,34 @@ mod tests {
                     "unlimited fixed-predicate count unexpectedly refused its resource envelope",
                 )
             ),
+        );
+    }
+
+    #[test]
+    fn ordinary_word_run_unlimited_count_errors_preserve_facade_contract() {
+        let expected = SearchError::UnicodeWordRun(
+            super::UnicodeWordRunError::WorkLimitExceeded {
+                needed: u64::MAX,
+                limit: u64::MAX,
+            },
+        );
+        assert_eq!(
+            super::ordinary_word_run_unlimited_count_error(
+                super::WordRunReduceError::ArithmeticOverflow {
+                    computation: "injected word-run count overflow",
+                },
+            ),
+            expected,
+        );
+        assert_eq!(
+            super::ordinary_word_run_unlimited_count_error(
+                super::WordRunReduceError::AccountingInvariant {
+                    resource: super::WordRunReduceResource::UnitEvents,
+                    actual: 2,
+                    upper: 1,
+                },
+            ),
+            expected,
         );
     }
 
