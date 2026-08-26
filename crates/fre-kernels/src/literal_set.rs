@@ -604,40 +604,10 @@ fn find_direct_dfa_ascii_root_after_initial_miss(
 ) -> Option<usize> {
     debug_assert!(remaining.len() >= ORDINARY_ROOT_ASCII_MIN_BYTES);
     debug_assert!(!roots.set().contains(remaining[0]));
-    let mut at = 0_usize;
-    let mut blocks = remaining.chunks_exact(ASCII_NARROW_BYTES);
-    for block in blocks.by_ref() {
-        let block: &[u8; ASCII_NARROW_BYTES] = block
-            .try_into()
-            .expect("chunks_exact yields one complete ASCII classifier block");
-        let members = roots.classify_16(block).member_mask();
-        if members != 0 {
-            let lane = usize::try_from(members.trailing_zeros())
-                .expect("a u16 lane index fits usize");
-            let relative = at
-                .checked_add(lane)
-                .expect("a classifier lane stays inside its source slice");
-            #[cfg(test)]
-            ordinary_direct_probe::record_root_ascii(relative);
-            return Some(relative);
-        }
-        at = at
-            .checked_add(ASCII_NARROW_BYTES)
-            .expect("complete classifier blocks stay inside the source slice");
-    }
-    for (lane, &byte) in blocks.remainder().iter().enumerate() {
-        if roots.set().contains(byte) {
-            let relative = at
-                .checked_add(lane)
-                .expect("a scalar remainder lane stays inside its source slice");
-            #[cfg(test)]
-            ordinary_direct_probe::record_root_ascii(relative);
-            return Some(relative);
-        }
-    }
+    let relative = roots.find_first_member(remaining);
     #[cfg(test)]
-    ordinary_direct_probe::record_root_ascii(remaining.len());
-    None
+    ordinary_direct_probe::record_root_ascii(relative.unwrap_or(remaining.len()));
+    relative
 }
 
 #[inline]

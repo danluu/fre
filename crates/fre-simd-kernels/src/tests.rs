@@ -1305,6 +1305,75 @@ fn non_ascii_inputs_never_match_even_for_the_full_set() {
 }
 
 #[test]
+fn whole_slice_ascii_member_finder_preserves_first_member_at_boundaries() {
+    let cases = [
+        (AsciiByteSet::EMPTY, None),
+        (
+            AsciiByteSet::from_words([
+                (1_u64 << b'!') | (1_u64 << b'0') | (1_u64 << b'?'),
+                (1_u64 << (b'A' - 64))
+                    | (1_u64 << (b'Z' - 64))
+                    | (1_u64 << (b'~' - 64)),
+            ]),
+            Some(b'Z'),
+        ),
+        (AsciiByteSet::ALL, Some(b'a')),
+    ];
+    let lengths = [
+        0_usize, 1, 2, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 95, 96,
+        97, 127, 128, 129, 255, 256, 257,
+    ];
+    let positions = [
+        0_usize, 1, 14, 15, 16, 17, 30, 31, 32, 47, 48, 63, 64, 95, 96,
+        127, 128, 255, 256,
+    ];
+
+    for (set, member) in cases {
+        #[cfg(not(feature = "static-dispatch"))]
+        let classifiers = [
+            AsciiByteSetClassifier::new(set),
+            AsciiByteSetClassifier::with_policy(set, DispatchPolicy::Portable)
+                .expect("the scalar classifier is always available"),
+        ];
+        #[cfg(feature = "static-dispatch")]
+        let classifiers = [AsciiByteSetClassifier::new(set)];
+
+        for classifier in classifiers {
+            for alignment in 0..32 {
+                for len in lengths {
+                    let mut source = vec![0xff; alignment + len];
+                    let bytes = &source[alignment..];
+                    assert_eq!(
+                        classifier.find_first_member(bytes),
+                        bytes.iter().position(|&byte| set.contains(byte)),
+                        "empty case set={set:?} alignment={alignment} len={len}",
+                    );
+                    let Some(member) = member else {
+                        continue;
+                    };
+                    for position in positions {
+                        if position >= len {
+                            continue;
+                        }
+                        let final_position = len - 1;
+                        source[alignment + position] = member;
+                        source[alignment + final_position] = member;
+                        let bytes = &source[alignment..];
+                        assert_eq!(
+                            classifier.find_first_member(bytes),
+                            bytes.iter().position(|&byte| set.contains(byte)),
+                            "set={set:?} alignment={alignment} len={len} position={position}",
+                        );
+                        source[alignment + position] = 0xff;
+                        source[alignment + final_position] = 0xff;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn fixed_array_references_work_at_every_common_input_alignment() {
     let classifier = AsciiByteSetClassifier::new(AsciiByteSet::from_words([
         0x1020_4080_0102_0408,

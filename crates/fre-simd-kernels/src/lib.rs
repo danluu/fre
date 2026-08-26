@@ -1280,6 +1280,49 @@ impl AsciiByteSetClassifier {
         }
     }
 
+    /// Find the first byte belonging to this compiled set.
+    ///
+    /// `AArch64` enters one whole-slice NEON leaf after consulting the retained
+    /// dispatch receipt once. That leaf keeps the immutable nibble columns in
+    /// registers across complete blocks and recovers the exact first lane only
+    /// after a block group reports a member. Other targets retain the same
+    /// exact 16-byte classification loop used by callers before this method
+    /// was introduced.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "the retained or compiler-fixed receipt proves NEON before the whole-slice leaf is entered"
+    )]
+    pub fn find_first_member(&self, bytes: &[u8]) -> Option<usize> {
+        #[cfg(all(not(feature = "static-dispatch"), target_arch = "aarch64"))]
+        {
+            if matches!(self.selection.narrow().vector, VectorKind::Scalar) {
+                return find_first_ascii_member_scalar(self.set, bytes);
+            }
+            // SAFETY: the only non-scalar narrow AArch64 variant requires
+            // NEON in this classifier's immutable retained receipt.
+            unsafe { aarch64::find_ascii_members_neon(&self.columns, self.set, bytes) }
+        }
+        #[cfg(all(
+            feature = "static-dispatch",
+            target_arch = "aarch64",
+            target_feature = "neon"
+        ))]
+        {
+            // SAFETY: NEON is fixed in the authenticated compiler profile.
+            unsafe { aarch64::find_ascii_members_neon(&self.columns, self.set, bytes) }
+        }
+        #[cfg(not(any(
+            all(not(feature = "static-dispatch"), target_arch = "aarch64"),
+            all(
+                feature = "static-dispatch",
+                target_arch = "aarch64",
+                target_feature = "neon"
+            )
+        )))]
+        find_first_ascii_member_blocks(self, bytes)
+    }
+
     /// Count set members among exactly 16 bytes.
     #[must_use]
     pub fn count_16(&self, bytes: &[u8; ASCII_NARROW_BYTES]) -> u8 {
@@ -1291,6 +1334,48 @@ impl AsciiByteSetClassifier {
     pub fn count_32(&self, bytes: &[u8; ASCII_WIDE_BYTES]) -> u8 {
         self.classify_32(bytes).member_count()
     }
+}
+
+#[cfg(not(all(
+    feature = "static-dispatch",
+    target_arch = "aarch64",
+    target_feature = "neon"
+)))]
+fn find_first_ascii_member_scalar(set: AsciiByteSet, bytes: &[u8]) -> Option<usize> {
+    bytes.iter().position(|&byte| set.contains(byte))
+}
+
+#[cfg(not(any(
+    all(not(feature = "static-dispatch"), target_arch = "aarch64"),
+    all(
+        feature = "static-dispatch",
+        target_arch = "aarch64",
+        target_feature = "neon"
+    )
+)))]
+fn find_first_ascii_member_blocks(
+    classifier: &AsciiByteSetClassifier,
+    bytes: &[u8],
+) -> Option<usize> {
+    let mut block_start = 0_usize;
+    let mut blocks = bytes.chunks_exact(ASCII_NARROW_BYTES);
+    for block in &mut blocks {
+        let block: &[u8; ASCII_NARROW_BYTES] = block
+            .try_into()
+            .expect("chunks_exact yields one complete ASCII classifier block");
+        let members = classifier.classify_16(block).member_mask();
+        if members != 0 {
+            return block_start.checked_add(
+                usize::try_from(members.trailing_zeros())
+                    .expect("a 16-bit lane index fits in usize"),
+            );
+        }
+        block_start = block_start
+            .checked_add(ASCII_NARROW_BYTES)
+            .expect("complete classifier blocks stay inside the source slice");
+    }
+    find_first_ascii_member_scalar(classifier.set, blocks.remainder())
+        .and_then(|relative| block_start.checked_add(relative))
 }
 
 #[derive(Clone, Copy, Debug)]
