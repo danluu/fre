@@ -18748,7 +18748,7 @@ impl<'a> PortableOrdinaryCanonical<'a> {
         &self,
         haystack: &[u8],
         start: usize,
-        visitor: F,
+        mut visitor: F,
     ) -> Result<Result<(), E>, PortableFindIterError>
     where
         F: FnMut(Match) -> Result<bool, E>,
@@ -18811,6 +18811,25 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 },
                 visitor,
             );
+        }
+
+        if let Self::Native(regex) = self
+            && let PortablePlan::ReverseInner(plan) = &regex.plan
+        {
+            return plan
+                .try_visit_spans_while_in(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                    ReverseInnerReduceLimits::unlimited(),
+                    |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        })
+                    },
+                )
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search);
         }
 
         // Preserve the construction-selected source cursor when this native
@@ -24747,13 +24766,15 @@ impl<'r> PortableOrdinarySession<'r> {
     ///
     /// This is the ranged companion to [`Self::try_visit_spans`]. Assertions
     /// retain complete original-haystack context and offsets remain absolute.
-    /// Positive exact literals and K0 pass selected items directly to the
-    /// callback without an accounting iterator, result buffer, or search-call
-    /// cap. Unguarded literal/class-run plans reuse their report-free ordinary
-    /// span search on each remaining tail; guarded plans keep the context-aware
-    /// canonical fallback. Other canonical fallback plans iterate the compact
-    /// binding with unlimited value searches and the ordinary empty-match
-    /// progress rule.
+    /// Positive exact literals, K0, and a retained reverse-inner reducer pass
+    /// selected items directly to the callback without an accounting iterator,
+    /// result buffer, or search-call cap. Unguarded literal/class-run plans
+    /// reuse their report-free ordinary span search on each remaining tail;
+    /// guarded plans keep the context-aware canonical fallback. Reverse-inner
+    /// tail windows retain absolute offsets and stop their shared traversal
+    /// immediately on callback stop or error. Other canonical fallback plans
+    /// iterate the compact binding with unlimited value searches and the
+    /// ordinary empty-match progress rule.
     ///
     /// # Errors
     ///
@@ -47797,6 +47818,103 @@ mod tests {
                     fre_kernels::LiteralClassRunLiteralSearchError::InvalidWindow { .. }
                 )
             ))
+        ));
+        assert!(!invalid_callback);
+    }
+
+    #[test]
+    fn ordinary_reverse_inner_binding_visits_direct_spans_with_callback_control() {
+        fn selected_spans(
+            regex: &PortableRegex,
+            haystack: &[u8],
+            start: usize,
+        ) -> Vec<(usize, usize)> {
+            let mut cursor = start;
+            let mut spans = Vec::new();
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                spans.push((matched.start(), matched.end()));
+                cursor = matched.end();
+            }
+            spans
+        }
+
+        let regex = PortableBuilder::new(r"[abλ]+aa[abλ]+")
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::Native(bound_regex)
+            ) if core::ptr::eq(*bound_regex, &regex)
+        ));
+        assert!(
+            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>()
+                <= 2 * core::mem::size_of::<usize>()
+        );
+
+        for haystack in [
+            b"!baaab!abbbaabbb!bbbb!baaab!".as_slice(),
+            b"!\xce\xbbbaaab\xce\xbb!abbaabbb!\xce\xbbbaaab!".as_slice(),
+            b"\xffbaaab\x80!\xce\xbbbaaab\xce!abbaabbb\xed\xa0\x80!".as_slice(),
+        ] {
+            for start in 0..=haystack.len() {
+                let expected = selected_spans(&regex, haystack, start);
+                let mut actual = Vec::new();
+                assert_eq!(
+                    ordinary
+                        .try_visit_spans_at(haystack, start, |matched| {
+                            actual.push((matched.start(), matched.end()));
+                            Ok::<bool, ()>(true)
+                        })
+                        .unwrap(),
+                    Ok(()),
+                    "haystack={haystack:?}, start={start}",
+                );
+                assert_eq!(actual, expected, "haystack={haystack:?}, start={start}");
+            }
+        }
+
+        let haystack = b"baaab!abbaabbb!bbaabb!";
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |matched| {
+                    stopped.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(false)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(stopped, [(0, 5)]);
+
+        let mut errored = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |matched| {
+                    errored.push((matched.start(), matched.end()));
+                    Err::<bool, _>("callback")
+                })
+                .unwrap(),
+            Err("callback"),
+        );
+        assert_eq!(errored, [(0, 5)]);
+
+        let mut invalid_callback = false;
+        assert!(matches!(
+            ordinary.try_visit_spans_at(haystack, haystack.len() + 1, |_| {
+                invalid_callback = true;
+                Ok::<bool, ()>(true)
+            }),
+            Err(PortableFindIterError::Search(SearchError::ReverseInner(
+                fre_kernels::ReverseInnerReduceError::InvalidWindow { .. }
+            )))
         ));
         assert!(!invalid_callback);
     }

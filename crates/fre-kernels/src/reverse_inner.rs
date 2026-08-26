@@ -42,7 +42,7 @@
     reason = "all resource and index arithmetic is checked before use; bitmap shifts use proved 0..=63 operands"
 )]
 
-use core::{fmt, mem::size_of};
+use core::{convert::Infallible, fmt, mem::size_of, ops::ControlFlow};
 
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize, ExactVec, copy_exact};
 use fre_simd_kernels::{
@@ -119,6 +119,28 @@ const UNION_ROOT_CANDIDATE_WORK: usize = 1;
 const UNION_EXACT_CANDIDATE_WORK: usize = 1;
 const UNION_FALLBACK_WORK: usize = 1;
 const ADAPTIVE_UNION_PROVED_RUN_SAMPLES_BEFORE_FALLBACK: usize = 2;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_REDUCE_FINDER_CALLS: core::cell::Cell<usize> = const {
+        core::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_test_reduce_finder_calls() {
+    TEST_REDUCE_FINDER_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn record_test_reduce_finder_call() {
+    TEST_REDUCE_FINDER_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn test_reduce_finder_calls() -> usize {
+    TEST_REDUCE_FINDER_CALLS.with(core::cell::Cell::get)
+}
 
 /// Complete operation selected before source access.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1619,13 +1641,20 @@ impl ReverseInnerPlan {
         F: FnMut(CompleteSpan),
     {
         let upper = self.preflight(haystack, window, Operation::SpanVisit, limits)?;
-        let actual = self.execute_with_visitor(
+        let outcome = self.execute_with_visitor(
             haystack,
             window,
             Operation::SpanVisit,
             upper,
-            &mut visitor,
+            &mut |span| {
+                visitor(span);
+                ControlFlow::<Infallible>::Continue(())
+            },
         )?;
+        let actual = match outcome {
+            ControlFlow::Continue(actual) => actual,
+            ControlFlow::Break(never) => match never {},
+        };
         Ok(SpanVisitResult {
             matches: actual.count,
             span_sum: actual.span_sum,
@@ -1636,6 +1665,59 @@ impl ReverseInnerPlan {
                 actual,
             },
         })
+    }
+
+    /// Visit complete non-overlapping maximal-run spans until exhaustion,
+    /// successful callback stop, or callback error.
+    ///
+    /// Prospective limits are checked before source access or the first
+    /// callback. Once a callback returns `Ok(false)` or `Err`, traversal
+    /// returns immediately without searching the remaining source. Callback
+    /// errors remain nested so they cannot be confused with reducer errors.
+    pub fn try_visit_spans_while<F, E>(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        visitor: F,
+    ) -> Result<Result<(), E>, ReduceError>
+    where
+        F: FnMut(CompleteSpan) -> Result<bool, E>,
+    {
+        self.try_visit_spans_while_in(
+            haystack,
+            Window::full(haystack),
+            limits,
+            visitor,
+        )
+    }
+
+    /// Visit complete spans wholly inside `window` until exhaustion,
+    /// successful callback stop, or callback error.
+    pub fn try_visit_spans_while_in<F, E>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, ReduceError>
+    where
+        F: FnMut(CompleteSpan) -> Result<bool, E>,
+    {
+        let upper = self.preflight(haystack, window, Operation::SpanVisit, limits)?;
+        match self.execute_with_visitor(
+            haystack,
+            window,
+            Operation::SpanVisit,
+            upper,
+            &mut |span| match visitor(span) {
+                Ok(true) => ControlFlow::Continue(()),
+                Ok(false) => ControlFlow::Break(Ok(())),
+                Err(error) => ControlFlow::Break(Err(error)),
+            },
+        )? {
+            ControlFlow::Continue(_) => Ok(Ok(())),
+            ControlFlow::Break(outcome) => Ok(outcome),
+        }
     }
 
     /// Find the selected leftmost-first span in the complete haystack.
@@ -2140,19 +2222,24 @@ impl ReverseInnerPlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
-        self.execute_with_visitor(haystack, window, operation, upper, &mut |_| {})
+        match self.execute_with_visitor(haystack, window, operation, upper, &mut |_| {
+            ControlFlow::<Infallible>::Continue(())
+        })? {
+            ControlFlow::Continue(actual) => Ok(actual),
+            ControlFlow::Break(never) => match never {},
+        }
     }
 
-    fn execute_with_visitor<F>(
+    fn execute_with_visitor<F, B>(
         &self,
         haystack: &[u8],
         window: Window,
         operation: Operation,
         upper: ReduceUpperBounds,
         visitor: &mut F,
-    ) -> Result<ReduceActualCounters, ReduceError>
+    ) -> Result<ControlFlow<B, ReduceActualCounters>, ReduceError>
     where
-        F: FnMut(CompleteSpan),
+        F: FnMut(CompleteSpan) -> ControlFlow<B>,
     {
         let actual = ReduceActualCounters {
             input_bytes: upper.input_bytes,
@@ -2687,7 +2774,7 @@ impl ReverseInnerPlan {
         clippy::too_many_lines,
         reason = "adaptive union traversal, certified fallback, and exact counters remain adjacent"
     )]
-    fn execute_adaptive_union<F>(
+    fn execute_adaptive_union<F, B>(
         &self,
         haystack: &[u8],
         window: Window,
@@ -2695,9 +2782,9 @@ impl ReverseInnerPlan {
         upper: ReduceUpperBounds,
         mut actual: ReduceActualCounters,
         visitor: &mut F,
-    ) -> Result<ReduceActualCounters, ReduceError>
+    ) -> Result<ControlFlow<B, ReduceActualCounters>, ReduceError>
     where
-        F: FnMut(CompleteSpan),
+        F: FnMut(CompleteSpan) -> ControlFlow<B>,
     {
         let mut cursor = window.start();
         let mut unproductive_run_samples = 0_usize;
@@ -2717,7 +2804,7 @@ impl ReverseInnerPlan {
                             computation: "adaptive-union total finder calls",
                         })?;
                     verify_actual(actual, upper)?;
-                    return Ok(actual);
+                    return Ok(ControlFlow::Continue(actual));
                 }
                 UnionNext::DenseFallback { resume_start } => {
                     return self.execute_independent_from(
@@ -2853,11 +2940,13 @@ impl ReverseInnerPlan {
                     MATCH_WORK,
                     "literal-union match work",
                 )?;
-                if operation == Operation::SpanVisit {
-                    visitor(CompleteSpan {
+                if operation == Operation::SpanVisit
+                    && let ControlFlow::Break(value) = visitor(CompleteSpan {
                         start: run_start,
                         end: run_end,
-                    });
+                    })
+                {
+                    return Ok(ControlFlow::Break(value));
                 }
             } else {
                 unproductive_run_samples = checked_add_reduce(
@@ -2895,7 +2984,7 @@ impl ReverseInnerPlan {
         }
     }
 
-    fn execute_grouped_union<F>(
+    fn execute_grouped_union<F, B>(
         &self,
         haystack: &[u8],
         window: Window,
@@ -2903,9 +2992,9 @@ impl ReverseInnerPlan {
         upper: ReduceUpperBounds,
         mut actual: ReduceActualCounters,
         visitor: &mut F,
-    ) -> Result<ReduceActualCounters, ReduceError>
+    ) -> Result<ControlFlow<B, ReduceActualCounters>, ReduceError>
     where
-        F: FnMut(CompleteSpan),
+        F: FnMut(CompleteSpan) -> ControlFlow<B>,
     {
         let mut cursor = window.start();
         let mut fallback = GroupedFallbackMeter::new(window.start(), actual.work);
@@ -2928,7 +3017,7 @@ impl ReverseInnerPlan {
                             computation: "grouped-union total finder calls",
                         })?;
                     verify_actual(actual, upper)?;
-                    return Ok(actual);
+                    return Ok(ControlFlow::Continue(actual));
                 }
                 GroupedUnionNext::DenseFallback { resume_start } => {
                     return self.execute_independent_from(
@@ -2993,18 +3082,20 @@ impl ReverseInnerPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "grouped-union accepting run work",
                 })?;
-            if operation == Operation::SpanVisit {
-                visitor(CompleteSpan {
+            if operation == Operation::SpanVisit
+                && let ControlFlow::Break(value) = visitor(CompleteSpan {
                     start: run_start,
                     end: run_end,
-                });
+                })
+            {
+                return Ok(ControlFlow::Break(value));
             }
             fallback.reset(run_end, actual.work);
             cursor = run_end;
         }
     }
 
-    fn execute_independent_from<F>(
+    fn execute_independent_from<F, B>(
         &self,
         haystack: &[u8],
         window: Window,
@@ -3013,9 +3104,9 @@ impl ReverseInnerPlan {
         resume_start: usize,
         mut actual: ReduceActualCounters,
         visitor: &mut F,
-    ) -> Result<ReduceActualCounters, ReduceError>
+    ) -> Result<ControlFlow<B, ReduceActualCounters>, ReduceError>
     where
-        F: FnMut(CompleteSpan),
+        F: FnMut(CompleteSpan) -> ControlFlow<B>,
     {
         let mut cursors = [resume_start; MAX_LITERALS];
         let mut cached = [None::<usize>; MAX_LITERALS];
@@ -3162,11 +3253,13 @@ impl ReverseInnerPlan {
                         })?;
                 }
                 actual.work = checked_add_reduce(actual.work, MATCH_WORK, "match work")?;
-                if operation == Operation::SpanVisit {
-                    visitor(CompleteSpan {
+                if operation == Operation::SpanVisit
+                    && let ControlFlow::Break(value) = visitor(CompleteSpan {
                         start: run_start,
                         end: run_end,
-                    });
+                    })
+                {
+                    return Ok(ControlFlow::Break(value));
                 }
             }
 
@@ -3189,7 +3282,7 @@ impl ReverseInnerPlan {
                 computation: "total finder calls",
             })?;
         verify_actual(actual, upper)?;
-        Ok(actual)
+        Ok(ControlFlow::Continue(actual))
     }
 
     #[allow(
@@ -4505,6 +4598,8 @@ fn find_and_charge(
     inner: bool,
     actual: &mut ReduceActualCounters,
 ) -> Result<Option<usize>, ReduceError> {
+    #[cfg(test)]
+    record_test_reduce_finder_call();
     if inner {
         actual.inner_finder_calls =
             checked_add_reduce(actual.inner_finder_calls, 1, "inner finder calls")?;
@@ -4988,7 +5083,7 @@ mod tests {
         GroupedFallbackMeter, MAX_ADMITTED_NON_ASCII_SCALARS, ReduceError, ReduceLimits,
         ReverseInnerPlan, SEARCH_OPERATION_ID, SHORTEST_SEARCH_OPERATION_ID,
         SPAN_SUM_OPERATION_ID, SPAN_VISIT_OPERATION_ID, ScalarRange, SearchLimits,
-        UNION_ACCOUNTING_ID,
+        UNION_ACCOUNTING_ID, reset_test_reduce_finder_calls, test_reduce_finder_calls,
         UNION_MASK_BUILD_WORK_PER_LITERAL, UNION_PLAN_ID, UNION_RECEIPT_DIGEST_BUILD_WORK,
         UnionMode, UnionState,
     };
@@ -5470,6 +5565,63 @@ mod tests {
     }
 
     #[test]
+    fn span_visit_while_stops_before_searching_the_remaining_source() {
+        let plan = plan(&SMALL_CLASS, &[b"aa"]);
+        let haystack = b"baaab!abbaabbb!bbaabb!tail-without-a-match";
+
+        reset_test_reduce_finder_calls();
+        let exhaustive = plan
+            .visit_spans(haystack, ReduceLimits::unlimited(), |_| {})
+            .unwrap();
+        let exhaustive_finder_calls = test_reduce_finder_calls();
+        assert_eq!(exhaustive.matches, 3);
+
+        reset_test_reduce_finder_calls();
+        let mut stopped_callbacks = 0_usize;
+        assert_eq!(
+            plan.try_visit_spans_while(haystack, ReduceLimits::unlimited(), |_| {
+                stopped_callbacks += 1;
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        let stopped_finder_calls = test_reduce_finder_calls();
+        assert_eq!(stopped_callbacks, 1);
+        assert!(stopped_finder_calls < exhaustive_finder_calls);
+
+        reset_test_reduce_finder_calls();
+        let mut error_callbacks = 0_usize;
+        assert_eq!(
+            plan.try_visit_spans_while(haystack, ReduceLimits::unlimited(), |_| {
+                error_callbacks += 1;
+                Err::<bool, _>("callback")
+            }),
+            Ok(Err("callback")),
+        );
+        assert_eq!(error_callbacks, 1);
+        assert_eq!(test_reduce_finder_calls(), stopped_finder_calls);
+
+        reset_test_reduce_finder_calls();
+        let mut refused_callbacks = 0_usize;
+        assert!(matches!(
+            plan.try_visit_spans_while(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: 0,
+                    ..ReduceLimits::unlimited()
+                },
+                |_| {
+                    refused_callbacks += 1;
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Err(ReduceError::SpanSumLimit { .. })
+        ));
+        assert_eq!(refused_callbacks, 0);
+        assert_eq!(test_reduce_finder_calls(), 0);
+    }
+
+    #[test]
     fn byte_windows_include_split_utf8_and_invalid_boundaries() {
         let plan = plan(&SMALL_CLASS, &SMALL_LITERALS);
         let regex = oracle(SMALL_PATTERN);
@@ -5484,6 +5636,25 @@ mod tests {
                 let sum = plan
                     .span_sum_in(haystack, window, ReduceLimits::unlimited())
                     .expect("window span sum");
+                let expected_spans: Vec<_> = regex
+                    .find_iter(&haystack[start..end])
+                    .map(|matched| CompleteSpan {
+                        start: start + matched.start(),
+                        end: start + matched.end(),
+                    })
+                    .collect();
+                let mut visited = Vec::new();
+                plan.try_visit_spans_while_in(
+                    haystack,
+                    window,
+                    ReduceLimits::unlimited(),
+                    |span| {
+                        visited.push(span);
+                        Ok::<bool, ()>(true)
+                    },
+                )
+                .expect("window span visit")
+                .expect("infallible window visitor");
                 let expected_find = regex
                     .find(&haystack[start..end])
                     .map(|matched| (start + matched.start(), start + matched.end()));
@@ -5506,6 +5677,7 @@ mod tests {
                 );
                 assert_eq!(found, expected_find, "find window={start}..{end}");
                 assert_eq!(exists, expected_find.is_some(), "exists window={start}..{end}");
+                assert_eq!(visited, expected_spans, "visit window={start}..{end}");
                 assert_eq!(
                     shortest, expected_shortest,
                     "shortest window={start}..{end}"
