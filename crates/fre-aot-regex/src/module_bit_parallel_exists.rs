@@ -307,6 +307,8 @@ fn lower_native_bit_parallel_layout(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         matched_cursor: emission.matched_cursor,
     }))
@@ -2928,7 +2930,9 @@ mod tests {
         // Full-object digests from a source-neutral rare-root fixture. These
         // pin the table layout, recurrence emitter, relocations, and target
         // feature routing together; a structural layout assertion alone would
-        // miss code drift in the zero-mask compatibility path.
+        // miss code drift in the zero-mask compatibility path. Every digest
+        // includes the 64-byte native text alignment introduced by 58696f4e0;
+        // that object-level change invalidated all 21 earlier frozen values.
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Vl);
         let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
         let sve2 = sve.with(CpuFeature::Aarch64Sve2);
@@ -2937,9 +2941,9 @@ mod tests {
                 "x86-sse2",
                 Target::x86_64_linux(),
                 [
-                    "91adc11f0c2e9d0124235e1323b7e478dc8c24e0584b5e0d7dada24c043876c4",
-                    "93de9044ade610c1944251458a8f87c6640002e798dce01897bbb7becd019a9c",
-                    "d896256d7c01d711cd4b0ba8edea6dc5e4eba5973a5f4d5cbf6b6d76c16f43ad",
+                    "8647285c9c6b109c277f033b3943379ebeaafd2f1314c6ab10bae1e2db4e9cfd",
+                    "9ebba671831ed07022a0ad82f038af1c3d70569446365293a8a60136922530e0",
+                    "43447af9e53a813b26a30486d4366cd0bae235683fd76233149011854fa01127",
                 ],
             ),
             (
@@ -2948,27 +2952,27 @@ mod tests {
                     .with_features(FeatureSet::of(CpuFeature::X86Avx2))
                     .unwrap(),
                 [
-                    "f56b1affb05b66d992e4d75b84ddf13f7703cffcecc392458e94491c62a306c5",
-                    "ab687be2a7221c74298a81f7f60d4745d55fae5a06f178a34e8031d43e5cdc9c",
-                    "c4785f17e09c105ba0141153bb512691c8470880384c2c20bcf99c972ab9216a",
+                    "c109ad97a046d926c3466fa193004e99b0194ba642d7e0cad0cd180c28a2b107",
+                    "6347ed615cd12bd5d9a857afe024ebbe9334ecc4c903e8a7602e6b933e864088",
+                    "21d046021fbc5a3e6fb875f35fb7b959ce59b87dc49b7d322eafd8dae3376048",
                 ],
             ),
             (
                 "x86-avx512",
                 Target::x86_64_linux().with_features(avx512).unwrap(),
                 [
-                    "1fa743484fd15cb0bf57578a2beef6c2a69e89df4f312ecc4933cb508fe21bda",
-                    "96dff82b4044ca5a3a5e9422b82770b01543c924f3825a65d1ef723ea03d1c25",
-                    "4828044920ba79807de4f8c6e007de53c7ce53585d36dd113db8328fe37e0383",
+                    "5471e787158544d90480d8acf921ebc73bbb97a394e8f5d7e5daa39ee4674e70",
+                    "bc3a3dd2d978f1d37adf3e44178c2c6a28d1dccc0a80a235dd6180d3fe9d2594",
+                    "99acd2e275c6fb5e041c57007d913a9a441efdd73612fdb5e17d8b4057c585da",
                 ],
             ),
             (
                 "arm-scalar",
                 Target::aarch64_macos(),
                 [
-                    "39107070e81bde41e444da227f856501a5d5e650983109bb60e98129f0a1b01f",
-                    "270bcef54b70b6e65d70a562a49627ed2145a4476eb6984e0381863275d020e7",
-                    "c2f51790348e543d03e2c192c2d9815a79161ba39baa59854dd4c3051009d17f",
+                    "9dc27ab8c7827d2cc99ec83e8b0f982300fe789a272dba191af21d77f0f4e579",
+                    "0e487892b48de76baae0460bdd752766c3144c7da5f0a0da1250629411c326f2",
+                    "0dfcbb63cc23135395de0d087be9b941a701cdaabfe37949aa617994cd9f3eb5",
                 ],
             ),
             (
@@ -2977,30 +2981,33 @@ mod tests {
                     .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                     .unwrap(),
                 [
-                    "0618c41cdc3c4a291c8d0aefd8f8c3992b2c7cda638054eea0c3317de48f4138",
-                    "4bc30e949a16ca95ee08c9eec565d668ebf3cca28f57aaed1ffdd28cd92adf74",
-                    "9deeed39822f1e5f3d158918651b70ddad35f8a56dd01962dec8ed158f55fe6c",
+                    "b5d0a93926e66648c0d83a87356f986043af9a21fb28ce53a8d0f31e014b2591",
+                    "f2e980aa9bb05168f11f53c015810ef306e21eb8e0f1507a2e8fbae1db557f9b",
+                    "2e823bc4510502658bddd105f11cf7bf5495a19b49052b5f0f19d0354c0cccf3",
                 ],
             ),
             (
                 "arm-sve",
                 Target::aarch64_linux().with_features(sve).unwrap(),
                 [
-                    "4f7a9145da5bf1de340b27d2f8664953433c887f2e9b816b7c5902adad6b9eec",
-                    "7fc8cafcb163068c498702be7b72b3c7446fe5790bddeeedc958c54b3318da9a",
-                    "070ac6cb592107a00e61009db8755b3f514332d0e8379a080935c6b8983da58f",
+                    "a7d86a56584a311d3751b98c1fe797c8908ef2d65fb5f7226c8cc79c1dfba6d7",
+                    "9b8a5a30b80c78ef858354f8bddb79a5d821dd1ec9a6b08e89cfc0cbe64cb21a",
+                    "1b9605a81b1639de2cd9f99de56a9a73bbf92805518cac5fbdf366a4c97df0b7",
                 ],
             ),
             (
                 "arm-sve2",
                 Target::aarch64_linux().with_features(sve2).unwrap(),
                 [
-                    "22a4fbbc2db82b1d297974352ffb225493a05e848c981be2e18451575dff2bc3",
-                    "37970abb33767c804e7c61fd527ea5e4e4be98e7901a77a69c84e6c98bd6a99e",
-                    "9e59570114716b6ed17679d132f3ae28ed6fb6d63da6ba6975320848c7827085",
+                    "ec75fdb1558239b36316594a504ebb33b0f167cb959392cff3c8032f55e0433e",
+                    "3aef28e53fe84e8b09fdbea7fdfc71b04aea3096e43db66cf7eaa020f0814e23",
+                    "898cb367994abf6e09c8a83e3bbe5f46882690f44f3aacf5632000fa189b4a5c",
                 ],
             ),
         ];
+        // Retain every target/word failure in one run. A changed first object
+        // must not hide drift in the other independently frozen objects.
+        let mut digest_mismatches = Vec::new();
         for (target_name, target, expected_digests) in targets {
             for (word_index, pattern_repetitions) in [78_usize, 142, 206].into_iter().enumerate() {
                 let pattern = format!(r"(?:{}Q|(?-u:\xFF))", r"\x01".repeat(pattern_repetitions));
@@ -3013,14 +3020,21 @@ mod tests {
                     .expect("zero-mask compatibility native layout");
                 assert_eq!(layout.words, word_index + 2, "{target_name}");
                 assert_eq!(layout.subset_source_mask, 0, "{target_name}");
-                assert_eq!(
-                    digest_hex(compiled.receipt().object_sha256),
-                    expected_digests[word_index],
-                    "{target_name} W{}",
-                    word_index + 2
-                );
+                let actual = digest_hex(compiled.receipt().object_sha256);
+                if actual != expected_digests[word_index] {
+                    digest_mismatches.push((
+                        target_name,
+                        word_index + 2,
+                        actual,
+                        expected_digests[word_index],
+                    ));
+                }
             }
         }
+        assert!(
+            digest_mismatches.is_empty(),
+            "zero-mask object digest mismatches: {digest_mismatches:#?}"
+        );
     }
 
     #[allow(

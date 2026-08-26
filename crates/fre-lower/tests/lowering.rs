@@ -9,7 +9,9 @@ use fre_lower::{
 use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustParsed, RustProfile, parse,
 };
-use regex_syntax::hir::{Hir, HirKind};
+use regex_syntax::hir::{
+    Capture, Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind,
+};
 fn profile(unicode: bool) -> CompatibilityProfile {
     let mut profile = RustProfile::rebar_1_12_4();
     profile.options.unicode = unicode;
@@ -316,6 +318,359 @@ fn embedded_literal_trie_reduces_shared_prefix_graphs_with_exact_limits() {
             ..
         })
     ));
+}
+
+#[test]
+fn embedded_byte_token_trie_compacts_ascii_folded_captured_arms_at_exact_limits() {
+    const PATTERN: &str = r"(?i-u:(shared-alpha)|(shared)|(shared-beta)|(shared-gamma)|(other))q";
+    let parsed = parsed(PATTERN, false);
+    let HirKind::Concat(parts) = parsed.hir.kind() else {
+        panic!(
+            "folded-arm fixture must retain its trailing literal: {:?}",
+            parsed.hir
+        );
+    };
+    let [alternative, suffix] = parts.as_slice() else {
+        panic!("folded-arm fixture changed root width: {:?}", parsed.hir);
+    };
+    let HirKind::Alternation(branches) = alternative.kind() else {
+        panic!("capture barriers must retain the folded-arm alternation: {alternative:?}");
+    };
+    assert!(
+        branches
+            .iter()
+            .all(|branch| matches!(branch.kind(), HirKind::Capture(_)))
+    );
+
+    let compact = lower_raw(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("folded byte-token trie lowers");
+    assert!(matches!(suffix.kind(), HirKind::Literal(_)));
+    assert!(
+        compact.stats().states() < 49,
+        "compact={:?}, naive_states=49",
+        compact.stats(),
+    );
+    assert!(
+        compact.stats().edges() < 95,
+        "compact={:?}, naive_edges=95",
+        compact.stats(),
+    );
+    assert_eq!(compact.stats().erased_captures(), branches.len());
+
+    let validated = lower(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("folded byte-token trie validates");
+    let stats = validated.stats();
+    let plan_stats = validated.automaton().stats();
+    let exact = LowerLimits {
+        max_work: stats.work(),
+        max_stack_items: stats.peak_stack_items(),
+        automata: fre_automata::CompileLimits {
+            max_states: stats.states(),
+            max_edges: stats.edges(),
+            max_storage_bytes: plan_stats.storage_bytes(),
+            max_validation_work: plan_stats.validation_work(),
+        },
+    };
+    assert_eq!(
+        lower_raw(&parsed, OperationSemantics::CaptureFree, exact)
+            .expect("exact folded byte-token limits replay")
+            .stats(),
+        stats,
+    );
+    assert!(matches!(
+        lower_raw(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                automata: fre_automata::CompileLimits {
+                    max_states: stats.states() - 1,
+                    ..fre_automata::CompileLimits::default()
+                },
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::States,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn embedded_byte_token_trie_patches_wide_terminal_classes_to_the_continuation() {
+    fn class(bytes: &[u8]) -> Hir {
+        let class = ClassBytes::new(
+            bytes
+                .iter()
+                .copied()
+                .map(|byte| ClassBytesRange::new(byte, byte)),
+        );
+        assert!(
+            class.ranges().len() > 2,
+            "fixture must retain wide terminal ranges"
+        );
+        Hir::class(Class::Bytes(class))
+    }
+
+    fn captured(index: u32, prefix: &'static [u8], terminal: Hir) -> Hir {
+        Hir::capture(Capture {
+            index,
+            name: None,
+            sub: Box::new(Hir::concat(vec![Hir::literal(prefix), terminal])),
+        })
+    }
+
+    let hir = Hir::concat(vec![
+        Hir::alternation(vec![
+            captured(1, b"shared", class(b"02468")),
+            captured(2, b"shared", class(b"13579")),
+            captured(3, b"other", class(b"ACE")),
+        ]),
+        Hir::literal(*b"q"),
+    ]);
+    let lowered = lower_hir(
+        &hir,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("wide terminal byte classes lower through the trie");
+    assert!(lowered.stats().states() < 23, "{:?}", lowered.stats());
+    assert!(lowered.stats().edges() < 34, "{:?}", lowered.stats());
+    assert_eq!(find_hir(&hir, b"xxshared4qyy"), Some((2, 10)));
+    assert_eq!(find_hir(&hir, b"xxshared5qyy"), Some((2, 10)));
+    assert_eq!(find_hir(&hir, b"xxotherCqyy"), Some((2, 9)));
+    assert_eq!(find_hir(&hir, b"xxsharedxqyy"), None);
+
+    let stats = lowered.stats();
+    let plan_stats = lowered.automaton().stats();
+    let exact = LowerLimits {
+        max_work: stats.work(),
+        max_stack_items: stats.peak_stack_items(),
+        automata: fre_automata::CompileLimits {
+            max_states: stats.states(),
+            max_edges: stats.edges(),
+            max_storage_bytes: plan_stats.storage_bytes(),
+            max_validation_work: plan_stats.validation_work(),
+        },
+    };
+    assert_eq!(
+        lower_hir_raw(&hir, OperationSemantics::CaptureFree, exact)
+            .expect("exact wide-terminal trie limits replay")
+            .stats(),
+        stats,
+    );
+}
+
+#[test]
+fn embedded_byte_token_trie_partial_overlap_preserves_ordinary_dimensions() {
+    fn class(bytes: &[u8]) -> Hir {
+        Hir::class(Class::Bytes(ClassBytes::new(
+            bytes
+                .iter()
+                .copied()
+                .map(|byte| ClassBytesRange::new(byte, byte)),
+        )))
+    }
+
+    fn captured(index: u32, parts: Vec<Hir>) -> Hir {
+        Hir::capture(Capture {
+            index,
+            name: None,
+            sub: Box::new(Hir::concat(parts)),
+        })
+    }
+
+    let branches = vec![
+        captured(1, vec![class(b"ab"), Hir::literal(*b"x")]),
+        captured(2, vec![class(b"bc"), Hir::literal(*b"y")]),
+        captured(3, vec![class(b"de"), Hir::literal(*b"z")]),
+    ];
+    let overlapping = Hir::alternation(branches);
+    let declined = lower_hir_raw(
+        &overlapping,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("partial token overlap declines to ordinary lowering");
+    assert_eq!(declined.stats().states(), 8);
+    assert_eq!(declined.stats().edges(), 9);
+}
+
+#[test]
+fn embedded_byte_token_trie_compacts_ascii_unicode_class_tokens() {
+    fn class(members: &[char]) -> Hir {
+        Hir::class(Class::Unicode(ClassUnicode::new(
+            members
+                .iter()
+                .copied()
+                .map(|scalar| ClassUnicodeRange::new(scalar, scalar)),
+        )))
+    }
+
+    fn captured(index: u32, parts: Vec<Hir>) -> Hir {
+        Hir::capture(Capture {
+            index,
+            name: None,
+            sub: Box::new(Hir::concat(parts)),
+        })
+    }
+
+    let hir = Hir::concat(vec![
+        Hir::alternation(vec![
+            captured(1, vec![class(&['A', 'a']), class(&['B', 'b'])]),
+            captured(2, vec![class(&['A', 'a'])]),
+            captured(3, vec![class(&['A', 'a']), class(&['C', 'c'])]),
+            captured(4, vec![class(&['x'])]),
+        ]),
+        Hir::literal(*b"q"),
+    ]);
+    let lowered = lower_hir(
+        &hir,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("ASCII Unicode-class token trie lowers");
+    assert!(lowered.stats().states() < 9, "{:?}", lowered.stats());
+    assert!(lowered.stats().edges() < 16, "{:?}", lowered.stats());
+    assert_eq!(find_hir(&hir, b"aBq"), Some((0, 3)));
+    assert_eq!(find_hir(&hir, b"aq"), Some((0, 2)));
+    assert_eq!(find_hir(&hir, b"acq"), Some((0, 3)));
+    assert_eq!(find_hir(&hir, b"Xq"), None);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the generated token oracle checks priority, spans, and Exists in every window"
+)]
+fn embedded_byte_token_trie_matches_an_independent_equal_disjoint_oracle() {
+    fn class(bytes: &[u8]) -> Hir {
+        Hir::class(Class::Bytes(ClassBytes::new(
+            bytes
+                .iter()
+                .copied()
+                .map(|byte| ClassBytesRange::new(byte, byte)),
+        )))
+    }
+
+    fn oracle(
+        branches: &[Vec<Vec<u8>>],
+        suffix: u8,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<(usize, usize)> {
+        for start in window.start()..=window.end() {
+            for branch in branches {
+                let Some(branch_end) = start.checked_add(branch.len()) else {
+                    continue;
+                };
+                let Some(end) = branch_end.checked_add(1) else {
+                    continue;
+                };
+                if end > window.end() || haystack.get(branch_end) != Some(&suffix) {
+                    continue;
+                }
+                if branch.iter().enumerate().all(|(offset, members)| {
+                    haystack
+                        .get(start + offset)
+                        .is_some_and(|byte| members.contains(byte))
+                }) {
+                    return Some((start, end));
+                }
+            }
+        }
+        None
+    }
+
+    let branches = vec![
+        vec![b"Aa".to_vec(), b"Bb".to_vec()],
+        vec![b"Aa".to_vec()],
+        vec![b"Aa".to_vec(), b"Cc".to_vec()],
+        vec![b"Bb".to_vec(), b"Aa".to_vec()],
+        vec![b"Aa".to_vec(), b"Bb".to_vec(), b"Cc".to_vec()],
+        vec![b"x".to_vec()],
+    ];
+    let alternatives = branches
+        .iter()
+        .enumerate()
+        .map(|(index, tokens)| {
+            let parts = tokens.iter().map(|members| class(members)).collect();
+            Hir::capture(Capture {
+                index: u32::try_from(index + 1).unwrap(),
+                name: None,
+                sub: Box::new(Hir::concat(parts)),
+            })
+        })
+        .collect();
+    let hir = Hir::concat(vec![Hir::alternation(alternatives), Hir::literal(*b"q")]);
+    let lowered = lower_hir(
+        &hir,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("generated byte-token trie lowers");
+    assert!(lowered.stats().states() < 16, "{:?}", lowered.stats());
+    assert!(lowered.stats().edges() < 27, "{:?}", lowered.stats());
+    let automaton = lowered.automaton();
+    let mut workspace = K0Workspace::new(automaton, WorkspaceLimits::unlimited())
+        .expect("generated byte-token workspace");
+
+    let mut haystacks = vec![
+        b"Aq".to_vec(),
+        b"aBq".to_vec(),
+        b"AbCq".to_vec(),
+        b"bAq".to_vec(),
+        b"zaCqz".to_vec(),
+        b"xq".to_vec(),
+        b"acq".to_vec(),
+    ];
+    haystacks.extend(words(3));
+    for haystack in &haystacks {
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = SearchWindow::new(start, end);
+                let expected = oracle(&branches, b'q', haystack, window);
+                let actual = automaton
+                    .prepare::<Span>()
+                    .search_window_with_workspace(
+                        haystack,
+                        window,
+                        &mut workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .expect("generated byte-token Span search")
+                    .into_output();
+                assert_eq!(
+                    tuple(actual),
+                    expected,
+                    "haystack={haystack:?}, window={window:?}"
+                );
+                let exists = automaton
+                    .prepare::<Exists>()
+                    .search_window_with_workspace(
+                        haystack,
+                        window,
+                        &mut workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .expect("generated byte-token Exists search")
+                    .into_output();
+                assert_eq!(
+                    exists,
+                    expected.is_some(),
+                    "haystack={haystack:?}, window={window:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

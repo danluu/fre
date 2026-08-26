@@ -1,10 +1,12 @@
 use fre_aot_regex::{
-    CompileError, CompileResource, EntryAbi, ObjectError, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    CompileError, CompileLimitsV1, CompileResource, EntryAbi,
+    LinkedPreparedRowUniformCaptureReducerV1, ObjectError, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy, SlowAotLimits,
     Target, UniformCaptureCompileRequest, UniformCapturePreparedSpanFillCompileError,
     UniformCaptureReducerCompileDisposition, UniformCaptureReducerCompileError,
-    UniformCaptureReducerDomain, UniformCaptureReducerOperation,
-    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
+    UniformCaptureReducerDomain, UniformCaptureReducerLinkCompileDispositionV1,
+    UniformCaptureReducerOperation, compile_uniform_capture_prepared_span_fill_selector,
+    compile_uniform_capture_reducer, compile_uniform_capture_reducer_linked_v1,
 };
 use fre_lower::UniformCaptureParticipationDecline;
 use fre_syntax::{
@@ -30,6 +32,51 @@ fn parse_rebar(pattern: &str) -> RustParsed {
 
 fn request(source_bytes: usize, target: Target) -> UniformCaptureCompileRequest {
     UniformCaptureCompileRequest::new(source_bytes, target).profile(RustProfile::rebar_1_12_4())
+}
+
+fn compile_linked_row_search_at_operation_object_boundary(
+    parsed: &RustParsed,
+    source_bytes: usize,
+    target: Target,
+    operation: UniformCaptureReducerOperation,
+) -> LinkedPreparedRowUniformCaptureReducerV1 {
+    let mut max_object_bytes = CompileLimitsV1::default().max_object_bytes;
+    for _ in 0..16 {
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = max_object_bytes;
+        match compile_uniform_capture_reducer_linked_v1(
+            parsed,
+            request(source_bytes, target).selector_limits(limits),
+            operation,
+        ) {
+            Err(UniformCaptureReducerCompileError::Finalization(CompileError::Object(
+                ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    ..
+                },
+            ))) => {
+                max_object_bytes = max_object_bytes
+                    .checked_sub(1024)
+                    .expect("linked-row boundary remains positive");
+            }
+            Err(error) => panic!("linked-row boundary compile failed: {error}"),
+            Ok(UniformCaptureReducerLinkCompileDispositionV1::PreparedRowSearch(selected)) => {
+                return selected;
+            }
+            Ok(UniformCaptureReducerLinkCompileDispositionV1::Combined(selected)) => {
+                max_object_bytes = selected
+                    .compiled()
+                    .object()
+                    .len()
+                    .checked_sub(1)
+                    .expect("combined operation object is nonempty");
+            }
+            Ok(UniformCaptureReducerLinkCompileDispositionV1::Declined(decline)) => {
+                panic!("uniform public fixture unexpectedly declined: {decline:?}");
+            }
+        }
+    }
+    panic!("linked-row public boundary retries did not converge")
 }
 
 #[test]
@@ -378,4 +425,158 @@ int main(void){{
         );
     }
     fs::remove_dir_all(directory).expect("remove uniform capture linker directory");
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links and executes the strict RowSearch plus separate capture reducer objects"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the two-object host differential closes both operation domains and raw ABI failure transactions"
+)]
+fn linked_host_row_search_uniform_capture_reducers_match_exact_outputs() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    let target = if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        }
+    } else if cfg!(target_os = "linux") {
+        Target::aarch64_linux()
+    } else {
+        Target::aarch64_macos()
+    };
+    let parsed = parse_rebar(PUBLIC_PREPARED_FIXTURE);
+    let cases: [(UniformCaptureReducerOperation, &[u8], u64); 2] = [
+        (
+            UniformCaptureReducerOperation::CountCaptures,
+            "абвгде xx абвгд".as_bytes(),
+            4,
+        ),
+        (
+            UniformCaptureReducerOperation::GrepCaptures,
+            "абвгде\r\nno\nабвгд абвгде\n\nz".as_bytes(),
+            6,
+        ),
+    ];
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-linked-row-uniform-capture-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create linked-row capture linker directory");
+    let compiler = if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    };
+
+    for (index, (operation, haystack, expected)) in cases.iter().enumerate() {
+        let selected = compile_linked_row_search_at_operation_object_boundary(
+            &parsed,
+            PUBLIC_PREPARED_FIXTURE.len(),
+            target,
+            *operation,
+        );
+        selected
+            .authenticate()
+            .expect("authenticate linked-host two-object capture reducer");
+        let receipt = selected.receipt();
+        assert_eq!(receipt.operation(), *operation);
+        assert_eq!(receipt.semantic_runtime_calls(), 0);
+        assert_eq!(
+            selected
+                .reducer_module()
+                .required_runtime_symbols()
+                .collect::<Vec<_>>(),
+            [selected.row().module().entry_symbol()],
+        );
+        let (program_symbol, program_len) = selected
+            .row()
+            .module()
+            .required_runtime_program()
+            .expect("strict RowSearch preparation program");
+        let initializer = haystack
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let reducer_symbol = selected.reducer_symbol();
+        let source = format!(
+            r#"#include <stddef.h>
+#include <stdint.h>
+typedef void *handle_t;
+typedef struct {{uint32_t struct_size;uint32_t config_version;uint64_t operation_flags;uint64_t max_start_filter_setup_work;uint64_t max_grep_count_workspace_bytes;uint64_t v2_reserved[4];uint64_t max_handle_bytes;uint64_t max_ordered_nfa_scratch_bytes;uint64_t max_ordered_nfa_setup_work;uint64_t required_capabilities;uint64_t reserved[2];}} prepare_v3_t;
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v3(const unsigned char*,size_t,const prepare_v3_t*,handle_t*);
+extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);
+extern const unsigned char {program_symbol}[];
+extern uint32_t {reducer_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);
+static const unsigned char haystack[]={{{initializer}}};
+int main(void){{
+  const prepare_v3_t config={{112U,3U,UINT64_C(2),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C(1),{{0,0}}}};
+  handle_t handle=0;uint64_t out=UINT64_C(0x1122334455667788);unsigned char raw[24]={{0}};
+  if(fre_aot_regex_runtime_prepare_exclusive_v3({program_symbol},{program_len}U,&config,&handle)!=0U||handle==0)return 1;
+  if({reducer_symbol}(handle,haystack,sizeof(haystack),&out)!=0U||out!=UINT64_C({expected}))return 2;
+  out=UINT64_C(0x1122334455667788);
+  if({reducer_symbol}(0,haystack,sizeof(haystack),&out)!=5U||out!=UINT64_C(0x1122334455667788))return 3;
+  if({reducer_symbol}(handle,(const unsigned char*)(uintptr_t)1,(size_t)-1,&out)!=2U||out!=UINT64_C(0x1122334455667788))return 4;
+  if({reducer_symbol}(handle,haystack,sizeof(haystack),(uint64_t*)(void*)(raw+1))!=2U)return 5;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(handle)!=0U)return 6;
+  return 0;
+}}
+"#,
+        );
+        let row_object = directory.join(format!("row-{index}.o"));
+        let reducer_object = directory.join(format!("reducer-{index}.o"));
+        let c_path = directory.join(format!("linked-row-{index}.c"));
+        let executable = directory.join(format!("linked-row-{index}"));
+        fs::write(&row_object, selected.row().object()).expect("write strict RowSearch object");
+        fs::write(&reducer_object, selected.reducer_object())
+            .expect("write linked capture reducer object");
+        fs::write(&c_path, source).expect("write linked-row capture C harness");
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&row_object)
+            .arg(&reducer_object)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link two-object capture reducer C harness");
+        assert!(
+            status.success(),
+            "two-object capture harness failed to link"
+        );
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute two-object capture reducer C harness");
+        assert!(
+            output.status.success(),
+            "two-object capture reducer {operation:?} status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    fs::remove_dir_all(directory).expect("remove linked-row capture linker directory");
 }

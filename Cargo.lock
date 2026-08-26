@@ -186,6 +186,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-aot-direct-count-benchmark"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-regex",
+ "fre-aot-regex-runtime",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "fre-aot-elf"
 version = "0.1.0"
 dependencies = [
@@ -234,9 +245,13 @@ name = "fre-aot-regex"
 version = "0.1.0"
 dependencies = [
  "fre",
+ "fre-aot-aarch64",
+ "fre-aot-count-compiler",
+ "fre-aot-optimizer",
  "fre-automata",
  "fre-capture-lab",
  "fre-exact-alloc",
+ "fre-kernel-ir",
  "fre-kernels",
  "fre-lower",
  "fre-simd-kernels",
@@ -475,7 +490,9 @@ version = "0.1.0"
 dependencies = [
  "fre-aot-regex",
  "fre-aot-regex-runtime",
+ "fre-lower",
  "fre-syntax",
+ "sha2",
 ]
 
 [[package]]

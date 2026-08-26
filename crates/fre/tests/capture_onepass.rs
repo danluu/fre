@@ -189,36 +189,128 @@ fn graph_and_resource_refusals_preserve_exact_history_semantics() {
         .build()
         .expect("eligible baseline");
     let report = eligible.build_report();
-    let onepass_work = report
-        .onepass_capture
-        .expect("baseline one-pass sidecar")
-        .compile_work;
-    let combined_work = report
-        .engine
-        .compile_work
+    let onepass = report.onepass_capture.expect("baseline one-pass sidecar");
+    let onepass_work = onepass.compile_work;
+    let optional_stability_proof_work = onepass
+        .states
+        .checked_add(onepass.transitions)
+        .and_then(|work| work.checked_add(1))
+        .expect("optional stability proof work");
+    let mandatory_onepass_work = onepass_work
+        .checked_sub(optional_stability_proof_work)
+        .expect("mandatory one-pass work");
+    assert!(mandatory_onepass_work > 0);
+    let engine_work = report.engine.compile_work;
+    let combined_work = engine_work
         .checked_add(onepass_work)
         .expect("combined compile work");
     let defaults = CaptureBuildLimits::default();
-    let resource_refused = CaptureBuilder::new(r"(a+)(b)")
-        .unicode(false)
-        .limits(CaptureBuildLimits {
-            engine: CaptureEngineBuildLimits {
-                max_compile_work: combined_work - 1,
-                ..defaults.engine
-            },
-            ..defaults
-        })
-        .build()
-        .expect("optional one-pass resource refusal");
+    let build_with_sidecar_work = |sidecar_work| {
+        CaptureBuilder::new(r"(a+)(b)")
+            .unicode(false)
+            .limits(CaptureBuildLimits {
+                engine: CaptureEngineBuildLimits {
+                    max_compile_work: engine_work
+                        .checked_add(sidecar_work)
+                        .expect("engine plus sidecar work"),
+                    ..defaults.engine
+                },
+                ..defaults
+            })
+            .build()
+            .expect("one-pass work boundary build")
+    };
+
+    // The post-accept stability proof is an atomic optional optimization. A
+    // ceiling one below the proof-complete report must retain the already
+    // completed one-pass plan and charge only its mandatory work.
+    let optional_proof_refused = build_with_sidecar_work(onepass_work - 1);
+    let proof_refused_onepass = optional_proof_refused
+        .build_report()
+        .onepass_capture
+        .expect("mandatory one-pass plan survives optional proof refusal");
+    assert_eq!(proof_refused_onepass.compile_work, mandatory_onepass_work);
+    assert_eq!(
+        optional_proof_refused
+            .build_report()
+            .onepass_capture_compile_work,
+        mandatory_onepass_work
+    );
+    assert_eq!(
+        optional_proof_refused.build_report().engine.compile_work
+            + optional_proof_refused
+                .build_report()
+                .onepass_capture_compile_work,
+        engine_work + mandatory_onepass_work
+    );
+    assert!(engine_work + mandatory_onepass_work < combined_work - 1);
+    assert!(
+        optional_proof_refused
+            .build_report()
+            .exact_replay_identity
+            .onepass
+            .is_some()
+    );
+    let proof_refused_replay = optional_proof_refused
+        .captures_exact_window(
+            b"aaab",
+            CaptureWindow::all(b"aaab"),
+            CaptureSpan { start: 0, end: 4 },
+            CaptureSearchLimits::default(),
+        )
+        .expect("optional-proof-refused exact replay");
+    assert_eq!(
+        proof_refused_replay.report.candidate,
+        CandidateKind::OnePassCapture
+    );
+    assert!(proof_refused_replay.captures.is_some());
+
+    let mandatory_admitted = build_with_sidecar_work(mandatory_onepass_work);
+    assert_eq!(
+        mandatory_admitted
+            .build_report()
+            .onepass_capture
+            .expect("exact mandatory one-pass plan")
+            .compile_work,
+        mandatory_onepass_work
+    );
+    assert_eq!(
+        mandatory_admitted
+            .build_report()
+            .onepass_capture_compile_work,
+        mandatory_onepass_work
+    );
+    assert_eq!(
+        mandatory_admitted.build_report().engine.compile_work
+            + mandatory_admitted
+                .build_report()
+                .onepass_capture_compile_work,
+        engine_work + mandatory_onepass_work
+    );
+    let mandatory_replay = mandatory_admitted
+        .captures_exact_window(
+            b"aaab",
+            CaptureWindow::all(b"aaab"),
+            CaptureSpan { start: 0, end: 4 },
+            CaptureSearchLimits::default(),
+        )
+        .expect("mandatory-work exact replay");
+    assert_eq!(
+        mandatory_replay.report.candidate,
+        CandidateKind::OnePassCapture
+    );
+    assert!(mandatory_replay.captures.is_some());
+
+    let resource_refused = build_with_sidecar_work(mandatory_onepass_work - 1);
     assert!(resource_refused.build_report().onepass_capture.is_none());
     assert_eq!(
         resource_refused.build_report().onepass_capture_compile_work,
-        onepass_work - 1
+        mandatory_onepass_work - 1
     );
     assert_eq!(
         resource_refused.build_report().engine.compile_work
             + resource_refused.build_report().onepass_capture_compile_work,
-        combined_work - 1
+        engine_work + mandatory_onepass_work - 1
     );
     assert!(
         resource_refused

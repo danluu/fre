@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -455,6 +456,24 @@ def prepared_scalar_grep_provenance_fields() -> dict[str, str]:
     }
 
 
+def operation_only_prepared_scalar_grep_provenance_fields() -> dict[str, str]:
+    fields = prepared_scalar_grep_provenance_fields()
+    operation_identity = "e" * 64
+    reducer = f"fre_aot_regex_grep_count_exclusive_v1_{operation_identity}"
+    fields.update({
+        "program_symbol": (
+            f"fre_aot_regex_runtime_program_v1_{operation_identity}"
+        ),
+        "entry_symbol": reducer,
+        "entry_abi": CENSUS.PREPARED_SCALAR_REDUCE_ENTRY_ABI,
+        "reducer_symbol": reducer,
+        "span_fill_symbol": "",
+        "prepared_bulk_strategy": "None",
+        "required_runtime_symbols": "",
+    })
+    return fields
+
+
 def direct_scalar_grep_provenance_fields() -> dict[str, str]:
     fields = prepared_scalar_grep_provenance_fields()
     aggregate_identity = "e" * 64
@@ -570,41 +589,61 @@ def scalar_native_reducer_provenance_fields(
 
 def native_uniform_capture_provenance_fields(
     model: str = "grep-captures", ordered: bool = False,
-    operation_only: bool = False,
+    operation_only: bool = False, row_search: bool = False,
 ) -> dict[str, str]:
     if operation_only and not ordered:
         raise AssertionError("operation-only uniform capture requires Ordered-NFA V15")
+    if row_search and not ordered:
+        raise AssertionError("RowSearch uniform capture requires Ordered-NFA V15")
+    if row_search and operation_only:
+        raise AssertionError("RowSearch and operation-only routes are distinct")
     fields = prepared_scalar_grep_provenance_fields()
     entry_identity = "d" * 64
     program_identity = "e" * 64
     reducer_identity = "f" * 64
     if model == "count-captures":
-        adapter = "general-aot-native-uniform-capture-count-reducer-v1"
+        adapter = (
+            "general-aot-native-uniform-capture-count-row-search-reducer-v1"
+            if row_search
+            else "general-aot-native-uniform-capture-count-reducer-v1"
+        )
         reducer = (
             f"fre_aot_regex_count_captures_exclusive_v1_{reducer_identity}"
         )
         grep_iteration = "not-applicable"
     elif model == "grep-captures":
-        adapter = "general-aot-native-uniform-capture-grep-reducer-v1"
+        adapter = (
+            "general-aot-native-uniform-capture-grep-row-search-reducer-v1"
+            if row_search
+            else "general-aot-native-uniform-capture-grep-reducer-v1"
+        )
         reducer = (
             f"fre_aot_regex_grep_captures_exclusive_v1_{reducer_identity}"
         )
-        grep_iteration = "linked-native-uniform-capture-reducer-v1"
+        grep_iteration = (
+            CENSUS.LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE
+            if row_search
+            else "linked-native-uniform-capture-reducer-v1"
+        )
     else:
         raise AssertionError(f"unsupported synthetic capture model {model!r}")
     if operation_only:
         entry_identity = program_identity
+    elif row_search:
+        program_identity = entry_identity
     fields.update({
         "adapter": adapter,
         "model": model,
         "benchmark": f"synthetic/native-uniform-{model}",
         "engine": "OrderedNfa" if ordered else "OrderedDfa",
         "aggregate_strategy": (
+            CENSUS.LINKED_UNIFORM_CAPTURE_ROW_SEARCH_AGGREGATE
+            if row_search else
             "Some(NativeOrderedNfaFused)" if ordered else "Some(NativeFused)"
         ),
         "prepared_bulk_strategy": (
             "Some(NativeOrderedNfaLoop)"
-            if ordered and not operation_only else "None"
+            if ordered and not operation_only and not row_search else "None"
         ),
         "span_iteration_strategy": "not-applicable",
         "grep_iteration_strategy": grep_iteration,
@@ -628,31 +667,155 @@ def native_uniform_capture_provenance_fields(
         "program_symbol": (
             f"fre_aot_regex_runtime_program_v1_{program_identity}"
         ),
+        "program_sha256": program_identity if row_search else fields["program_sha256"],
         "program_len": "512",
         "entry_symbol": (
             f"fre_aot_regex_count_exclusive_v1_{entry_identity}"
             if operation_only
+            else f"fre_aot_regex_search_exclusive_v1_{entry_identity}"
+            if row_search
             else f"fre_aot_regex_search_v1_{entry_identity}"
         ),
         "entry_abi": (
             CENSUS.PREPARED_SCALAR_REDUCE_ENTRY_ABI
-            if operation_only else CENSUS.SPAN_SEARCH_ENTRY_ABI
+            if operation_only else CENSUS.PREPARED_SPAN_SEARCH_ENTRY_ABI
+            if row_search else CENSUS.SPAN_SEARCH_ENTRY_ABI
         ),
         "reducer_symbol": reducer,
         "span_fill_symbol": (
             f"fre_aot_regex_fill_spans_exclusive_v1_{entry_identity}"
-            if ordered and not operation_only else ""
+            if ordered and not operation_only and not row_search else ""
         ),
         "required_runtime_symbols": (
             ",".join(CENSUS.PREPARED_V15_SHARED_COUNT_RUNTIME_SYMBOLS)
-            if ordered and not operation_only else ""
+            if ordered and not operation_only and not row_search else ""
         ),
         "boundary": (
+            CENSUS.LINKED_UNIFORM_CAPTURE_ROW_SEARCH_BOUNDARY
+            if row_search else
             "single-call-native-uniform-capture-helper-backed-reducer"
             if ordered and not operation_only
             else "single-call-native-uniform-capture-reducer"
         ),
     })
+    if row_search:
+        operation = model
+        domain = (
+            "whole-haystack" if model == "count-captures"
+            else "byte-slice-lines-lf-crlf"
+        )
+        proof: dict[str, object] = {
+            "link_receipt_schema": 1,
+            "operation": operation,
+            "domain": domain,
+            "multiplier": 3,
+            "proof_algorithm_version": 1,
+            "proof_accounting_version": 1,
+            "minimum_match_bytes": 1,
+            "participating_user_captures": 2,
+            "canonical_capture_annotations": 2,
+            "proof_work": 17,
+            "proof_peak_stack_items": 5,
+            "line_terminator": 10,
+            "row_automaton_sha256": "2" * 64,
+            "row_program_sha256": program_identity,
+            "row_object_sha256": fields["object_sha256"],
+            "row_object_bytes": 8192,
+            "row_entry_symbol": fields["entry_symbol"],
+            "reducer_code_sha256": "6" * 64,
+            "reducer_object_sha256": "7" * 64,
+            "reducer_object_bytes": 1024,
+            "max_object_bytes": CENSUS.MAX_NATIVE_ROW_OBJECT_BYTES,
+            "external_relocation": {
+                "symbol": fields["entry_symbol"],
+                "offset": 64,
+                "kind": 4,
+                "addend": 0,
+            },
+            "semantic_runtime_calls": 0,
+        }
+        proof["proof_identity_sha256"] = (
+            CENSUS.linked_uniform_capture_proof_identity(proof)
+        )
+        count_symbol, reducer_symbol = CENSUS.linked_uniform_capture_symbols(
+            proof, fields["target"], fields["feature_bits"]
+        )
+        proof["count_symbol"] = count_symbol
+        proof["reducer_symbol"] = reducer_symbol
+        proof["artifact_identity_sha256"] = (
+            CENSUS.linked_uniform_capture_artifact_identity(
+                proof, fields["target"], fields["feature_bits"]
+            )
+        )
+        fields["reducer_symbol"] = reducer_symbol
+        fields.update({
+            "prepared_surface": CENSUS.PREPARED_V15_ROW_SEARCH_SURFACE,
+            "uniform_capture_link_receipt_schema": "1",
+            "uniform_capture_operation": operation,
+            "uniform_capture_domain": domain,
+            "uniform_capture_multiplier": str(proof["multiplier"]),
+            "uniform_capture_proof_algorithm_version": "1",
+            "uniform_capture_proof_accounting_version": "1",
+            "uniform_capture_minimum_match_bytes": str(
+                proof["minimum_match_bytes"]
+            ),
+            "uniform_capture_participating_user_captures": str(
+                proof["participating_user_captures"]
+            ),
+            "uniform_capture_canonical_capture_annotations": str(
+                proof["canonical_capture_annotations"]
+            ),
+            "uniform_capture_proof_work": str(proof["proof_work"]),
+            "uniform_capture_proof_peak_stack_items": str(
+                proof["proof_peak_stack_items"]
+            ),
+            "uniform_capture_proof_identity_sha256": str(
+                proof["proof_identity_sha256"]
+            ),
+            "uniform_capture_line_terminator": "10",
+            "uniform_capture_row_automaton_sha256": str(
+                proof["row_automaton_sha256"]
+            ),
+            "uniform_capture_row_program_sha256": str(
+                proof["row_program_sha256"]
+            ),
+            "uniform_capture_row_object_sha256": str(
+                proof["row_object_sha256"]
+            ),
+            "uniform_capture_row_object_bytes": str(proof["row_object_bytes"]),
+            "uniform_capture_row_entry_symbol": str(proof["row_entry_symbol"]),
+            "uniform_capture_count_symbol": count_symbol,
+            "uniform_capture_reducer_symbol": reducer_symbol,
+            "uniform_capture_reducer_code_sha256": str(
+                proof["reducer_code_sha256"]
+            ),
+            "uniform_capture_reducer_object_sha256": str(
+                proof["reducer_object_sha256"]
+            ),
+            "uniform_capture_reducer_object_bytes": str(
+                proof["reducer_object_bytes"]
+            ),
+            "uniform_capture_max_object_bytes": str(proof["max_object_bytes"]),
+            "uniform_capture_external_relocation_count": "1",
+            "uniform_capture_external_relocation_symbol": str(
+                proof["external_relocation"]["symbol"]
+            ),
+            "uniform_capture_external_relocation_offset": str(
+                proof["external_relocation"]["offset"]
+            ),
+            "uniform_capture_external_relocation_kind": str(
+                "X86PltRelative32"
+                if proof["external_relocation"]["kind"] == 1
+                else "Aarch64Branch26"
+            ),
+            "uniform_capture_external_relocation_addend": str(
+                proof["external_relocation"]["addend"]
+            ),
+            "uniform_capture_semantic_runtime_calls": "0",
+            "uniform_capture_artifact_identity_sha256": str(
+                proof["artifact_identity_sha256"]
+            ),
+        })
     return fields
 
 
@@ -811,7 +974,9 @@ def shared_ordered_many_provenance_fields(
     }
 
 
-def mixed_prepared_grep_provenance_fields() -> dict[str, str]:
+def mixed_prepared_grep_provenance_fields(
+    strict_row_search: bool = False,
+) -> dict[str, str]:
     ordinary_identity = "a" * 64
     prepared_identity = "b" * 64
     fields = {
@@ -884,6 +1049,88 @@ def mixed_prepared_grep_provenance_fields() -> dict[str, str]:
         "component_1_program_sha256": "5" * 64,
         "component_1_object_sha256": "6" * 64,
     })
+    if strict_row_search:
+        fields.update({
+            "component_0_entry_abi": CENSUS.SPAN_SEARCH_ENTRY_ABI,
+            "component_0_prepared_surface": CENSUS.NO_PREPARED_SURFACE,
+            "component_1_entry_abi": CENSUS.PREPARED_SPAN_SEARCH_ENTRY_ABI,
+            "component_1_prepared_surface": (
+                CENSUS.PREPARED_V15_ROW_SEARCH_SURFACE
+            ),
+            "component_1_runtime_symbols": "",
+            "component_1_span_fill_symbol": "",
+            "component_1_prepared_bulk_strategy": "None",
+        })
+    return fields
+
+
+def mixed_multi_grep_reducer_provenance_fields(
+    strict_row_search: bool = False,
+) -> dict[str, str]:
+    fields = mixed_prepared_grep_provenance_fields(strict_row_search)
+    routes = (0, 2 if strict_row_search else 1)
+    fields.update({
+        "adapter": (
+            "general-aot-native-mixed-prepared-ordered-nfa-v15-"
+            "multi-grep-whole-operation-reducer-v1"
+        ),
+        "aggregate_strategy": (
+            "native-independent-mixed-prepared-span-row-whole-grep-reducer-v1"
+        ),
+        "boundary": "single-call-native-mixed-multi-grep-reducer",
+        "native_multi_grep_reducer": "true",
+        "multi_grep_reducer_abi_version": "1",
+        "multi_grep_reducer_mixed_handle_table": "true",
+        "multi_grep_reducer_required_handle_count": "2",
+        "multi_grep_reducer_row_routes": ",".join(map(str, routes)),
+        "multi_grep_reducer_source_cardinality": "2",
+        "multi_grep_reducer_source_bytes": "12",
+        "multi_grep_reducer_ordered_sources_sha256": "c" * 64,
+        "multi_grep_reducer_code_sha256": "d" * 64,
+        "multi_grep_reducer_object_sha256": "e" * 64,
+        "multi_grep_reducer_relocation_count": "2",
+        "multi_grep_reducer_semantic_runtime_calls": "0",
+        "multi_grep_reducer_object_bytes": "1208",
+        "multi_grep_reducer_max_object_bytes": str(268435456 - 8192),
+    })
+    operation = hashlib.sha256()
+    operation.update(b"fre-aot-regex/rebar-mixed-multi-grep-reducer/v1\0")
+    operation.update((1).to_bytes(4, "little"))
+    operation.update(bytes((1, 0, 1)))
+    operation.update(int(fields["feature_bits"], 16).to_bytes(8, "little"))
+    operation.update((2).to_bytes(8, "little"))
+    operation.update((12).to_bytes(8, "little"))
+    operation.update(bytes.fromhex("c" * 64))
+    operation.update((2).to_bytes(8, "little"))
+    for row in (0, 1):
+        operation.update(row.to_bytes(8, "little"))
+    operation.update((2).to_bytes(8, "little"))
+    for index, route in enumerate(routes):
+        operation.update(index.to_bytes(8, "little"))
+        operation.update(bytes((route,)))
+        entry = fields[f"component_{index}_entry_symbol"].encode("ascii")
+        operation.update(len(entry).to_bytes(8, "little"))
+        operation.update(entry)
+        for suffix in ("automaton_sha256", "program_sha256", "object_sha256"):
+            operation.update(bytes.fromhex(fields[f"component_{index}_{suffix}"]))
+    identity = operation.hexdigest()
+    symbol = f"fre_aot_regex_rebar_mixed_multi_grep_v1_{identity}"
+    fields["multi_grep_reducer_operation_identity_sha256"] = identity
+    fields["multi_grep_reducer_symbol"] = symbol
+    artifact = hashlib.sha256()
+    artifact.update(b"fre-aot-regex/rebar-mixed-multi-grep-reducer-artifact/v1\0")
+    artifact.update(bytes.fromhex(identity))
+    symbol_bytes = symbol.encode("ascii")
+    artifact.update(len(symbol_bytes).to_bytes(8, "little"))
+    artifact.update(symbol_bytes)
+    artifact.update(bytes.fromhex("d" * 64))
+    artifact.update(bytes.fromhex("e" * 64))
+    artifact.update((2).to_bytes(8, "little"))
+    artifact.update((1208).to_bytes(8, "little"))
+    artifact.update((268435456 - 8192).to_bytes(8, "little"))
+    artifact.update((2).to_bytes(8, "little"))
+    artifact.update(bytes(routes))
+    fields["multi_grep_reducer_artifact_identity_sha256"] = artifact.hexdigest()
     return fields
 
 
@@ -1474,6 +1721,163 @@ def single_capture_reducer_provenance_fields(
     return fields
 
 
+def weighted_capture_reducer_provenance_fields(
+    model: str = "count-captures", target: str = "aarch64-linux"
+) -> dict[str, str]:
+    if model == "count-captures":
+        operation, domain = 1, 1
+        adapter = "general-aot-native-weighted-capture-count-reducer-v1"
+        symbol_prefix = "fre_aot_regex_weighted_count_captures_v1_"
+    elif model == "grep-captures":
+        operation, domain = 2, 2
+        adapter = "general-aot-native-weighted-capture-grep-reducer-v1"
+        symbol_prefix = "fre_aot_regex_weighted_grep_captures_v1_"
+    else:
+        raise AssertionError(f"unsupported synthetic weighted model {model!r}")
+    if target.startswith("aarch64-"):
+        feature_bits = "0000000100000000"
+        relocation_kind, relocation_addend = 5, 0
+    elif target.startswith("x86_64-"):
+        feature_bits = "0000000000000001"
+        relocation_kind, relocation_addend = 2, -4
+    else:
+        raise AssertionError(f"unsupported synthetic weighted target {target!r}")
+
+    entries = [
+        f"fre_aot_regex_search_v1_{'7' * 64}",
+        f"fre_aot_regex_search_v1_{'8' * 64}",
+    ]
+    automata = ["1" * 64, "4" * 64]
+    programs = ["2" * 64, "5" * 64]
+    objects = ["3" * 64, "6" * 64]
+    components = [
+        {
+            "ordinal": index,
+            "native": True,
+            "source_ordinal": index,
+            "entry_symbol": entries[index],
+            "required_runtime_symbols": [],
+            "automaton_sha256": automata[index],
+            "program_sha256": programs[index],
+            "object_sha256": objects[index],
+        }
+        for index in range(2)
+    ]
+    source_map = [0, 1, 0]
+    first_ordinals = [0, 1]
+    weights = [2, 3]
+    user_captures = [1, 2, 1]
+    proof = {
+        "capture_resolution": "static-uniform-multiplier",
+        "capture_proof_algorithm_version": 1,
+        "capture_proof_accounting_version": 1,
+        "source_participating_groups": [2, 3, 2],
+        "source_minimum_match_bytes": [1, 2, 1],
+        "source_capture_annotations": [1, 2, 1],
+        "source_proof_work": [7, 9, 7],
+        "source_proof_peak_stack_items": [3, 4, 3],
+        "source_selector_automaton_sha256": [automata[0], automata[1], automata[0]],
+        "source_selector_program_sha256": [programs[0], programs[1], programs[0]],
+        "source_selector_object_sha256": [objects[0], objects[1], objects[0]],
+    }
+    fields = {
+        **frozen_validation_fields(),
+        "schema": "fre.aot.rebar-runner.v6",
+        "disposition": "executed",
+        "configured": "true",
+        "adapter": adapter,
+        "model": model,
+        "benchmark": f"synthetic/{model}/weighted",
+        "source_commit": "1" * 40,
+        "source_tree": "2" * 40,
+        "target": target,
+        "feature_bits": feature_bits,
+        "compiler_version": "1",
+        "optimizer_version": "1",
+        "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedContextDfa)",
+        "aggregate_strategy": "native-weighted-capture-row-reducer-v1",
+        "native_row_bridge": "true",
+        "uniform_capture_bridge": "true",
+        "weighted_capture_reducer_bridge": "true",
+        "weighted_receipt_schema": "1",
+        "source_pattern_count": "3",
+        "pattern_bytes": "8",
+        "row_total_object_bytes": "246",
+        "component_count": "2",
+        "source_to_component": "0,1,0",
+        "component_first_source_ordinals": "0,1",
+        "component_weights": "2,3",
+        "component_entry_symbols": ",".join(entries),
+        "component_automaton_sha256": ",".join(automata),
+        "component_program_sha256": ",".join(programs),
+        "component_object_sha256": ",".join(objects),
+        "capture_resolution": "static-uniform-multiplier",
+        "capture_proof_algorithm_version": "1",
+        "capture_proof_accounting_version": "1",
+        "source_participating_groups": "2,3,2",
+        "source_minimum_match_bytes": "1,2,1",
+        "source_participating_user_captures": "1,2,1",
+        "source_capture_annotations": "1,2,1",
+        "source_proof_work": "7,9,7",
+        "source_proof_peak_stack_items": "3,4,3",
+        "source_selector_automaton_sha256": ",".join(
+            proof["source_selector_automaton_sha256"]
+        ),
+        "source_selector_program_sha256": ",".join(
+            proof["source_selector_program_sha256"]
+        ),
+        "source_selector_object_sha256": ",".join(
+            proof["source_selector_object_sha256"]
+        ),
+        "line_terminator": "10",
+        "operation": str(operation),
+        "domain": str(domain),
+        "ordered_sources_sha256": "9" * 64,
+        "operation_identity_sha256": "0" * 64,
+        "reducer_symbol": "",
+        "reducer_symbol_sha256": "0" * 64,
+        "reducer_code_sha256": "a" * 64,
+        "reducer_object_sha256": "b" * 64,
+        "reducer_object_bytes": "1234",
+        "reducer_object_cap": str(CENSUS.MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES),
+        "reducer_artifact_identity_sha256": "0" * 64,
+        "external_relocation_count": "2",
+        "external_relocation_components": "0,1",
+        "external_relocation_offsets": "16,32",
+        "external_relocation_kinds": f"{relocation_kind},{relocation_kind}",
+        "external_relocation_addends": f"{relocation_addend},{relocation_addend}",
+        "semantic_runtime_symbols": "",
+        "boundary": (
+            "single-call-helper-free-native-multi-component-weighted-row-reducer"
+        ),
+        "required_comparators": "rust-regex-1.12.4,fre-current-runtime",
+    }
+    operation_identity = CENSUS.weighted_capture_operation_identity(
+        fields, components, source_map, first_ordinals, weights, proof, user_captures
+    )
+    reducer_symbol = f"{symbol_prefix}{operation_identity}"
+    relocations = [
+        {
+            "component": index,
+            "offset": offset,
+            "kind": relocation_kind,
+            "addend": relocation_addend,
+        }
+        for index, offset in enumerate((16, 32))
+    ]
+    fields["operation_identity_sha256"] = operation_identity
+    fields["reducer_symbol"] = reducer_symbol
+    fields["reducer_symbol_sha256"] = CENSUS.sha_bytes(reducer_symbol.encode())
+    fields["reducer_artifact_identity_sha256"] = (
+        CENSUS.weighted_capture_artifact_identity(
+            operation_identity, reducer_symbol, fields["reducer_code_sha256"],
+            fields["reducer_object_sha256"], int(fields["reducer_object_bytes"]),
+            int(fields["reducer_object_cap"]), relocations,
+        )
+    )
+    return fields
+
+
 def synthetic_single_capture_reducer_qualification_receipt(
     plan: dict[str, object],
     source_route: str = "exact-span-participation-v1",
@@ -1613,6 +2017,44 @@ class TrueNativeCensusTests(unittest.TestCase):
             "uniform-capture-row-bridge-v1",
             definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
+        self.assertIn(
+            "native-multi-grep-reducer-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
+        )
+        self.assertIn(
+            "native-row-scalar-reducer-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
+        )
+        multi_grep = definitions["multiGrepReducerProvenance"]
+        self.assertFalse(multi_grep["additionalProperties"])
+        self.assertEqual(
+            multi_grep["properties"]["semantic_runtime_calls"]["const"], 0
+        )
+        self.assertIn("mixed_handle_table", multi_grep["required"])
+        self.assertEqual(
+            multi_grep["properties"]["row_routes"]["items"]["enum"], [0, 1, 2]
+        )
+        row_scalar = definitions["rowScalarReducerProvenance"]
+        self.assertFalse(row_scalar["additionalProperties"])
+        self.assertEqual(
+            row_scalar["properties"]["semantic_runtime_calls"]["const"], 0
+        )
+        self.assertIn("mixed_handle_table", row_scalar["required"])
+        self.assertEqual(
+            row_scalar["properties"]["row_routes"]["items"]["enum"], [0, 1, 2]
+        )
+        component = definitions["componentProvenance"]
+        self.assertIn("PreparedSpanSearchV1", component["properties"]["entry_abi"]["enum"])
+        self.assertIn("RowSearchOnly", component["properties"]["prepared_surface"]["enum"])
+        prepared_component = definitions["preparedV15ComponentProvenance"]
+        self.assertEqual(len(prepared_component["oneOf"]), 3)
+        prepared_condition = next(
+            item for item in definitions["provenance"]["allOf"]
+            if item.get("then", {}).get("required") == ["prepared_v15_limits"]
+        )
+        conditional_text = json.dumps(prepared_condition["if"], sort_keys=True)
+        self.assertIn("native-multi-grep-reducer-v1", conditional_text)
+        self.assertIn("native-row-scalar-reducer-v1", conditional_text)
         self.assertIn("uniform_capture", definitions["provenance"]["required"])
         proof = definitions["uniformCaptureProvenance"]
         self.assertFalse(proof["additionalProperties"])
@@ -1624,7 +2066,19 @@ class TrueNativeCensusTests(unittest.TestCase):
         self.assertFalse(reducer_proof["additionalProperties"])
         self.assertEqual(
             reducer_proof["properties"]["route_variant"]["enum"],
-            ["direct-v1", "ordered-v15", "ordered-v15-operation-only"],
+            [
+                "direct-v1", "ordered-v15", "ordered-v15-operation-only",
+                "ordered-v15-row-search-v1",
+            ],
+        )
+        self.assertIn("external_relocation", reducer_proof["properties"])
+        self.assertEqual(
+            reducer_proof["properties"]["semantic_runtime_calls"]["const"], 0
+        )
+        self.assertFalse(
+            definitions["uniformCaptureRowSearchRelocationProvenance"][
+                "additionalProperties"
+            ]
         )
         strict = definitions["strictCaptureProvenance"]
         self.assertFalse(strict["additionalProperties"])
@@ -1669,6 +2123,19 @@ class TrueNativeCensusTests(unittest.TestCase):
         )
         self.assertIn(
             "single-capture-whole-operation-reducer-v1",
+            definitions["provenance"]["properties"]["composite_kind"]["enum"],
+        )
+        weighted = definitions["weightedCaptureReducerProvenance"]
+        self.assertFalse(weighted["additionalProperties"])
+        self.assertIn("external_relocations", weighted["required"])
+        self.assertIn("operation_identity_sha256", weighted["required"])
+        self.assertEqual(weighted["properties"]["reducer_object_cap"]["const"], 16 * 1024 * 1024)
+        self.assertIn(
+            "weighted-capture-reducer-v6",
+            definitions["provenance"]["properties"]["kind"]["enum"],
+        )
+        self.assertIn(
+            "weighted-capture-whole-operation-reducer-v1",
             definitions["provenance"]["properties"]["composite_kind"]["enum"],
         )
         self.assertIn(
@@ -2391,7 +2858,13 @@ class TrueNativeCensusTests(unittest.TestCase):
             "linked-native-uniform-capture-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
+            "linked-native-uniform-capture-row-search-reducer-v1": (
+                False, True, "whole-operation-native-authenticated"
+            ),
             "linked-native-single-capture-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-native-weighted-capture-reducer": (
                 False, True, "whole-operation-native-authenticated"
             ),
             "linked-native-uniform-capture-helper-backed-reducer": (
@@ -2417,6 +2890,28 @@ class TrueNativeCensusTests(unittest.TestCase):
             ),
             "linked-native-row-adapter-loop": (
                 True, False, "native-search-core-with-adapter-outer-loop"
+            ),
+            "linked-native-multi-grep-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-native-mixed-multi-grep-reducer": (
+                False,
+                False,
+                "single-call-native-reducer-retains-semantic-runtime-helpers",
+            ),
+            "linked-native-strict-mixed-multi-grep-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-native-row-scalar-reducer": (
+                False, True, "whole-operation-native-authenticated"
+            ),
+            "linked-native-row-scalar-helper-backed-reducer": (
+                False,
+                False,
+                "single-call-native-reducer-retains-semantic-runtime-helpers",
+            ),
+            "linked-native-strict-mixed-row-scalar-reducer": (
+                False, True, "whole-operation-native-authenticated"
             ),
             "linked-uniform-capture-row-adapter-loop": (
                 True,
@@ -2947,6 +3442,406 @@ class TrueNativeCensusTests(unittest.TestCase):
             ),
         )
 
+        reducer_fields = dict(grep_fields)
+        reducer_fields.update({
+            "adapter": "general-aot-native-multi-grep-whole-operation-reducer-v1",
+            "aggregate_strategy": "native-independent-span-row-whole-grep-reducer-v1",
+            "boundary": "single-call-helper-free-native-multi-grep-reducer",
+            "native_multi_grep_reducer": "true",
+            "multi_grep_reducer_abi_version": "1",
+            "multi_grep_reducer_mixed_handle_table": "false",
+            "multi_grep_reducer_required_handle_count": "0",
+            "multi_grep_reducer_row_routes": "0,0",
+            "multi_grep_reducer_source_cardinality": "3",
+            "multi_grep_reducer_source_bytes": "12",
+            "multi_grep_reducer_ordered_sources_sha256": "a" * 64,
+            "multi_grep_reducer_code_sha256": "b" * 64,
+            "multi_grep_reducer_object_sha256": "c" * 64,
+            "multi_grep_reducer_relocation_count": "2",
+            "multi_grep_reducer_semantic_runtime_calls": "0",
+            "multi_grep_reducer_object_bytes": "1208",
+            "multi_grep_reducer_max_object_bytes": str(268435456 - 4096),
+        })
+        operation = hashlib.sha256()
+        operation.update(b"fre-aot-regex/rebar-multi-grep-reducer/v1\0")
+        operation.update((1).to_bytes(4, "little"))
+        operation.update(bytes((0, 0, 0)))
+        operation.update((0).to_bytes(8, "little"))
+        operation.update((3).to_bytes(8, "little"))
+        operation.update((12).to_bytes(8, "little"))
+        operation.update(bytes.fromhex("a" * 64))
+        operation.update((3).to_bytes(8, "little"))
+        for row in (0, 1, 0):
+            operation.update(row.to_bytes(8, "little"))
+        operation.update((2).to_bytes(8, "little"))
+        for index, first_source in enumerate((0, 1)):
+            operation.update(first_source.to_bytes(8, "little"))
+            entry = reducer_fields[f"component_{index}_entry_symbol"].encode("ascii")
+            operation.update(len(entry).to_bytes(8, "little"))
+            operation.update(entry)
+            for suffix in ("automaton_sha256", "program_sha256", "object_sha256"):
+                operation.update(bytes.fromhex(reducer_fields[f"component_{index}_{suffix}"]))
+        operation_identity = operation.hexdigest()
+        reducer_symbol = f"fre_aot_regex_rebar_multi_grep_v1_{operation_identity}"
+        reducer_fields["multi_grep_reducer_operation_identity_sha256"] = (
+            operation_identity
+        )
+        reducer_fields["multi_grep_reducer_symbol"] = reducer_symbol
+        artifact = hashlib.sha256()
+        artifact.update(b"fre-aot-regex/rebar-multi-grep-reducer-artifact/v1\0")
+        artifact.update(bytes.fromhex(operation_identity))
+        reducer_symbol_bytes = reducer_symbol.encode("ascii")
+        artifact.update(len(reducer_symbol_bytes).to_bytes(8, "little"))
+        artifact.update(reducer_symbol_bytes)
+        artifact.update(bytes.fromhex("b" * 64))
+        artifact.update(bytes.fromhex("c" * 64))
+        artifact.update((2).to_bytes(8, "little"))
+        artifact.update((1208).to_bytes(8, "little"))
+        artifact.update((268435456 - 4096).to_bytes(8, "little"))
+        reducer_fields["multi_grep_reducer_artifact_identity_sha256"] = (
+            artifact.hexdigest()
+        )
+        reducer_encoded = " ".join(
+            f"{key}={value}" for key, value in reducer_fields.items()
+        ).encode()
+        reducer_receipt = CENSUS.provenance_receipt(
+            CENSUS.parse_provenance(reducer_encoded)
+        )
+        CENSUS.validate_provenance_record(
+            reducer_receipt, "synthetic native multi-Grep reducer"
+        )
+        self.assertEqual(
+            reducer_receipt["composite_kind"], "native-multi-grep-reducer-v1"
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(reducer_receipt),
+            ([reducer_symbol], "linked-native-multi-grep-reducer"),
+        )
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(reducer_receipt),
+            sorted(
+                reducer_fields[f"component_{index}_entry_symbol"]
+                for index in range(2)
+            ),
+        )
+        poisoned_reducer = copy.deepcopy(reducer_receipt)
+        poisoned_reducer["multi_grep_reducer"]["source_bytes"] = 13
+        with self.assertRaisesRegex(CENSUS.CensusError, "operation identity"):
+            CENSUS.validate_provenance_record(
+                poisoned_reducer, "poisoned native multi-Grep reducer"
+            )
+
+        for model, operation_name, operation_tag, adapter in (
+            (
+                "count", "count", 1,
+                "general-aot-native-row-count-whole-operation-reducer-v1",
+            ),
+            (
+                "count-spans", "span-sum", 2,
+                "general-aot-native-row-span-sum-whole-operation-reducer-v1",
+            ),
+        ):
+            scalar_fields = dict(fields)
+            scalar_fields.update({
+                "model": model,
+                "adapter": adapter,
+                "aggregate_strategy": (
+                    "native-independent-span-row-whole-scalar-reducer-v1"
+                ),
+                "boundary": "single-call-helper-free-native-row-scalar-reducer",
+                "native_row_scalar_reducer": "true",
+                "row_scalar_reducer_abi_version": "1",
+                "row_scalar_reducer_operation": operation_name,
+                "row_scalar_reducer_mixed_handle_table": "false",
+                "row_scalar_reducer_required_handle_count": "0",
+                "row_scalar_reducer_row_routes": "0,0",
+                "row_scalar_reducer_source_cardinality": "3",
+                "row_scalar_reducer_source_bytes": "12",
+                "row_scalar_reducer_ordered_sources_sha256": "d" * 64,
+                "row_scalar_reducer_code_sha256": "e" * 64,
+                "row_scalar_reducer_object_sha256": "f" * 64,
+                "row_scalar_reducer_relocation_count": "2",
+                "row_scalar_reducer_relocation_sections": "0,0",
+                "row_scalar_reducer_relocation_offsets": "64,128",
+                "row_scalar_reducer_relocation_kinds": "1,1",
+                "row_scalar_reducer_relocation_symbols": "1,2",
+                "row_scalar_reducer_relocation_addends": "-4,-4",
+                "row_scalar_reducer_semantic_runtime_calls": "0",
+                "row_scalar_reducer_object_bytes": "1232",
+                "row_scalar_reducer_max_object_bytes": str(268435456 - 4096),
+            })
+            operation_digest = hashlib.sha256()
+            operation_digest.update(
+                b"fre-aot-regex/rebar-native-row-scalar-reducer/v1\0"
+            )
+            operation_digest.update((1).to_bytes(4, "little"))
+            operation_digest.update(bytes((operation_tag, 0, 0, 0)))
+            operation_digest.update((0).to_bytes(8, "little"))
+            operation_digest.update((3).to_bytes(8, "little"))
+            operation_digest.update((12).to_bytes(8, "little"))
+            operation_digest.update(bytes.fromhex("d" * 64))
+            operation_digest.update((3).to_bytes(8, "little"))
+            for row in (0, 1, 0):
+                operation_digest.update(row.to_bytes(8, "little"))
+            operation_digest.update((2).to_bytes(8, "little"))
+            for index, first_source in enumerate((0, 1)):
+                operation_digest.update(first_source.to_bytes(8, "little"))
+                entry = scalar_fields[
+                    f"component_{index}_entry_symbol"
+                ].encode("ascii")
+                operation_digest.update(len(entry).to_bytes(8, "little"))
+                operation_digest.update(entry)
+                for suffix in (
+                    "automaton_sha256", "program_sha256", "object_sha256",
+                ):
+                    operation_digest.update(bytes.fromhex(
+                        scalar_fields[f"component_{index}_{suffix}"]
+                    ))
+            scalar_identity = operation_digest.hexdigest()
+            scalar_symbol = (
+                f"fre_aot_regex_rebar_row_scalar_v1_{scalar_identity}"
+            )
+            scalar_fields["row_scalar_reducer_operation_identity_sha256"] = (
+                scalar_identity
+            )
+            scalar_fields["row_scalar_reducer_symbol"] = scalar_symbol
+            scalar_artifact = hashlib.sha256()
+            scalar_artifact.update(
+                b"fre-aot-regex/rebar-native-row-scalar-reducer-artifact/v1\0"
+            )
+            scalar_artifact.update(bytes.fromhex(scalar_identity))
+            scalar_symbol_bytes = scalar_symbol.encode("ascii")
+            scalar_artifact.update(len(scalar_symbol_bytes).to_bytes(8, "little"))
+            scalar_artifact.update(scalar_symbol_bytes)
+            scalar_artifact.update(bytes.fromhex("e" * 64))
+            scalar_artifact.update(bytes.fromhex("f" * 64))
+            scalar_artifact.update((2).to_bytes(8, "little"))
+            for offset, symbol in ((64, 1), (128, 2)):
+                scalar_artifact.update((0).to_bytes(8, "little"))
+                scalar_artifact.update(offset.to_bytes(8, "little"))
+                scalar_artifact.update(bytes((1,)))
+                scalar_artifact.update(symbol.to_bytes(8, "little"))
+                scalar_artifact.update((-4).to_bytes(8, "little", signed=True))
+            scalar_artifact.update((1232).to_bytes(8, "little"))
+            scalar_artifact.update((268435456 - 4096).to_bytes(8, "little"))
+            scalar_fields["row_scalar_reducer_artifact_identity_sha256"] = (
+                scalar_artifact.hexdigest()
+            )
+            scalar_encoded = " ".join(
+                f"{key}={value}" for key, value in scalar_fields.items()
+            ).encode()
+            scalar_receipt = CENSUS.provenance_receipt(
+                CENSUS.parse_provenance(scalar_encoded)
+            )
+            CENSUS.validate_provenance_record(
+                scalar_receipt, f"synthetic native row-scalar {model} reducer"
+            )
+            self.assertEqual(
+                scalar_receipt["composite_kind"],
+                "native-row-scalar-reducer-v1",
+            )
+            self.assertEqual(
+                CENSUS.operation_route_from_provenance_record(scalar_receipt),
+                ([scalar_symbol], "linked-native-row-scalar-reducer"),
+            )
+            poisoned_scalar = copy.deepcopy(scalar_receipt)
+            poisoned_scalar["row_scalar_reducer"]["relocation_addends"][0] = 0
+            with self.assertRaisesRegex(CENSUS.CensusError, "relocation closure"):
+                CENSUS.validate_provenance_record(
+                    poisoned_scalar, "poisoned native row-scalar reducer"
+                )
+
+        mixed = dict(fields)
+        prepared_identity = "8" * 64
+        mixed.update({
+            "model": "count",
+            "engine": "IndependentNativeSpanRows(OrderedDfa,OrderedNfa)",
+            "adapter": (
+                "general-aot-native-row-count-mixed-prepared-"
+                "whole-operation-reducer-v1"
+            ),
+            "aggregate_strategy": (
+                "native-independent-mixed-span-row-whole-scalar-reducer-v1"
+            ),
+            "boundary": "single-call-native-mixed-row-scalar-reducer",
+            "prepare_max_handle_bytes": str(CENSUS.PREPARED_V15_MAX_HANDLE_BYTES),
+            "prepare_max_scratch_bytes": str(CENSUS.PREPARED_V15_MAX_SCRATCH_BYTES),
+            "prepare_max_setup_work": str(CENSUS.PREPARED_V15_MAX_SETUP_WORK),
+            "component_1_entry_symbol": (
+                f"fre_aot_regex_search_exclusive_v1_{prepared_identity}"
+            ),
+            "component_1_runtime_symbols": ",".join(
+                CENSUS.PREPARED_V15_RUNTIME_SYMBOLS
+            ),
+            "component_1_required_prepare_capabilities": "0000000000000001",
+            "component_1_prepare_config_version": "3",
+            "component_1_prepare_operation_flags": "0000000000000002",
+            "component_1_runtime_program_symbol": (
+                f"fre_aot_regex_runtime_program_v1_{prepared_identity}"
+            ),
+            "component_1_runtime_program_len": "4096",
+            "component_1_span_fill_symbol": (
+                f"fre_aot_regex_fill_spans_exclusive_v1_{prepared_identity}"
+            ),
+            "component_1_prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+            "native_row_scalar_reducer": "true",
+            "row_scalar_reducer_abi_version": "1",
+            "row_scalar_reducer_operation": "count",
+            "row_scalar_reducer_mixed_handle_table": "true",
+            "row_scalar_reducer_required_handle_count": "2",
+            "row_scalar_reducer_row_routes": "0,1",
+            "row_scalar_reducer_source_cardinality": "3",
+            "row_scalar_reducer_source_bytes": "12",
+            "row_scalar_reducer_ordered_sources_sha256": "d" * 64,
+            "row_scalar_reducer_code_sha256": "e" * 64,
+            "row_scalar_reducer_object_sha256": "f" * 64,
+            "row_scalar_reducer_relocation_count": "2",
+            "row_scalar_reducer_relocation_sections": "0,0",
+            "row_scalar_reducer_relocation_offsets": "64,128",
+            "row_scalar_reducer_relocation_kinds": "1,1",
+            "row_scalar_reducer_relocation_symbols": "1,2",
+            "row_scalar_reducer_relocation_addends": "-4,-4",
+            "row_scalar_reducer_semantic_runtime_calls": "0",
+            "row_scalar_reducer_object_bytes": "1232",
+            "row_scalar_reducer_max_object_bytes": str(268435456 - 4096),
+        })
+        operation_digest = hashlib.sha256()
+        operation_digest.update(
+            b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer/v1\0"
+        )
+        operation_digest.update((1).to_bytes(4, "little"))
+        operation_digest.update(bytes((1, 0, 0, 0)))
+        operation_digest.update((0).to_bytes(8, "little"))
+        operation_digest.update((3).to_bytes(8, "little"))
+        operation_digest.update((12).to_bytes(8, "little"))
+        operation_digest.update(bytes.fromhex("d" * 64))
+        operation_digest.update((3).to_bytes(8, "little"))
+        for row in (0, 1, 0):
+            operation_digest.update(row.to_bytes(8, "little"))
+        operation_digest.update((2).to_bytes(8, "little"))
+        for index, (first_source, route) in enumerate(((0, 0), (1, 1))):
+            operation_digest.update(first_source.to_bytes(8, "little"))
+            operation_digest.update(bytes((route,)))
+            entry = mixed[f"component_{index}_entry_symbol"].encode("ascii")
+            operation_digest.update(len(entry).to_bytes(8, "little"))
+            operation_digest.update(entry)
+            for suffix in ("automaton_sha256", "program_sha256", "object_sha256"):
+                operation_digest.update(bytes.fromhex(
+                    mixed[f"component_{index}_{suffix}"]
+                ))
+        mixed_identity = operation_digest.hexdigest()
+        mixed_symbol = f"fre_aot_regex_rebar_mixed_row_scalar_v1_{mixed_identity}"
+        mixed["row_scalar_reducer_operation_identity_sha256"] = mixed_identity
+        mixed["row_scalar_reducer_symbol"] = mixed_symbol
+        artifact = hashlib.sha256()
+        artifact.update(
+            b"fre-aot-regex/rebar-mixed-native-row-scalar-reducer-artifact/v1\0"
+        )
+        artifact.update(bytes.fromhex(mixed_identity))
+        symbol_bytes = mixed_symbol.encode("ascii")
+        artifact.update(len(symbol_bytes).to_bytes(8, "little"))
+        artifact.update(symbol_bytes)
+        artifact.update(bytes.fromhex("e" * 64))
+        artifact.update(bytes.fromhex("f" * 64))
+        artifact.update((2).to_bytes(8, "little"))
+        for offset, symbol in ((64, 1), (128, 2)):
+            artifact.update((0).to_bytes(8, "little"))
+            artifact.update(offset.to_bytes(8, "little"))
+            artifact.update(bytes((1,)))
+            artifact.update(symbol.to_bytes(8, "little"))
+            artifact.update((-4).to_bytes(8, "little", signed=True))
+        artifact.update((1232).to_bytes(8, "little"))
+        artifact.update((268435456 - 4096).to_bytes(8, "little"))
+        artifact.update((2).to_bytes(8, "little"))
+        artifact.update(bytes((0, 1)))
+        mixed["row_scalar_reducer_artifact_identity_sha256"] = artifact.hexdigest()
+        mixed_receipt = CENSUS.provenance_receipt(CENSUS.parse_provenance(
+            " ".join(f"{key}={value}" for key, value in mixed.items()).encode()
+        ))
+        CENSUS.validate_provenance_record(
+            mixed_receipt, "synthetic mixed native row-scalar reducer"
+        )
+        self.assertTrue(mixed_receipt["row_scalar_reducer"]["mixed_handle_table"])
+        self.assertEqual(mixed_receipt["row_scalar_reducer"]["row_routes"], [0, 1])
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(mixed_receipt),
+            ([mixed_symbol], "linked-native-row-scalar-helper-backed-reducer"),
+        )
+        prepared_identity_symbols = [
+            mixed["component_1_entry_symbol"],
+            mixed["component_1_span_fill_symbol"],
+            mixed["component_1_runtime_program_symbol"],
+        ]
+        identity_symbols = sorted([
+            mixed["component_0_entry_symbol"],
+            *prepared_identity_symbols,
+        ])
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(mixed_receipt),
+            identity_symbols,
+        )
+        self.assertEqual(
+            CENSUS.authenticate_identity_defined_symbol_inventory(
+                mixed_receipt, set(identity_symbols), set(identity_symbols)
+            ),
+            identity_symbols,
+        )
+        for missing_symbol in prepared_identity_symbols:
+            for missing_from_replica in (False, True):
+                with self.subTest(
+                    identity=missing_symbol,
+                    binary="replica" if missing_from_replica else "primary",
+                ):
+                    primary = set(identity_symbols)
+                    replica = set(identity_symbols)
+                    (replica if missing_from_replica else primary).remove(
+                        missing_symbol
+                    )
+                    with self.assertRaisesRegex(
+                        CENSUS.CensusError, "identity symbols are absent"
+                    ):
+                        CENSUS.authenticate_identity_defined_symbol_inventory(
+                            mixed_receipt, primary, replica
+                        )
+
+        missing_identity = copy.deepcopy(mixed_receipt)
+        del missing_identity["components"][1]["prepared_v15"][
+            "runtime_program_symbol"
+        ]
+        with self.assertRaisesRegex(CENSUS.CensusError, "identit.*malformed"):
+            CENSUS.identity_defined_symbols_from_provenance(missing_identity)
+
+        wrong_identity = copy.deepcopy(mixed_receipt)
+        wrong_identity["components"][1]["prepared_v15"][
+            "runtime_program_symbol"
+        ] = f"fre_aot_regex_runtime_program_v1_{'9' * 64}"
+        with self.assertRaisesRegex(CENSUS.CensusError, "component identity differs"):
+            CENSUS.identity_defined_symbols_from_provenance(wrong_identity)
+
+        duplicate_identity = copy.deepcopy(mixed_receipt)
+        duplicate_prepared = duplicate_identity["components"][1]["prepared_v15"]
+        duplicate_prepared["runtime_program_symbol"] = duplicate_prepared[
+            "span_fill_symbol"
+        ]
+        with self.assertRaisesRegex(CENSUS.CensusError, "repeats a linked identity"):
+            CENSUS.identity_defined_symbols_from_provenance(duplicate_identity)
+
+        wrong_route = copy.deepcopy(mixed_receipt)
+        wrong_route["components"][1]["entry_symbol"] = (
+            f"fre_aot_regex_search_v1_{prepared_identity}"
+        )
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.identity_defined_symbols_from_provenance(wrong_route)
+
+        numeric_scalar_boolean = copy.deepcopy(mixed_receipt)
+        numeric_scalar_boolean["row_scalar_reducer"]["mixed_handle_table"] = 1
+        with self.assertRaisesRegex(CENSUS.CensusError, "not boolean"):
+            CENSUS.validate_normalized_row_scalar_reducer(
+                numeric_scalar_boolean["row_scalar_reducer"],
+                numeric_scalar_boolean,
+                "numeric mixed row-scalar boolean",
+            )
+
         poisoned_grep = dict(grep_fields)
         poisoned_grep["aggregate_strategy"] = "native-independent-span-row-selector-v1"
         with self.assertRaisesRegex(CENSUS.CensusError, "wrong typed route"):
@@ -3012,6 +3907,122 @@ class TrueNativeCensusTests(unittest.TestCase):
                         " ".join(
                             f"{key}={item}" for key, item in poisoned.items()
                         ).encode()
+                    )
+
+    def test_operation_only_prepared_grep_v15_closes_exact_topology(self) -> None:
+        fields = operation_only_prepared_scalar_grep_provenance_fields()
+        parsed = CENSUS.parse_provenance(
+            " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        )
+        receipt = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(
+            receipt, "synthetic operation-only prepared grep"
+        )
+        self.assertEqual(receipt["kind"], "prepared-grep-v15-v2")
+        self.assertEqual(
+            receipt["prepared_grep_v15"]["artifact_identity_sha256"],
+            "e" * 64,
+        )
+        self.assertEqual(
+            receipt["prepared_grep_v15"]["reducer_identity_sha256"],
+            "e" * 64,
+        )
+        self.assertEqual(
+            CENSUS.selected_operation_entries(parsed),
+            ([fields["reducer_symbol"]], "linked-native-grep-count-reducer"),
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt),
+            ([fields["reducer_symbol"]], "linked-native-grep-count-reducer"),
+        )
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(receipt),
+            [fields["program_symbol"]],
+        )
+        self.assertEqual(
+            CENSUS.declared_runtime_symbols_from_provenance(receipt), []
+        )
+
+        raw_poisons = {
+            "entry-abi": ("entry_abi", CENSUS.SPAN_SEARCH_ENTRY_ABI),
+            "prepared-bulk": (
+                "prepared_bulk_strategy", "Some(NativeOrderedNfaLoop)"
+            ),
+            "runtime-helper": (
+                "required_runtime_symbols", "fre_aot_regex_runtime_search_v1"
+            ),
+            "span-fill": (
+                "span_fill_symbol",
+                f"fre_aot_regex_fill_spans_exclusive_v1_{'e' * 64}",
+            ),
+            "entry-family": (
+                "entry_symbol", f"fre_aot_regex_search_v1_{'e' * 64}"
+            ),
+            "entry-identity": (
+                "entry_symbol",
+                f"fre_aot_regex_grep_count_exclusive_v1_{'d' * 64}",
+            ),
+            "program-identity": (
+                "program_symbol",
+                f"fre_aot_regex_runtime_program_v1_{'d' * 64}",
+            ),
+            "reducer-identity": (
+                "reducer_symbol",
+                f"fre_aot_regex_grep_count_exclusive_v1_{'d' * 64}",
+            ),
+        }
+        for poison, (key, value) in raw_poisons.items():
+            with self.subTest(layer="raw", poison=poison):
+                poisoned = dict(fields)
+                poisoned[key] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{name}={item}" for name, item in poisoned.items()
+                        ).encode()
+                    )
+
+        normalized_poisons = {
+            "entry-abi": ("entry_abi", CENSUS.SPAN_SEARCH_ENTRY_ABI),
+            "prepared-bulk": (
+                "prepared_bulk_strategy", "Some(NativeOrderedNfaLoop)"
+            ),
+            "runtime-helper": (
+                "required_runtime_symbols", ["fre_aot_regex_runtime_search_v1"]
+            ),
+            "span-fill": (
+                "span_fill_symbol",
+                f"fre_aot_regex_fill_spans_exclusive_v1_{'e' * 64}",
+            ),
+            "entry-identity": (
+                "entry_symbol",
+                f"fre_aot_regex_grep_count_exclusive_v1_{'d' * 64}",
+            ),
+            "program-identity": (
+                "program_symbol",
+                f"fre_aot_regex_runtime_program_v1_{'d' * 64}",
+            ),
+        }
+        for poison, (key, value) in normalized_poisons.items():
+            with self.subTest(layer="normalized", poison=poison):
+                poisoned = copy.deepcopy(receipt)
+                poisoned[key] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.validate_provenance_record(
+                        poisoned,
+                        f"poisoned operation-only prepared grep ({poison})",
+                    )
+        for poison, key in (
+            ("artifact-proof", "artifact_identity_sha256"),
+            ("reducer-proof", "reducer_identity_sha256"),
+        ):
+            with self.subTest(layer="normalized-proof", poison=poison):
+                poisoned = copy.deepcopy(receipt)
+                poisoned["prepared_grep_v15"][key] = "d" * 64
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.validate_provenance_record(
+                        poisoned,
+                        f"poisoned operation-only prepared grep ({poison})",
                     )
 
     def test_operation_only_shared_v15_fails_closed_on_topology_or_abi_tamper(self) -> None:
@@ -3111,12 +4122,16 @@ class TrueNativeCensusTests(unittest.TestCase):
 
     def test_native_uniform_capture_closes_single_call_route(self) -> None:
         for model in ("count-captures", "grep-captures"):
-            for ordered, operation_only in ((False, False), (True, False), (True, True)):
+            for ordered, operation_only, row_search in (
+                (False, False, False), (True, False, False),
+                (True, True, False), (True, False, True),
+            ):
                 with self.subTest(
-                    model=model, ordered=ordered, operation_only=operation_only
+                    model=model, ordered=ordered, operation_only=operation_only,
+                    row_search=row_search,
                 ):
                     fields = native_uniform_capture_provenance_fields(
-                        model, ordered, operation_only
+                        model, ordered, operation_only, row_search
                     )
                     parsed = CENSUS.parse_provenance(
                         " ".join(
@@ -3128,6 +4143,8 @@ class TrueNativeCensusTests(unittest.TestCase):
                         receipt, "synthetic native uniform capture"
                     )
                     route = (
+                        CENSUS.LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE
+                        if row_search else
                         "linked-native-uniform-capture-helper-backed-reducer"
                         if ordered and not operation_only
                         else "linked-native-uniform-capture-reducer"
@@ -3135,7 +4152,8 @@ class TrueNativeCensusTests(unittest.TestCase):
                     self.assertEqual(receipt["kind"], "scalar-v2")
                     self.assertEqual(
                         receipt["uniform_capture"]["route_variant"],
-                        "ordered-v15-operation-only"
+                        "ordered-v15-row-search-v1"
+                        if row_search else "ordered-v15-operation-only"
                         if operation_only
                         else "ordered-v15" if ordered else "direct-v1",
                     )
@@ -3151,7 +4169,8 @@ class TrueNativeCensusTests(unittest.TestCase):
                         fields["entry_symbol"], fields["program_symbol"]
                     ]
                     if ordered and not operation_only:
-                        identity_symbols.append(fields["span_fill_symbol"])
+                        if fields["span_fill_symbol"]:
+                            identity_symbols.append(fields["span_fill_symbol"])
                     self.assertEqual(
                         CENSUS.identity_defined_symbols_from_provenance(receipt),
                         sorted(identity_symbols),
@@ -3199,6 +4218,136 @@ class TrueNativeCensusTests(unittest.TestCase):
                     CENSUS.validate_provenance_record(
                         poisoned, "poisoned native uniform capture"
                     )
+
+    def test_linked_uniform_capture_row_search_accepts_emitted_route_names(self) -> None:
+        for model, adapter, grep_iteration in (
+            (
+                "count-captures",
+                "general-aot-native-uniform-capture-count-row-search-reducer-v1",
+                "not-applicable",
+            ),
+            (
+                "grep-captures",
+                "general-aot-native-uniform-capture-grep-row-search-reducer-v1",
+                "linked-native-uniform-capture-row-search-reducer-v1",
+            ),
+        ):
+            with self.subTest(model=model):
+                fields = native_uniform_capture_provenance_fields(
+                    model, ordered=True, row_search=True
+                )
+                self.assertEqual(fields["adapter"], adapter)
+                self.assertEqual(
+                    fields["grep_iteration_strategy"], grep_iteration
+                )
+                parsed = CENSUS.parse_provenance(
+                    " ".join(
+                        f"{key}={value}" for key, value in fields.items()
+                    ).encode()
+                )
+                receipt = CENSUS.provenance_receipt(parsed)
+                CENSUS.validate_provenance_record(
+                    receipt, "emitted-name linked RowSearch uniform capture"
+                )
+
+    def test_linked_uniform_capture_row_search_closes_two_objects(self) -> None:
+        fields = native_uniform_capture_provenance_fields(
+            "grep-captures", ordered=True, row_search=True
+        )
+        self.assertEqual(
+            fields["adapter"],
+            "general-aot-native-uniform-capture-grep-row-search-reducer-v1",
+        )
+        self.assertEqual(
+            fields["grep_iteration_strategy"],
+            "linked-native-uniform-capture-row-search-reducer-v1",
+        )
+        encoded = " ".join(
+            f"{key}={value}" for key, value in fields.items()
+        ).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        receipt = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(
+            receipt, "synthetic linked RowSearch uniform capture"
+        )
+        self.assertEqual(
+            CENSUS.selected_operation_entries(parsed),
+            ([fields["reducer_symbol"]], CENSUS.LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE),
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt),
+            ([fields["reducer_symbol"]], CENSUS.LINKED_UNIFORM_CAPTURE_ROW_SEARCH_ROUTE),
+        )
+        proof = receipt["uniform_capture"]
+        self.assertEqual(proof["prepared_surface"], "RowSearchOnly")
+        self.assertEqual(proof["semantic_runtime_calls"], 0)
+        self.assertEqual(proof["external_relocation"]["symbol"], fields["entry_symbol"])
+        self.assertLessEqual(proof["row_object_bytes"], proof["max_object_bytes"])
+        self.assertLessEqual(proof["reducer_object_bytes"], proof["max_object_bytes"])
+
+        raw_poisons = {
+            "entry_abi": CENSUS.SPAN_SEARCH_ENTRY_ABI,
+            "prepared_surface": CENSUS.PREPARED_V15_COMPATIBILITY_SURFACE,
+            "required_runtime_symbols": "fre_aot_regex_runtime_search_exclusive_v1",
+            "uniform_capture_external_relocation_count": "0",
+            "uniform_capture_external_relocation_symbol": (
+                f"fre_aot_regex_search_exclusive_v1_{'9' * 64}"
+            ),
+            "uniform_capture_external_relocation_kind": "X86PltRelative32",
+            "uniform_capture_semantic_runtime_calls": "1",
+            "uniform_capture_row_object_bytes": str(
+                CENSUS.MAX_NATIVE_ROW_OBJECT_BYTES + 1
+            ),
+            "uniform_capture_proof_identity_sha256": "8" * 64,
+            "uniform_capture_artifact_identity_sha256": "9" * 64,
+        }
+        for name, value in raw_poisons.items():
+            with self.subTest(layer="raw", poison=name):
+                poisoned = dict(fields)
+                poisoned[name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+        missing = dict(fields)
+        del missing["uniform_capture_reducer_object_sha256"]
+        with self.assertRaisesRegex(CENSUS.CensusError, "field closure"):
+            CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in missing.items()).encode()
+            )
+        legacy = native_uniform_capture_provenance_fields()
+        legacy["prepared_surface"] = CENSUS.PREPARED_V15_ROW_SEARCH_SURFACE
+        with self.assertRaisesRegex(CENSUS.CensusError, "field closure"):
+            CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in legacy.items()).encode()
+            )
+
+        normalized_poisons = {
+            "prepared_surface": CENSUS.PREPARED_V15_COMPATIBILITY_SURFACE,
+            "count_symbol": f"fre_aot_regex_count_exclusive_v1_{'9' * 64}",
+            "row_object_sha256": "8" * 64,
+            "max_object_bytes": 1,
+            "semantic_runtime_calls": 1,
+            "artifact_identity_sha256": "9" * 64,
+        }
+        for name, value in normalized_poisons.items():
+            with self.subTest(layer="normalized", poison=name):
+                poisoned = copy.deepcopy(receipt)
+                poisoned["uniform_capture"][name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.validate_provenance_record(
+                        poisoned, "poisoned linked RowSearch uniform capture"
+                    )
+        poisoned = copy.deepcopy(receipt)
+        poisoned["uniform_capture"]["external_relocation"]["offset"] = (
+            proof["reducer_object_bytes"]
+        )
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.validate_provenance_record(
+                poisoned, "poisoned linked RowSearch relocation"
+            )
 
     def test_shared_ordered_many_closes_one_reducer_route_and_receipt(self) -> None:
         for model in ("count", "count-spans"):
@@ -3469,6 +4618,206 @@ class TrueNativeCensusTests(unittest.TestCase):
         with self.assertRaisesRegex(CENSUS.CensusError, "keys differ"):
             CENSUS.validate_provenance_record(normalized, "missing ordinary route marker")
 
+    def test_mixed_multi_grep_reducer_closes_routes_helpers_and_identities(self) -> None:
+        fields = mixed_multi_grep_reducer_provenance_fields()
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        expected_route = (
+            [fields["multi_grep_reducer_symbol"]],
+            "linked-native-mixed-multi-grep-reducer",
+        )
+        self.assertEqual(CENSUS.selected_operation_entries(parsed), expected_route)
+        receipt = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(receipt, "synthetic mixed multi-Grep reducer")
+        proof = receipt["multi_grep_reducer"]
+        self.assertEqual(receipt["composite_kind"], "native-multi-grep-reducer-v1")
+        self.assertTrue(proof["mixed_handle_table"])
+        self.assertEqual(proof["required_handle_count"], 2)
+        self.assertEqual(proof["row_routes"], [0, 1])
+        self.assertIn("prepared_v15_limits", receipt)
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt),
+            expected_route,
+        )
+        identity_symbols = sorted([
+                fields["component_0_entry_symbol"],
+                fields["component_1_entry_symbol"],
+                fields["component_1_span_fill_symbol"],
+                fields["component_1_runtime_program_symbol"],
+        ])
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(receipt),
+            identity_symbols,
+        )
+        self.assertEqual(
+            CENSUS.authenticate_identity_defined_symbol_inventory(
+                receipt, set(identity_symbols), set(identity_symbols)
+            ),
+            identity_symbols,
+        )
+        for symbol in (
+            fields["component_1_entry_symbol"],
+            fields["component_1_span_fill_symbol"],
+            fields["component_1_runtime_program_symbol"],
+        ):
+            for missing_from_primary in (True, False):
+                with self.subTest(
+                    missing_symbol=symbol,
+                    binary="primary" if missing_from_primary else "replica",
+                ):
+                    primary = set(identity_symbols)
+                    replica = set(identity_symbols)
+                    (primary if missing_from_primary else replica).remove(symbol)
+                    with self.assertRaisesRegex(
+                        CENSUS.CensusError, "identity symbols are absent"
+                    ):
+                        CENSUS.authenticate_identity_defined_symbol_inventory(
+                            receipt, primary, replica
+                        )
+
+        poisons = {
+            "multi_grep_reducer_row_routes": "1,0",
+            "multi_grep_reducer_required_handle_count": "1",
+            "multi_grep_reducer_mixed_handle_table": "false",
+            "boundary": "single-call-helper-free-native-multi-grep-reducer",
+        }
+        for name, value in poisons.items():
+            with self.subTest(name=name):
+                poisoned = dict(fields)
+                poisoned[name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+
+        wrong_entry = copy.deepcopy(receipt)
+        wrong_entry["components"][1]["entry_symbol"] = (
+            f"fre_aot_regex_search_v1_{'b' * 64}"
+        )
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.identity_defined_symbols_from_provenance(wrong_entry)
+
+        missing_program = copy.deepcopy(receipt)
+        missing_program["components"][1]["prepared_v15"][
+            "runtime_program_symbol"
+        ] = ""
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.identity_defined_symbols_from_provenance(missing_program)
+
+        duplicate_identity = copy.deepcopy(receipt)
+        duplicate_prepared = duplicate_identity["components"][1]["prepared_v15"]
+        duplicate_prepared["runtime_program_symbol"] = duplicate_prepared[
+            "span_fill_symbol"
+        ]
+        with self.assertRaisesRegex(CENSUS.CensusError, "repeats"):
+            CENSUS.identity_defined_symbols_from_provenance(duplicate_identity)
+
+        poisoned_metadata = copy.deepcopy(receipt)
+        poisoned_metadata["components"][1]["prepared_v15"][
+            "prepare_config_version"
+        ] = 2
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.validate_provenance_record(
+                poisoned_metadata, "poisoned mixed multi-Grep prepared metadata"
+            )
+
+        numeric_boolean = copy.deepcopy(receipt)
+        numeric_boolean["multi_grep_reducer"]["mixed_handle_table"] = 1
+        with self.assertRaisesRegex(CENSUS.CensusError, "not boolean"):
+            CENSUS.validate_normalized_multi_grep_reducer(
+                numeric_boolean["multi_grep_reducer"],
+                numeric_boolean,
+                "numeric mixed multi-Grep boolean",
+            )
+
+    def test_strict_row_search_mixed_reducer_is_whole_native_and_fail_closed(self) -> None:
+        fields = mixed_multi_grep_reducer_provenance_fields(strict_row_search=True)
+        encoded = " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        parsed = CENSUS.parse_provenance(encoded)
+        expected_route = (
+            [fields["multi_grep_reducer_symbol"]],
+            "linked-native-strict-mixed-multi-grep-reducer",
+        )
+        self.assertEqual(CENSUS.selected_operation_entries(parsed), expected_route)
+        receipt = CENSUS.provenance_receipt(parsed)
+        CENSUS.validate_provenance_record(receipt, "strict mixed multi-Grep")
+        self.assertEqual(receipt["multi_grep_reducer"]["row_routes"], [0, 2])
+        self.assertEqual(
+            receipt["components"][1]["prepared_v15"]["entry_abi"],
+            CENSUS.PREPARED_SPAN_SEARCH_ENTRY_ABI,
+        )
+        self.assertEqual(
+            receipt["components"][1]["prepared_v15"]["prepared_surface"],
+            CENSUS.PREPARED_V15_ROW_SEARCH_SURFACE,
+        )
+        self.assertEqual(
+            CENSUS.operation_route_from_provenance_record(receipt), expected_route
+        )
+        self.assertEqual(
+            CENSUS.OPERATION_ROUTE_POLICIES[expected_route[1]].boundary,
+            CENSUS.OperationBoundary.WHOLE_OPERATION,
+        )
+        identity_symbols = sorted([
+            fields["component_0_entry_symbol"],
+            fields["component_1_entry_symbol"],
+            fields["component_1_runtime_program_symbol"],
+        ])
+        self.assertEqual(
+            CENSUS.identity_defined_symbols_from_provenance(receipt),
+            identity_symbols,
+        )
+        self.assertNotIn("", identity_symbols)
+        self.assertFalse(CENSUS.every_prepared_component_is_strict([
+            receipt["components"][1],
+            CENSUS.provenance_receipt(CENSUS.parse_provenance(
+                " ".join(
+                    f"{key}={value}"
+                    for key, value in mixed_prepared_grep_provenance_fields().items()
+                ).encode()
+            ))["components"][1],
+        ]))
+
+        poisons = {
+            "component_1_entry_abi": CENSUS.SPAN_SEARCH_ENTRY_ABI,
+            "component_1_prepared_surface": CENSUS.PREPARED_V15_COMPATIBILITY_SURFACE,
+            "component_1_runtime_symbols": ",".join(
+                CENSUS.PREPARED_V15_RUNTIME_SYMBOLS
+            ),
+            "component_1_span_fill_symbol": (
+                f"fre_aot_regex_fill_spans_exclusive_v1_{'b' * 64}"
+            ),
+            "component_1_prepared_bulk_strategy": "Some(NativeOrderedNfaLoop)",
+            "multi_grep_reducer_row_routes": "0,1",
+        }
+        for name, value in poisons.items():
+            with self.subTest(name=name):
+                poisoned = dict(fields)
+                poisoned[name] = value
+                with self.assertRaises(CENSUS.CensusError):
+                    CENSUS.parse_provenance(
+                        " ".join(
+                            f"{key}={item}" for key, item in poisoned.items()
+                        ).encode()
+                    )
+
+        partial = dict(fields)
+        del partial["component_0_entry_abi"]
+        with self.assertRaisesRegex(CENSUS.CensusError, "partial"):
+            CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in partial.items()).encode()
+            )
+
+        normalized_poison = copy.deepcopy(receipt)
+        normalized_poison["components"][1]["prepared_v15"][
+            "prepared_surface"
+        ] = CENSUS.PREPARED_V15_COMPATIBILITY_SURFACE
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.validate_provenance_record(
+                normalized_poison, "poisoned strict mixed multi-Grep"
+            )
+
     def test_uniform_capture_v3_seals_proof_lists_and_mapped_selector_digests(self) -> None:
         fields = uniform_capture_provenance_fields()
         fields.update({
@@ -3655,6 +5004,104 @@ class TrueNativeCensusTests(unittest.TestCase):
                             validated["classification"]["reason"],
                             "whole-operation-native-authenticated",
                         )
+
+    def test_weighted_capture_reducer_v6_closes_one_helper_free_call(self) -> None:
+        for model in ("count-captures", "grep-captures"):
+            for target in ("aarch64-linux", "x86_64-macos"):
+                with self.subTest(model=model, target=target):
+                    fields = weighted_capture_reducer_provenance_fields(model, target)
+                    encoded = " ".join(
+                        f"{key}={value}" for key, value in fields.items()
+                    ).encode()
+                    parsed = CENSUS.parse_provenance(encoded)
+                    provenance = CENSUS.provenance_receipt(parsed)
+                    CENSUS.validate_provenance_record(
+                        provenance, "synthetic weighted capture reducer"
+                    )
+                    reducer = fields["reducer_symbol"]
+                    expected_route = (
+                        [reducer], "linked-native-weighted-capture-reducer"
+                    )
+                    self.assertEqual(
+                        CENSUS.selected_operation_entries(parsed), expected_route
+                    )
+                    self.assertEqual(
+                        CENSUS.operation_route_from_provenance_record(provenance),
+                        expected_route,
+                    )
+                    self.assertEqual(
+                        provenance["kind"], "weighted-capture-reducer-v6"
+                    )
+                    self.assertEqual(
+                        provenance["composite_kind"],
+                        "weighted-capture-whole-operation-reducer-v1",
+                    )
+                    self.assertEqual(provenance["source_to_artifact"], [0, 1, 0])
+                    self.assertEqual(
+                        provenance["weighted_capture_reducer"]["component_weights"],
+                        [2, 3],
+                    )
+                    self.assertEqual(
+                        CENSUS.identity_defined_symbols_from_provenance(provenance),
+                        sorted(fields["component_entry_symbols"].split(",")),
+                    )
+                    policy = CENSUS.OPERATION_ROUTE_POLICIES[expected_route[1]]
+                    self.assertEqual(
+                        policy.boundary, CENSUS.OperationBoundary.WHOLE_OPERATION
+                    )
+
+    def test_weighted_capture_reducer_v6_fails_closed_on_receipt_mutation(self) -> None:
+        base = weighted_capture_reducer_provenance_fields()
+
+        def parse(fields: dict[str, str]) -> dict[str, str]:
+            return CENSUS.parse_provenance(
+                " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+            )
+
+        mutations: list[tuple[str, dict[str, str]]] = []
+        for field, value in (
+            ("operation_identity_sha256", "f" * 64),
+            ("source_participating_user_captures", "0,2,1"),
+            ("component_weights", "3,3"),
+            ("source_selector_object_sha256", f"{'3' * 64},{'3' * 64},{'3' * 64}"),
+            ("external_relocation_components", "1,0"),
+            ("external_relocation_components", "0"),
+            ("external_relocation_offsets", "32,16"),
+            ("external_relocation_offsets", "16,not-a-number"),
+            ("external_relocation_kinds", "2,2"),
+            ("external_relocation_addends", "-4,-4"),
+            ("reducer_artifact_identity_sha256", "f" * 64),
+            ("line_terminator", "13"),
+        ):
+            poisoned = dict(base)
+            poisoned[field] = value
+            mutations.append((field, poisoned))
+        extra = dict(base)
+        extra["unbound_weighted_fact"] = "1"
+        mutations.append(("extra_field", extra))
+        for field, poisoned in mutations:
+            with self.subTest(mutation=field):
+                with self.assertRaises(CENSUS.CensusError):
+                    parse(poisoned)
+        for field in (
+            "external_relocation_components", "external_relocation_offsets",
+            "external_relocation_kinds", "external_relocation_addends",
+        ):
+            with self.subTest(missing=field):
+                missing = dict(base)
+                missing.pop(field)
+                with self.assertRaisesRegex(CENSUS.CensusError, "omits"):
+                    parse(missing)
+
+        normalized = CENSUS.provenance_receipt(parse(base))
+        poisoned_normalized = copy.deepcopy(normalized)
+        poisoned_normalized["weighted_capture_reducer"]["external_relocations"][0][
+            "offset"
+        ] = 33
+        with self.assertRaises(CENSUS.CensusError):
+            CENSUS.validate_provenance_record(
+                poisoned_normalized, "mutated normalized weighted capture reducer"
+            )
 
     def test_single_capture_reducer_v5_fails_closed(self) -> None:
         base = single_capture_reducer_provenance_fields()

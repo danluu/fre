@@ -356,6 +356,12 @@ def expected_object_hashes(provenance: dict[str, object]) -> list[str]:
         hashes = [component["object_sha256"] for component in provenance["components"]]
     if provenance.get("composite_kind") == "regex-redux-fixed-v1":
         hashes.append(provenance["object_sha256"])
+    if provenance.get("kind") == "weighted-capture-reducer-v6":
+        hashes.append(provenance["object_sha256"])
+    if provenance.get("composite_kind") in {
+        "native-multi-grep-reducer-v1", "native-row-scalar-reducer-v1",
+    }:
+        hashes.append(provenance["object_sha256"])
     return hashes
 
 

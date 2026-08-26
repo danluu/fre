@@ -8,19 +8,25 @@
 use super::{
     aarch64_add_w_reg, aarch64_add_x_imm, aarch64_add_x_lsl, aarch64_add_x_reg, aarch64_add_x_uxtw,
     aarch64_and_low_w, aarch64_and_w, aarch64_cmp_w, aarch64_cmp_w_imm, aarch64_cmp_x,
-    aarch64_load_byte_reg, aarch64_load_pair_x, aarch64_load_u32_constant,
-    aarch64_load_u64_constant, aarch64_load_w_imm, aarch64_load_w_uxtw, aarch64_load_x_imm,
-    aarch64_load_x_lsl3, aarch64_lsr_w_imm, aarch64_lsr_x_imm, aarch64_mov_x,
-    aarch64_orr_w, aarch64_store_pair_x,
+    aarch64_cmp_x_imm, aarch64_emit_candidate_any, aarch64_emit_candidate_batch_any,
+    aarch64_emit_start_filter_constants, aarch64_emit_start_filter_vector_candidates,
+    aarch64_ld1_four_16b, aarch64_load_byte_reg, aarch64_load_pair_x, aarch64_load_q,
+    aarch64_load_u32_constant, aarch64_load_u64_constant, aarch64_load_w_imm,
+    aarch64_load_w_uxtw, aarch64_load_x_imm, aarch64_load_x_lsl3, aarch64_lsr_w_imm,
+    aarch64_lsr_x_imm, aarch64_mov_x, aarch64_orr_16b, aarch64_orr_w,
+    aarch64_store_pair_x, aarch64_umaxv_16b, aarch64_umov_b0,
     aarch64_store_w, aarch64_store_x, aarch64_sub_w_imm, aarch64_sub_x_imm,
-    aarch64_sub_x_reg, Aarch64Assembler,
-    ModuleRelocation, ObjectError, RelocationKind, AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO,
-    AARCH64_LS, AARCH64_NE, PARTIAL_TABLE_SYMBOL, PREPARED_FALLBACK_RUNTIME_SYMBOL, TEXT_SECTION,
+    aarch64_sub_x_reg, Aarch64Assembler, ModuleRelocation, NativeByteRange, NativeStartFilter,
+    ObjectError, RelocationKind, AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_LS,
+    AARCH64_NE, AARCH64_STANDALONE_FILTER_FIRST_CONSTANT, EMPTY_NATIVE_START_FILTER,
+    MAX_SCALAR_REFINEMENT_PRIMARY_FREQUENCY_UNITS, estimated_filter_frequency_units,
+    PARTIAL_TABLE_SYMBOL, PREPARED_FALLBACK_RUNTIME_SYMBOL, TEXT_SECTION,
 };
 use crate::{
     ordered_nfa_native::{
         NativeOrderedNfaObjectImage, NativeOrderedNfaObjectLayout,
-        NativeOrderedNfaStartPrefixPlan, WholeWindowWidthBounds,
+        NativeOrderedNfaStartPrefixPlan, NativeOrderedNfaTerminalRangeV1,
+        WholeWindowWidthBounds,
         ORDERED_NFA_EDGE_DISPATCH_V1_ADMITTED_ROWS_FIELD,
         ORDERED_NFA_EDGE_DISPATCH_V1_BYTE_MAP_OFFSET_FIELD,
         ORDERED_NFA_EDGE_DISPATCH_V1_CONTROL_FIELD,
@@ -170,10 +176,12 @@ const L_CLASS_RETURN: u16 = 208;
 const L_ASSERT_CACHE_KNOWN: u16 = 216;
 const L_ASSERT_CACHE_ENABLED: u16 = 224;
 const L_ASSERT_CACHE_BIT: u16 = 232;
+const L_START_PREFIX_VECTOR_READY: u16 = 240;
+const L_START_PREFIX_VECTOR_DENSE: u16 = 248;
 
 const _: () = assert!(FRAME_BYTES.is_multiple_of(16));
 const _: () = assert!(STACK_BYTES.is_multiple_of(16));
-const _: () = assert!(L_ASSERT_CACHE_BIT + 8 <= FRAME_BYTES);
+const _: () = assert!(L_START_PREFIX_VECTOR_DENSE + 8 <= FRAME_BYTES);
 
 /// One complete AArch64 public/private Ordered-NFA text fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,12 +191,18 @@ pub(super) struct Aarch64OrderedNfaNativeEntry {
     pub(super) private_entry_offset: usize,
     /// Handle-only, source-free classifier for one whole prepared operation.
     pub(super) bulk_gate_entry_offset: usize,
+    /// Whether this exact emitted entry contains the admitted ASIMD
+    /// start-prefix scanner. This compiler-only fact is returned by the
+    /// semantic emitter that made the decision, rather than reconstructed
+    /// from the request policy.
+    pub(super) start_prefix_vector_lowered: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OrderedNfaEntrySurface {
     Compatibility,
     OperationOnly,
+    RowSearchOnly,
 }
 
 fn scratch_bytes(layout: NativeOrderedNfaObjectLayout) -> Result<usize, ObjectError> {
@@ -1241,6 +1255,33 @@ fn emit_exact_scratch_auth(
     Ok(())
 }
 
+/// Restore the scratch/payload register view proved by the enclosing
+/// aggregate wrapper's one-shot operation gate. This entry is text-local and
+/// the exclusive handle contract keeps all write-once addresses stable until
+/// the wrapper's reduction returns.
+fn emit_trusted_aggregate_scratch_setup(a: &mut A<'_>) -> Result<(), ObjectError> {
+    a.load_x(8, 19, FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET)?;
+    a.mov_x(19, 8)?;
+    a.store_x(19, 31, usize::from(L_SCRATCH))?;
+    for ((offset, local), register) in [
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_SEEN_ADDRESS_OFFSET, L_SEEN),
+        (
+            FROZEN_ORDERED_NFA_SCRATCH_V1_CURRENT_ADDRESS_OFFSET,
+            L_CURRENT,
+        ),
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_ROOTS_ADDRESS_OFFSET, L_ROOTS),
+        (FROZEN_ORDERED_NFA_SCRATCH_V1_STACK_ADDRESS_OFFSET, L_STACK),
+    ]
+    .into_iter()
+    .zip([25, 26, 27, 28])
+    {
+        a.load_x(8, 19, offset)?;
+        a.store_x(8, 31, usize::from(local))?;
+        a.mov_x(register, 8)?;
+    }
+    Ok(())
+}
+
 fn cmp_w_value(a: &mut A<'_>, register: u8, value: u32) -> Result<(), ObjectError> {
     if value <= 0x0fff {
         return a.cmp_w_imm(register, u16::try_from(value).unwrap());
@@ -1916,6 +1957,117 @@ fn emit_start_prefix_membership(
     a.branch(missed)
 }
 
+/// Select only an exact singleton cover for the architectural ASIMD idle
+/// scanner. Inclusive ranges retain the established scalar path because their
+/// frequent hits cannot generally repay vector setup on unknown haystacks.
+fn exact_start_prefix_vector_filter(
+    plan: NativeOrderedNfaStartPrefixPlan,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    let ranges = plan.ranges();
+    if ranges.is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 Ordered-NFA empty start-prefix vector cover",
+        ));
+    }
+    if ranges.iter().any(|range| range.start != range.end) {
+        return Ok(None);
+    }
+    let mut filter = EMPTY_NATIVE_START_FILTER;
+    let mut previous = None;
+    for (index, range) in ranges.iter().enumerate() {
+        if previous.is_some_and(|byte| byte >= range.start) {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA start-prefix vector range order",
+            ));
+        }
+        let slot = filter
+            .ranges
+            .get_mut(index)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA start-prefix vector range capacity",
+            ))?;
+        *slot = NativeByteRange {
+            start: range.start,
+            end: range.end,
+        };
+        previous = Some(range.end);
+    }
+    filter.range_count = u8::try_from(ranges.len()).map_err(|_| {
+        ObjectError::ArithmeticOverflow("AArch64 Ordered-NFA start-prefix vector range count")
+    })?;
+    filter.candidate_bytes = u16::try_from(ranges.len()).map_err(|_| {
+        ObjectError::ArithmeticOverflow("AArch64 Ordered-NFA start-prefix vector candidate bytes")
+    })?;
+    // A vector hit must still enter the complete semantic machine. Use the
+    // same target-neutral public byte-frequency model as the ordinary root
+    // scanners and admit only candidates sparse enough to amortize that
+    // handoff on an unknown haystack. This deliberately excludes common
+    // singleton covers as well as every inclusive range.
+    Ok(
+        (estimated_filter_frequency_units(filter) <= MAX_SCALAR_REFINEMENT_PRIMARY_FREQUENCY_UNITS)
+            .then_some(filter),
+    )
+}
+
+/// Select the ASIMD reverse scanner only when the authenticated terminal
+/// range is sparse enough that a long miss can amortize its bounded constants.
+/// Common and wide ranges retain the established scalar reverse walk, and
+/// short windows bypass vector setup in the emitted control flow.
+fn sparse_terminal_range_vector_filter(
+    range: NativeOrderedNfaTerminalRangeV1,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    if range.start > range.end || range.reverse_depth != 0 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 Ordered-NFA terminal-range vector proof",
+        ));
+    }
+    let mut filter = EMPTY_NATIVE_START_FILTER;
+    filter.ranges[0] = NativeByteRange {
+        start: range.start,
+        end: range.end,
+    };
+    filter.range_count = 1;
+    filter.candidate_bytes = u16::from(range.end)
+        .checked_sub(u16::from(range.start))
+        .and_then(|width| width.checked_add(1))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 Ordered-NFA terminal-range candidate bytes",
+        ))?;
+    Ok(
+        (estimated_filter_frequency_units(filter) <= MAX_SCALAR_REFINEMENT_PRIMARY_FREQUENCY_UNITS)
+            .then_some(filter),
+    )
+}
+
+/// Recover the last set byte from V24 and publish its exclusive semantic end.
+/// Candidate masks contain exact `0xff`/`0x00` bytes. CLZ therefore converts
+/// the highest set bit in either 64-bit half into the highest selected lane
+/// without rereading the haystack.
+fn emit_terminal_range_last_lane(
+    a: &mut A<'_>,
+    search_entry: usize,
+) -> Result<(), ObjectError> {
+    let low_half = a.asm.label()?;
+    let lane_selected = a.asm.label()?;
+    a.raw(0x4e18_3f0c)?; // umov x12, v24.d[1]
+    a.cbz_x(12, low_half)?;
+    a.raw(0xdac0_118c)?; // clz x12, x12
+    a.i(aarch64_lsr_x_imm(12, 12, 3))?;
+    a.constant32(13, 15)?;
+    a.sub_x(12, 13, 12)?;
+    a.branch(lane_selected)?;
+    a.asm.bind(low_half)?;
+    a.raw(0x4e08_3f0c)?; // umov x12, v24.d[0]
+    a.raw(0xdac0_118c)?; // clz x12, x12
+    a.i(aarch64_lsr_x_imm(12, 12, 3))?;
+    a.constant32(13, 7)?;
+    a.sub_x(12, 13, 12)?;
+    a.asm.bind(lane_selected)?;
+    a.add_x(8, 8, 12)?;
+    a.add_x_imm(22, 8, 1)?;
+    a.branch(search_entry)
+}
+
 fn start_closure_labels(
     asm: &mut Aarch64Assembler,
     program: NativeEpsilonClosureProgramView<'_>,
@@ -2110,12 +2262,19 @@ fn emit_static_start_closure(
 fn emit_semantic_body(
     asm: &mut Aarch64Assembler,
     image: &NativeOrderedNfaObjectImage<'_>,
+    allow_start_prefix_vector: bool,
     assertion: usize,
     no_match: usize,
     matched: usize,
     runtime_failure: usize,
-) -> Result<(), ObjectError> {
+) -> Result<bool, ObjectError> {
     let layout = image.layout;
+    let start_prefix_vector_filter = allow_start_prefix_vector
+        .then_some(layout.start_prefix)
+        .flatten()
+        .map(exact_start_prefix_vector_filter)
+        .transpose()?
+        .flatten();
     let start_program = selected_start_closure_program(image)?;
     let start_labels = start_program
         .map(|program| start_closure_labels(asm, program))
@@ -2144,6 +2303,18 @@ fn emit_semantic_body(
     let not_accept = asm.label()?;
 
     let mut a = A { asm };
+    if start_prefix_vector_filter.is_some() {
+        // Constants are initialized only if an idle scan actually reaches a
+        // complete vector. Immediate positives and short windows therefore
+        // retain the scalar prefix path's setup cost exactly.
+        a.store_w(31, 31, usize::from(L_START_PREFIX_VECTOR_READY))?;
+        // A four-vector hit switches the next idle probe to one vector. One
+        // empty single-vector probe returns to the sparse four-vector path.
+        // This search-invocation-local hysteresis protects clustered/adversarial
+        // prefix densities without changing the compiler's unknown-input
+        // sparse admission model.
+        a.store_w(31, 31, usize::from(L_START_PREFIX_VECTOR_DENSE))?;
+    }
     a.branch(boundary)?;
 
     a.asm.bind(boundary)?;
@@ -2366,15 +2537,168 @@ fn emit_semantic_body(
         finish,
     )?;
     if let Some(prefix) = layout.start_prefix {
-        let scan_next = a.asm.label()?;
-        let scan_hit = a.asm.label()?;
-        a.asm.bind(scan_next)?;
-        a.add_x_imm(9, 9, 1)?;
-        a.cmp_x(9, 22)?;
-        a.branch_cond(AARCH64_HS, finish)?;
-        a.i(aarch64_load_byte_reg(8, 20, 9))?;
-        emit_start_prefix_membership(&mut a, prefix, 8, scan_hit, scan_next)?;
+        let scan_hit;
+        if let Some(filter) = start_prefix_vector_filter {
+            scan_hit = a.asm.label()?;
+            a.add_x_imm(9, 9, 1)?;
+            let scan_vector = a.asm.label()?;
+            let scan_batch = a.asm.label()?;
+            let scan_single = a.asm.label()?;
+            let scan_scalar = a.asm.label()?;
+            let scan_scalar_next = a.asm.label()?;
+            let constants_ready = a.asm.label()?;
+            let batch_hit = a.asm.label()?;
+            let batch_block0 = a.asm.label()?;
+            let batch_block1 = a.asm.label()?;
+            let batch_block2 = a.asm.label()?;
+            let vector_hit = a.asm.label()?;
+            let low_half_hit = a.asm.label()?;
+            let lane_selected = a.asm.label()?;
+            a.asm.bind(scan_vector)?;
+            a.cmp_x(9, 22)?;
+            a.branch_cond(AARCH64_HS, finish)?;
+            a.sub_x(10, 22, 9)?;
+            a.i(aarch64_cmp_x_imm(10, 16))?;
+            a.branch_cond(AARCH64_LO, scan_scalar)?;
+            a.load_w(12, 31, usize::from(L_START_PREFIX_VECTOR_READY))?;
+            a.cbnz_w(12, constants_ready)?;
+            aarch64_emit_start_filter_constants(
+                a.asm,
+                filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            a.constant32(12, 1)?;
+            a.store_w(12, 31, usize::from(L_START_PREFIX_VECTOR_READY))?;
+            a.asm.bind(constants_ready)?;
+            a.i(aarch64_cmp_x_imm(10, 64))?;
+            a.branch_cond(AARCH64_LO, scan_single)?;
+            a.load_w(12, 31, usize::from(L_START_PREFIX_VECTOR_DENSE))?;
+            a.cbnz_w(12, scan_single)?;
+            a.asm.bind(scan_batch)?;
+            a.add_x(12, 20, 9)?;
+            a.i(aarch64_ld1_four_16b(24, 12))?;
+            for block in 0_u8..4 {
+                aarch64_emit_start_filter_vector_candidates(
+                    a.asm,
+                    filter,
+                    24_u8
+                        .checked_add(block)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 Ordered-NFA prefix batch source",
+                        ))?,
+                    block,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            }
+            // Preserve all four masks for exact first-block and first-lane
+            // recovery on the rare hit edge. The hot miss edge reduces only
+            // scratch copies before advancing one complete cache line.
+            aarch64_emit_candidate_batch_any(a.asm, 0)?;
+            a.branch_cond(AARCH64_NE, batch_hit)?;
+            a.add_x_imm(9, 9, 64)?;
+            // No hit means the density receipt is still clear and all filter
+            // constants remain live. Stay inside the sparse batch loop while
+            // another complete cache line is available instead of repeating
+            // mode and lazy-constant checks for every 64-byte miss.
+            a.sub_x(10, 22, 9)?;
+            a.i(aarch64_cmp_x_imm(10, 64))?;
+            a.branch_cond(AARCH64_HS, scan_batch)?;
+            a.branch(scan_vector)?;
+
+            a.asm.bind(batch_hit)?;
+            a.constant32(12, 1)?;
+            a.store_w(12, 31, usize::from(L_START_PREFIX_VECTOR_DENSE))?;
+            aarch64_emit_candidate_any(a.asm, 0)?;
+            a.branch_cond(AARCH64_NE, batch_block0)?;
+            aarch64_emit_candidate_any(a.asm, 1)?;
+            a.branch_cond(AARCH64_NE, batch_block1)?;
+            aarch64_emit_candidate_any(a.asm, 2)?;
+            a.branch_cond(AARCH64_NE, batch_block2)?;
+            // The aggregate mask proved a hit and the first three blocks are
+            // empty, so V3 is the exact selected block without another
+            // horizontal reduction.
+            a.i(aarch64_orr_16b(24, 3, 3))?;
+            a.add_x_imm(9, 9, 48)?;
+            a.branch(vector_hit)?;
+            a.asm.bind(batch_block2)?;
+            a.i(aarch64_orr_16b(24, 2, 2))?;
+            a.add_x_imm(9, 9, 32)?;
+            a.branch(vector_hit)?;
+            a.asm.bind(batch_block1)?;
+            a.i(aarch64_orr_16b(24, 1, 1))?;
+            a.add_x_imm(9, 9, 16)?;
+            a.branch(vector_hit)?;
+            a.asm.bind(batch_block0)?;
+            a.i(aarch64_orr_16b(24, 0, 0))?;
+            a.branch(vector_hit)?;
+
+            a.asm.bind(scan_single)?;
+            a.add_x(12, 20, 9)?;
+            a.i(aarch64_load_q(0, 12))?;
+            aarch64_emit_start_filter_vector_candidates(
+                a.asm,
+                filter,
+                0,
+                24,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            // Reduce a scratch copy so V24 retains the exact lane mask for
+            // direct earliest-lane recovery on the rare hit edge.
+            a.i(aarch64_umaxv_16b(7, 24))?;
+            a.i(aarch64_umov_b0(12, 7))?;
+            a.cmp_w_imm(12, 0)?;
+            a.branch_cond(AARCH64_NE, vector_hit)?;
+            a.store_w(31, 31, usize::from(L_START_PREFIX_VECTOR_DENSE))?;
+            a.add_x_imm(9, 9, 16)?;
+            a.branch(scan_vector)?;
+
+            a.asm.bind(vector_hit)?;
+            // UMOV the two 64-bit halves of the exact 0xff/0x00 mask. The
+            // first set bit is lane*8, so RBIT+CLZ followed by >>3 selects the
+            // earliest candidate without rescanning any haystack byte.
+            a.raw(0x4e08_3f0c)?; // umov x12, v24.d[0]
+            a.cbnz_x(12, low_half_hit)?;
+            a.raw(0x4e18_3f0c)?; // umov x12, v24.d[1]
+            a.raw(0xdac0_018c)?; // rbit x12, x12
+            a.raw(0xdac0_118c)?; // clz x12, x12
+            a.i(aarch64_lsr_x_imm(12, 12, 3))?;
+            a.add_x_imm(12, 12, 8)?;
+            a.branch(lane_selected)?;
+            a.asm.bind(low_half_hit)?;
+            a.raw(0xdac0_018c)?; // rbit x12, x12
+            a.raw(0xdac0_118c)?; // clz x12, x12
+            a.i(aarch64_lsr_x_imm(12, 12, 3))?;
+            a.asm.bind(lane_selected)?;
+            a.add_x(9, 9, 12)?;
+            a.branch(scan_hit)?;
+
+            a.asm.bind(scan_scalar)?;
+            a.cmp_x(9, 22)?;
+            a.branch_cond(AARCH64_HS, finish)?;
+            a.i(aarch64_load_byte_reg(8, 20, 9))?;
+            emit_start_prefix_membership(&mut a, prefix, 8, scan_hit, scan_scalar_next)?;
+            a.asm.bind(scan_scalar_next)?;
+            a.add_x_imm(9, 9, 1)?;
+            a.branch(scan_scalar)?;
+        } else {
+            let scan_next = a.asm.label()?;
+            scan_hit = a.asm.label()?;
+            a.asm.bind(scan_next)?;
+            a.add_x_imm(9, 9, 1)?;
+            a.cmp_x(9, 22)?;
+            a.branch_cond(AARCH64_HS, finish)?;
+            a.i(aarch64_load_byte_reg(8, 20, 9))?;
+            emit_start_prefix_membership(&mut a, prefix, 8, scan_hit, scan_next)?;
+        }
         a.asm.bind(scan_hit)?;
+        if start_prefix_vector_filter.is_some() {
+            // V16+ is caller-clobbered. A hit leaves the closed scan loop and
+            // can reach local assertion/decode/member calls before the next
+            // idle scan, so invalidate the lazy setup before publishing that
+            // candidate. The next complete vector rematerializes constants;
+            // the no-hit vector loop retains them without crossing a call.
+            a.store_w(31, 31, usize::from(L_START_PREFIX_VECTOR_READY))?;
+        }
         a.store_x(9, 31, usize::from(L_POSITION))?;
         a.branch(boundary)?;
     }
@@ -2596,14 +2920,50 @@ fn emit_semantic_body(
     a.store_x(8, 23, 0)?;
     a.load_x(8, 19, FROZEN_ORDERED_NFA_SCRATCH_V1_PENDING_END_OFFSET)?;
     a.store_x(8, 23, 8)?;
-    a.branch(matched)
+    a.branch(matched)?;
+    Ok(start_prefix_vector_filter.is_some())
 }
 
 /// Emit the AArch64 AAPCS64 private/public V15 one-Span search entry.
 pub(super) fn lower_aarch64(
     image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
-    lower_aarch64_with_surface(image, OrderedNfaEntrySurface::Compatibility)
+    lower_aarch64_with_surface_and_vector_policies(
+        image,
+        OrderedNfaEntrySurface::Compatibility,
+        true,
+        true,
+    )
+}
+
+/// Rebuild the exact compatibility entry with independent compiler-text ASIMD
+/// policy for the start-prefix and terminal-range scanners. The canonical
+/// graph, retained object, scalar proofs and every other accelerator remain
+/// unchanged.
+pub(super) fn lower_aarch64_with_vector_policies(
+    image: &NativeOrderedNfaObjectImage<'_>,
+    allow_start_prefix_vector: bool,
+    allow_terminal_range_vector: bool,
+) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    lower_aarch64_with_surface_and_vector_policies(
+        image,
+        OrderedNfaEntrySurface::Compatibility,
+        allow_start_prefix_vector,
+        allow_terminal_range_vector,
+    )
+}
+
+#[cfg(test)]
+fn lower_aarch64_with_terminal_range_vector_policy(
+    image: &NativeOrderedNfaObjectImage<'_>,
+    allow_terminal_range_vector: bool,
+) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    lower_aarch64_with_surface_and_vector_policies(
+        image,
+        OrderedNfaEntrySurface::Compatibility,
+        true,
+        allow_terminal_range_vector,
+    )
 }
 
 /// Emit only the private V15 search and its source-free capability gate.
@@ -2613,18 +2973,62 @@ pub(super) fn lower_aarch64(
 pub(super) fn lower_aarch64_operation_only(
     image: &NativeOrderedNfaObjectImage<'_>,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
-    lower_aarch64_with_surface(image, OrderedNfaEntrySurface::OperationOnly)
+    lower_aarch64_with_surface_and_vector_policies(
+        image,
+        OrderedNfaEntrySurface::OperationOnly,
+        true,
+        true,
+    )
 }
 
-fn lower_aarch64_with_surface(
+/// Operation-only counterpart to
+/// [`lower_aarch64_with_vector_policies`].
+pub(super) fn lower_aarch64_operation_only_with_vector_policies(
+    image: &NativeOrderedNfaObjectImage<'_>,
+    allow_start_prefix_vector: bool,
+    allow_terminal_range_vector: bool,
+) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    lower_aarch64_with_surface_and_vector_policies(
+        image,
+        OrderedNfaEntrySurface::OperationOnly,
+        allow_start_prefix_vector,
+        allow_terminal_range_vector,
+    )
+}
+
+/// Emit one externally callable V15 Span search with no compatibility
+/// fallback. The handle and immutable object are fully reauthenticated on
+/// every call; no enclosing aggregate gate is trusted.
+pub(super) fn lower_aarch64_row_search_only_with_vector_policies(
+    image: &NativeOrderedNfaObjectImage<'_>,
+    allow_start_prefix_vector: bool,
+    allow_terminal_range_vector: bool,
+) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
+    lower_aarch64_with_surface_and_vector_policies(
+        image,
+        OrderedNfaEntrySurface::RowSearchOnly,
+        allow_start_prefix_vector,
+        allow_terminal_range_vector,
+    )
+}
+
+fn lower_aarch64_with_surface_and_vector_policies(
     image: &NativeOrderedNfaObjectImage<'_>,
     surface: OrderedNfaEntrySurface,
+    allow_start_prefix_vector: bool,
+    allow_terminal_range_vector: bool,
 ) -> Result<Aarch64OrderedNfaNativeEntry, ObjectError> {
     // The fragmented terminal proof is aggregate-only. Revalidate it here so
     // a forged compiler-only receipt still fails closed, but do not let it
     // change the shared/public/private one-Span entry.
     let _ = image.terminal_exact_set_plan()?;
     let layout = image.layout;
+    let terminal_range_vector_filter = allow_terminal_range_vector
+        .then_some(layout.terminal_range)
+        .flatten()
+        .map(sparse_terminal_range_vector_filter)
+        .transpose()?
+        .flatten();
     let expected_scratch_bytes = scratch_bytes(layout)?;
     let mut asm = Aarch64Assembler::new();
     let invalid_argument = asm.label()?;
@@ -2642,6 +3046,7 @@ fn lower_aarch64_with_surface(
     let clear_generation_loop = asm.label()?;
     let clear_generation_store = asm.label()?;
     let after_generation_clear = asm.label()?;
+    let authenticated_search = asm.label()?;
     let search_entry = asm.label()?;
     let terminal_scan = if layout.terminal_range.is_some() {
         Some(asm.label()?)
@@ -2672,7 +3077,12 @@ fn lower_aarch64_with_surface(
     let private_table = emit_prologue_and_raw_checks(&mut asm, invalid_argument, invalid_handle)?;
     {
         let mut a = A { asm: &mut asm };
-        a.branch(shared_auth)?;
+        if surface == OrderedNfaEntrySurface::OperationOnly {
+            emit_trusted_aggregate_scratch_setup(&mut a)?;
+            a.branch(authenticated_search)?;
+        } else {
+            a.branch(shared_auth)?;
+        }
     }
 
     asm.bind(bulk_gate_entry)?;
@@ -2708,6 +3118,10 @@ fn lower_aarch64_with_surface(
         a.mov_x(19, 8)?;
         a.store_x(19, 31, usize::from(L_SCRATCH))?;
         emit_exact_scratch_auth(&mut a, layout, expected_scratch_bytes, runtime_failure)?;
+    }
+    asm.bind(authenticated_search)?;
+    {
+        let mut a = A { asm: &mut asm };
 
         if let Some(bounds) = layout.whole_window_width_bounds {
             emit_whole_window_width_gate(&mut a, bounds, no_match)?;
@@ -2792,22 +3206,139 @@ fn lower_aarch64_with_surface(
         asm.bind(scan)?;
         let mut a = A { asm: &mut asm };
         a.load_x(9, 31, usize::from(L_POSITION))?;
-        a.cmp_x(8, 9)?;
-        a.branch_cond(AARCH64_LS, no_match)?;
-        a.sub_x_imm(8, 8, 1)?;
-        a.i(aarch64_load_byte_reg(10, 20, 8))?;
-        a.cmp_w_imm(10, u16::from(range.start))?;
-        a.branch_cond(AARCH64_LO, scan)?;
-        a.cmp_w_imm(10, u16::from(range.end))?;
-        a.branch_cond(AARCH64_HI, scan)?;
-        a.add_x_imm(22, 8, 1)?;
-        a.branch(search_entry)?;
+        if let Some(filter) = terminal_range_vector_filter {
+            let vector = a.asm.label()?;
+            let single = a.asm.label()?;
+            let scalar = a.asm.label()?;
+            let batch_hit = a.asm.label()?;
+            let batch_block0 = a.asm.label()?;
+            let batch_block1 = a.asm.label()?;
+            let batch_block2 = a.asm.label()?;
+            let batch_block3 = a.asm.label()?;
+            let vector_hit = a.asm.label()?;
+
+            // Short inputs retain the incumbent byte loop without paying for
+            // vector constants. A complete vector installs the immutable
+            // compiler-proved range once for the whole reverse scan.
+            a.cmp_x(8, 9)?;
+            a.branch_cond(AARCH64_LS, no_match)?;
+            a.sub_x(10, 8, 9)?;
+            a.i(aarch64_cmp_x_imm(10, 16))?;
+            a.branch_cond(AARCH64_LO, scalar)?;
+            aarch64_emit_start_filter_constants(
+                a.asm,
+                filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            a.branch(vector)?;
+
+            a.asm.bind(vector)?;
+            a.sub_x(10, 8, 9)?;
+            a.i(aarch64_cmp_x_imm(10, 64))?;
+            a.branch_cond(AARCH64_LO, single)?;
+            a.sub_x_imm(8, 8, 64)?;
+            a.add_x(12, 20, 8)?;
+            a.i(aarch64_ld1_four_16b(24, 12))?;
+            for block in 0_u8..4 {
+                let candidates = 24_u8.checked_add(block).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "AArch64 Ordered-NFA terminal-range batch candidates",
+                    ),
+                )?;
+                aarch64_emit_start_filter_vector_candidates(
+                    a.asm,
+                    filter,
+                    candidates,
+                    candidates,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            }
+            aarch64_emit_candidate_batch_any(a.asm, 24)?;
+            a.branch_cond(AARCH64_NE, batch_hit)?;
+            a.branch(vector)?;
+
+            // Probe retained masks from the end of the batch. The aggregate
+            // test guarantees one succeeds; the final recovery edge remains
+            // scalar-correct if that internal invariant is ever violated.
+            a.asm.bind(batch_hit)?;
+            for (candidates, hit) in [
+                (27_u8, batch_block3),
+                (26, batch_block2),
+                (25, batch_block1),
+                (24, batch_block0),
+            ] {
+                aarch64_emit_candidate_any(a.asm, candidates)?;
+                a.branch_cond(AARCH64_NE, hit)?;
+            }
+            a.add_x_imm(8, 8, 64)?;
+            a.branch(scalar)?;
+
+            for (label, candidates, offset) in [
+                (batch_block0, 24_u8, 0_u16),
+                (batch_block1, 25, 16),
+                (batch_block2, 26, 32),
+                (batch_block3, 27, 48),
+            ] {
+                a.asm.bind(label)?;
+                if candidates != 24 {
+                    a.i(aarch64_orr_16b(24, candidates, candidates))?;
+                }
+                if offset != 0 {
+                    a.add_x_imm(8, 8, offset)?;
+                }
+                a.branch(vector_hit)?;
+            }
+
+            a.asm.bind(single)?;
+            a.i(aarch64_cmp_x_imm(10, 16))?;
+            a.branch_cond(AARCH64_LO, scalar)?;
+            a.sub_x_imm(8, 8, 16)?;
+            a.add_x(12, 20, 8)?;
+            a.i(aarch64_load_q(24, 12))?;
+            aarch64_emit_start_filter_vector_candidates(
+                a.asm,
+                filter,
+                24,
+                24,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_any(a.asm, 24)?;
+            a.branch_cond(AARCH64_NE, vector_hit)?;
+            a.branch(vector)?;
+
+            a.asm.bind(vector_hit)?;
+            emit_terminal_range_last_lane(&mut a, search_entry)?;
+
+            a.asm.bind(scalar)?;
+            a.cmp_x(8, 9)?;
+            a.branch_cond(AARCH64_LS, no_match)?;
+            a.sub_x_imm(8, 8, 1)?;
+            a.i(aarch64_load_byte_reg(10, 20, 8))?;
+            a.cmp_w_imm(10, u16::from(range.start))?;
+            a.branch_cond(AARCH64_LO, scalar)?;
+            a.cmp_w_imm(10, u16::from(range.end))?;
+            a.branch_cond(AARCH64_HI, scalar)?;
+            a.add_x_imm(22, 8, 1)?;
+            a.branch(search_entry)?;
+        } else {
+            a.cmp_x(8, 9)?;
+            a.branch_cond(AARCH64_LS, no_match)?;
+            a.sub_x_imm(8, 8, 1)?;
+            a.i(aarch64_load_byte_reg(10, 20, 8))?;
+            a.cmp_w_imm(10, u16::from(range.start))?;
+            a.branch_cond(AARCH64_LO, scan)?;
+            a.cmp_w_imm(10, u16::from(range.end))?;
+            a.branch_cond(AARCH64_HI, scan)?;
+            a.add_x_imm(22, 8, 1)?;
+            a.branch(search_entry)?;
+        }
     }
 
     asm.bind(search_entry)?;
-    emit_semantic_body(
+    let start_prefix_vector_lowered = emit_semantic_body(
         &mut asm,
         image,
+        allow_start_prefix_vector,
         assertion,
         no_match,
         matched,
@@ -2967,12 +3498,14 @@ fn lower_aarch64_with_surface(
         relocations,
         private_entry_offset,
         bulk_gate_entry_offset,
+        start_prefix_vector_lowered,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     fn optimizing_ordered_nfa(pattern: &str) -> crate::CompiledProgram {
         let parsed = fre_syntax::parse(fre_syntax::ParseRequest::rust(
@@ -3047,6 +3580,18 @@ mod tests {
             crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
                 start: 0x80,
                 end: 0xff,
+                reverse_depth: 0,
+            },
+        );
+        image
+    }
+
+    fn sparse_terminal_range_image() -> NativeOrderedNfaObjectImage<'static> {
+        let mut image = minimal_image();
+        image.layout.terminal_range = Some(
+            crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
+                start: 0x01,
+                end: 0x08,
                 reverse_depth: 0,
             },
         );
@@ -3147,6 +3692,185 @@ mod tests {
         };
         assert_eq!(end_conditions(&scalar_entry.code), [AARCH64_EQ, AARCH64_EQ]);
         assert_eq!(end_conditions(&selected_entry.code), [AARCH64_HS, AARCH64_HS]);
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_batches_only_sparse_exact_start_prefix_covers() {
+        let exact_program = optimizing_ordered_nfa(r"Q?Q?Q?Q?Q?Q?Q?Q?Zx");
+        let exact = NativeOrderedNfaObjectImage::try_build(
+            exact_program.native_ordered_nfa_view().unwrap(),
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        let exact_prefix = exact.layout.start_prefix.unwrap();
+        assert_eq!(
+            exact_prefix
+                .ranges()
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            [(b'Q', b'Q'), (b'Z', b'Z')],
+        );
+        assert!(exact_start_prefix_vector_filter(exact_prefix)
+            .unwrap()
+            .is_some());
+        let exact_entry = lower_aarch64(&exact).unwrap();
+        let exact_words = exact_entry
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let q_constant = crate::module::aarch64_movi_16b(
+            AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            b'Q',
+        )
+        .unwrap();
+        let z_constant = crate::module::aarch64_movi_16b(
+            AARCH64_STANDALONE_FILTER_FIRST_CONSTANT + 1,
+            b'Z',
+        )
+        .unwrap();
+        assert!(exact_words.contains(&q_constant));
+        assert!(exact_words.contains(&z_constant));
+        assert!(exact_words.contains(&aarch64_ld1_four_16b(24, 12).unwrap()));
+        assert!(exact_words.contains(&aarch64_load_q(0, 12).unwrap()));
+        assert!(exact_words.contains(&aarch64_add_x_imm(9, 9, 64).unwrap()));
+        assert!(exact_words.contains(&aarch64_add_x_imm(9, 9, 32).unwrap()));
+        assert!(exact_words.contains(&aarch64_add_x_imm(9, 9, 48).unwrap()));
+        assert!(exact_words.contains(&aarch64_orr_16b(24, 0, 0).unwrap()));
+        assert!(exact_words.contains(&aarch64_orr_16b(24, 1, 1).unwrap()));
+        assert!(exact_words.contains(&aarch64_orr_16b(24, 2, 2).unwrap()));
+        assert!(exact_words.contains(&aarch64_orr_16b(24, 3, 3).unwrap()));
+        let ready_clear = aarch64_store_w(31, 31, L_START_PREFIX_VECTOR_READY).unwrap();
+        let clear_positions = exact_words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| (word == ready_clear).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(clear_positions.len(), 2);
+        let first_constant = exact_words
+            .iter()
+            .position(|&word| word == q_constant)
+            .unwrap();
+        let last_constant = exact_words
+            .iter()
+            .position(|&word| word == z_constant)
+            .unwrap();
+        assert!(clear_positions[0] < first_constant);
+        assert!(last_constant < clear_positions[1]);
+        assert!(
+            exact_words[first_constant..clear_positions[1]]
+                .iter()
+                .all(|word| word & 0xfc00_0000 != 0x9400_0000),
+            "the ready interval must not cross a local or external call",
+        );
+        let density_clear =
+            aarch64_store_w(31, 31, L_START_PREFIX_VECTOR_DENSE).unwrap();
+        let density_load =
+            aarch64_load_w_imm(12, 31, L_START_PREFIX_VECTOR_DENSE).unwrap();
+        let density_set =
+            aarch64_store_w(12, 31, L_START_PREFIX_VECTOR_DENSE).unwrap();
+        let density_clear_positions = exact_words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| (word == density_clear).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(density_clear_positions.len(), 2);
+        assert!(density_clear_positions[0] < first_constant);
+        let density_load_positions = exact_words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| (word == density_load).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(density_load_positions.len(), 1);
+        let density_load_position = density_load_positions[0];
+        assert_eq!(
+            exact_words[density_load_position + 1] & 0xff00_001f,
+            0x3500_000c,
+            "a dense receipt must select the one-vector probe",
+        );
+        let density_set_position = exact_words
+            .iter()
+            .position(|&word| word == density_set)
+            .unwrap();
+        assert_eq!(
+            exact_words[density_set_position - 1],
+            crate::module::aarch64_movz_x(12, 1, 0).unwrap(),
+        );
+        assert!(density_load_position < density_set_position);
+        assert_eq!(
+            exact_words[density_clear_positions[1] + 1],
+            aarch64_add_x_imm(9, 9, 16).unwrap(),
+            "one empty dense probe must immediately restore sparse batching",
+        );
+        assert!(
+            exact_words.windows(5).any(|window| {
+                window[0] == aarch64_add_x_imm(9, 9, 64).unwrap()
+                    && window[1] == crate::module::aarch64_sub_x_reg(10, 22, 9).unwrap()
+                    && window[2] == aarch64_cmp_x_imm(10, 64).unwrap()
+                    && window[3] & 0xff00_001f == 0x5400_0002
+                    && window[4] & 0xfc00_0000 == 0x1400_0000
+            }),
+            "a sparse miss must remain in the batch loop while 64 bytes remain",
+        );
+        assert!(exact_entry.start_prefix_vector_lowered);
+        let scalar_exact = lower_aarch64_with_vector_policies(&exact, false, true).unwrap();
+        assert!(!scalar_exact.start_prefix_vector_lowered);
+        assert!(!scalar_exact
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .any(|word| word == aarch64_load_q(0, 12).unwrap()));
+        assert_eq!(exact_entry.relocations, scalar_exact.relocations);
+        assert!(exact_entry.code.len() > scalar_exact.code.len());
+
+        let common_program = optimizing_ordered_nfa(r"a?a?a?a?a?a?a?a?Zx");
+        let common = NativeOrderedNfaObjectImage::try_build(
+            common_program.native_ordered_nfa_view().unwrap(),
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        let common_prefix = common.layout.start_prefix.unwrap();
+        assert!(common_prefix
+            .ranges()
+            .iter()
+            .all(|range| range.start == range.end));
+        assert!(exact_start_prefix_vector_filter(common_prefix)
+            .unwrap()
+            .is_none());
+        assert!(!lower_aarch64(&common)
+            .unwrap()
+            .start_prefix_vector_lowered);
+        assert_eq!(
+            lower_aarch64(&common).unwrap(),
+            lower_aarch64_with_vector_policies(&common, false, true).unwrap(),
+        );
+
+        let range_program = optimizing_ordered_nfa(r"a?b?c?d?e?f?g?h?[a-z]x");
+        let range = NativeOrderedNfaObjectImage::try_build(
+            range_program.native_ordered_nfa_view().unwrap(),
+            usize::MAX,
+        )
+        .unwrap()
+        .unwrap();
+        let range_prefix = range.layout.start_prefix.unwrap();
+        assert!(exact_start_prefix_vector_filter(range_prefix)
+            .unwrap()
+            .is_none());
+        let range_entry = lower_aarch64(&range).unwrap();
+        assert!(!range_entry.start_prefix_vector_lowered);
+        let range_words = range_entry
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(!range_words.contains(&aarch64_load_q(0, 12).unwrap()));
+        assert_eq!(
+            range_entry,
+            lower_aarch64_with_vector_policies(&range, false, true).unwrap(),
+        );
     }
 
     #[test]
@@ -3278,6 +4002,11 @@ mod tests {
     #[test]
     fn ordered_nfa_aarch64_entry_has_exact_relocation_shape() {
         let entry = lower_aarch64(&minimal_image()).unwrap();
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&entry.code)),
+            "0c5bc7859f552f1fca254929173ac8144cc7b81f1f0501674f680979e9b1da75",
+            "compatibility text must remain byte-identical to 979fc26e8",
+        );
         assert!(!entry.code.is_empty());
         assert!(entry.code.len().is_multiple_of(4));
         assert!(entry.private_entry_offset > 0);
@@ -3337,6 +4066,9 @@ mod tests {
     fn ordered_nfa_aarch64_operation_only_entry_has_closed_local_relocations() {
         let compatibility = lower_aarch64(&minimal_image()).unwrap();
         let operation = lower_aarch64_operation_only(&minimal_image()).unwrap();
+        let reauthenticated =
+            lower_aarch64_row_search_only_with_vector_policies(&minimal_image(), true, true)
+                .unwrap();
 
         assert!(!operation.code.is_empty());
         assert!(operation.code.len() < compatibility.code.len());
@@ -3359,6 +4091,22 @@ mod tests {
             .relocations
             .iter()
             .all(|relocation| relocation.symbol != PREPARED_FALLBACK_RUNTIME_SYMBOL));
+        assert_ne!(operation.code, reauthenticated.code);
+        assert!(operation.bulk_gate_entry_offset > reauthenticated.bulk_gate_entry_offset);
+        assert!(operation.code.len() > reauthenticated.code.len());
+        assert_eq!(operation.relocations.len(), reauthenticated.relocations.len());
+        assert_eq!(
+            operation
+                .relocations
+                .iter()
+                .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
+                .collect::<Vec<_>>(),
+            reauthenticated
+                .relocations
+                .iter()
+                .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]
@@ -3400,6 +4148,17 @@ mod tests {
                 .any(|word| word == compare));
         }
         assert_eq!(
+            filtered,
+            lower_aarch64_with_terminal_range_vector_policy(&terminal_range_image(), false)
+                .unwrap(),
+            "the common high-byte range must retain the incumbent scalar walk",
+        );
+        assert!(!filtered
+            .code
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .any(|word| word == aarch64_ld1_four_16b(24, 12).unwrap()));
+        assert_eq!(
             filtered
                 .relocations
                 .iter()
@@ -3411,6 +4170,162 @@ mod tests {
                 .map(|relocation| (relocation.kind, relocation.symbol, relocation.addend))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn ordered_nfa_aarch64_batches_only_sparse_terminal_ranges() {
+        let sparse_range = sparse_terminal_range_image().layout.terminal_range.unwrap();
+        let sparse_filter = sparse_terminal_range_vector_filter(sparse_range)
+            .unwrap()
+            .expect("eight rare bytes must admit the vector reverse scanner");
+        assert_eq!(
+            sparse_filter
+                .ranges()
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            [(0x01, 0x08)],
+        );
+        assert!(sparse_terminal_range_vector_filter(
+            terminal_range_image().layout.terminal_range.unwrap()
+        )
+        .unwrap()
+        .is_none());
+        assert!(sparse_terminal_range_vector_filter(NativeOrderedNfaTerminalRangeV1 {
+            start: b'a',
+            end: b'z',
+            reverse_depth: 0,
+        })
+        .unwrap()
+        .is_none());
+        assert!(matches!(
+            sparse_terminal_range_vector_filter(NativeOrderedNfaTerminalRangeV1 {
+                start: 0x08,
+                end: 0x01,
+                reverse_depth: 0,
+            }),
+            Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA terminal-range vector proof"
+            ))
+        ));
+        assert!(matches!(
+            sparse_terminal_range_vector_filter(NativeOrderedNfaTerminalRangeV1 {
+                start: 0x01,
+                end: 0x08,
+                reverse_depth: 1,
+            }),
+            Err(ObjectError::InvalidModule(
+                "AArch64 Ordered-NFA terminal-range vector proof"
+            ))
+        ));
+
+        let image = sparse_terminal_range_image();
+        let selected = lower_aarch64(&image).unwrap();
+        let scalar = lower_aarch64_with_terminal_range_vector_policy(&image, false).unwrap();
+        let selected_words = selected
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let scalar_words = scalar
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(selected_words.contains(&aarch64_ld1_four_16b(24, 12).unwrap()));
+        assert!(selected_words.contains(&aarch64_load_q(24, 12).unwrap()));
+        assert!(selected_words.contains(&aarch64_sub_x_imm(8, 8, 64).unwrap()));
+        assert!(selected_words.contains(&aarch64_sub_x_imm(8, 8, 16).unwrap()));
+        for offset in [16_u16, 32, 48] {
+            assert!(selected_words.contains(&aarch64_add_x_imm(8, 8, offset).unwrap()));
+        }
+        for source in [25_u8, 26, 27] {
+            assert!(selected_words.contains(&aarch64_orr_16b(24, source, source).unwrap()));
+        }
+        for word in [0x4e18_3f0c, 0x4e08_3f0c, 0xdac0_118c] {
+            assert!(selected_words.contains(&word));
+        }
+        for immediate in [0x01_u16, 0x08] {
+            assert!(selected_words.contains(&aarch64_cmp_w_imm(10, immediate).unwrap()));
+        }
+        assert!(selected_words.contains(&aarch64_load_byte_reg(10, 20, 8).unwrap()));
+        assert!(!scalar_words.contains(&aarch64_ld1_four_16b(24, 12).unwrap()));
+        assert!(!scalar_words.contains(&aarch64_load_q(24, 12).unwrap()));
+        assert!(selected.code.len() > scalar.code.len());
+        assert_eq!(selected.relocations, scalar.relocations);
+
+        fn oracle(haystack: &[u8], start: usize, end: usize) -> Option<usize> {
+            haystack[start..end]
+                .iter()
+                .rposition(|byte| (0x01..=0x08).contains(byte))
+                .map(|offset| start + offset + 1)
+        }
+
+        fn batched(haystack: &[u8], start: usize, end: usize) -> Option<usize> {
+            let mut cursor = end;
+            while cursor - start >= 64 {
+                let base = cursor - 64;
+                if let Some(offset) = haystack[base..cursor]
+                    .iter()
+                    .rposition(|byte| (0x01..=0x08).contains(byte))
+                {
+                    return Some(base + offset + 1);
+                }
+                cursor = base;
+            }
+            while cursor - start >= 16 {
+                let base = cursor - 16;
+                if let Some(offset) = haystack[base..cursor]
+                    .iter()
+                    .rposition(|byte| (0x01..=0x08).contains(byte))
+                {
+                    return Some(base + offset + 1);
+                }
+                cursor = base;
+            }
+            while cursor > start {
+                cursor -= 1;
+                if (0x01..=0x08).contains(&haystack[cursor]) {
+                    return Some(cursor + 1);
+                }
+            }
+            None
+        }
+
+        for window_len in 0_usize..=160 {
+            for prefix in [0_usize, 1, 7] {
+                let start = prefix;
+                let end = start + window_len;
+                let mut haystack = vec![0x40; end + 7];
+                if start > 0 {
+                    haystack[start - 1] = 0x01;
+                }
+                if end < haystack.len() {
+                    haystack[end] = 0x08;
+                }
+                assert_eq!(batched(&haystack, start, end), oracle(&haystack, start, end));
+                for hit in start..end {
+                    for byte in [0x01_u8, 0x08] {
+                        haystack[hit] = byte;
+                        assert_eq!(
+                            batched(&haystack, start, end),
+                            oracle(&haystack, start, end),
+                            "window={start}..{end}, hit={hit:#x}, byte={byte:#x}",
+                        );
+                        if hit > start {
+                            haystack[start] = 0x04;
+                            assert_eq!(
+                                batched(&haystack, start, end),
+                                oracle(&haystack, start, end),
+                                "multiple hits in window={start}..{end}, latest={hit:#x}",
+                            );
+                            haystack[start] = 0x40;
+                        }
+                        haystack[hit] = 0x40;
+                    }
+                }
+            }
+        }
     }
 
     #[test]

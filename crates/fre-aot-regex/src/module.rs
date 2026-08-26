@@ -14,10 +14,11 @@
 use core::fmt::Write as _;
 
 use fre_automata::K0CompilerPrefillLimits;
+use fre_exact_alloc::{CopyError, try_box_preserve};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CompileError, DeterminizationReport, DeterminizeLimits, DfaStats,
+    CompileError, CompileResource, DeterminizationReport, DeterminizeLimits, DfaStats,
     NativeSlowPartialQuotientReceipt, ObjectError,
     absolute_anchored_cut::AbsoluteAnchoredBounds,
     bit_parallel_exists::NativeBitParallelExistsView,
@@ -29,13 +30,28 @@ use crate::{
     },
     context_dfa::ContextDfaStats,
     context_native::MAX_CONTEXT_NATIVE_DATA_BYTES,
+    direct_count_v3::{
+        DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
+        DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
+        DirectExactSingletonCountAotReport, DirectExactSingletonCountCostShape,
+        DirectExactSingletonCountSelectionBasis, DirectExactSingletonCountSuccessorMode,
+        PreparedDirectExactSingletonCount,
+        direct_exact_singleton_count_short_fallback_max_bytes,
+    },
+    direct_span_sum_v1::{
+        DIRECT_EXACT_SINGLETON_SPAN_SUM_AOT_SCHEMA_VERSION,
+        DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+        DirectExactSingletonSpanSumAotReport, DirectExactSingletonSpanSumCostShape,
+        DirectExactSingletonSpanSumSelectionBasis,
+        DirectExactSingletonSpanSumSuccessorMode,
+    },
     dfa::{
         CompleteDfaFinalizationReceipt, ForwardCell, ForwardStartAction, NativeDfaView,
     },
     dfa_loop_skip,
     finite_language::{
         NativeFiniteExistsChoiceView, NativeFiniteLanguageView,
-        NativeFiniteSelectedEndTeddyView,
+        NativeFiniteSelectedEndGrepCountView, NativeFiniteSelectedEndTeddyView,
     },
     mandatory_teddy::{
         self, MandatoryTeddyIncumbentCosts, MandatoryTeddyIsa, MandatoryTeddyPlan,
@@ -542,6 +558,33 @@ pub struct ExactFiniteSelectedEndTeddyAotReport {
     pub incumbent_code_bytes: usize,
     pub incumbent_data_bytes: usize,
     pub incumbent_relocation_count: usize,
+}
+
+/// Provenance for the opt-in exact-finite matching-line reducer.
+///
+/// The reducer invokes the unchanged direct `SelectedEnd` entry over the
+/// remaining haystack, counts the line containing that endpoint, and jumps to
+/// the next LF before searching again. Admission independently proves a
+/// non-empty assertion-free exact finite language containing neither CR nor
+/// LF, so one selected endpoint cannot cross a line boundary and one jump
+/// cannot hide a second matching line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactFiniteSelectedEndGrepCountAotReport {
+    pub artifact_identity: [u8; 32],
+    pub output: OutputContract,
+    pub source_count: u32,
+    pub source_bytes: usize,
+    pub maximum_width: u32,
+    /// Identity over the complete final additive module, including every
+    /// section, symbol, relocation, and the locally patched call.
+    pub module_sha256: [u8; 32],
+    /// Digest of the unchanged ordinary entry called by the reducer.
+    pub ordinary_entry_sha256: [u8; 32],
+    /// Digest of the final reducer bytes after the local call is patched.
+    pub reducer_code_sha256: [u8; 32],
+    pub ordinary_entry_offset: usize,
+    pub reducer_entry_offset: usize,
+    pub local_call_offset: usize,
 }
 
 /// Why a V2 exact-finite Teddy wrapper was selected.
@@ -1097,6 +1140,359 @@ struct NativeDfaEmission {
     scanner: Option<NativeScannerEmission>,
     suffix_scanner: Option<NativeScannerEmission>,
     conjunction: Option<NativeVectorConjunctionEmission>,
+    direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
+}
+
+/// Local entry into an ordinary direct DFA after its public raw-argument
+/// checks and result initialization. An additive wrapper may enter this body
+/// only after proving the same facts and authenticating the exact output
+/// contract. On x86-64, the wrapper must also reproduce this entry's precise
+/// callee-save prologue before entering the shared body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDirectSearchTrustedCore {
+    code_offset: usize,
+    output: OutputContract,
+    entry_contract: NativeDirectSearchEntryContract,
+    result_abi: NativeDirectSearchResultAbi,
+    entry_code_sha256: [u8; 32],
+    prologue: NativeDirectSearchTrustedCorePrologue,
+}
+
+/// Exact selected-layout receipt from which an aggregate-only complete Span
+/// scan may be regenerated. The public entry and the exact program-symbol
+/// extent are authenticated independently before this recipe is consumed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCompleteSpanReduceSource {
+    layout: NativeDfaLayout,
+    aarch64_sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    aarch64_sve_suffix_kind: Option<Aarch64SveFilterKind>,
+    program_bytes: usize,
+    program_sha256: [u8; 32],
+}
+
+const COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE: &str =
+    "complete Span reducer source";
+
+std::thread_local! {
+    static COMPLETE_SPAN_REDUCE_RECIPE_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct CompleteSpanReduceRecipeScope {
+    previous: bool,
+}
+
+impl Drop for CompleteSpanReduceRecipeScope {
+    fn drop(&mut self) {
+        COMPLETE_SPAN_REDUCE_RECIPE_ENABLED.with(|enabled| {
+            enabled.set(self.previous);
+        });
+    }
+}
+
+/// Enable the private regeneration recipe for one exact Count compile and
+/// append transaction. The scope is thread-local and restores nested state on
+/// normal return or unwind, so unrelated compiler calls retain the ce964
+/// lowering and allocation behavior.
+#[cfg(test)]
+pub(crate) fn with_complete_span_reduce_recipe<T>(run: impl FnOnce() -> T) -> T {
+    with_complete_span_reduce_recipe_policy(true, run)
+}
+
+#[cfg(test)]
+pub(crate) fn without_complete_span_reduce_recipe<T>(
+    run: impl FnOnce() -> T,
+) -> T {
+    with_complete_span_reduce_recipe_policy(false, run)
+}
+
+#[cfg(test)]
+fn with_complete_span_reduce_recipe_policy<T>(
+    requested: bool,
+    run: impl FnOnce() -> T,
+) -> T {
+    let scope = complete_span_reduce_recipe_scope(requested);
+    let result = run();
+    drop(scope);
+    result
+}
+
+pub(crate) fn complete_span_reduce_recipe_scope(
+    requested: bool,
+) -> CompleteSpanReduceRecipeScope {
+    let previous = COMPLETE_SPAN_REDUCE_RECIPE_ENABLED.with(|enabled| {
+        enabled.replace(requested)
+    });
+    CompleteSpanReduceRecipeScope { previous }
+}
+
+fn complete_span_reduce_recipe_enabled() -> bool {
+    COMPLETE_SPAN_REDUCE_RECIPE_ENABLED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct CompleteSpanReduceSourceAllocationInjection;
+
+#[cfg(test)]
+impl CompleteSpanReduceSourceAllocationInjection {
+    fn arm() -> Self {
+        COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.replace(1),
+                0,
+                "complete Span reducer allocation injection was already armed",
+            );
+        });
+        Self
+    }
+
+    fn assert_failed_once(&self) {
+        COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.get(),
+                2,
+                "complete Span reducer allocation injection was not consumed exactly once",
+            );
+        });
+    }
+
+    fn assert_not_attempted(&self) {
+        COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.get(),
+                1,
+                "complete Span reducer allocation injection was unexpectedly consumed",
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for CompleteSpanReduceSourceAllocationInjection {
+    fn drop(&mut self) {
+        COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| state.set(0));
+    }
+}
+
+#[cfg(test)]
+fn with_complete_span_reduce_source_allocation_failure<T>(
+    run: impl FnOnce() -> T,
+) -> T {
+    let injection = CompleteSpanReduceSourceAllocationInjection::arm();
+    let result = run();
+    injection.assert_failed_once();
+    result
+}
+
+#[cfg(test)]
+fn without_complete_span_reduce_source_allocation_attempt<T>(
+    run: impl FnOnce() -> T,
+) -> T {
+    let injection = CompleteSpanReduceSourceAllocationInjection::arm();
+    let result = run();
+    injection.assert_not_attempted();
+    result
+}
+
+pub(crate) fn complete_span_reduce_source_allocation<T>(
+    allocation: Result<Box<T>, (CopyError, T)>,
+) -> Result<Box<T>, ObjectError> {
+    allocation.map_err(|_| {
+        ObjectError::Allocation(COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE)
+    })
+}
+
+fn is_complete_span_reduce_source_allocation(error: &ObjectError) -> bool {
+    matches!(
+        error,
+        ObjectError::Allocation(site)
+            if *site == COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+    )
+}
+
+fn allocate_complete_span_reduce_source(
+    source: NativeCompleteSpanReduceSource,
+) -> Result<Box<NativeCompleteSpanReduceSource>, ObjectError> {
+    #[cfg(test)]
+    {
+        let inject = COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_INJECTION.with(|state| {
+            match state.get() {
+                0 => false,
+                1 => {
+                    state.set(2);
+                    true
+                }
+                2 => panic!(
+                    "complete Span reducer source allocation was retried after failure"
+                ),
+                _ => unreachable!("invalid complete Span reducer allocation injection state"),
+            }
+        });
+        if inject {
+            return complete_span_reduce_source_allocation(Err((
+                CopyError::AllocationFailed,
+                source,
+            )));
+        }
+    }
+    complete_span_reduce_source_allocation(try_box_preserve(source))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCompleteSpanReduceCore {
+    code_offset: usize,
+    code_size: usize,
+    code_sha256: [u8; 32],
+    public_entry_sha256: [u8; 32],
+    program_bytes: usize,
+    program_sha256: [u8; 32],
+    entry_contract: NativeCompleteSpanReduceEntryContract,
+    result_abi: NativeCompleteSpanReduceResultAbi,
+}
+
+struct NativeCompleteSpanReducePending {
+    emission: NativeDfaEmission,
+    core: NativeCompleteSpanReduceCore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCompleteSpanReduceEntryContract {
+    AuthenticatedCompleteSpanV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCompleteSpanReduceResultAbi {
+    CountAndSpanSumU64V1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDirectSearchEntryContract {
+    PublicCompleteV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDirectSearchResultAbi {
+    ExistsStatusOnlyV1,
+    SpanMatchedWritesBothV1,
+}
+
+impl NativeDirectSearchResultAbi {
+    const fn for_output(output: OutputContract) -> Option<Self> {
+        match output {
+            OutputContract::Exists => Some(Self::ExistsStatusOnlyV1),
+            OutputContract::Span => Some(Self::SpanMatchedWritesBothV1),
+            OutputContract::SelectedEnd => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDirectSearchTrustedCorePrologue {
+    X86_64 {
+        save_rbx: bool,
+        save_r12_r13: bool,
+        save_r14_r15: bool,
+    },
+    Aarch64,
+}
+
+impl NativeDirectSearchTrustedCorePrologue {
+    fn identity_tag(self) -> u8 {
+        match self {
+            Self::X86_64 {
+                save_rbx,
+                save_r12_r13,
+                save_r14_r15,
+            } => {
+                0x80 | u8::from(save_rbx)
+                    | (u8::from(save_r12_r13) << 1)
+                    | (u8::from(save_r14_r15) << 2)
+            }
+            Self::Aarch64 => 1,
+        }
+    }
+}
+
+fn authenticate_native_direct_search_trusted_core(
+    architecture: Architecture,
+    text: &[u8],
+    entry_start: usize,
+    entry_end: usize,
+    core: NativeDirectSearchTrustedCore,
+    expected_output: OutputContract,
+) -> Result<(), ObjectError> {
+    if core.output != expected_output
+        || core.entry_contract != NativeDirectSearchEntryContract::PublicCompleteV1
+        || Some(core.result_abi) != NativeDirectSearchResultAbi::for_output(expected_output)
+        || !(entry_start..entry_end).contains(&core.code_offset)
+        || !core.code_offset.is_multiple_of(match architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 4,
+        })
+        || !matches!(
+            (architecture, core.prologue),
+            (
+                Architecture::X86_64,
+                NativeDirectSearchTrustedCorePrologue::X86_64 { .. }
+            ) | (
+                Architecture::Aarch64,
+                NativeDirectSearchTrustedCorePrologue::Aarch64
+            )
+        )
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core contract is inconsistent",
+        ));
+    }
+    let entry = text
+        .get(entry_start..entry_end)
+        .ok_or(ObjectError::InvalidModule(
+            "direct search trusted core entry is outside text",
+        ))?;
+    let entry_sha256: [u8; 32] = Sha256::digest(entry).into();
+    if entry_sha256 != core.entry_code_sha256 {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core entry identity is inconsistent",
+        ));
+    }
+    if let NativeDirectSearchTrustedCorePrologue::X86_64 {
+        save_r12_r13,
+        save_r14_r15,
+        ..
+    } = core.prologue
+        && save_r14_r15
+        && !save_r12_r13
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core has an impossible x86 save mask",
+        ));
+    }
+    let landmark_matches = match architecture {
+        Architecture::X86_64 => {
+            text.get(core.code_offset..core.code_offset.saturating_add(6))
+                == Some([0x48, 0x89, 0xd6, 0x4c, 0x8d, 0x0d].as_slice())
+        }
+        Architecture::Aarch64 => {
+            let end = core.code_offset.saturating_add(12);
+            let mut landmark = [0_u8; 12];
+            landmark[..4].copy_from_slice(&aarch64_mov_x(9, 2)?.to_le_bytes());
+            landmark[4..8].copy_from_slice(&0x9000_0005_u32.to_le_bytes());
+            landmark[8..].copy_from_slice(&aarch64_add_x_imm(5, 5, 0)?.to_le_bytes());
+            text.get(core.code_offset..end) == Some(landmark.as_slice())
+        }
+    };
+    if !landmark_matches {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core landmark is malformed",
+        ));
+    }
+    Ok(())
 }
 
 struct NativeDynamicRowsEmission {
@@ -1267,21 +1663,29 @@ enum NativeDfaEntryContract {
     /// Variable-width Span completion may therefore return that start without
     /// a reverse-K0 postflight. Hole exits retain the ordinary resume ABI.
     PreparedPartialPropagatedStartCore,
+    /// Compiler-private complete Span scan used only after one additive
+    /// aggregate wrapper authenticates the public artifact identity. It
+    /// returns both Count and SpanSum in a private two-word result and never
+    /// publishes a partial match.
+    CompleteSpanReduceCoreV1,
 }
 
 impl NativeDfaEntryContract {
     const fn validates_public_args(self) -> bool {
-        !matches!(
-            self,
-            Self::PreparedPartialCore | Self::PreparedPartialPropagatedStartCore
-        )
+        matches!(self, Self::Public | Self::ExactAbsoluteAnchored { .. })
     }
 
     const fn register_outcome(self) -> bool {
         matches!(
             self,
-            Self::PreparedPartialCore | Self::PreparedPartialPropagatedStartCore
+            Self::PreparedPartialCore
+                | Self::PreparedPartialPropagatedStartCore
+                | Self::CompleteSpanReduceCoreV1
         )
+    }
+
+    const fn complete_span_reduce(self) -> bool {
+        matches!(self, Self::CompleteSpanReduceCoreV1)
     }
 
     const fn propagates_partial_span_window_start(self) -> bool {
@@ -1297,7 +1701,8 @@ impl NativeDfaEntryContract {
             Self::ExactAbsoluteAnchored { bounds, width } => Some((bounds, width)),
             Self::Public
             | Self::PreparedPartialCore
-            | Self::PreparedPartialPropagatedStartCore => None,
+            | Self::PreparedPartialPropagatedStartCore
+            | Self::CompleteSpanReduceCoreV1 => None,
         }
     }
 }
@@ -1355,6 +1760,245 @@ enum Aarch64MixedVectorPreference {
     )]
     PreferAsimd,
     PreferSve,
+}
+
+impl CompiledModule {
+    /// Authenticate the exact public complete-Span DFA and its table extent,
+    /// then lower an aggregate-only copy of that selected layout. This is an
+    /// additive compiler transaction: absence is an ordinary route decline,
+    /// while a present but inconsistent receipt is always terminal.
+    fn prepare_complete_span_reduce_core(
+        &self,
+        trusted_core: NativeDirectSearchTrustedCore,
+    ) -> Result<Option<NativeCompleteSpanReducePending>, ObjectError> {
+        if self.native_complete_span_reduce_core.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer source was already consumed",
+            ));
+        }
+        let Some(source) = self.native_complete_span_reduce_source.as_deref() else {
+            return Ok(None);
+        };
+        if source.layout.output != OutputContract::Span || source.layout.partial.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer source has an incompatible layout",
+            ));
+        }
+        match self.target.architecture {
+            Architecture::X86_64
+                if source.aarch64_sve_filter_plan.is_some()
+                    || source.aarch64_sve_suffix_kind.is_some() =>
+            {
+                return Err(ObjectError::InvalidModule(
+                    "x86 complete Span reducer source retained an AArch64 plan",
+                ));
+            }
+            Architecture::X86_64 | Architecture::Aarch64 => {}
+        }
+
+        let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("complete Span reducer entry index is invalid"),
+        )?;
+        let entry_start = usize::try_from(entry.offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("complete Span reducer entry offset"))?;
+        let entry_size = usize::try_from(entry.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("complete Span reducer entry size"))?;
+        let entry_end = entry_start
+            .checked_add(entry_size)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "complete Span reducer entry extent",
+            ))?;
+        let text = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "complete Span reducer module has no text section",
+            ))?
+            .data
+            .as_ref();
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text.len()
+        {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer entry is not a complete text function",
+            ));
+        }
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            text,
+            entry_start,
+            entry_end,
+            trusted_core,
+            OutputContract::Span,
+        )?;
+
+        let program = self.symbols.get(PROGRAM_SYMBOL).ok_or(
+            ObjectError::InvalidModule("complete Span reducer program symbol is absent"),
+        )?;
+        let program_offset = usize::try_from(program.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("complete Span reducer program offset")
+        })?;
+        let program_size = usize::try_from(program.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("complete Span reducer program size"))?;
+        let program_data = self
+            .sections
+            .get(PROGRAM_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "complete Span reducer module has no program section",
+            ))?
+            .data
+            .as_ref();
+        let program_end = program_offset.checked_add(program_size).ok_or(
+            ObjectError::ArithmeticOverflow("complete Span reducer program extent"),
+        )?;
+        if program.binding != SymbolBinding::Local
+            || program.kind != SymbolKind::Object
+            || program.section != Some(PROGRAM_SECTION)
+            || program_offset != 0
+            || program_size != source.program_bytes
+            || program_end != program_data.len()
+            || Sha256::digest(
+                program_data
+                    .get(program_offset..program_end)
+                    .ok_or(ObjectError::InvalidModule(
+                        "complete Span reducer program extent is outside data",
+                    ))?,
+            )
+            .as_slice()
+                != source.program_sha256
+        {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer program identity is inconsistent",
+            ));
+        }
+
+        let regenerated = match self.target.architecture {
+            Architecture::X86_64 => {
+                lower_x86_64_dfa_with_emission(source.layout, self.target.features)?
+            }
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                source.layout,
+                self.target.features,
+                self.target.operating_system,
+                source.aarch64_sve_filter_plan,
+                source.aarch64_sve_suffix_kind,
+                NativeDfaEntryContract::Public,
+            )?,
+        };
+        let regenerated_core = regenerated.direct_search_trusted_core.ok_or(
+            ObjectError::InvalidModule(
+                "regenerated public Span DFA omitted its trusted-core receipt",
+            ),
+        )?;
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &regenerated.code,
+            0,
+            regenerated.code.len(),
+            regenerated_core,
+            OutputContract::Span,
+        )?;
+        if regenerated.code.as_slice() != &text[entry_start..entry_end]
+            || regenerated_core.code_offset.checked_add(entry_start)
+                != Some(trusted_core.code_offset)
+            || regenerated_core.output != trusted_core.output
+            || regenerated_core.entry_contract != trusted_core.entry_contract
+            || regenerated_core.result_abi != trusted_core.result_abi
+            || regenerated_core.entry_code_sha256 != trusted_core.entry_code_sha256
+            || regenerated_core.prologue != trusted_core.prologue
+        {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer public entry regeneration disagrees",
+            ));
+        }
+        let entry_start_u64 = u64::try_from(entry_start).map_err(|_| {
+            ObjectError::ArithmeticOverflow("complete Span reducer relocation base")
+        })?;
+        let entry_end_u64 = u64::try_from(entry_end).map_err(|_| {
+            ObjectError::ArithmeticOverflow("complete Span reducer relocation extent")
+        })?;
+        let mut actual_relocations = self.relocations.iter().filter(|relocation| {
+            relocation.section == TEXT_SECTION
+                && (entry_start_u64..entry_end_u64).contains(&relocation.offset)
+        });
+        for expected in &regenerated.relocations {
+            if expected.section != TEXT_SECTION || expected.symbol != PROGRAM_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "regenerated public Span DFA has an unexpected relocation",
+                ));
+            }
+            let actual = actual_relocations.next().ok_or(ObjectError::InvalidModule(
+                "complete Span reducer public entry lost a relocation",
+            ))?;
+            if actual.section != expected.section
+                || actual.offset != expected.offset.checked_add(entry_start_u64).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "complete Span reducer relocation offset",
+                    ),
+                )?
+                || actual.kind != expected.kind
+                || actual.symbol != expected.symbol
+                || actual.addend != expected.addend
+            {
+                return Err(ObjectError::InvalidModule(
+                    "complete Span reducer public relocation regeneration disagrees",
+                ));
+            }
+        }
+        if actual_relocations.next().is_some() {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer public entry has an extra relocation",
+            ));
+        }
+
+        let emission = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                source.layout,
+                self.target.features,
+                NativeDfaEntryContract::CompleteSpanReduceCoreV1,
+            )?,
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                source.layout,
+                self.target.features,
+                self.target.operating_system,
+                source.aarch64_sve_filter_plan,
+                source.aarch64_sve_suffix_kind,
+                NativeDfaEntryContract::CompleteSpanReduceCoreV1,
+            )?,
+        };
+        if emission.code.is_empty()
+            || emission.direct_search_trusted_core.is_some()
+            || emission
+                .relocations
+                .iter()
+                .any(|relocation| {
+                    relocation.section != TEXT_SECTION || relocation.symbol != PROGRAM_SYMBOL
+                })
+        {
+            return Err(ObjectError::InvalidModule(
+                "complete Span reducer private emission is inconsistent",
+            ));
+        }
+        let code_size = emission.code.len();
+        let code_sha256 = Sha256::digest(&emission.code).into();
+        Ok(Some(NativeCompleteSpanReducePending {
+            emission,
+            core: NativeCompleteSpanReduceCore {
+                code_offset: 0,
+                code_size,
+                code_sha256,
+                public_entry_sha256: trusted_core.entry_code_sha256,
+                program_bytes: source.program_bytes,
+                program_sha256: source.program_sha256,
+                entry_contract:
+                    NativeCompleteSpanReduceEntryContract::AuthenticatedCompleteSpanV1,
+                result_abi: NativeCompleteSpanReduceResultAbi::CountAndSpanSumU64V1,
+            },
+        }))
+    }
 }
 
 /// Explicit Linux policy for a target that reports both fixed-width ASIMD and
@@ -1522,6 +2166,16 @@ pub enum PreparedBulkStrategy {
     NativeOrderedNfaLoop,
 }
 
+/// Implementation selected behind a handle-free direct Exists-batch symbol.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DirectExistsBatchStrategy {
+    /// Generated code validates one descriptor array and locally invokes the
+    /// ordinary matcher's implementation once per independent haystack. The
+    /// compiler may authenticate a private full-window entry into that same
+    /// implementation, without changing the public ordinary entry.
+    NativeOrdinaryEntryLoop,
+}
+
 /// Prepared-handle capability bit required by an object whose aggregate/fill
 /// benchmark path is published through the native Ordered-TNFA iterator.
 /// This value is intentionally identical to runtime V3's capability bit but
@@ -1603,10 +2257,55 @@ pub(crate) enum PreparedOrderedNfaV15LoweringDisposition {
     DataLimit { required: usize },
 }
 
+pub(crate) struct DirectExactSingletonCountPatchRollback {
+    original_text: Box<[u8]>,
+    original_relocations: Option<Box<[ModuleRelocation]>>,
+    old_count_symbol_name: String,
+    old_count_symbol_size: u64,
+}
+
+pub(crate) struct DirectExactSingletonSpanSumPatchRollback {
+    original_text: Box<[u8]>,
+    original_relocations: Option<Box<[ModuleRelocation]>>,
+    old_span_sum_symbol_name: String,
+    old_span_sum_symbol_size: u64,
+}
+
+const DIRECT_EXACT_SINGLETON_COUNT_DIRECT_THUNK_BYTES: usize = 16;
+
+struct DirectExactSingletonCountColdLong {
+    code: Vec<u8>,
+    identity_page_offset: usize,
+    identity_page_off12_offset: usize,
+    core_branch_offset: usize,
+}
+
+struct DirectExactSingletonSpanSumColdLong {
+    code: Vec<u8>,
+    identity_page_offset: usize,
+    identity_page_off12_offset: usize,
+    wrapper_branch_offset: usize,
+}
+
+struct DirectExactSingletonSpanSumWrapper {
+    code: Vec<u8>,
+    count_call_offset: usize,
+}
+
+struct AuthenticatedDirectExactSingletonSpanSumIncumbent {
+    symbol_index: usize,
+    symbol_start: usize,
+    symbol_size: usize,
+    authenticated_body_offset: usize,
+    module_identity: [u8; 32],
+    identity_symbol_index: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedOrderedNfaV15Surface {
     Compatibility,
     ScalarOperationOnly,
+    RowSearchOnly,
 }
 
 /// Object-format-neutral native module.
@@ -1620,6 +2319,10 @@ pub struct CompiledModule {
     prepared_entry_symbol_index: Option<usize>,
     prepared_span_fill_symbol_index: Option<usize>,
     prepared_exists_batch_symbol_index: Option<usize>,
+    direct_exists_batch_symbol_index: Option<usize>,
+    native_direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
+    native_complete_span_reduce_source: Option<Box<NativeCompleteSpanReduceSource>>,
+    native_complete_span_reduce_core: Option<NativeCompleteSpanReduceCore>,
     prepared_count_symbol_index: Option<usize>,
     prepared_span_sum_symbol_index: Option<usize>,
     prepared_grep_count_symbol_index: Option<usize>,
@@ -1634,6 +2337,15 @@ pub struct CompiledModule {
     ordered_nfa_bulk_gate_target: Option<usize>,
     prepared_aggregate_exports: PreparedAggregateExports,
     prepared_aggregate_strategy: Option<PreparedAggregateStrategy>,
+    /// First instruction after the direct Count wrapper's complete public
+    /// argument and artifact-identity authentication prefix.
+    prepared_count_authenticated_body_offset: Option<usize>,
+    /// First instruction after the direct `SpanSum` wrapper's complete public
+    /// argument and artifact-identity authentication prefix.
+    prepared_span_sum_authenticated_body_offset: Option<usize>,
+    direct_exact_singleton_count_aot_report: Option<DirectExactSingletonCountAotReport>,
+    direct_exact_singleton_span_sum_aot_report:
+        Option<DirectExactSingletonSpanSumAotReport>,
     runtime_symbol_index: Option<usize>,
     runtime_program_symbol_index: Option<usize>,
     start_accelerator: StartAccelerator,
@@ -1644,6 +2356,8 @@ pub struct CompiledModule {
     exact_finite_exists_leaf_report: Option<ExactFiniteExistsLeafReport>,
     exact_finite_selected_end_teddy_aot_report: Option<ExactFiniteSelectedEndTeddyAotReport>,
     exact_finite_selected_end_teddy_aot_report_v2: Option<ExactFiniteSelectedEndTeddyAotReportV2>,
+    exact_finite_selected_end_grep_count_aot_report:
+        Option<ExactFiniteSelectedEndGrepCountAotReport>,
     ordered_finite_language_aot_report: Option<OrderedFiniteLanguageAotReport>,
     slow_retained_forward_minimized: bool,
     optimizing_fallbacks_may_continue: bool,
@@ -1664,6 +2378,11 @@ pub struct CompiledModule {
     /// Whether this exact Ordered-NFA text uses the anchored-prefix first-byte
     /// proof. This compiler-only bit drives its monotone final-object retry.
     ordered_nfa_start_prefix_lowered: bool,
+    /// Whether the emitted Ordered-NFA text actually selected its optional
+    /// ASIMD start-prefix scanner. This lowering-produced compiler-only fact
+    /// gates the exact scalar-prefix final-object ablation; a target policy
+    /// permission or an ordinary scalar prefix alone is insufficient.
+    ordered_nfa_start_prefix_vector_lowered: bool,
     /// Exact graph-proved fragmented final-byte membership retained for
     /// exhaustive Count/SpanSum wrappers. The ordinary Ordered-NFA entry is
     /// byte-inert to these compiler-only words; they drive the first monotone
@@ -1791,6 +2510,9 @@ const PREPARED_SPAN_FILL_SYMBOL_PREFIX: &str =
     "fre_aot_regex_fill_spans_exclusive_v1_";
 const PREPARED_EXISTS_BATCH_SYMBOL_PREFIX: &str =
     "fre_aot_regex_is_match_batch_exclusive_v1_";
+const DIRECT_EXISTS_BATCH_SYMBOL_PREFIX: &str = "fre_aot_regex_is_match_batch_v1_";
+const DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/direct-exists-batch-trusted-full-window-v2\0";
 const PREPARED_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_count_exclusive_v1_";
 const PREPARED_SPAN_SUM_SYMBOL_PREFIX: &str = "fre_aot_regex_span_sum_exclusive_v1_";
 const PREPARED_GREP_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_grep_count_exclusive_v1_";
@@ -1933,6 +2655,8 @@ struct NativeLowering {
     /// This drives a final-object retry to the exact pre-feature complete-DFA
     /// portfolio and never enters frozen data.
     exact_pair_suffix_lowered: bool,
+    direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
+    complete_span_reduce_source: Option<Box<NativeCompleteSpanReduceSource>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2687,11 +3411,13 @@ enum PreparedEntryKind {
 )]
 struct PreparedOrderedNfaEntryLayout {
     operation_only: bool,
+    row_search_only: bool,
     object_abi_version: u32,
     terminal_exact_set_lowered: Option<[u64; 4]>,
     whole_window_width_gate_lowered: bool,
     start_closure_dispatch_lowered: bool,
     start_prefix_lowered: bool,
+    start_prefix_vector_lowered: bool,
     object_offset: usize,
     object_size: usize,
     object_alignment: usize,
@@ -3151,6 +3877,36 @@ impl CompiledModule {
             allow_ordered_nfa_start_prefix,
             allow_ordered_nfa_whole_window_width_gate,
             allow_ordered_nfa_terminal_exact_set,
+            true,
+            max_native_data_bytes,
+        )
+    }
+
+    /// Rebuild the exact post-width-retry Ordered-NFA candidate while
+    /// retaining the scalar anchored-prefix proof and disabling only its
+    /// AArch64 ASIMD idle scanner. This is the final-object-cap incumbent for
+    /// the additive SIMD text; frozen native data and every older retained
+    /// route remain unchanged.
+    pub(crate) fn lower_ordered_nfa_scalar_prefix_after_width_retry(
+        program: &CompiledProgram,
+        target: Target,
+        allow_endpoint_oracle: bool,
+        allow_ordered_nfa: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        Self::lower_without_slow_optimization(
+            program,
+            target,
+            false,
+            allow_endpoint_oracle,
+            allow_ordered_nfa,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
             max_native_data_bytes,
         )
     }
@@ -3377,7 +4133,7 @@ impl CompiledModule {
                     allow_ordered_nfa
                         .then(|| program.native_ordered_nfa_view())
                         .flatten()
-                        .map(|view| (view, effective_native_data_limit_bytes)),
+                        .map(|view| (view, effective_native_data_limit_bytes, true)),
                     target,
                 )
                 .map_err(CompileError::from);
@@ -3642,7 +4398,7 @@ impl CompiledModule {
                 allow_ordered_nfa
                     .then(|| program.native_ordered_nfa_view())
                     .flatten()
-                    .map(|view| (view, effective_native_data_limit_bytes)),
+                    .map(|view| (view, effective_native_data_limit_bytes, true)),
                 target,
             )
             .map_err(CompileError::from);
@@ -4351,7 +5107,7 @@ impl CompiledModule {
             allow_ordered_nfa
                 .then(|| program.native_ordered_nfa_view())
                 .flatten()
-                .map(|view| (view, effective_native_data_limit_bytes)),
+                .map(|view| (view, effective_native_data_limit_bytes, true)),
             target,
         )
         .map_err(CompileError::from)?;
@@ -4388,6 +5144,7 @@ impl CompiledModule {
             true,
             true,
             allow_ordered_nfa,
+            true,
             true,
             true,
             true,
@@ -4468,6 +5225,36 @@ impl CompiledModule {
         clippy::fn_params_excessive_bools,
         reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
     )]
+    pub(crate) fn lower_prepared_ordered_nfa_v15_row_search_with_native_data_limit(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        Self::lower_prepared_ordered_nfa_v15_with_native_data_limit_and_surface(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+            PreparedOrderedNfaV15Surface::RowSearchOnly,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
     fn lower_prepared_ordered_nfa_v15_with_native_data_limit_and_surface(
         program: &CompiledProgram,
         target: Target,
@@ -4491,6 +5278,7 @@ impl CompiledModule {
             allow_ordered_nfa_terminal_exact_set,
             max_native_data_bytes,
             surface,
+            true,
         )? {
             PreparedOrderedNfaV15LoweringDisposition::Lowered(module) => Ok(module),
             PreparedOrderedNfaV15LoweringDisposition::Unsupported => Err(
@@ -4537,6 +5325,7 @@ impl CompiledModule {
             allow_ordered_nfa_terminal_exact_set,
             max_native_data_bytes,
             PreparedOrderedNfaV15Surface::Compatibility,
+            true,
         )
     }
 
@@ -4567,7 +5356,79 @@ impl CompiledModule {
             allow_ordered_nfa_terminal_exact_set,
             max_native_data_bytes,
             PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+            true,
         )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::fn_params_excessive_bools,
+        reason = "final-object retries independently remove six additive Ordered-NFA accelerators"
+    )]
+    pub(crate) fn lower_prepared_ordered_nfa_v15_row_search_reported(
+        program: &CompiledProgram,
+        target: Target,
+        allow_ordered_edge_dispatch: bool,
+        allow_ordered_nfa_terminal_range: bool,
+        allow_ordered_nfa_start_closure_dispatch: bool,
+        allow_ordered_nfa_start_prefix: bool,
+        allow_ordered_nfa_whole_window_width_gate: bool,
+        allow_ordered_nfa_terminal_exact_set: bool,
+        max_native_data_bytes: usize,
+    ) -> Result<PreparedOrderedNfaV15LoweringDisposition, CompileError> {
+        Self::lower_prepared_ordered_nfa_v15_reported_with_surface(
+            program,
+            target,
+            allow_ordered_edge_dispatch,
+            allow_ordered_nfa_terminal_range,
+            allow_ordered_nfa_start_closure_dispatch,
+            allow_ordered_nfa_start_prefix,
+            allow_ordered_nfa_whole_window_width_gate,
+            allow_ordered_nfa_terminal_exact_set,
+            max_native_data_bytes,
+            PreparedOrderedNfaV15Surface::RowSearchOnly,
+            true,
+        )
+    }
+
+    /// Rebuild the exact prepared candidate after terminal-set and width-gate
+    /// retries while retaining scalar prefix acceleration and disabling only
+    /// the additive AArch64 ASIMD idle scanner.
+    pub(crate) fn lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+        surface: PreparedOrderedNfaV15Surface,
+    ) -> Result<Self, CompileError> {
+        match Self::lower_prepared_ordered_nfa_v15_reported_with_surface(
+            program,
+            target,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            max_native_data_bytes,
+            surface,
+            false,
+        )? {
+            PreparedOrderedNfaV15LoweringDisposition::Lowered(module) => Ok(module),
+            PreparedOrderedNfaV15LoweringDisposition::Unsupported => {
+                Err(ObjectError::InvalidModule(
+                    "prepared Ordered-NFA scalar-prefix retry is unsupported",
+                )
+                .into())
+            }
+            PreparedOrderedNfaV15LoweringDisposition::DataLimit { required } => {
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit: max_native_data_bytes,
+                    required,
+                }
+                .into())
+            }
+        }
     }
 
     #[allow(
@@ -4586,6 +5447,7 @@ impl CompiledModule {
         allow_ordered_nfa_terminal_exact_set: bool,
         max_native_data_bytes: usize,
         surface: PreparedOrderedNfaV15Surface,
+        allow_start_prefix_vector: bool,
     ) -> Result<PreparedOrderedNfaV15LoweringDisposition, CompileError> {
         target.validate()?;
         let program_bytes = program.serialize()?;
@@ -4618,6 +5480,7 @@ impl CompiledModule {
                 max_native_data_bytes,
                 FROZEN_ORDERED_NFA_V15_MAX_DESCRIPTOR_BYTES,
                 surface,
+                allow_start_prefix_vector,
             )? {
                 NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => {
                     (lowering, layout)
@@ -4660,6 +5523,15 @@ impl CompiledModule {
                     && module.prepared_span_fill_symbol().is_none()
                     && module.required_runtime_symbols().next().is_none()
             }
+            PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                module.prepared_bulk_strategy().is_none()
+                    && module.prepared_entry_symbol() == Some(module.entry_symbol())
+                    && module.prepared_span_fill_symbol().is_none()
+                    && module.prepared_aggregate_exports().is_empty()
+                    && module.prepared_aggregate_strategy().is_none()
+                    && module.required_runtime_symbols().next().is_none()
+                    && module.required_runtime_program().is_some()
+            }
         };
         if !surface_is_exact
             || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
@@ -4688,6 +5560,7 @@ impl CompiledModule {
         allow_ordered_nfa_start_prefix: bool,
         allow_ordered_nfa_whole_window_width_gate: bool,
         allow_ordered_nfa_terminal_exact_set: bool,
+        allow_ordered_nfa_start_prefix_vector: bool,
         max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
         target.validate()?;
@@ -4750,7 +5623,13 @@ impl CompiledModule {
                     }
                     view
                 })
-                .map(|view| (view, max_native_data_bytes)),
+                .map(|view| {
+                    (
+                        view,
+                        max_native_data_bytes,
+                        allow_ordered_nfa_start_prefix_vector,
+                    )
+                }),
             target,
         )
         .map_err(CompileError::from)
@@ -4769,12 +5648,15 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
-        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize, bool)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         let prelowered = if native_materialized_fallback {
             native
-                .map(|view| lower_native_dfa(view, target).unwrap_or(None))
+                .map(|view| {
+                    materialized_native_fallback_outcome(lower_native_dfa(view, target))
+                })
+                .transpose()?
                 .flatten()
         } else {
             None
@@ -4821,7 +5703,7 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
-        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize, bool)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         Self::lower_serialized_with_prelowered_and_exact_finite_exists(
@@ -4867,7 +5749,7 @@ impl CompiledModule {
         native_endpoint_oracle: Option<NativeBitParallelEndpointOracleView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView<'_>>,
-        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+        native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize, bool)>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         if slow_retained_forward_minimized && slow_aot_report.is_none() {
@@ -5201,6 +6083,18 @@ impl CompiledModule {
                 }
             ))
         );
+        let ordered_nfa_row_search_only = matches!(
+            prepared_layout.map(|layout| layout.kind),
+            Some(PreparedEntryKind::OrderedNfa(
+                PreparedOrderedNfaEntryLayout {
+                    operation_only: true,
+                    row_search_only: true,
+                    ..
+                }
+            ))
+        );
+        let ordered_nfa_scalar_operation_only =
+            ordered_nfa_operation_only && !ordered_nfa_row_search_only;
         let prepared_bulk_layout = match prepared_layout {
             Some(prepared) => {
                 let output =
@@ -5209,18 +6103,24 @@ impl CompiledModule {
             }
             None => PreparedBulkEntryLayout::default(),
         };
-        let native_prepared_bulk_search_target = prepared_layout
-            .map(native_prepared_bulk_search_target)
-            .transpose()?
-            .flatten();
-        let ordered_nfa_bulk_gate_target = prepared_layout.and_then(|prepared| {
-            match prepared.kind {
+        let native_prepared_bulk_search_target = if ordered_nfa_row_search_only {
+            None
+        } else {
+            prepared_layout
+                .map(native_prepared_bulk_search_target)
+                .transpose()?
+                .flatten()
+        };
+        let ordered_nfa_bulk_gate_target = if ordered_nfa_row_search_only {
+            None
+        } else {
+            prepared_layout.and_then(|prepared| match prepared.kind {
                 PreparedEntryKind::OrderedNfa(ordered) => {
                     Some(ordered.bulk_gate_entry_offset)
                 }
                 PreparedEntryKind::RuntimeAdapter | PreparedEntryKind::Native(_) => None,
-            }
-        });
+            })
+        };
         // The bulk entry is generated after every possible prepared-entry
         // composition, including endpoint-oracle composites. Recompute the
         // identity over the final text while retaining the exact serialized
@@ -5286,7 +6186,7 @@ impl CompiledModule {
         };
         let prepared_entry_name = prepared_layout
             .map(|_| {
-                if ordered_nfa_operation_only {
+                if ordered_nfa_scalar_operation_only {
                     owned_string(
                         ".Lfre_aot_regex_ordered_nfa_operation_private_v1",
                         "Ordered-NFA operation-only private symbol",
@@ -5304,8 +6204,7 @@ impl CompiledModule {
             .exists_batch
             .map(|_| identity_symbol(PREPARED_EXISTS_BATCH_SYMBOL_PREFIX, &native_digest))
             .transpose()?;
-        let runtime_program_name = lowering
-            .needs_runtime
+        let runtime_program_name = (lowering.needs_runtime || ordered_nfa_row_search_only)
             .then(|| identity_symbol(RUNTIME_PROGRAM_SYMBOL_PREFIX, &native_digest))
             .transpose()?;
 
@@ -5313,7 +6212,7 @@ impl CompiledModule {
             .map_err(|_| ObjectError::ArithmeticOverflow("module code size"))?;
         let data_size = u64::try_from(lowering.data.len())
             .map_err(|_| ObjectError::ArithmeticOverflow("module program size"))?;
-        let program_size = if lowering.needs_runtime {
+        let program_size = if lowering.needs_runtime || ordered_nfa_row_search_only {
             u64::try_from(serialized_program_size)
                 .map_err(|_| ObjectError::ArithmeticOverflow("serialized module program size"))?
         } else {
@@ -5422,10 +6321,40 @@ impl CompiledModule {
                 size: program_size,
             });
             (Some(RUNTIME_SYMBOL), Some(RUNTIME_PROGRAM_SYMBOL))
+        } else if ordered_nfa_row_search_only {
+            if symbols.len() != RUNTIME_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "row-search Ordered-NFA symbol prefix is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_ordered_nfa_row_search_no_runtime_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: 0,
+            });
+            if symbols.len() != RUNTIME_PROGRAM_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "row-search Ordered-NFA program symbol padding is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: runtime_program_name.ok_or(ObjectError::InvalidModule(
+                    "row-search program identity was not constructed",
+                ))?,
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: program_size,
+            });
+            (None, Some(RUNTIME_PROGRAM_SYMBOL))
         } else {
             (None, None)
         };
-        if ordered_nfa_operation_only {
+        if ordered_nfa_scalar_operation_only {
             // Ordered-NFA relocation records and the public compatibility
             // layout deliberately keep their established symbol ordinals.
             // Fill the two runtime-only ordinals with defined local program
@@ -5487,7 +6416,7 @@ impl CompiledModule {
                 name: prepared_entry_name.ok_or(ObjectError::InvalidModule(
                     "prepared entry identity was not constructed",
                 ))?,
-                binding: if ordered_nfa_operation_only {
+                binding: if ordered_nfa_scalar_operation_only {
                     SymbolBinding::Local
                 } else {
                     SymbolBinding::Global
@@ -5599,6 +6528,7 @@ impl CompiledModule {
                             && (lowering.needs_runtime
                                 || prepared_bulk_layout
                                     != PreparedBulkEntryLayout::default()))
+                        || (ordered.row_search_only && !ordered.operation_only)
                     {
                         return Err(ObjectError::InvalidModule(
                             "Ordered-NFA prepared symbol geometry is inconsistent",
@@ -6146,10 +7076,18 @@ impl CompiledModule {
             sections,
             symbols: symbols.into_boxed_slice(),
             relocations: lowering.relocations.into_boxed_slice(),
-            entry_symbol_index: ENTRY_SYMBOL,
+            entry_symbol_index: if ordered_nfa_row_search_only {
+                PREPARED_ENTRY_SYMBOL
+            } else {
+                ENTRY_SYMBOL
+            },
             prepared_entry_symbol_index,
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
+            direct_exists_batch_symbol_index: None,
+            native_direct_search_trusted_core: lowering.direct_search_trusted_core,
+            native_complete_span_reduce_source: lowering.complete_span_reduce_source,
+            native_complete_span_reduce_core: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -6166,6 +7104,10 @@ impl CompiledModule {
             ordered_nfa_bulk_gate_target,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
+            prepared_count_authenticated_body_offset: None,
+            prepared_span_sum_authenticated_body_offset: None,
+            direct_exact_singleton_count_aot_report: None,
+            direct_exact_singleton_span_sum_aot_report: None,
             runtime_symbol_index,
             runtime_program_symbol_index,
             start_accelerator: lowering.start_accelerator,
@@ -6176,6 +7118,7 @@ impl CompiledModule {
             exact_finite_exists_leaf_report,
             exact_finite_selected_end_teddy_aot_report: None,
             exact_finite_selected_end_teddy_aot_report_v2: None,
+            exact_finite_selected_end_grep_count_aot_report: None,
             ordered_finite_language_aot_report,
             slow_retained_forward_minimized,
             optimizing_fallbacks_may_continue: true,
@@ -6195,6 +7138,13 @@ impl CompiledModule {
                 prepared_layout.map(|layout| layout.kind),
                 Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
                     start_prefix_lowered: true,
+                    ..
+                }))
+            ),
+            ordered_nfa_start_prefix_vector_lowered: matches!(
+                prepared_layout.map(|layout| layout.kind),
+                Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
+                    start_prefix_vector_lowered: true,
                     ..
                 }))
             ),
@@ -6422,6 +7372,16 @@ impl CompiledModule {
         self.exact_finite_selected_end_teddy_aot_report_v2.as_ref()
     }
 
+    /// Return provenance for the opt-in exact-finite `SelectedEnd` line-jump
+    /// GrepCount reducer.
+    #[must_use]
+    pub const fn exact_finite_selected_end_grep_count_aot_report(
+        &self,
+    ) -> Option<&ExactFiniteSelectedEndGrepCountAotReport> {
+        self.exact_finite_selected_end_grep_count_aot_report
+            .as_ref()
+    }
+
     /// Return exact geometry for a selected ordered finite-language native
     /// leaf. This is absent for every stable restored program because its
     /// source-authenticated optimizer sidecar is deliberately not serialized.
@@ -6544,6 +7504,32 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
+    /// Return the handle-free independent-haystack Exists batch entry.
+    ///
+    /// The returned symbol accepts a pointer to an array of pointer/length
+    /// descriptors, a descriptor count, one writable byte per item, and a
+    /// writable processed-prefix count. It is present only when explicitly
+    /// requested for a self-contained direct [`OutputContract::Exists`]
+    /// module. Its canonical C/Rust function type is
+    /// `FreAotRegexIndependentExistsBatchV1` in `fre-aot-regex-runtime`; the
+    /// ordinary scalar entry remains unchanged.
+    #[must_use]
+    pub fn direct_exists_batch_symbol(&self) -> Option<&str> {
+        self.direct_exists_batch_symbol_index
+            .and_then(|index| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return how the handle-free direct Exists-batch symbol executes.
+    #[must_use]
+    pub const fn direct_exists_batch_strategy(&self) -> Option<DirectExistsBatchStrategy> {
+        if self.direct_exists_batch_symbol_index.is_some() {
+            Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop)
+        } else {
+            None
+        }
+    }
+
     /// Return the prepared full-haystack Count entry, when requested.
     ///
     /// The entry accepts a runtime-exclusive handle prepared from this
@@ -6591,6 +7577,207 @@ impl CompiledModule {
     #[must_use]
     pub const fn prepared_aggregate_strategy(&self) -> Option<PreparedAggregateStrategy> {
         self.prepared_aggregate_strategy
+    }
+
+    /// Whether this completed helper-free aggregate contains a Count or
+    /// SpanSum wrapper whose local call was retargeted to the authenticated
+    /// post-init body of its public complete Span entry.
+    pub(crate) fn uses_direct_span_trusted_core_aggregate(&self) -> bool {
+        self.prepared_aggregate_strategy == Some(PreparedAggregateStrategy::NativeFused)
+            && (self
+                .prepared_aggregate_exports
+                .contains(PreparedAggregateExports::COUNT)
+                || self
+                    .prepared_aggregate_exports
+                    .contains(PreparedAggregateExports::SPAN_SUM))
+            && self.native_direct_search_trusted_core.is_some_and(|core| {
+                core.output == OutputContract::Span
+                    && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+                    && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
+            })
+            && self.native_complete_span_reduce_core.is_none()
+            && self.prepared_entry_symbol_index.is_none()
+            && self.required_runtime_symbols().next().is_none()
+    }
+
+    /// Whether one exact Count or SpanSum export calls a single authenticated
+    /// complete-Span reduction core rather than iterating the public Span ABI.
+    pub(crate) fn uses_complete_span_reduce_aggregate(&self) -> bool {
+        let Some(core) = self.native_direct_search_trusted_core else {
+            return false;
+        };
+        let Some(reduce) = self.native_complete_span_reduce_core else {
+            return false;
+        };
+        let code_end = reduce.code_offset.checked_add(reduce.code_size);
+        self.prepared_aggregate_strategy == Some(PreparedAggregateStrategy::NativeFused)
+            && (self.prepared_aggregate_exports == PreparedAggregateExports::COUNT
+                || self.prepared_aggregate_exports == PreparedAggregateExports::SPAN_SUM)
+            && core.output == OutputContract::Span
+            && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+            && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
+            && reduce.entry_contract
+                == NativeCompleteSpanReduceEntryContract::AuthenticatedCompleteSpanV1
+            && reduce.result_abi == NativeCompleteSpanReduceResultAbi::CountAndSpanSumU64V1
+            && reduce.public_entry_sha256 == core.entry_code_sha256
+            && reduce.program_bytes != 0
+            && self.native_complete_span_reduce_source.is_none()
+            && reduce.code_size != 0
+            && code_end.is_some_and(|end| {
+                self.sections
+                    .get(TEXT_SECTION)
+                    .and_then(|section| section.data.get(reduce.code_offset..end))
+                    .is_some_and(|code| {
+                        <[u8; 32]>::from(Sha256::digest(code)) == reduce.code_sha256
+                    })
+            })
+            && self.prepared_entry_symbol_index.is_none()
+            && self.required_runtime_symbols().next().is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn has_complete_span_reduce_source_for_test(&self) -> bool {
+        self.native_complete_span_reduce_source.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_span_reduce_core_offset(&self) -> Option<usize> {
+        let reduce = self.native_complete_span_reduce_core?;
+        self.uses_complete_span_reduce_aggregate()
+            .then_some(reduce.code_offset)
+    }
+
+    pub(crate) fn direct_span_trusted_core_entry_sha256(&self) -> Option<[u8; 32]> {
+        let core = self.native_direct_search_trusted_core?;
+        (core.output == OutputContract::Span
+            && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+            && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1)
+            .then_some(core.entry_code_sha256)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_span_trusted_core_offset(&self) -> Option<usize> {
+        let core = self.native_direct_search_trusted_core?;
+        (core.output == OutputContract::Span
+            && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+            && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1)
+            .then_some(core.code_offset)
+    }
+
+    /// Remove only the compiler-private Span core receipt. This is used after
+    /// a proven final ObjectBytes decline to reconstruct the byte-identical
+    /// pre-feature DirectOrdinary aggregate wrapper. Every allocator or
+    /// authentication failure during that retry remains terminal.
+    pub(crate) fn without_direct_span_trusted_core_for_aggregate(
+        mut self,
+    ) -> Result<Self, ObjectError> {
+        match self.native_direct_search_trusted_core {
+            Some(core)
+                if core.output == OutputContract::Span
+                    && core.entry_contract == NativeDirectSearchEntryContract::PublicCompleteV1
+                    && core.result_abi == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1 =>
+            {
+                self.native_direct_search_trusted_core = None;
+                Ok(self)
+            }
+            None => Ok(self),
+            Some(_) => Err(ObjectError::InvalidModule(
+                "aggregate Span trusted-core fallback has an inconsistent receipt",
+            )),
+        }
+    }
+
+    /// Suppress only the optional complete-reduction recipe on a freshly
+    /// reconstructed ordinary module. The public trusted Span core remains
+    /// available, yielding the exact ce964 aggregate incumbent.
+    pub(crate) fn without_complete_span_reduce_for_aggregate(
+        mut self,
+    ) -> Result<Self, ObjectError> {
+        let Some(core) = self.native_direct_search_trusted_core else {
+            return if self.native_complete_span_reduce_source.is_none()
+                && self.native_complete_span_reduce_core.is_none()
+            {
+                Ok(self)
+            } else {
+                Err(ObjectError::InvalidModule(
+                    "complete Span reducer fallback lost its trusted-core receipt",
+                ))
+            };
+        };
+        match (
+            self.native_complete_span_reduce_source.as_deref(),
+            self.native_complete_span_reduce_core,
+        ) {
+            (Some(source), None)
+                if core.output == OutputContract::Span
+                    && core.entry_contract
+                        == NativeDirectSearchEntryContract::PublicCompleteV1
+                    && core.result_abi
+                        == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
+                    && source.layout.output == OutputContract::Span
+                    && source.layout.partial.is_none() =>
+            {
+                self.native_complete_span_reduce_source = None;
+                Ok(self)
+            }
+            (None, None) => Ok(self),
+            _ => Err(ObjectError::InvalidModule(
+                "complete Span reducer fallback has an inconsistent receipt",
+            )),
+        }
+    }
+
+    /// Return the authenticated direct Count-v3 selection, when the explicit
+    /// Count aggregate portfolio chose it over the complete incumbent.
+    #[must_use]
+    pub const fn direct_exact_singleton_count_aot_report(
+        &self,
+    ) -> Option<&DirectExactSingletonCountAotReport> {
+        self.direct_exact_singleton_count_aot_report.as_ref()
+    }
+
+    /// Return the exact authenticated direct `SpanSum` selection, when the
+    /// explicit aggregate portfolio chose it over the complete incumbent.
+    #[must_use]
+    pub const fn direct_exact_singleton_span_sum_aot_report(
+        &self,
+    ) -> Option<&DirectExactSingletonSpanSumAotReport> {
+        self.direct_exact_singleton_span_sum_aot_report.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_flip_text_byte(&mut self, offset: usize) -> bool {
+        let Some(byte) = self.sections[TEXT_SECTION].data.get_mut(offset) else {
+            return false;
+        };
+        *byte ^= 1;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_flip_program_byte(&mut self, offset: usize) -> bool {
+        let Some(byte) = self.sections[PROGRAM_SECTION].data.get_mut(offset) else {
+            return false;
+        };
+        *byte ^= 1;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_flip_text_relocation_addend_in_range(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        let Some(relocation) = self.relocations.iter_mut().find(|relocation| {
+            relocation.section == TEXT_SECTION
+                && usize::try_from(relocation.offset)
+                    .is_ok_and(|offset| (start..end).contains(&offset))
+        }) else {
+            return false;
+        };
+        relocation.addend ^= 1;
+        true
     }
 
     /// Return how the emitted prepared bulk-search symbol performs its loop.
@@ -6685,6 +7872,15 @@ impl CompiledModule {
         self.ordered_nfa_start_prefix_lowered
     }
 
+    /// Whether the exact emitted Ordered-NFA entry contains its optional
+    /// ASIMD start-prefix scanner. This fact comes directly from the target
+    /// lowering and is used only to decide whether scalar-prefix object-cap
+    /// ablation is applicable.
+    #[must_use]
+    pub(crate) const fn has_ordered_nfa_start_prefix_vector(&self) -> bool {
+        self.ordered_nfa_start_prefix_vector_lowered
+    }
+
     /// Whether the module retains the compiler-only fragmented terminal proof
     /// for exhaustive aggregate wrappers. The shared one-Span entry remains
     /// byte-identical without it; this receipt participates in monotone
@@ -6759,6 +7955,687 @@ impl CompiledModule {
     #[cfg(test)]
     pub(crate) fn inject_test_only_runtime_program_dependency(&mut self) {
         self.runtime_program_symbol_index = Some(PROGRAM_SYMBOL);
+    }
+    /// Authenticate the allocation-free module half of exact-finite
+    /// GrepCount admission. A caller uses this before serializing the program
+    /// so a structural decline performs no additive allocation at all.
+    pub(crate) fn can_append_exact_finite_selected_end_grep_count(
+        &self,
+    ) -> Result<bool, ObjectError> {
+        if self
+            .exact_finite_selected_end_grep_count_aot_report
+            .is_some()
+            || !self.prepared_aggregate_exports.is_empty()
+            || self.prepared_count_symbol_index.is_some()
+            || self.prepared_span_sum_symbol_index.is_some()
+            || self.prepared_grep_count_symbol_index.is_some()
+            || self.prepared_aggregate_strategy.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount was appended more than once or overlaps another aggregate surface",
+            ));
+        }
+        if self.prepared_entry_symbol_index.is_some()
+            || self.prepared_span_fill_symbol_index.is_some()
+            || self.prepared_exists_batch_symbol_index.is_some()
+            || self.prepared_bulk_strategy.is_some()
+            || self.required_prepare_capabilities != 0
+            || self.native_prepared_bulk_search_target.is_some()
+            || self.ordered_nfa_bulk_gate_target.is_some()
+            || self.runtime_symbol_index.is_some()
+            || self.runtime_program_symbol_index.is_some()
+            || self.required_runtime_symbols().next().is_some()
+        {
+            return Ok(false);
+        }
+        let text_len = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount module has no text section",
+            ))?
+            .data
+            .len();
+        if self.sections.get(PROGRAM_SECTION).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount module has no data section",
+            ));
+        }
+        let entry = self
+            .symbols
+            .get(self.entry_symbol_index)
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount entry index is invalid",
+            ))?;
+        let entry_start = usize::try_from(entry.offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount entry offset"))?;
+        let entry_size = usize::try_from(entry.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount entry size"))?;
+        let entry_end =
+            entry_start
+                .checked_add(entry_size)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "exact-finite GrepCount entry extent",
+                ))?;
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount target is not a complete text function",
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Append the opt-in exact-finite `SelectedEnd` matching-line reducer to
+    /// a complete self-contained direct module. Unsupported module topology or
+    /// local-call reach returns `None`; malformed state, allocation failure,
+    /// arithmetic failure, and backend failure remain terminal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "route authentication, fallible construction, local relocation, identity, and publication form one transaction"
+    )]
+    pub(crate) fn append_exact_finite_selected_end_grep_count(
+        mut self,
+        proof: NativeFiniteSelectedEndGrepCountView,
+        serialized_program: &[u8],
+    ) -> Result<Option<Self>, ObjectError> {
+        if !self.can_append_exact_finite_selected_end_grep_count()? {
+            return Ok(None);
+        }
+        if proof.artifact_identity == [0; 32]
+            || proof.source_count == 0
+            || proof.total_source_bytes == 0
+            || proof.maximum_width == 0
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount proof is incomplete",
+            ));
+        }
+        let serialized_output =
+            serialized_program_output_contract(serialized_program, serialized_program.len())?;
+        if serialized_output != OutputContract::SelectedEnd {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount runtime program is not SelectedEnd",
+            ));
+        }
+        let serialized_identity: [u8; 32] = Sha256::digest(serialized_program).into();
+        if serialized_identity != proof.artifact_identity {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount runtime program identity disagrees",
+            ));
+        }
+        let text_len = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount module has no text section",
+            ))?
+            .data
+            .len();
+        if self.sections.get(PROGRAM_SECTION).is_none() {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount module has no data section",
+            ));
+        }
+        let entry = self
+            .symbols
+            .get(self.entry_symbol_index)
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount entry index is invalid",
+            ))?;
+        let entry_start = usize::try_from(entry.offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount entry offset"))?;
+        let entry_size = usize::try_from(entry.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount entry size"))?;
+        let entry_end =
+            entry_start
+                .checked_add(entry_size)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "exact-finite GrepCount entry extent",
+                ))?;
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount target is not a complete text function",
+            ));
+        }
+        let ordinary_entry_sha256: [u8; 32] = Sha256::digest(
+            self.sections[TEXT_SECTION]
+                .data
+                .get(entry_start..entry_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "exact-finite GrepCount ordinary entry is outside text",
+                ))?,
+        )
+        .into();
+
+        let wrapper = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_exact_finite_selected_end_grep_count()?,
+            Architecture::Aarch64 => lower_aarch64_exact_finite_selected_end_grep_count()?,
+        };
+        let wrapper = Some(wrapper);
+        if !native_aggregate_wrappers_fit(
+            self.target.architecture,
+            text_len,
+            entry_start,
+            &[&wrapper],
+        )? {
+            return Ok(None);
+        }
+        let wrapper = wrapper.ok_or(ObjectError::InvalidModule(
+            "exact-finite GrepCount wrapper disappeared after preflight",
+        ))?;
+        if wrapper.ordered_nfa_gate_call_offset.is_some()
+            || wrapper.bulk_runtime_fallback_offset.is_some()
+            || wrapper.compatibility_identity_relocation.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite GrepCount wrapper retained another execution edge",
+            ));
+        }
+
+        let architecture = self.target.architecture;
+        let code_alignment_mask = match architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let code_offset =
+            text_len
+                .checked_add(code_alignment_mask)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "exact-finite GrepCount entry alignment",
+                ))?
+                & !code_alignment_mask;
+        let final_text_len =
+            code_offset
+                .checked_add(wrapper.code.len())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "exact-finite GrepCount entry extent",
+                ))?;
+        let program_offset = self.sections[PROGRAM_SECTION]
+            .data
+            .len()
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-finite GrepCount runtime program alignment",
+            ))?
+            & !15;
+        let identity_offset = program_offset
+            .checked_add(serialized_program.len())
+            .and_then(|end| end.checked_add(15))
+            .map(|end| end & !15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-finite GrepCount identity alignment",
+            ))?;
+        let final_data_len = identity_offset
+            .checked_add(proof.artifact_identity.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-finite GrepCount identity extent",
+            ))?;
+
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        let mut data = std::mem::take(&mut sections[PROGRAM_SECTION].data).into_vec();
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("exact-finite GrepCount text"))?;
+        data.try_reserve_exact(final_data_len.saturating_sub(data.len()))
+            .map_err(|_| ObjectError::Allocation("exact-finite GrepCount data"))?;
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        symbols
+            .try_reserve_exact(3)
+            .map_err(|_| ObjectError::Allocation("exact-finite GrepCount symbols"))?;
+        let relocation_count = match architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        };
+        let mut relocations = std::mem::take(&mut self.relocations).into_vec();
+        relocations
+            .try_reserve_exact(relocation_count)
+            .map_err(|_| ObjectError::Allocation("exact-finite GrepCount relocations"))?;
+
+        data.resize(program_offset, 0);
+        push_bytes(&mut data, serialized_program)?;
+        let runtime_program_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(
+                RUNTIME_PROGRAM_SYMBOL_PREFIX,
+                "exact-finite GrepCount runtime program prefix",
+            )?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Object,
+            section: Some(PROGRAM_SECTION),
+            offset: offset_u64(
+                program_offset,
+                "exact-finite GrepCount runtime program offset",
+            )?,
+            size: u64::try_from(serialized_program.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact-finite GrepCount runtime program size")
+            })?,
+        });
+        data.resize(identity_offset, 0);
+        push_bytes(&mut data, &proof.artifact_identity)?;
+        let identity_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(
+                ".Lfre_aot_regex_exact_finite_grep_count_identity",
+                "exact-finite GrepCount identity symbol",
+            )?,
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(PROGRAM_SECTION),
+            offset: offset_u64(identity_offset, "exact-finite GrepCount identity offset")?,
+            size: 32,
+        });
+
+        match architecture {
+            Architecture::X86_64 => text.resize(code_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < code_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        let local_call_offset = code_offset
+            .checked_add(wrapper.prepared_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-finite GrepCount local call offset",
+            ))?;
+        let wrapper_size = wrapper.code.len();
+        let identity_relocation = wrapper
+            .identity_relocation
+            .ok_or(ObjectError::InvalidModule(
+                "exact-finite GrepCount wrapper has no identity guard",
+            ))?;
+        push_bytes(&mut text, &wrapper.code)?;
+        match (architecture, identity_relocation) {
+            (Architecture::X86_64, NativePreparedIdentityRelocation::X86PcRelative32(offset)) => {
+                if offset.checked_add(4).is_none_or(|end| end > wrapper_size)
+                    || offset >= wrapper.prepared_call_offset
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 exact-finite GrepCount identity guard is outside its entry",
+                    ));
+                }
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: offset_u64(
+                        code_offset
+                            .checked_add(offset)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "x86 exact-finite GrepCount identity relocation",
+                            ))?,
+                        "x86 exact-finite GrepCount identity relocation",
+                    )?,
+                    kind: RelocationKind::X86PcRelative32,
+                    symbol: identity_symbol_index,
+                    addend: -4,
+                });
+                patch_x86_64_local_call(&mut text, local_call_offset, entry_start)?;
+            }
+            (
+                Architecture::Aarch64,
+                NativePreparedIdentityRelocation::Aarch64Page21PageOff12 { page, page_offset },
+            ) => {
+                if page.checked_add(4).is_none_or(|end| end > wrapper_size)
+                    || page_offset
+                        .checked_add(4)
+                        .is_none_or(|end| end > wrapper_size)
+                    || page >= wrapper.prepared_call_offset
+                    || page_offset >= wrapper.prepared_call_offset
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 exact-finite GrepCount identity guard is outside its entry",
+                    ));
+                }
+                relocations.extend([
+                    ModuleRelocation {
+                        section: TEXT_SECTION,
+                        offset: offset_u64(
+                            code_offset.checked_add(page).ok_or(
+                                ObjectError::ArithmeticOverflow(
+                                    "AArch64 exact-finite GrepCount identity ADRP",
+                                ),
+                            )?,
+                            "AArch64 exact-finite GrepCount identity ADRP",
+                        )?,
+                        kind: RelocationKind::Aarch64Page21,
+                        symbol: identity_symbol_index,
+                        addend: 0,
+                    },
+                    ModuleRelocation {
+                        section: TEXT_SECTION,
+                        offset: offset_u64(
+                            code_offset.checked_add(page_offset).ok_or(
+                                ObjectError::ArithmeticOverflow(
+                                    "AArch64 exact-finite GrepCount identity ADD",
+                                ),
+                            )?,
+                            "AArch64 exact-finite GrepCount identity ADD",
+                        )?,
+                        kind: RelocationKind::Aarch64PageOff12,
+                        symbol: identity_symbol_index,
+                        addend: 0,
+                    },
+                ]);
+                patch_aarch64_local_call(&mut text, local_call_offset, entry_start)?;
+            }
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "exact-finite GrepCount identity relocation has the wrong ISA",
+                ));
+            }
+        }
+
+        let grep_count_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: owned_string(
+                PREPARED_GREP_COUNT_SYMBOL_PREFIX,
+                "exact-finite GrepCount entry prefix",
+            )?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: offset_u64(code_offset, "exact-finite GrepCount code offset")?,
+            size: u64::try_from(wrapper_size)
+                .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite GrepCount code size"))?,
+        });
+        let canonical_identity_symbols = [
+            (runtime_program_symbol_index, RUNTIME_PROGRAM_SYMBOL_PREFIX),
+            (grep_count_symbol_index, PREPARED_GREP_COUNT_SYMBOL_PREFIX),
+        ];
+        let module_identity = prepared_aggregate_module_digest(
+            self.target,
+            proof.artifact_identity,
+            PreparedAggregateExports::GREP_COUNT,
+            PreparedAggregateStrategy::NativeFused,
+            &text,
+            &data,
+            &symbols,
+            &relocations,
+            &canonical_identity_symbols,
+        )?;
+        symbols[runtime_program_symbol_index].name =
+            identity_symbol(RUNTIME_PROGRAM_SYMBOL_PREFIX, &module_identity)?;
+        symbols[grep_count_symbol_index].name =
+            identity_symbol(PREPARED_GREP_COUNT_SYMBOL_PREFIX, &module_identity)?;
+        let reducer_code_sha256: [u8; 32] =
+            Sha256::digest(text.get(code_offset..final_text_len).ok_or(
+                ObjectError::InvalidModule("exact-finite GrepCount reducer is outside final text"),
+            )?)
+            .into();
+
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        sections[PROGRAM_SECTION].data = data.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+        self.symbols = symbols.into_boxed_slice();
+        self.relocations = relocations.into_boxed_slice();
+        self.prepared_grep_count_symbol_index = Some(grep_count_symbol_index);
+        self.prepared_aggregate_exports = PreparedAggregateExports::GREP_COUNT;
+        self.prepared_aggregate_strategy = Some(PreparedAggregateStrategy::NativeFused);
+        self.runtime_program_symbol_index = Some(runtime_program_symbol_index);
+
+        if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report.take() {
+            module_exact_finite_selected_end_teddy::refresh_report_parts(
+                &mut report,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?;
+            self.exact_finite_selected_end_teddy_aot_report = Some(report);
+        }
+        if let Some(mut report) = self.exact_finite_selected_end_teddy_aot_report_v2.take() {
+            module_exact_finite_selected_end_teddy::refresh_report_v2_parts(
+                &mut report,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?;
+            self.exact_finite_selected_end_teddy_aot_report_v2 = Some(report);
+        }
+        self.exact_finite_selected_end_grep_count_aot_report =
+            Some(ExactFiniteSelectedEndGrepCountAotReport {
+                artifact_identity: proof.artifact_identity,
+                output: OutputContract::SelectedEnd,
+                source_count: proof.source_count,
+                source_bytes: proof.total_source_bytes,
+                maximum_width: proof.maximum_width,
+                module_sha256: module_identity,
+                ordinary_entry_sha256,
+                reducer_code_sha256,
+                ordinary_entry_offset: entry_start,
+                reducer_entry_offset: code_offset,
+                local_call_offset,
+            });
+        Ok(Some(self))
+    }
+
+
+    /// Append a handle-free independent-haystack Exists loop only to a
+    /// complete self-contained direct module. Prepared and runtime-backed
+    /// modules return `None`; structural contradictions on a purported direct
+    /// module remain hard errors.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "route authentication, fallible construction, identity, and publication form one transactional append"
+    )]
+    pub(crate) fn append_direct_exists_batch(
+        mut self,
+        output: OutputContract,
+    ) -> Result<Option<Self>, ObjectError> {
+        if output != OutputContract::Exists
+            || self.prepared_entry_symbol_index.is_some()
+            || self.prepared_bulk_strategy.is_some()
+            || self.native_prepared_bulk_search_target.is_some()
+            || self.runtime_symbol_index.is_some()
+        {
+            return Ok(None);
+        }
+        if self.direct_exists_batch_symbol_index.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists batch was appended more than once",
+            ));
+        }
+        if self.prepared_span_fill_symbol_index.is_some()
+            || self.prepared_exists_batch_symbol_index.is_some()
+            || !self.prepared_aggregate_exports.is_empty()
+            || self.prepared_aggregate_strategy.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists batch overlaps another additive surface",
+            ));
+        }
+        let has_unresolved_function_dependency = self
+            .symbols
+            .iter()
+            .enumerate()
+            .any(|(index, symbol)| {
+                symbol.section.is_none()
+                    && symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && self
+                        .relocations
+                        .iter()
+                        .any(|relocation| relocation.symbol == index)
+            });
+        if has_unresolved_function_dependency {
+            return Ok(None);
+        }
+        let Some(trusted_core) = self.native_direct_search_trusted_core else {
+            return Ok(None);
+        };
+
+        let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("direct Exists batch entry index is invalid"),
+        )?;
+        let entry_start = usize::try_from(entry.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch entry offset")
+        })?;
+        let entry_size = usize::try_from(entry.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch entry size")
+        })?;
+        let entry_end = entry_start
+            .checked_add(entry_size)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch entry extent",
+            ))?;
+        let text_len = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists batch module has no text section",
+            ))?
+            .data
+            .len();
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists batch target is not a complete text function",
+            ));
+        }
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &self.sections[TEXT_SECTION].data,
+            entry_start,
+            entry_end,
+            trusted_core,
+            OutputContract::Exists,
+        )?;
+        let entry_name_digest: [u8; 32] = Sha256::digest(entry.name.as_bytes()).into();
+        let wrapper = match self.target.architecture {
+            Architecture::X86_64 => {
+                lower_x86_64_direct_exists_batch(trusted_core.prologue)?
+            }
+            Architecture::Aarch64 => {
+                lower_aarch64_direct_exists_batch(trusted_core.prologue)?
+            }
+        };
+        let alignment_mask = match self.target.architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let code_offset = text_len
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch entry alignment",
+            ))?
+            & !alignment_mask;
+        let final_text_len = code_offset
+            .checked_add(wrapper.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch entry extent",
+            ))?;
+
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("direct Exists batch text"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(code_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < code_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &wrapper.code)?;
+        let call_offset = code_offset
+            .checked_add(wrapper.search_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch local call offset",
+            ))?;
+        let trampoline_offset = code_offset
+            .checked_add(wrapper.trampoline_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch trampoline offset",
+            ))?;
+        let core_jump_offset = code_offset
+            .checked_add(wrapper.core_jump_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch trusted-core jump offset",
+            ))?;
+        match self.target.architecture {
+            Architecture::X86_64 => {
+                patch_x86_64_local_call(&mut text, call_offset, trampoline_offset)?;
+                patch_x86_64_local_jump(
+                    &mut text,
+                    core_jump_offset,
+                    trusted_core.code_offset,
+                )?;
+            }
+            Architecture::Aarch64 => {
+                patch_aarch64_local_call(&mut text, call_offset, trampoline_offset)?;
+                patch_aarch64_local_branch(
+                    &mut text,
+                    core_jump_offset,
+                    trusted_core.code_offset,
+                )?;
+            }
+        }
+        let mut batch_identity = Sha256::new();
+        batch_identity.update(DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN);
+        batch_identity.update(entry_name_digest);
+        batch_identity.update(u64::try_from(trusted_core.code_offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch identity call target")
+        })?.to_le_bytes());
+        batch_identity.update([trusted_core.prologue.identity_tag()]);
+        batch_identity.update(u64::try_from(code_offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch identity code offset")
+        })?.to_le_bytes());
+        batch_identity.update(text.get(code_offset..final_text_len).ok_or(
+            ObjectError::InvalidModule("direct Exists batch wrapper is outside final text"),
+        )?);
+        let batch_identity: [u8; 32] = batch_identity.finalize().into();
+        let batch_name = identity_symbol(DIRECT_EXISTS_BATCH_SYMBOL_PREFIX, &batch_identity)?;
+        if let Some(ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report)) =
+            &mut self.exact_finite_exists_leaf_report
+        {
+            report.native_code_sha256 = Sha256::digest(&text).into();
+        }
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        symbols
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("direct Exists batch symbol"))?;
+        let batch_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: batch_name,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: u64::try_from(code_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct Exists batch code offset")
+            })?,
+            size: u64::try_from(wrapper.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct Exists batch code size")
+            })?,
+        });
+        self.symbols = symbols.into_boxed_slice();
+        self.direct_exists_batch_symbol_index = Some(batch_symbol_index);
+        Ok(Some(self))
     }
 
     #[allow(
@@ -6974,43 +8851,160 @@ impl CompiledModule {
         } else {
             None
         };
+        let direct_span_trusted_core = if span_reducers_requested {
+            match (direct_search_target, self.native_direct_search_trusted_core) {
+                (Some(NativeSpanReducerTarget::DirectOrdinary(entry_start)), Some(core)) => {
+                    let entry = &self.symbols[self.entry_symbol_index];
+                    let entry_size = usize::try_from(entry.size).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("direct Span trusted core entry size")
+                    })?;
+                    let entry_end = entry_start.checked_add(entry_size).ok_or(
+                        ObjectError::ArithmeticOverflow("direct Span trusted core entry extent"),
+                    )?;
+                    authenticate_native_direct_search_trusted_core(
+                        self.target.architecture,
+                        &self.sections[TEXT_SECTION].data,
+                        entry_start,
+                        entry_end,
+                        core,
+                        OutputContract::Span,
+                    )?;
+                    Some(core)
+                }
+                (Some(NativeSpanReducerTarget::DirectOrdinary(_)), None) | (None, _) => None,
+                (Some(NativeSpanReducerTarget::PreparedPrivate(_)), _) => {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Span trusted core selected a prepared target",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let complete_span_reduce_requested =
+            exports == PreparedAggregateExports::COUNT;
+        let mut complete_span_reduce_pending = if complete_span_reduce_requested {
+            direct_span_trusted_core
+                .map(|core| self.prepare_complete_span_reduce_core(core))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let complete_span_reduce_selection = if let (
+            Some(ordinary_target),
+            Some(pending),
+        ) = (direct_search_target, complete_span_reduce_pending.as_mut()) {
+            let alignment_mask = match self.target.architecture {
+                Architecture::X86_64 => 15,
+                Architecture::Aarch64 => 3,
+            };
+            let core_offset = self.sections[TEXT_SECTION]
+                .data
+                .len()
+                .checked_add(alignment_mask)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "complete Span reducer core alignment",
+                ))?
+                & !alignment_mask;
+            let core_end = core_offset.checked_add(pending.emission.code.len()).ok_or(
+                ObjectError::ArithmeticOverflow("complete Span reducer core extent"),
+            )?;
+            pending.core.code_offset = core_offset;
+            let count_wrapper = (exports == PreparedAggregateExports::COUNT)
+                .then(|| match self.target.architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_complete_span_reduce_export(PreparedSpanSink::Count)
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_complete_span_reduce_export(PreparedSpanSink::Count)
+                    }
+                })
+                .transpose()?;
+            let span_sum_wrapper = (exports == PreparedAggregateExports::SPAN_SUM)
+                .then(|| match self.target.architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_complete_span_reduce_export(PreparedSpanSink::SpanSum)
+                    }
+                    Architecture::Aarch64 => {
+                        lower_aarch64_complete_span_reduce_export(PreparedSpanSink::SpanSum)
+                    }
+                })
+                .transpose()?;
+            let target = NativeSpanReducerTarget::DirectOrdinary(core_offset);
+            if native_aggregate_wrappers_fit(
+                self.target.architecture,
+                core_end,
+                target.offset(),
+                &[&count_wrapper, &span_sum_wrapper],
+            )? {
+                Some((
+                    Some(target),
+                    count_wrapper,
+                    span_sum_wrapper,
+                    None,
+                ))
+            } else {
+                // A local-call range decline restores the exact ce964 target
+                // and wrappers; no candidate bytes have been appended yet.
+                complete_span_reduce_pending = None;
+                let _ = ordinary_target;
+                None
+            }
+        } else {
+            None
+        };
         let (
             direct_search_target,
             direct_count_wrapper,
             direct_span_sum_wrapper,
             direct_grep_count_wrapper,
-        ) =
+        ) = if let Some(selection) = complete_span_reduce_selection {
+            selection
+        } else {
             if let Some(target) = direct_search_target {
+                let direct_span_call_kind = direct_span_trusted_core.map_or(
+                    NativeSpanReducerCallKind::DirectOrdinary,
+                    |core| NativeSpanReducerCallKind::DirectTrustedCore(core.prologue),
+                );
                 let count_wrapper = exports
                     .contains(PreparedAggregateExports::COUNT)
                     .then(|| match self.target.architecture {
                         Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
                             PreparedSpanSink::Count,
-                            NativeSpanReducerCallKind::DirectOrdinary,
+                            direct_span_call_kind,
                             false,
                         ),
                         Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
                             PreparedSpanSink::Count,
-                            NativeSpanReducerCallKind::DirectOrdinary,
+                            direct_span_call_kind,
                             false,
                         ),
                     })
-                    .transpose()?;
+                    .transpose()?
+                    .map(|mut wrapper| {
+                        wrapper.trusted_core = direct_span_trusted_core;
+                        wrapper
+                    });
                 let span_sum_wrapper = exports
                     .contains(PreparedAggregateExports::SPAN_SUM)
                     .then(|| match self.target.architecture {
                         Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
                             PreparedSpanSink::SpanSum,
-                            NativeSpanReducerCallKind::DirectOrdinary,
+                            direct_span_call_kind,
                             false,
                         ),
                         Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
                             PreparedSpanSink::SpanSum,
-                            NativeSpanReducerCallKind::DirectOrdinary,
+                            direct_span_call_kind,
                             false,
                         ),
                     })
-                    .transpose()?;
+                    .transpose()?
+                    .map(|mut wrapper| {
+                        wrapper.trusted_core = direct_span_trusted_core;
+                        wrapper
+                    });
                 let grep_count_wrapper = grep_reducer_requested
                     .then(|| match self.target.architecture {
                         Architecture::X86_64 => lower_x86_64_prepared_grep_count(
@@ -7041,7 +9035,8 @@ impl CompiledModule {
                 }
             } else {
                 (None, None, None, None)
-            };
+            }
+        };
         if prepared_search_target.is_some() && direct_search_target.is_some() {
             return Err(ObjectError::InvalidModule(
                 "prepared aggregate selected overlapping native search targets",
@@ -7164,10 +9159,18 @@ impl CompiledModule {
                         }
                     }
                 }
+                NativeSpanReducerCallKind::DirectTrustedCore(_) => {
+                    return Err(ObjectError::InvalidModule(
+                        "native Count target unexpectedly retained a wrapper-only call kind",
+                    ));
+                }
             })
         } else {
             None
         };
+        let direct_count_authenticated_body_relative = native_count_wrapper
+            .as_ref()
+            .and_then(|wrapper| wrapper.authenticated_body_offset);
         let native_span_sum_wrapper = if span_sum_native {
             Some(match native_call.ok_or(ObjectError::InvalidModule(
                 "native SpanSum reducer has no local call kind",
@@ -7228,10 +9231,18 @@ impl CompiledModule {
                         }
                     }
                 }
+                NativeSpanReducerCallKind::DirectTrustedCore(_) => {
+                    return Err(ObjectError::InvalidModule(
+                        "native SpanSum target unexpectedly retained a wrapper-only call kind",
+                    ));
+                }
             })
         } else {
             None
         };
+        let direct_span_sum_authenticated_body_relative = native_span_sum_wrapper
+            .as_ref()
+            .and_then(|wrapper| wrapper.authenticated_body_offset);
         let native_grep_count_wrapper = if native_grep_reducer {
             Some(match native_call.ok_or(ObjectError::InvalidModule(
                 "native GrepCount reducer has no local call kind",
@@ -7257,6 +9268,11 @@ impl CompiledModule {
                             true,
                         )?,
                     }
+                }
+                NativeSpanReducerCallKind::DirectTrustedCore(_) => {
+                    return Err(ObjectError::InvalidModule(
+                        "GrepCount cannot target a direct-search trusted core",
+                    ));
                 }
             })
         } else {
@@ -7365,6 +9381,17 @@ impl CompiledModule {
             Architecture::Aarch64 => 3,
         };
         let mut final_text_len = text.len();
+        if let Some(pending) = complete_span_reduce_pending.as_ref() {
+            final_text_len = align(
+                final_text_len,
+                code_alignment_mask,
+                "complete Span reducer core alignment",
+            )?
+            .checked_add(pending.emission.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "complete Span reducer core extent",
+            ))?;
+        }
         let entry_code_sizes = [
             exports
                 .contains(PreparedAggregateExports::COUNT)
@@ -7432,6 +9459,13 @@ impl CompiledModule {
                     .checked_mul(native_relocations_per_export)
                     .and_then(|native| runtime.checked_add(native))
             })
+            .and_then(|count| {
+                count.checked_add(
+                    complete_span_reduce_pending
+                        .as_ref()
+                        .map_or(0, |pending| pending.emission.relocations.len()),
+                )
+            })
             .ok_or(ObjectError::ArithmeticOverflow(
                 "prepared aggregate relocation count",
             ))?;
@@ -7496,6 +9530,74 @@ impl CompiledModule {
             offset: offset_u64(identity_offset, "prepared aggregate identity offset")?,
             size: 32,
         });
+
+        if let Some(pending) = complete_span_reduce_pending.take() {
+            let core_offset = align(
+                text.len(),
+                code_alignment_mask,
+                "complete Span reducer core append alignment",
+            )?;
+            let pending_code_sha256: [u8; 32] = Sha256::digest(&pending.emission.code).into();
+            if core_offset != pending.core.code_offset
+                || pending.core.code_size != pending.emission.code.len()
+                || pending.core.code_sha256 != pending_code_sha256
+                || pending.core.entry_contract
+                    != NativeCompleteSpanReduceEntryContract::AuthenticatedCompleteSpanV1
+                || pending.core.result_abi
+                    != NativeCompleteSpanReduceResultAbi::CountAndSpanSumU64V1
+            {
+                return Err(ObjectError::InvalidModule(
+                    "complete Span reducer pending receipt is inconsistent",
+                ));
+            }
+            match architecture {
+                Architecture::X86_64 => text.resize(core_offset, 0x90),
+                Architecture::Aarch64 => {
+                    while text.len() < core_offset {
+                        push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                    }
+                }
+            }
+            push_bytes(&mut text, &pending.emission.code)?;
+            let relocation_base = offset_u64(
+                core_offset,
+                "complete Span reducer relocation base",
+            )?;
+            for mut relocation in pending.emission.relocations {
+                if relocation.section != TEXT_SECTION || relocation.symbol != PROGRAM_SYMBOL {
+                    return Err(ObjectError::InvalidModule(
+                        "complete Span reducer core has an unexpected relocation",
+                    ));
+                }
+                relocation.offset = relocation.offset.checked_add(relocation_base).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "complete Span reducer relocation offset",
+                    ),
+                )?;
+                relocations.push(relocation);
+            }
+            let trusted_core = self.native_direct_search_trusted_core.ok_or(
+                ObjectError::InvalidModule(
+                    "complete Span reducer append lost its source receipt",
+                ),
+            )?;
+            let source = self.native_complete_span_reduce_source.as_deref().ok_or(
+                ObjectError::InvalidModule(
+                    "complete Span reducer append lost its layout recipe",
+                ),
+            )?;
+            if self.native_complete_span_reduce_core.is_some()
+                || source.program_bytes != pending.core.program_bytes
+                || source.program_sha256 != pending.core.program_sha256
+                || trusted_core.entry_code_sha256 != pending.core.public_entry_sha256
+            {
+                return Err(ObjectError::InvalidModule(
+                    "complete Span reducer append source identity changed",
+                ));
+            }
+            self.native_complete_span_reduce_source = None;
+            self.native_complete_span_reduce_core = Some(pending.core);
+        }
 
         let append_runtime = |text: &mut Vec<u8>,
                               symbols: &mut Vec<ModuleSymbol>,
@@ -7663,6 +9765,23 @@ impl CompiledModule {
             let search_target = native_search_target.ok_or(ObjectError::InvalidModule(
                 "native prepared scalar reducer has no local search target",
             ))?;
+            let trusted_core = match (
+                wrapper.trusted_core,
+                wrapper.trusted_core_trampoline_offset,
+                wrapper.trusted_core_jump_offset,
+            ) {
+                (Some(core), Some(trampoline), Some(jump))
+                    if matches!(search_target, NativeSpanReducerTarget::DirectOrdinary(_)) =>
+                {
+                    Some((core, trampoline, jump))
+                }
+                (None, None, None) => None,
+                _ => {
+                    return Err(ObjectError::InvalidModule(
+                        "native prepared scalar reducer trusted-core topology is inconsistent",
+                    ));
+                }
+            };
             let alignment_mask = match architecture {
                 Architecture::X86_64 => 15,
                 Architecture::Aarch64 => 3,
@@ -7687,6 +9806,24 @@ impl CompiledModule {
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "native prepared aggregate local call offset",
                 ))?;
+            let trusted_core_trampoline_offset = trusted_core
+                .map(|(_, trampoline, _)| {
+                    code_offset.checked_add(trampoline).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "native prepared scalar reducer trusted-core trampoline offset",
+                        ),
+                    )
+                })
+                .transpose()?;
+            let trusted_core_jump_offset = trusted_core
+                .map(|(_, _, jump)| {
+                    code_offset.checked_add(jump).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "native prepared scalar reducer trusted-core jump offset",
+                        ),
+                    )
+                })
+                .transpose()?;
             let ordered_gate_call_offset = ordered_gate_call
                 .map(|call| {
                     code_offset.checked_add(call).ok_or(
@@ -7742,7 +9879,16 @@ impl CompiledModule {
                         symbol: identity_symbol_index,
                         addend: -4,
                     });
-                    patch_x86_64_local_call(text, call_offset, search_target.offset())?;
+                    patch_x86_64_local_call(
+                        text,
+                        call_offset,
+                        trusted_core_trampoline_offset.unwrap_or(search_target.offset()),
+                    )?;
+                    if let (Some((core, _, _)), Some(jump_offset)) =
+                        (trusted_core, trusted_core_jump_offset)
+                    {
+                        patch_x86_64_local_jump(text, jump_offset, core.code_offset)?;
+                    }
                 }
                 Architecture::Aarch64 => {
                     let NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
@@ -7793,7 +9939,16 @@ impl CompiledModule {
                             addend: 0,
                         },
                     ]);
-                    patch_aarch64_local_call(text, call_offset, search_target.offset())?;
+                    patch_aarch64_local_call(
+                        text,
+                        call_offset,
+                        trusted_core_trampoline_offset.unwrap_or(search_target.offset()),
+                    )?;
+                    if let (Some((core, _, _)), Some(jump_offset)) =
+                        (trusted_core, trusted_core_jump_offset)
+                    {
+                        patch_aarch64_local_branch(text, jump_offset, core.code_offset)?;
+                    }
                 }
             }
             if let Some((_, identity_relocation, _)) = ordered_compatibility {
@@ -8001,9 +10156,79 @@ impl CompiledModule {
                         PREPARED_GREP_COUNT_SYMBOL_PREFIX,
                     )?
                 })
-            } else {
-                None
+        } else {
+            None
+        };
+        let prepared_count_authenticated_body_offset =
+            match (prepared_count_symbol_index, direct_count_authenticated_body_relative) {
+                (Some(index), Some(relative)) => {
+                    let symbol = symbols.get(index).ok_or(ObjectError::InvalidModule(
+                        "direct Count authentication symbol index is invalid",
+                    ))?;
+                    let start = usize::try_from(symbol.offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count authentication entry offset",
+                        )
+                    })?;
+                    let size = usize::try_from(symbol.size).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count authentication entry size",
+                        )
+                    })?;
+                    if relative.checked_add(16).is_none_or(|end| end > size) {
+                        return Err(ObjectError::InvalidModule(
+                            "direct Count authentication body is outside its entry",
+                        ));
+                    }
+                    Some(start.checked_add(relative).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count authentication body offset",
+                        ),
+                    )?)
+                }
+                (None | Some(_), None) => None,
+                (None, Some(_)) => {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Count authentication body has no Count entry",
+                    ));
+                }
             };
+        let prepared_span_sum_authenticated_body_offset = match (
+            prepared_span_sum_symbol_index,
+            direct_span_sum_authenticated_body_relative,
+        ) {
+            (Some(index), Some(relative)) => {
+                let symbol = symbols.get(index).ok_or(ObjectError::InvalidModule(
+                    "direct SpanSum authentication symbol index is invalid",
+                ))?;
+                let start = usize::try_from(symbol.offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum authentication entry offset",
+                    )
+                })?;
+                let size = usize::try_from(symbol.size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum authentication entry size",
+                    )
+                })?;
+                if relative.checked_add(16).is_none_or(|end| end > size) {
+                    return Err(ObjectError::InvalidModule(
+                        "direct SpanSum authentication body is outside its entry",
+                    ));
+                }
+                Some(start.checked_add(relative).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum authentication body offset",
+                    ),
+                )?)
+            }
+            (None | Some(_), None) => None,
+            (None, Some(_)) => {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum authentication body has no SpanSum entry",
+                ));
+            }
+        };
         let canonical_identity_symbols = [
             (
                 new_runtime_program_symbol_index.unwrap_or(usize::MAX),
@@ -8082,6 +10307,12 @@ impl CompiledModule {
         self.prepared_grep_count_symbol_index = prepared_grep_count_symbol_index;
         self.prepared_aggregate_exports = exports;
         self.prepared_aggregate_strategy = Some(aggregate_strategy);
+        self.prepared_count_authenticated_body_offset =
+            prepared_count_authenticated_body_offset;
+        self.prepared_span_sum_authenticated_body_offset =
+            prepared_span_sum_authenticated_body_offset;
+        self.direct_exact_singleton_count_aot_report = None;
+        self.direct_exact_singleton_span_sum_aot_report = None;
         self.runtime_program_symbol_index = runtime_program_symbol_index;
         if let Some(entry) = operation_entry_symbol_index {
             self.entry_symbol_index = entry;
@@ -8118,6 +10349,1696 @@ impl CompiledModule {
             self.exact_finite_selected_end_teddy_aot_report_v2 = Some(report);
         }
         Ok(self)
+    }
+
+    /// Replace only the already authenticated body of a fully materialized
+    /// direct Count incumbent with one audited exact-singleton Count-v3 core.
+    /// The public symbol, four-argument ABI, argument checks, and four-word
+    /// handle/artifact identity comparison remain unchanged.
+    pub(crate) fn install_direct_exact_singleton_count(
+        &mut self,
+        literal: &[u8],
+        artifact_identity: [u8; 32],
+        candidate: &PreparedDirectExactSingletonCount,
+    ) -> Result<Option<DirectExactSingletonCountPatchRollback>, ObjectError> {
+        if self.target.architecture != Architecture::Aarch64
+            || self.target.abi != CallAbi::Aapcs64
+            || !self
+                .target
+                .features
+                .contains(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            || self.prepared_aggregate_exports != PreparedAggregateExports::COUNT
+            || self.prepared_aggregate_strategy != Some(PreparedAggregateStrategy::NativeFused)
+            || self.required_runtime_symbols().next().is_some()
+            || self.direct_exact_singleton_count_aot_report.is_some()
+            || !(1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+        {
+            return Ok(None);
+        }
+        if candidate.target != self.target
+            || candidate.artifact_identity != artifact_identity
+            || candidate.literal_sha256 != <[u8; 32]>::from(Sha256::digest(literal))
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 candidate binding disagrees",
+            ));
+        }
+        let candidate_recipe = fre_aot_optimizer::inspect_count_recipe_v3(
+            &candidate.canonical_recipe,
+        )
+        .map_err(|_| {
+            ObjectError::InvalidModule(
+                "direct Count-v3 canonical recipe authentication failed",
+            )
+        })?;
+        if candidate_recipe.identity().as_bytes() != &candidate.recipe_identity {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 canonical recipe identity disagrees",
+            ));
+        }
+        let Some(authenticated_body_offset) = self.prepared_count_authenticated_body_offset else {
+            return Ok(None);
+        };
+        let count_index = self.prepared_count_symbol_index.ok_or(
+            ObjectError::InvalidModule("direct Count-v3 candidate has no Count symbol"),
+        )?;
+        let count = self.symbols.get(count_index).ok_or(ObjectError::InvalidModule(
+            "direct Count-v3 Count symbol index is invalid",
+        ))?;
+        let count_start = usize::try_from(count.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 Count entry offset")
+        })?;
+        let count_size = usize::try_from(count.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 Count entry size")
+        })?;
+        let count_end = count_start.checked_add(count_size).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 Count entry extent"),
+        )?;
+        let relative_body = authenticated_body_offset.checked_sub(count_start).ok_or(
+            ObjectError::InvalidModule("direct Count-v3 authentication body precedes its entry"),
+        )?;
+        let mut expected = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::Count,
+            NativeSpanReducerCallKind::DirectOrdinary,
+            false,
+        )?;
+        let call_offset = count_start
+            .checked_add(expected.prepared_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 incumbent call offset",
+            ))?;
+        let ordinary = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("direct Count-v3 ordinary symbol index is invalid"),
+        )?;
+        let ordinary_offset = usize::try_from(ordinary.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 ordinary entry offset")
+        })?;
+        let call_instruction = aarch64_local_call_instruction(call_offset, ordinary_offset)?
+            .ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent call is out of range",
+            ))?;
+        let expected_call_end = expected.prepared_call_offset.checked_add(4).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 incumbent call extent"),
+        )?;
+        expected
+            .code
+            .get_mut(expected.prepared_call_offset..expected_call_end)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent call escapes its entry",
+            ))?
+            .copy_from_slice(&call_instruction.to_le_bytes());
+        let NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+            page: identity_page,
+            page_offset: identity_page_offset,
+        } = expected.identity_relocation.ok_or(ObjectError::InvalidModule(
+            "direct Count-v3 incumbent has no identity relocation",
+        ))?
+        else {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent identity relocation has the wrong ISA",
+            ));
+        };
+        let identity_page = count_start.checked_add(identity_page).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 identity ADRP offset"),
+        )?;
+        let identity_page_offset = count_start.checked_add(identity_page_offset).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 identity ADD offset"),
+        )?;
+        let mut incumbent_relocations = self.relocations.iter().filter(|relocation| {
+            relocation.section == TEXT_SECTION
+                && usize::try_from(relocation.offset)
+                    .is_ok_and(|offset| (count_start..count_end).contains(&offset))
+        });
+        let identity_page_relocation = incumbent_relocations.next().ok_or(
+            ObjectError::InvalidModule("direct Count-v3 incumbent identity ADRP is absent"),
+        )?;
+        let identity_page_offset_relocation = incumbent_relocations.next().ok_or(
+            ObjectError::InvalidModule("direct Count-v3 incumbent identity ADD is absent"),
+        )?;
+        if incumbent_relocations.next().is_some()
+            || identity_page_relocation.offset
+                != u64::try_from(identity_page).unwrap_or(u64::MAX)
+            || identity_page_relocation.kind != RelocationKind::Aarch64Page21
+            || identity_page_relocation.addend != 0
+            || identity_page_offset_relocation.offset
+                != u64::try_from(identity_page_offset).unwrap_or(u64::MAX)
+            || identity_page_offset_relocation.kind != RelocationKind::Aarch64PageOff12
+            || identity_page_offset_relocation.addend != 0
+            || identity_page_relocation.symbol != identity_page_offset_relocation.symbol
+            || identity_page >= authenticated_body_offset
+            || identity_page_offset >= authenticated_body_offset
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent relocation surface disagrees",
+            ));
+        }
+        let identity_data_symbol = self
+            .symbols
+            .get(identity_page_relocation.symbol)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent identity symbol is invalid",
+            ))?;
+        let identity_offset = usize::try_from(identity_data_symbol.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 identity data offset")
+        })?;
+        let identity_end = identity_offset.checked_add(artifact_identity.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 identity data extent"),
+        )?;
+        if count.binding != SymbolBinding::Global
+            || count.kind != SymbolKind::Function
+            || count.section != Some(TEXT_SECTION)
+            || !count.name.starts_with(PREPARED_COUNT_SYMBOL_PREFIX)
+            || ordinary.binding != SymbolBinding::Global
+            || ordinary.kind != SymbolKind::Function
+            || ordinary.section != Some(TEXT_SECTION)
+            || count_size != expected.code.len()
+            || expected.authenticated_body_offset != Some(relative_body)
+            || relative_body.checked_add(16).is_none_or(|end| end > count_size)
+            || self.sections[TEXT_SECTION]
+                .data
+                .get(count_start..count_end)
+                != Some(expected.code.as_slice())
+            || identity_data_symbol.name != ".Lfre_aot_regex_prepared_aggregate_identity"
+            || identity_data_symbol.binding != SymbolBinding::Local
+            || identity_data_symbol.kind != SymbolKind::Object
+            || identity_data_symbol.section != Some(PROGRAM_SECTION)
+            || identity_data_symbol.size != 32
+            || self.sections[PROGRAM_SECTION].data.get(identity_offset..identity_end)
+                != Some(artifact_identity.as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent authentication prefix disagrees",
+            ));
+        }
+        let canonical = [(count_index, PREPARED_COUNT_SYMBOL_PREFIX)];
+        let incumbent_module_identity = prepared_aggregate_module_digest(
+            self.target,
+            artifact_identity,
+            PreparedAggregateExports::COUNT,
+            PreparedAggregateStrategy::NativeFused,
+            self.sections[TEXT_SECTION].bytes(),
+            self.sections[PROGRAM_SECTION].bytes(),
+            &self.symbols,
+            &self.relocations,
+            &canonical,
+        )?;
+
+        let original_text_bytes = self.sections[TEXT_SECTION].data.len();
+        if count_end > original_text_bytes {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 Count entry escapes text",
+            ));
+        }
+        if !original_text_bytes.is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent text is not instruction aligned",
+            ));
+        }
+        let text_alignment = usize::try_from(self.sections[TEXT_SECTION].alignment).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 text section alignment")
+        })?;
+        if !text_alignment.is_multiple_of(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES) {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 text section cannot honor producer alignment",
+            ));
+        }
+        let short_fallback_max_bytes =
+            direct_exact_singleton_count_short_fallback_max_bytes(
+                candidate_recipe.strategy(),
+                literal.len(),
+            );
+        let incumbent_body_bytes = count_end.checked_sub(authenticated_body_offset).ok_or(
+            ObjectError::InvalidModule("direct Count-v3 incumbent body extent is invalid"),
+        )?;
+        if !incumbent_body_bytes.is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 incumbent body is not instruction aligned",
+            ));
+        }
+        if short_fallback_max_bytes.is_some() && count_end != original_text_bytes {
+            return Ok(None);
+        }
+        if short_fallback_max_bytes.is_some() {
+            for (symbol_index, symbol) in self.symbols.iter().enumerate() {
+                if symbol_index == count_index || symbol.section != Some(TEXT_SECTION) {
+                    continue;
+                }
+                let symbol_offset = usize::try_from(symbol.offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 incumbent text symbol offset",
+                    )
+                })?;
+                let symbol_bytes = usize::try_from(symbol.size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 incumbent text symbol size",
+                    )
+                })?;
+                let symbol_end = symbol_offset.checked_add(symbol_bytes).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 incumbent text symbol extent",
+                    ),
+                )?;
+                if symbol_offset >= authenticated_body_offset
+                    || symbol_end > authenticated_body_offset
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "direct Count-v3 incumbent body has an unaudited symbol",
+                    ));
+                }
+            }
+        }
+        let copied_incumbent_body_offset = None;
+        let copied_incumbent_body_bytes = None;
+        let mut cold_long = short_fallback_max_bytes
+            .map(|_| lower_aarch64_direct_count_cold_long())
+            .transpose()?;
+        let cold_long_offset = cold_long.as_ref().map(|_| original_text_bytes);
+        if DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES < 4
+            || !DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES.is_power_of_two()
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 producer code alignment is invalid",
+            ));
+        }
+        let unaligned_core_offset = original_text_bytes
+            .checked_add(cold_long.as_ref().map_or(0, |cold| cold.code.len()))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 unaligned core extent",
+            ))?;
+        let core_offset = unaligned_core_offset
+            .checked_add(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES - 1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 core alignment",
+            ))?
+            & !(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES - 1);
+        let cold_long_bytes = cold_long_offset
+            .map(|offset| {
+                core_offset.checked_sub(offset).ok_or(ObjectError::InvalidModule(
+                    "direct Count-v3 cold-long extent precedes its start",
+                ))
+            })
+            .transpose()?;
+        if !core_offset.is_multiple_of(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES) {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 core start violates producer alignment",
+            ));
+        }
+        let final_text_bytes = core_offset
+            .checked_add(candidate.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 core extent",
+            ))?;
+        let selected_count_size = if short_fallback_max_bytes.is_some() {
+            core_offset.checked_sub(count_start).ok_or(
+                ObjectError::InvalidModule("direct Count-v3 selected Count extent is invalid"),
+            )?
+        } else {
+            count_size
+        };
+        let selected_count_symbol_size = u64::try_from(selected_count_size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 selected Count symbol size")
+        })?;
+        let incumbent_code_bytes = u32::try_from(count_size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 incumbent code bytes")
+        })?;
+        let appended_code_bytes = final_text_bytes.checked_sub(original_text_bytes).ok_or(
+            ObjectError::ArithmeticOverflow("direct Count-v3 appended code bytes"),
+        )?;
+        let selected_code_bytes = count_size
+            .checked_add(appended_code_bytes)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 selected code bytes",
+            ))?;
+        let incumbent_cost = DirectExactSingletonCountCostShape {
+            scan_passes: 1,
+            native_calls_per_match: 1,
+            internal_span_publications_per_match: 1,
+            unresolved_runtime_helpers: 0,
+            code_bytes: incumbent_code_bytes,
+        };
+        let selected_cost = DirectExactSingletonCountCostShape {
+            scan_passes: 1,
+            native_calls_per_match: 0,
+            internal_span_publications_per_match: 0,
+            unresolved_runtime_helpers: 0,
+            code_bytes: selected_code_bytes,
+        };
+        let incumbent_components = incumbent_cost.runtime_components();
+        let selected_components = selected_cost.runtime_components();
+        let no_worse = selected_components
+            .iter()
+            .zip(incumbent_components)
+            .all(|(selected, incumbent)| *selected <= incumbent);
+        let strictly_better = selected_components
+            .iter()
+            .zip(incumbent_components)
+            .any(|(selected, incumbent)| *selected < incumbent);
+        if !no_worse
+            || (!strictly_better && selected_cost.code_bytes >= incumbent_cost.code_bytes)
+        {
+            return Ok(None);
+        }
+
+        let hot_gate = if let (Some(short_max), Some(cold_offset), Some(cold)) = (
+            short_fallback_max_bytes,
+            cold_long_offset,
+            cold_long.as_mut(),
+        ) {
+            let direct_min = short_max.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 short threshold"),
+            )?;
+            if !direct_min.is_multiple_of(1 << 12) {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 short threshold is not page aligned",
+                ));
+            }
+            let pages = u16::try_from(direct_min >> 12).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct Count-v3 short threshold pages")
+            })?;
+            let (relative_compare, relative_branch) =
+                aarch64_prepared_signed_length_check(&expected.code, relative_body)?;
+            let compare_offset = count_start.checked_add(relative_compare).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 length compare offset"),
+            )?;
+            let branch_offset = count_start.checked_add(relative_branch).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 length branch offset"),
+            )?;
+            let Some(cold_branch) = aarch64_local_cond_branch_instruction(
+                branch_offset,
+                cold_offset,
+                AARCH64_HS,
+            )? else {
+                return Ok(None);
+            };
+            let core_branch_offset = cold_offset
+                .checked_add(cold.core_branch_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 cold core branch offset",
+                ))?;
+            let Some(core_branch) =
+                aarch64_local_branch_instruction(core_branch_offset, core_offset)?
+            else {
+                return Ok(None);
+            };
+            let core_branch_end = cold
+                .core_branch_offset
+                .checked_add(4)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 cold core branch extent",
+                ))?;
+            cold.code
+                .get_mut(cold.core_branch_offset..core_branch_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Count-v3 cold core branch escapes its stub",
+                ))?
+                .copy_from_slice(&core_branch.to_le_bytes());
+            Some((
+                compare_offset,
+                [
+                    aarch64_cmp_x_imm_lsl12(2, pages)?,
+                    cold_branch,
+                ],
+            ))
+        } else {
+            None
+        };
+        let direct_patch_bytes = if hot_gate.is_none() {
+            let branch_offset = authenticated_body_offset.checked_add(12).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 core branch offset"),
+            )?;
+            let Some(branch) =
+                aarch64_local_branch_instruction(branch_offset, core_offset)?
+            else {
+                return Ok(None);
+            };
+            let direct_patch = [
+                aarch64_mov_x(0, 1)?,
+                aarch64_mov_x(1, 2)?,
+                aarch64_mov_x(2, 3)?,
+                branch,
+            ];
+            let mut bytes = [0_u8; DIRECT_EXACT_SINGLETON_COUNT_DIRECT_THUNK_BYTES];
+            for (slot, instruction) in bytes.chunks_exact_mut(4).zip(direct_patch) {
+                slot.copy_from_slice(&instruction.to_le_bytes());
+            }
+            if authenticated_body_offset
+                .checked_add(bytes.len())
+                .is_none_or(|end| end > count_end)
+            {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 wrapper patch escapes its incumbent body",
+                ));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let literal_bytes = u8::try_from(literal.len()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Count-v3 literal width")
+        })?;
+        let mut text = Vec::new();
+        text.try_reserve_exact(final_text_bytes)
+            .map_err(|_| ObjectError::Allocation("direct Count-v3 module text"))?;
+        text.extend_from_slice(&self.sections[TEXT_SECTION].data);
+        if let Some((compare_offset, gate)) = hot_gate {
+            let patch_end = compare_offset.checked_add(8).ok_or(
+                ObjectError::ArithmeticOverflow("direct Count-v3 cold gate extent"),
+            )?;
+            let patch = text
+                .get_mut(compare_offset..patch_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Count-v3 cold gate escapes the incumbent wrapper",
+                ))?;
+            for (slot, instruction) in patch.chunks_exact_mut(4).zip(gate) {
+                slot.copy_from_slice(&instruction.to_le_bytes());
+            }
+            let cold = cold_long.as_ref().ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 cold gate lost its long stub",
+            ))?;
+            if cold_long_offset != Some(text.len()) {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 cold-long offset disagrees",
+                ));
+            }
+            text.extend_from_slice(&cold.code);
+        } else {
+            let direct_patch_bytes = direct_patch_bytes.ok_or(
+                ObjectError::InvalidModule("direct Count-v3 direct patch is absent"),
+            )?;
+            let patch_end = authenticated_body_offset
+                .checked_add(direct_patch_bytes.len())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 wrapper patch extent",
+                ))?;
+            text[authenticated_body_offset..patch_end]
+                .copy_from_slice(&direct_patch_bytes);
+        }
+        while text.len() < core_offset {
+            text.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+        }
+        text.extend_from_slice(&candidate.code);
+        let embedded_sha256: [u8; 32] =
+            Sha256::digest(&text[core_offset..final_text_bytes]).into();
+        if text.get(core_offset..final_text_bytes) != Some(candidate.code.as_ref())
+            || embedded_sha256 != candidate.core_sha256
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 embedded core identity disagrees",
+            ));
+        }
+        candidate.authenticate_embedded(
+            literal,
+            core_offset,
+            &text[core_offset..final_text_bytes],
+        )?;
+        let selected_relocations = if let (Some(cold_offset), Some(cold)) =
+            (cold_long_offset, cold_long.as_ref())
+        {
+            let selected_count = self.relocations.len().checked_add(2).ok_or(
+                ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 selected relocation count",
+                ),
+            )?;
+            let mut relocations = Vec::new();
+            relocations
+                .try_reserve_exact(selected_count)
+                .map_err(|_| ObjectError::Allocation("direct Count-v3 relocations"))?;
+            relocations.extend_from_slice(&self.relocations);
+            for (relative, kind) in [
+                (cold.identity_page_offset, RelocationKind::Aarch64Page21),
+                (
+                    cold.identity_page_off12_offset,
+                    RelocationKind::Aarch64PageOff12,
+                ),
+            ] {
+                let offset = cold_offset.checked_add(relative).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 cold identity relocation offset",
+                    ),
+                )?;
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: u64::try_from(offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count-v3 cold identity relocation",
+                        )
+                    })?,
+                    kind,
+                    symbol: identity_page_relocation.symbol,
+                    addend: 0,
+                });
+            }
+            Some(relocations.into_boxed_slice())
+        } else {
+            None
+        };
+        let selection_basis = if short_fallback_max_bytes.is_some() {
+            DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominanceWithShortIncumbent
+        } else {
+            DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance
+        };
+        let mut selected_identity = Sha256::new();
+        selected_identity.update(b"fre-aot-regex/direct-exact-singleton-count-module/v5\0");
+        selected_identity.update(incumbent_module_identity);
+        selected_identity.update(artifact_identity);
+        selected_identity.update(candidate.recipe_identity);
+        selected_identity.update(candidate.core_sha256);
+        selected_identity.update([
+            literal_bytes,
+            1, // NonOverlapping successor.
+            if short_fallback_max_bytes.is_some() { 3 } else { 1 },
+        ]);
+        selected_identity.update(short_fallback_max_bytes.unwrap_or(0).to_le_bytes());
+        for extent in [
+            copied_incumbent_body_offset,
+            copied_incumbent_body_bytes,
+            cold_long_offset,
+            cold_long_bytes,
+        ] {
+            selected_identity.update(
+                u64::try_from(extent.unwrap_or(0))
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count-v3 copied incumbent identity extent",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+        }
+        selected_identity.update(
+            u64::try_from(authenticated_body_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 authenticated body identity offset",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        selected_identity.update(
+            u64::try_from(core_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("direct Count-v3 core identity offset")
+                })?
+                .to_le_bytes(),
+        );
+        selected_identity.update(
+            u64::try_from(DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 core identity alignment",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        selected_identity.update(selected_count_symbol_size.to_le_bytes());
+        selected_identity.update(
+            u64::try_from(candidate.code.len())
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("direct Count-v3 core identity bytes")
+                })?
+                .to_le_bytes(),
+        );
+        selected_identity.update(incumbent_cost.runtime_components());
+        selected_identity.update(incumbent_cost.code_bytes.to_le_bytes());
+        selected_identity.update(selected_cost.runtime_components());
+        selected_identity.update(selected_cost.code_bytes.to_le_bytes());
+        selected_identity.update(Sha256::digest(&text));
+        let identity_relocations = selected_relocations
+            .as_deref()
+            .unwrap_or(&self.relocations);
+        selected_identity.update(
+            u64::try_from(identity_relocations.len())
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct Count-v3 selected relocation identity count",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        for relocation in identity_relocations {
+            selected_identity.update(
+                u64::try_from(relocation.section)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count-v3 selected relocation identity section",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+            selected_identity.update(relocation.offset.to_le_bytes());
+            selected_identity.update([match relocation.kind {
+                RelocationKind::X86PcRelative32 => 1,
+                RelocationKind::X86PltRelative32 => 2,
+                RelocationKind::Aarch64Page21 => 3,
+                RelocationKind::Aarch64PageOff12 => 4,
+                RelocationKind::Aarch64Branch26 => 5,
+            }]);
+            selected_identity.update(
+                u64::try_from(relocation.symbol)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct Count-v3 selected relocation identity symbol",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+            selected_identity.update(relocation.addend.to_le_bytes());
+        }
+        let module_identity: [u8; 32] = selected_identity.finalize().into();
+        let count_name = identity_symbol(PREPARED_COUNT_SYMBOL_PREFIX, &module_identity)?;
+        let selected_text = text.into_boxed_slice();
+        let original_relocations = selected_relocations.map(|selected| {
+            std::mem::replace(&mut self.relocations, selected)
+        });
+        let original_text = std::mem::replace(
+            &mut self.sections[TEXT_SECTION].data,
+            selected_text,
+        );
+        let old_count_symbol_name = std::mem::replace(
+            &mut self.symbols[count_index].name,
+            count_name,
+        );
+        let old_count_symbol_size = std::mem::replace(
+            &mut self.symbols[count_index].size,
+            selected_count_symbol_size,
+        );
+        self.direct_exact_singleton_count_aot_report = Some(
+            DirectExactSingletonCountAotReport {
+                schema_version: DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
+                literal_bytes,
+                successor_mode: DirectExactSingletonCountSuccessorMode::NonOverlapping,
+                selection_basis,
+                incumbent_strategy: PreparedAggregateStrategy::NativeFused,
+                incumbent_cost,
+                selected_cost,
+                authenticated_wrapper_body_offset: authenticated_body_offset,
+                short_fallback_max_bytes,
+                copied_incumbent_body_offset,
+                copied_incumbent_body_bytes,
+                cold_long_offset,
+                cold_long_bytes,
+                core_alignment_bytes: DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
+                core_offset,
+                core_bytes: candidate.code.len(),
+                core_sha256: candidate.core_sha256,
+                compile_identity: candidate.compile_identity,
+                object_identity: candidate.object_identity,
+                recipe_identity: candidate.recipe_identity,
+                module_identity,
+            },
+        );
+        Ok(Some(DirectExactSingletonCountPatchRollback {
+            original_text,
+            original_relocations,
+            old_count_symbol_name,
+            old_count_symbol_size,
+        }))
+    }
+
+    /// Restore the byte-identical fully materialized incumbent after the only
+    /// safe post-selection decline: the completed candidate object exceeds the
+    /// caller's explicit object-byte ceiling.
+    pub(crate) fn rollback_direct_exact_singleton_count(
+        &mut self,
+        rollback: DirectExactSingletonCountPatchRollback,
+    ) -> Result<(), ObjectError> {
+        let DirectExactSingletonCountPatchRollback {
+            original_text,
+            original_relocations,
+            old_count_symbol_name,
+            old_count_symbol_size,
+        } = rollback;
+        let report = self
+            .direct_exact_singleton_count_aot_report
+            .ok_or(ObjectError::InvalidModule(
+                "direct Count-v3 rollback has no selected report",
+            ))?;
+        let original_text_bytes = original_text.len();
+        let gated = report.short_fallback_max_bytes.is_some();
+        if report.core_alignment_bytes != DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES
+            || !report.core_offset.is_multiple_of(report.core_alignment_bytes)
+            || !usize::try_from(self.sections[TEXT_SECTION].alignment)
+                .ok()
+                .is_some_and(|alignment| alignment.is_multiple_of(report.core_alignment_bytes))
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 rollback core alignment disagrees",
+            ));
+        }
+        if gated {
+            let (Some(cold_offset), Some(cold_bytes), Some(original_relocations_ref)) = (
+                report.cold_long_offset,
+                report.cold_long_bytes,
+                original_relocations.as_ref(),
+            ) else {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 rollback cold-long fields are absent",
+                ));
+            };
+            if report.copied_incumbent_body_offset.is_some()
+                || report.copied_incumbent_body_bytes.is_some()
+                || cold_offset != original_text_bytes
+                || cold_offset.checked_add(cold_bytes) != Some(report.core_offset)
+                || self.relocations.len()
+                    != original_relocations_ref.len().checked_add(2).unwrap_or(usize::MAX)
+            {
+                return Err(ObjectError::InvalidModule(
+                    "direct Count-v3 rollback cold-long layout disagrees",
+                ));
+            }
+        } else if report.copied_incumbent_body_offset.is_some()
+            || report.copied_incumbent_body_bytes.is_some()
+            || report.cold_long_offset.is_some()
+            || report.cold_long_bytes.is_some()
+            || original_relocations.is_some()
+            || report.core_offset < original_text_bytes
+            || report.core_offset - original_text_bytes >= report.core_alignment_bytes
+            || self.sections[TEXT_SECTION]
+                .data
+                .get(original_text_bytes..report.core_offset)
+                .is_none_or(|padding| {
+                    !padding
+                        .chunks_exact(4)
+                        .all(|word| word == 0xd503_201f_u32.to_le_bytes())
+                })
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 rollback ungated layout disagrees",
+            ));
+        }
+        if report.core_offset.checked_add(report.core_bytes)
+            != Some(self.sections[TEXT_SECTION].data.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 rollback checkpoint disagrees",
+            ));
+        }
+        let count_index = self.prepared_count_symbol_index.ok_or(
+            ObjectError::InvalidModule("direct Count-v3 rollback lost Count symbol"),
+        )?;
+        let count = self.symbols.get(count_index).ok_or(ObjectError::InvalidModule(
+            "direct Count-v3 rollback Count symbol is invalid",
+        ))?;
+        let selected_size_delta = if gated {
+            u64::try_from(report.cold_long_bytes.unwrap_or(0))
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "direct Count-v3 rollback selected Count size delta",
+                )
+            })?
+        } else {
+            0
+        };
+        let expected_selected_count_size = old_count_symbol_size
+            .checked_add(selected_size_delta)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Count-v3 rollback selected Count symbol size",
+            ))?;
+        if count.size != expected_selected_count_size {
+            return Err(ObjectError::InvalidModule(
+                "direct Count-v3 rollback Count symbol size disagrees",
+            ));
+        }
+        self.sections[TEXT_SECTION].data = original_text;
+        if let Some(original_relocations) = original_relocations {
+            self.relocations = original_relocations;
+        }
+        self.symbols[count_index].name = old_count_symbol_name;
+        self.symbols[count_index].size = old_count_symbol_size;
+        self.direct_exact_singleton_count_aot_report = None;
+        Ok(())
+    }
+
+    fn authenticate_direct_exact_singleton_span_sum_incumbent(
+        &self,
+        artifact_identity: [u8; 32],
+    ) -> Result<AuthenticatedDirectExactSingletonSpanSumIncumbent, ObjectError> {
+        let authenticated_body_offset = self
+            .prepared_span_sum_authenticated_body_offset
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum incumbent has no authenticated body",
+            ))?;
+        let symbol_index = self.prepared_span_sum_symbol_index.ok_or(
+            ObjectError::InvalidModule("direct SpanSum incumbent has no SpanSum symbol"),
+        )?;
+        let span_sum = self.symbols.get(symbol_index).ok_or(
+            ObjectError::InvalidModule("direct SpanSum symbol index is invalid"),
+        )?;
+        let symbol_start = usize::try_from(span_sum.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum entry offset")
+        })?;
+        let symbol_size = usize::try_from(span_sum.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum entry size")
+        })?;
+        let symbol_end = symbol_start.checked_add(symbol_size).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum entry extent"),
+        )?;
+        let relative_body = authenticated_body_offset.checked_sub(symbol_start).ok_or(
+            ObjectError::InvalidModule(
+                "direct SpanSum authentication body precedes its entry",
+            ),
+        )?;
+        let mut expected = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::SpanSum,
+            NativeSpanReducerCallKind::DirectOrdinary,
+            false,
+        )?;
+        let call_offset = symbol_start
+            .checked_add(expected.prepared_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum incumbent call offset",
+            ))?;
+        let ordinary = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("direct SpanSum ordinary symbol index is invalid"),
+        )?;
+        let ordinary_offset = usize::try_from(ordinary.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum ordinary entry offset")
+        })?;
+        let call_instruction = aarch64_local_call_instruction(call_offset, ordinary_offset)?
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum incumbent call is out of range",
+            ))?;
+        let expected_call_end = expected.prepared_call_offset.checked_add(4).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum incumbent call extent"),
+        )?;
+        expected
+            .code
+            .get_mut(expected.prepared_call_offset..expected_call_end)
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum incumbent call escapes its entry",
+            ))?
+            .copy_from_slice(&call_instruction.to_le_bytes());
+        let NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+            page: identity_page,
+            page_offset: identity_page_offset,
+        } = expected.identity_relocation.ok_or(ObjectError::InvalidModule(
+            "direct SpanSum incumbent has no identity relocation",
+        ))?
+        else {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum incumbent identity relocation has the wrong ISA",
+            ));
+        };
+        let identity_page = symbol_start.checked_add(identity_page).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum identity ADRP offset"),
+        )?;
+        let identity_page_offset = symbol_start.checked_add(identity_page_offset).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum identity ADD offset"),
+        )?;
+        let mut incumbent_relocations = self.relocations.iter().filter(|relocation| {
+            relocation.section == TEXT_SECTION
+                && usize::try_from(relocation.offset)
+                    .is_ok_and(|offset| (symbol_start..symbol_end).contains(&offset))
+        });
+        let identity_page_relocation = incumbent_relocations.next().ok_or(
+            ObjectError::InvalidModule("direct SpanSum identity ADRP is absent"),
+        )?;
+        let identity_page_offset_relocation = incumbent_relocations.next().ok_or(
+            ObjectError::InvalidModule("direct SpanSum identity ADD is absent"),
+        )?;
+        if incumbent_relocations.next().is_some()
+            || identity_page_relocation.offset
+                != u64::try_from(identity_page).unwrap_or(u64::MAX)
+            || identity_page_relocation.kind != RelocationKind::Aarch64Page21
+            || identity_page_relocation.addend != 0
+            || identity_page_offset_relocation.offset
+                != u64::try_from(identity_page_offset).unwrap_or(u64::MAX)
+            || identity_page_offset_relocation.kind != RelocationKind::Aarch64PageOff12
+            || identity_page_offset_relocation.addend != 0
+            || identity_page_relocation.symbol != identity_page_offset_relocation.symbol
+            || identity_page >= authenticated_body_offset
+            || identity_page_offset >= authenticated_body_offset
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum incumbent relocation surface disagrees",
+            ));
+        }
+        let identity_symbol_index = identity_page_relocation.symbol;
+        let identity_data_symbol = self
+            .symbols
+            .get(identity_symbol_index)
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum identity symbol is invalid",
+            ))?;
+        let identity_offset = usize::try_from(identity_data_symbol.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum identity data offset")
+        })?;
+        let identity_end = identity_offset.checked_add(artifact_identity.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum identity data extent"),
+        )?;
+        if span_sum.binding != SymbolBinding::Global
+            || span_sum.kind != SymbolKind::Function
+            || span_sum.section != Some(TEXT_SECTION)
+            || !span_sum.name.starts_with(PREPARED_SPAN_SUM_SYMBOL_PREFIX)
+            || ordinary.binding != SymbolBinding::Global
+            || ordinary.kind != SymbolKind::Function
+            || ordinary.section != Some(TEXT_SECTION)
+            || symbol_size != expected.code.len()
+            || expected.authenticated_body_offset != Some(relative_body)
+            || relative_body.checked_add(16).is_none_or(|end| end > symbol_size)
+            || self.sections[TEXT_SECTION]
+                .data
+                .get(symbol_start..symbol_end)
+                != Some(expected.code.as_slice())
+            || identity_data_symbol.name != ".Lfre_aot_regex_prepared_aggregate_identity"
+            || identity_data_symbol.binding != SymbolBinding::Local
+            || identity_data_symbol.kind != SymbolKind::Object
+            || identity_data_symbol.section != Some(PROGRAM_SECTION)
+            || identity_data_symbol.size != 32
+            || self.sections[PROGRAM_SECTION].data.get(identity_offset..identity_end)
+                != Some(artifact_identity.as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum incumbent authentication prefix disagrees",
+            ));
+        }
+        let canonical = [(symbol_index, PREPARED_SPAN_SUM_SYMBOL_PREFIX)];
+        let module_identity = prepared_aggregate_module_digest(
+            self.target,
+            artifact_identity,
+            PreparedAggregateExports::SPAN_SUM,
+            PreparedAggregateStrategy::NativeFused,
+            self.sections[TEXT_SECTION].bytes(),
+            self.sections[PROGRAM_SECTION].bytes(),
+            &self.symbols,
+            &self.relocations,
+            &canonical,
+        )?;
+        Ok(AuthenticatedDirectExactSingletonSpanSumIncumbent {
+            symbol_index,
+            symbol_start,
+            symbol_size,
+            authenticated_body_offset,
+            module_identity,
+            identity_symbol_index,
+        })
+    }
+
+    /// Compose the audited direct Count-v3 core with a checked fixed-width
+    /// `SpanSum` leaf. Periodic widths retain the incumbent short path in its
+    /// original instruction slots and enter this composition only from a cold
+    /// long-input arm.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "incumbent authentication, failure-atomic layout, and receipt identity form one closed transaction"
+    )]
+    pub(crate) fn install_direct_exact_singleton_span_sum(
+        &mut self,
+        literal: &[u8],
+        artifact_identity: [u8; 32],
+        candidate: &PreparedDirectExactSingletonCount,
+    ) -> Result<Option<DirectExactSingletonSpanSumPatchRollback>, ObjectError> {
+        if self.target.architecture != Architecture::Aarch64
+            || self.target.abi != CallAbi::Aapcs64
+            || !self
+                .target
+                .features
+                .contains(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            || self.prepared_aggregate_exports != PreparedAggregateExports::SPAN_SUM
+            || self.prepared_aggregate_strategy != Some(PreparedAggregateStrategy::NativeFused)
+            || self.required_runtime_symbols().next().is_some()
+            || self.direct_exact_singleton_count_aot_report.is_some()
+            || self.direct_exact_singleton_span_sum_aot_report.is_some()
+            || !(1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+        {
+            return Ok(None);
+        }
+        if candidate.target != self.target
+            || candidate.artifact_identity != artifact_identity
+            || candidate.literal_sha256 != <[u8; 32]>::from(Sha256::digest(literal))
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 candidate binding disagrees",
+            ));
+        }
+        let candidate_recipe = fre_aot_optimizer::inspect_count_recipe_v3(
+            &candidate.canonical_recipe,
+        )
+        .map_err(|_| {
+            ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 canonical recipe authentication failed",
+            )
+        })?;
+        if candidate_recipe.identity().as_bytes() != &candidate.recipe_identity {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 canonical recipe identity disagrees",
+            ));
+        }
+        let Some(_) = self.prepared_span_sum_authenticated_body_offset else {
+            return Ok(None);
+        };
+        let incumbent =
+            self.authenticate_direct_exact_singleton_span_sum_incumbent(artifact_identity)?;
+        let original_text_bytes = self.sections[TEXT_SECTION].data.len();
+        let symbol_end = incumbent
+            .symbol_start
+            .checked_add(incumbent.symbol_size)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum incumbent extent",
+            ))?;
+        if symbol_end > original_text_bytes || !original_text_bytes.is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum incumbent text extent is invalid",
+            ));
+        }
+        let text_alignment = usize::try_from(self.sections[TEXT_SECTION].alignment).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum text section alignment")
+        })?;
+        if !text_alignment
+            .is_multiple_of(DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES)
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum text section cannot honor producer alignment",
+            ));
+        }
+        let short_fallback_max_bytes =
+            direct_exact_singleton_count_short_fallback_max_bytes(
+                candidate_recipe.strategy(),
+                literal.len(),
+            );
+        if short_fallback_max_bytes.is_some() && symbol_end != original_text_bytes {
+            return Ok(None);
+        }
+        if short_fallback_max_bytes.is_some() {
+            for (symbol_index, symbol) in self.symbols.iter().enumerate() {
+                if symbol_index == incumbent.symbol_index
+                    || symbol.section != Some(TEXT_SECTION)
+                {
+                    continue;
+                }
+                let offset = usize::try_from(symbol.offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum incumbent text symbol offset",
+                    )
+                })?;
+                let bytes = usize::try_from(symbol.size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum incumbent text symbol size",
+                    )
+                })?;
+                let end = offset.checked_add(bytes).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum incumbent text symbol extent",
+                    ),
+                )?;
+                if offset >= incumbent.authenticated_body_offset
+                    || end > incumbent.authenticated_body_offset
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "direct SpanSum incumbent body has an unaudited symbol",
+                    ));
+                }
+            }
+        }
+
+        let literal_bytes = u8::try_from(literal.len()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum literal width")
+        })?;
+        let mut cold_long = short_fallback_max_bytes
+            .map(|_| lower_aarch64_direct_exact_singleton_span_sum_cold_long())
+            .transpose()?;
+        let cold_long_offset = cold_long.as_ref().map(|_| original_text_bytes);
+        let cold_long_bytes = cold_long.as_ref().map(|cold| cold.code.len());
+        let mut wrapper =
+            lower_aarch64_direct_exact_singleton_span_sum_wrapper(literal_bytes)?;
+        let wrapper_offset = original_text_bytes
+            .checked_add(cold_long_bytes.unwrap_or(0))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum wrapper offset",
+            ))?;
+        let wrapper_end = wrapper_offset.checked_add(wrapper.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum wrapper extent"),
+        )?;
+        let core_alignment =
+            DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES;
+        if !core_alignment.is_power_of_two() || core_alignment < 4 {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 core alignment is invalid",
+            ));
+        }
+        let core_offset = wrapper_end
+            .checked_add(core_alignment - 1)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum Count-v3 core alignment",
+            ))?
+            & !(core_alignment - 1);
+        let wrapper_to_core_padding_bytes = core_offset.checked_sub(wrapper_end).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum Count-v3 core padding"),
+        )?;
+        if !wrapper_to_core_padding_bytes.is_multiple_of(4)
+            || !core_offset.is_multiple_of(core_alignment)
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 core is not producer aligned",
+            ));
+        }
+        let final_text_bytes = core_offset.checked_add(candidate.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum Count-v3 core extent"),
+        )?;
+        let selected_symbol_size = if short_fallback_max_bytes.is_some() {
+            core_offset.checked_sub(incumbent.symbol_start).ok_or(
+                ObjectError::InvalidModule(
+                    "direct SpanSum selected symbol extent is invalid",
+                ),
+            )?
+        } else {
+            incumbent.symbol_size
+        };
+        let selected_symbol_size = u64::try_from(selected_symbol_size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum selected symbol size")
+        })?;
+        let incumbent_code_bytes = u32::try_from(incumbent.symbol_size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct SpanSum incumbent code bytes")
+        })?;
+        let appended_code_bytes = final_text_bytes.checked_sub(original_text_bytes).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum appended code bytes"),
+        )?;
+        let selected_code_bytes = incumbent
+            .symbol_size
+            .checked_add(appended_code_bytes)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum selected code bytes",
+            ))?;
+        let incumbent_cost = DirectExactSingletonSpanSumCostShape {
+            scan_passes: 1,
+            native_scan_entries_per_operation: 1,
+            native_calls_per_match: 1,
+            internal_span_publications_per_match: 1,
+            unresolved_runtime_helpers: 0,
+            code_bytes: incumbent_code_bytes,
+        };
+        let selected_cost = DirectExactSingletonSpanSumCostShape {
+            scan_passes: 1,
+            native_scan_entries_per_operation: 1,
+            native_calls_per_match: 0,
+            internal_span_publications_per_match: 0,
+            unresolved_runtime_helpers: 0,
+            code_bytes: selected_code_bytes,
+        };
+        let incumbent_components = incumbent_cost.runtime_components();
+        let selected_components = selected_cost.runtime_components();
+        let no_worse = selected_components
+            .iter()
+            .zip(incumbent_components)
+            .all(|(selected, incumbent)| *selected <= incumbent);
+        let strictly_better = selected_components
+            .iter()
+            .zip(incumbent_components)
+            .any(|(selected, incumbent)| *selected < incumbent);
+        if !no_worse
+            || (!strictly_better && selected_cost.code_bytes >= incumbent_cost.code_bytes)
+        {
+            return Ok(None);
+        }
+
+        let relative_body = incumbent
+            .authenticated_body_offset
+            .checked_sub(incumbent.symbol_start)
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum authenticated body precedes its symbol",
+            ))?;
+        let expected = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::SpanSum,
+            NativeSpanReducerCallKind::DirectOrdinary,
+            false,
+        )?;
+        let hot_gate = if let (Some(short_max), Some(cold_offset), Some(cold)) = (
+            short_fallback_max_bytes,
+            cold_long_offset,
+            cold_long.as_mut(),
+        ) {
+            let direct_min = short_max.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("direct SpanSum short threshold"),
+            )?;
+            if !direct_min.is_multiple_of(1 << 12) {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum short threshold is not page aligned",
+                ));
+            }
+            let pages = u16::try_from(direct_min >> 12).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct SpanSum short threshold pages")
+            })?;
+            let (relative_compare, relative_branch) =
+                aarch64_prepared_signed_length_check(&expected.code, relative_body)?;
+            let compare_offset = incumbent
+                .symbol_start
+                .checked_add(relative_compare)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum length compare offset",
+                ))?;
+            let branch_offset = incumbent
+                .symbol_start
+                .checked_add(relative_branch)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum length branch offset",
+                ))?;
+            let Some(cold_branch) = aarch64_local_cond_branch_instruction(
+                branch_offset,
+                cold_offset,
+                AARCH64_HS,
+            )? else {
+                return Ok(None);
+            };
+            let wrapper_branch_offset = cold_offset
+                .checked_add(cold.wrapper_branch_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum cold wrapper branch offset",
+                ))?;
+            let Some(wrapper_branch) =
+                aarch64_local_branch_instruction(wrapper_branch_offset, wrapper_offset)?
+            else {
+                return Ok(None);
+            };
+            let wrapper_branch_end = cold
+                .wrapper_branch_offset
+                .checked_add(4)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum cold wrapper branch extent",
+                ))?;
+            cold.code
+                .get_mut(cold.wrapper_branch_offset..wrapper_branch_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct SpanSum cold wrapper branch escapes its stub",
+                ))?
+                .copy_from_slice(&wrapper_branch.to_le_bytes());
+            Some((
+                compare_offset,
+                [aarch64_cmp_x_imm_lsl12(2, pages)?, cold_branch],
+            ))
+        } else {
+            None
+        };
+        let direct_patch = if hot_gate.is_none() {
+            let branch = aarch64_local_branch_instruction(
+                incumbent.authenticated_body_offset,
+                wrapper_offset,
+            )?
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum wrapper branch is out of range",
+            ))?;
+            Some([branch, 0xd503_201f, 0xd503_201f, 0xd503_201f])
+        } else {
+            None
+        };
+        let call_offset = wrapper_offset
+            .checked_add(wrapper.count_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum Count-v3 call offset",
+            ))?;
+        let call = aarch64_local_call_instruction(call_offset, core_offset)?.ok_or(
+            ObjectError::InvalidModule("direct SpanSum Count-v3 call is out of range"),
+        )?;
+        let call_end = wrapper.count_call_offset.checked_add(4).ok_or(
+            ObjectError::ArithmeticOverflow("direct SpanSum Count-v3 call extent"),
+        )?;
+        wrapper
+            .code
+            .get_mut(wrapper.count_call_offset..call_end)
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum Count-v3 call escapes wrapper",
+            ))?
+            .copy_from_slice(&call.to_le_bytes());
+
+        let mut text = Vec::new();
+        text.try_reserve_exact(final_text_bytes)
+            .map_err(|_| ObjectError::Allocation("direct SpanSum module text"))?;
+        text.extend_from_slice(&self.sections[TEXT_SECTION].data);
+        if let Some((compare_offset, gate)) = hot_gate {
+            let patch_end = compare_offset.checked_add(8).ok_or(
+                ObjectError::ArithmeticOverflow("direct SpanSum cold gate extent"),
+            )?;
+            let patch = text.get_mut(compare_offset..patch_end).ok_or(
+                ObjectError::InvalidModule(
+                    "direct SpanSum cold gate escapes the incumbent wrapper",
+                ),
+            )?;
+            for (slot, instruction) in patch.chunks_exact_mut(4).zip(gate) {
+                slot.copy_from_slice(&instruction.to_le_bytes());
+            }
+            let cold = cold_long.as_ref().ok_or(ObjectError::InvalidModule(
+                "direct SpanSum cold gate lost its long stub",
+            ))?;
+            if cold_long_offset != Some(text.len()) {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum cold-long offset disagrees",
+                ));
+            }
+            text.extend_from_slice(&cold.code);
+        } else {
+            let patch = direct_patch.ok_or(ObjectError::InvalidModule(
+                "direct SpanSum direct patch is absent",
+            ))?;
+            let patch_end = incumbent
+                .authenticated_body_offset
+                .checked_add(16)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct SpanSum authenticated patch extent",
+                ))?;
+            for (slot, instruction) in text
+                .get_mut(incumbent.authenticated_body_offset..patch_end)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct SpanSum authenticated patch escapes its entry",
+                ))?
+                .chunks_exact_mut(4)
+                .zip(patch)
+            {
+                slot.copy_from_slice(&instruction.to_le_bytes());
+            }
+        }
+        text.extend_from_slice(&wrapper.code);
+        while text.len() < core_offset {
+            text.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+        }
+        text.extend_from_slice(&candidate.code);
+        let embedded_wrapper = text.get(wrapper_offset..wrapper_end).ok_or(
+            ObjectError::InvalidModule("direct SpanSum wrapper escapes selected text"),
+        )?;
+        let wrapper_sha256 = authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+            literal_bytes,
+            wrapper_offset,
+            core_offset,
+            embedded_wrapper,
+        )?;
+        let embedded_core = text.get(core_offset..final_text_bytes).ok_or(
+            ObjectError::InvalidModule("direct SpanSum Count-v3 core escapes selected text"),
+        )?;
+        candidate.authenticate_embedded(literal, core_offset, embedded_core)?;
+
+        let selected_relocations = if let (Some(cold_offset), Some(cold)) =
+            (cold_long_offset, cold_long.as_ref())
+        {
+            let selected_count = self.relocations.len().checked_add(2).ok_or(
+                ObjectError::ArithmeticOverflow(
+                    "direct SpanSum selected relocation count",
+                ),
+            )?;
+            let mut relocations = Vec::new();
+            relocations
+                .try_reserve_exact(selected_count)
+                .map_err(|_| ObjectError::Allocation("direct SpanSum relocations"))?;
+            relocations.extend_from_slice(&self.relocations);
+            for (relative, kind) in [
+                (cold.identity_page_offset, RelocationKind::Aarch64Page21),
+                (
+                    cold.identity_page_off12_offset,
+                    RelocationKind::Aarch64PageOff12,
+                ),
+            ] {
+                let offset = cold_offset.checked_add(relative).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum cold identity relocation offset",
+                    ),
+                )?;
+                relocations.push(ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: u64::try_from(offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct SpanSum cold identity relocation",
+                        )
+                    })?,
+                    kind,
+                    symbol: incumbent.identity_symbol_index,
+                    addend: 0,
+                });
+            }
+            Some(relocations.into_boxed_slice())
+        } else {
+            None
+        };
+        let selection_basis = if short_fallback_max_bytes.is_some() {
+            DirectExactSingletonSpanSumSelectionBasis::ExactWidthCountCompositionWithShortIncumbent
+        } else {
+            DirectExactSingletonSpanSumSelectionBasis::ExactWidthCountComposition
+        };
+        let mut selected_identity = Sha256::new();
+        selected_identity.update(
+            b"fre-aot-regex/direct-exact-singleton-span-sum-module/v3\0",
+        );
+        selected_identity.update(incumbent.module_identity);
+        selected_identity.update(artifact_identity);
+        selected_identity.update(candidate.recipe_identity);
+        selected_identity.update(wrapper_sha256);
+        selected_identity.update(candidate.core_sha256);
+        selected_identity.update([
+            literal_bytes,
+            1, // NonOverlapping successor.
+            if short_fallback_max_bytes.is_some() { 2 } else { 1 },
+        ]);
+        selected_identity.update(short_fallback_max_bytes.unwrap_or(0).to_le_bytes());
+        for extent in [
+            incumbent.authenticated_body_offset,
+            cold_long_offset.unwrap_or(0),
+            cold_long_bytes.unwrap_or(0),
+            wrapper_offset,
+            wrapper.code.len(),
+            wrapper_to_core_padding_bytes,
+            core_offset,
+            text_alignment,
+            core_alignment,
+            candidate.code.len(),
+        ] {
+            selected_identity.update(
+                u64::try_from(extent)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct SpanSum selected identity extent",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+        }
+        selected_identity.update(selected_symbol_size.to_le_bytes());
+        selected_identity.update(incumbent_cost.runtime_components());
+        selected_identity.update(incumbent_cost.code_bytes.to_le_bytes());
+        selected_identity.update(selected_cost.runtime_components());
+        selected_identity.update(selected_cost.code_bytes.to_le_bytes());
+        selected_identity.update(Sha256::digest(&text));
+        let identity_relocations = selected_relocations
+            .as_deref()
+            .unwrap_or(&self.relocations);
+        selected_identity.update(
+            u64::try_from(identity_relocations.len())
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "direct SpanSum selected relocation identity count",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        for relocation in identity_relocations {
+            selected_identity.update(
+                u64::try_from(relocation.section)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct SpanSum selected relocation identity section",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+            selected_identity.update(relocation.offset.to_le_bytes());
+            selected_identity.update([match relocation.kind {
+                RelocationKind::X86PcRelative32 => 1,
+                RelocationKind::X86PltRelative32 => 2,
+                RelocationKind::Aarch64Page21 => 3,
+                RelocationKind::Aarch64PageOff12 => 4,
+                RelocationKind::Aarch64Branch26 => 5,
+            }]);
+            selected_identity.update(
+                u64::try_from(relocation.symbol)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "direct SpanSum selected relocation identity symbol",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+            selected_identity.update(relocation.addend.to_le_bytes());
+        }
+        let module_identity: [u8; 32] = selected_identity.finalize().into();
+        let span_sum_name =
+            identity_symbol(PREPARED_SPAN_SUM_SYMBOL_PREFIX, &module_identity)?;
+        let selected_text = text.into_boxed_slice();
+        let original_relocations = selected_relocations
+            .map(|selected| std::mem::replace(&mut self.relocations, selected));
+        let original_text =
+            std::mem::replace(&mut self.sections[TEXT_SECTION].data, selected_text);
+        let old_span_sum_symbol_name = std::mem::replace(
+            &mut self.symbols[incumbent.symbol_index].name,
+            span_sum_name,
+        );
+        let old_span_sum_symbol_size = std::mem::replace(
+            &mut self.symbols[incumbent.symbol_index].size,
+            selected_symbol_size,
+        );
+        self.direct_exact_singleton_span_sum_aot_report = Some(
+            DirectExactSingletonSpanSumAotReport {
+                schema_version: DIRECT_EXACT_SINGLETON_SPAN_SUM_AOT_SCHEMA_VERSION,
+                literal_bytes,
+                successor_mode: DirectExactSingletonSpanSumSuccessorMode::NonOverlapping,
+                selection_basis,
+                count_recipe_strategy: candidate_recipe.strategy(),
+                incumbent_strategy: PreparedAggregateStrategy::NativeFused,
+                incumbent_cost,
+                selected_cost,
+                authenticated_wrapper_body_offset: incumbent.authenticated_body_offset,
+                short_fallback_max_bytes,
+                cold_long_offset,
+                cold_long_bytes,
+                wrapper_offset,
+                wrapper_bytes: wrapper.code.len(),
+                wrapper_sha256,
+                wrapper_to_core_padding_bytes,
+                core_offset,
+                text_section_alignment_bytes: text_alignment,
+                core_alignment_bytes: core_alignment,
+                core_bytes: candidate.code.len(),
+                core_sha256: candidate.core_sha256,
+                compile_identity: candidate.compile_identity,
+                object_identity: candidate.object_identity,
+                recipe_identity: candidate.recipe_identity,
+                module_identity,
+            },
+        );
+        Ok(Some(DirectExactSingletonSpanSumPatchRollback {
+            original_text,
+            original_relocations,
+            old_span_sum_symbol_name,
+            old_span_sum_symbol_size,
+        }))
+    }
+
+    /// Restore the byte-identical incumbent after a proven final object-byte
+    /// cap decline. Allocator failure is terminal and never reaches here.
+    pub(crate) fn rollback_direct_exact_singleton_span_sum(
+        &mut self,
+        rollback: DirectExactSingletonSpanSumPatchRollback,
+    ) -> Result<(), ObjectError> {
+        let DirectExactSingletonSpanSumPatchRollback {
+            original_text,
+            original_relocations,
+            old_span_sum_symbol_name,
+            old_span_sum_symbol_size,
+        } = rollback;
+        let report = self
+            .direct_exact_singleton_span_sum_aot_report
+            .ok_or(ObjectError::InvalidModule(
+                "direct SpanSum rollback has no selected report",
+            ))?;
+        let original_text_bytes = original_text.len();
+        let gated = report.short_fallback_max_bytes.is_some();
+        if report.core_alignment_bytes
+            != DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES
+            || !report.core_offset.is_multiple_of(report.core_alignment_bytes)
+            || usize::try_from(self.sections[TEXT_SECTION].alignment).ok()
+                != Some(report.text_section_alignment_bytes)
+            || !report
+                .text_section_alignment_bytes
+                .is_multiple_of(report.core_alignment_bytes)
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum rollback core alignment disagrees",
+            ));
+        }
+        if gated {
+            let (Some(cold_offset), Some(cold_bytes), Some(original_relocations_ref)) = (
+                report.cold_long_offset,
+                report.cold_long_bytes,
+                original_relocations.as_ref(),
+            ) else {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum rollback cold-long fields are absent",
+                ));
+            };
+            if cold_offset != original_text_bytes
+                || cold_offset.checked_add(cold_bytes) != Some(report.wrapper_offset)
+                || self.relocations.len()
+                    != original_relocations_ref.len().checked_add(2).unwrap_or(usize::MAX)
+            {
+                return Err(ObjectError::InvalidModule(
+                    "direct SpanSum rollback cold-long layout disagrees",
+                ));
+            }
+        } else if report.cold_long_offset.is_some()
+            || report.cold_long_bytes.is_some()
+            || original_relocations.is_some()
+            || report.wrapper_offset != original_text_bytes
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum rollback ungated layout disagrees",
+            ));
+        }
+        let wrapper_end = report
+            .wrapper_offset
+            .checked_add(report.wrapper_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum rollback wrapper extent",
+            ))?;
+        if wrapper_end.checked_add(report.wrapper_to_core_padding_bytes)
+                != Some(report.core_offset)
+            || report.wrapper_to_core_padding_bytes >= report.core_alignment_bytes
+            || !report.wrapper_to_core_padding_bytes.is_multiple_of(4)
+            || self.sections[TEXT_SECTION]
+                .data
+                .get(wrapper_end..report.core_offset)
+                .is_none_or(|padding| {
+                    !padding
+                        .chunks_exact(4)
+                        .all(|word| word == 0xd503_201f_u32.to_le_bytes())
+                })
+            || report.core_offset.checked_add(report.core_bytes)
+                != Some(self.sections[TEXT_SECTION].data.len())
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum rollback checkpoint disagrees",
+            ));
+        }
+        let span_sum_index = self.prepared_span_sum_symbol_index.ok_or(
+            ObjectError::InvalidModule("direct SpanSum rollback lost SpanSum symbol"),
+        )?;
+        let span_sum = self.symbols.get(span_sum_index).ok_or(
+            ObjectError::InvalidModule("direct SpanSum rollback symbol is invalid"),
+        )?;
+        let selected_size_delta = if gated {
+            u64::try_from(
+                report
+                    .cold_long_bytes
+                    .unwrap_or(0)
+                    .checked_add(report.wrapper_bytes)
+                    .and_then(|bytes| {
+                        bytes.checked_add(report.wrapper_to_core_padding_bytes)
+                    })
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "direct SpanSum rollback selected size delta",
+                    ))?,
+            )
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "direct SpanSum rollback selected symbol size delta",
+                )
+            })?
+        } else {
+            0
+        };
+        let expected_selected_size = old_span_sum_symbol_size
+            .checked_add(selected_size_delta)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct SpanSum rollback selected symbol size",
+            ))?;
+        if span_sum.size != expected_selected_size {
+            return Err(ObjectError::InvalidModule(
+                "direct SpanSum rollback symbol size disagrees",
+            ));
+        }
+        self.sections[TEXT_SECTION].data = original_text;
+        if let Some(original_relocations) = original_relocations {
+            self.relocations = original_relocations;
+        }
+        self.symbols[span_sum_index].name = old_span_sum_symbol_name;
+        self.symbols[span_sum_index].size = old_span_sum_symbol_size;
+        self.direct_exact_singleton_span_sum_aot_report = None;
+        Ok(())
     }
 
     /// Append one compiler-generated uniform-capture whole-operation reducer.
@@ -9625,6 +13546,17 @@ struct NativePreparedBulkWrapper {
     bulk_runtime_fallback_offset: Option<usize>,
     compatibility_identity_relocation: Option<NativePreparedIdentityRelocation>,
     identity_relocation: Option<NativePreparedIdentityRelocation>,
+    authenticated_body_offset: Option<usize>,
+    trusted_core: Option<NativeDirectSearchTrustedCore>,
+    trusted_core_trampoline_offset: Option<usize>,
+    trusted_core_jump_offset: Option<usize>,
+}
+
+struct NativeDirectExistsBatchWrapper {
+    code: Vec<u8>,
+    search_call_offset: usize,
+    trampoline_offset: usize,
+    core_jump_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9796,6 +13728,7 @@ impl NativeSpanReducerTarget {
 enum NativeSpanReducerCallKind {
     PreparedPrivate,
     DirectOrdinary,
+    DirectTrustedCore(NativeDirectSearchTrustedCorePrologue),
 }
 
 /// Check the exact local-call sites that `append_native` will produce before
@@ -9826,6 +13759,47 @@ fn native_aggregate_wrappers_fit(
             .ok_or(ObjectError::ArithmeticOverflow(
                 "direct aggregate call offset",
             ))?;
+        let trusted_core = match (
+            wrapper.trusted_core,
+            wrapper.trusted_core_trampoline_offset,
+            wrapper.trusted_core_jump_offset,
+        ) {
+            (Some(core), Some(trampoline), Some(jump)) => {
+                if !matches!(
+                    (architecture, core.prologue),
+                    (
+                        Architecture::X86_64,
+                        NativeDirectSearchTrustedCorePrologue::X86_64 { .. }
+                    ) | (
+                        Architecture::Aarch64,
+                        NativeDirectSearchTrustedCorePrologue::Aarch64
+                    )
+                ) || trampoline >= wrapper.code.len()
+                    || jump >= wrapper.code.len()
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "direct aggregate trusted-core trampoline is inconsistent",
+                    ));
+                }
+                Some((core, trampoline, jump))
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "direct aggregate trusted-core topology is incomplete",
+                ));
+            }
+        };
+        let local_call_target = trusted_core
+            .map(|(_, trampoline, _)| {
+                code_offset
+                    .checked_add(trampoline)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "direct aggregate trusted-core trampoline offset",
+                    ))
+            })
+            .transpose()?
+            .unwrap_or(target);
         match architecture {
             Architecture::X86_64 => {
                 let instruction_end = call_offset.checked_add(4).ok_or(
@@ -9846,16 +13820,48 @@ fn native_aggregate_wrappers_fit(
                         "direct aggregate x86 call placeholder is malformed",
                     ));
                 }
-                let (Ok(target), Ok(instruction_end)) =
-                    (i64::try_from(target), i64::try_from(instruction_end))
+                let (Ok(local_call_target), Ok(instruction_end)) =
+                    (i64::try_from(local_call_target), i64::try_from(instruction_end))
                 else {
                     return Ok(false);
                 };
-                let Some(displacement) = target.checked_sub(instruction_end) else {
+                let Some(displacement) = local_call_target.checked_sub(instruction_end) else {
                     return Ok(false);
                 };
                 if i32::try_from(displacement).is_err() {
                     return Ok(false);
+                }
+                if let Some((core, _, jump)) = trusted_core {
+                    let jump_end = code_offset
+                        .checked_add(jump)
+                        .and_then(|offset| offset.checked_add(4))
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "direct aggregate x86 trusted-core jump end",
+                        ))?;
+                    if jump
+                        .checked_sub(1)
+                        .and_then(|offset| wrapper.code.get(offset))
+                        != Some(&0xe9)
+                        || jump
+                            .checked_add(4)
+                            .and_then(|end| wrapper.code.get(jump..end))
+                            != Some(&[0, 0, 0, 0])
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "direct aggregate x86 trusted-core jump placeholder is malformed",
+                        ));
+                    }
+                    let (Ok(core), Ok(jump_end)) =
+                        (i64::try_from(core.code_offset), i64::try_from(jump_end))
+                    else {
+                        return Ok(false);
+                    };
+                    let Some(displacement) = core.checked_sub(jump_end) else {
+                        return Ok(false);
+                    };
+                    if i32::try_from(displacement).is_err() {
+                        return Ok(false);
+                    }
                 }
             }
             Architecture::Aarch64 => {
@@ -9876,17 +13882,17 @@ fn native_aggregate_wrappers_fit(
                         "direct aggregate AArch64 call placeholder is malformed",
                     ));
                 }
-                if !call_offset.is_multiple_of(4) || !target.is_multiple_of(4) {
+                if !call_offset.is_multiple_of(4) || !local_call_target.is_multiple_of(4) {
                     return Err(ObjectError::InvalidModule(
                         "direct aggregate AArch64 call is unaligned",
                     ));
                 }
-                let (Ok(target), Ok(call_offset)) =
-                    (i64::try_from(target), i64::try_from(call_offset))
+                let (Ok(local_call_target), Ok(call_offset)) =
+                    (i64::try_from(local_call_target), i64::try_from(call_offset))
                 else {
                     return Ok(false);
                 };
-                let Some(displacement) = target.checked_sub(call_offset) else {
+                let Some(displacement) = local_call_target.checked_sub(call_offset) else {
                     return Ok(false);
                 };
                 let Some(words) = displacement.checked_div(4) else {
@@ -9894,6 +13900,41 @@ fn native_aggregate_wrappers_fit(
                 };
                 if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
                     return Ok(false);
+                }
+                if let Some((core, trampoline, jump)) = trusted_core {
+                    let jump_end = jump.checked_add(4).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "direct aggregate AArch64 trusted-core branch extent",
+                        ),
+                    )?;
+                    if trampoline.checked_add(4) != Some(jump)
+                        || wrapper.code.get(jump..jump_end)
+                            != Some(0x1400_0000_u32.to_le_bytes().as_slice())
+                        || !core.code_offset.is_multiple_of(4)
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "direct aggregate AArch64 trusted-core branch is malformed",
+                        ));
+                    }
+                    let branch_offset = code_offset.checked_add(jump).ok_or(
+                        ObjectError::ArithmeticOverflow(
+                            "direct aggregate AArch64 trusted-core branch offset",
+                        ),
+                    )?;
+                    let (Ok(core), Ok(branch_offset)) =
+                        (i64::try_from(core.code_offset), i64::try_from(branch_offset))
+                    else {
+                        return Ok(false);
+                    };
+                    let Some(displacement) = core.checked_sub(branch_offset) else {
+                        return Ok(false);
+                    };
+                    let Some(words) = displacement.checked_div(4) else {
+                        return Ok(false);
+                    };
+                    if !(-(1_i64 << 25)..(1_i64 << 25)).contains(&words) {
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -10067,6 +14108,10 @@ fn append_prepared_bulk_entry(
                 bulk_runtime_fallback_offset: None,
                 compatibility_identity_relocation: None,
                 identity_relocation: None,
+                authenticated_body_offset: None,
+                trusted_core: None,
+                trusted_core_trampoline_offset: None,
+                trusted_core_jump_offset: None,
             },
             output == OutputContract::Span,
         )),
@@ -10079,6 +14124,10 @@ fn append_prepared_bulk_entry(
                 bulk_runtime_fallback_offset: None,
                 compatibility_identity_relocation: None,
                 identity_relocation: None,
+                authenticated_body_offset: None,
+                trusted_core: None,
+                trusted_core_trampoline_offset: None,
+                trusted_core_jump_offset: None,
             },
             output == OutputContract::Span,
         )),
@@ -10300,6 +14349,8 @@ fn lower_runtime_adapter(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size,
@@ -10319,6 +14370,7 @@ fn lower_native_ordered_nfa_prepared(
     view: NativeOrderedNfaProgramView<'_>,
     target: Target,
     max_native_data_bytes: usize,
+    allow_start_prefix_vector: bool,
 ) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
     Ok(match lower_native_ordered_nfa_prepared_reported(
         program_bytes,
@@ -10327,6 +14379,7 @@ fn lower_native_ordered_nfa_prepared(
         max_native_data_bytes,
         FROZEN_ORDERED_NFA_V1_MAX_DESCRIPTOR_BYTES,
         PreparedOrderedNfaV15Surface::Compatibility,
+        allow_start_prefix_vector,
     )? {
         NativeOrderedNfaPreparedOutcome::Lowered(lowering, layout) => Some((lowering, layout)),
         NativeOrderedNfaPreparedOutcome::Unsupported
@@ -10347,6 +14400,7 @@ fn lower_native_ordered_nfa_prepared_reported(
     max_native_data_bytes: usize,
     max_descriptor_bytes: usize,
     surface: PreparedOrderedNfaV15Surface,
+    allow_start_prefix_vector: bool,
 ) -> Result<NativeOrderedNfaPreparedOutcome, ObjectError> {
     let serialized_identity: [u8; 32] = Sha256::digest(&program_bytes).into();
     if serialized_identity != view.artifact_identity {
@@ -10406,7 +14460,11 @@ fn lower_native_ordered_nfa_prepared_reported(
         (PreparedOrderedNfaV15Surface::Compatibility, Architecture::Aarch64) => {
             lower_aarch64_runtime_adapter()?
         }
-        (PreparedOrderedNfaV15Surface::ScalarOperationOnly, _) => (Vec::new(), Vec::new()),
+        (
+            PreparedOrderedNfaV15Surface::ScalarOperationOnly
+            | PreparedOrderedNfaV15Surface::RowSearchOnly,
+            _,
+        ) => (Vec::new(), Vec::new()),
     };
     let ordinary_code_size = code.len();
     let code_alignment = match target.architecture {
@@ -10428,7 +14486,13 @@ fn lower_native_ordered_nfa_prepared_reported(
             }
         }
     }
-    let (entry_code, entry_relocations, private_relative, gate_relative) =
+    let (
+        entry_code,
+        entry_relocations,
+        private_relative,
+        gate_relative,
+        start_prefix_vector_lowered,
+    ) =
         match target.architecture {
             Architecture::X86_64 => {
                 let entry = match surface {
@@ -10438,21 +14502,41 @@ fn lower_native_ordered_nfa_prepared_reported(
                     PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
                         ordered_nfa_codegen::lower_x86_64_operation_only(&image)?
                     }
+                    PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                        ordered_nfa_codegen::lower_x86_64_row_search_only(&image)?
+                    }
                 };
                 (
                     entry.code,
                     entry.relocations,
                     entry.private_entry_offset,
                     entry.bulk_gate_entry_offset,
+                    false,
                 )
             }
             Architecture::Aarch64 => {
+                let allow_asimd = target.features.has(CpuFeature::Aarch64Asimd);
                 let entry = match surface {
                     PreparedOrderedNfaV15Surface::Compatibility => {
-                        ordered_nfa_aarch64_codegen::lower_aarch64(&image)?
+                        ordered_nfa_aarch64_codegen::lower_aarch64_with_vector_policies(
+                            &image,
+                            allow_start_prefix_vector && allow_asimd,
+                            allow_asimd,
+                        )?
                     }
                     PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
-                        ordered_nfa_aarch64_codegen::lower_aarch64_operation_only(&image)?
+                        ordered_nfa_aarch64_codegen::lower_aarch64_operation_only_with_vector_policies(
+                            &image,
+                            allow_start_prefix_vector && allow_asimd,
+                            allow_asimd,
+                        )?
+                    }
+                    PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                        ordered_nfa_aarch64_codegen::lower_aarch64_row_search_only_with_vector_policies(
+                            &image,
+                            allow_start_prefix_vector && allow_asimd,
+                            allow_asimd,
+                        )?
                     }
                 };
                 (
@@ -10460,6 +14544,7 @@ fn lower_native_ordered_nfa_prepared_reported(
                     entry.relocations,
                     entry.private_entry_offset,
                     entry.bulk_gate_entry_offset,
+                    entry.start_prefix_vector_lowered,
                 )
             }
         };
@@ -10514,14 +14599,16 @@ fn lower_native_ordered_nfa_prepared_reported(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size,
             code_offset: public_entry_offset,
             code_size: public_entry_size,
             kind: PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
-                operation_only: surface
-                    == PreparedOrderedNfaV15Surface::ScalarOperationOnly,
+                operation_only: surface != PreparedOrderedNfaV15Surface::Compatibility,
+                row_search_only: surface == PreparedOrderedNfaV15Surface::RowSearchOnly,
                 object_abi_version: if image.layout.terminal_range.is_some() {
                     ORDERED_NFA_OBJECT_V3_ABI_VERSION
                 } else if image.layout.ordered_edge_dispatch.is_some() {
@@ -10536,6 +14623,7 @@ fn lower_native_ordered_nfa_prepared_reported(
                     .is_some(),
                 start_closure_dispatch_lowered: image.layout.start_closure_dispatch.is_some(),
                 start_prefix_lowered: image.layout.start_prefix.is_some(),
+                start_prefix_vector_lowered,
                 object_offset,
                 object_size: image.bytes.len(),
                 object_alignment: ORDERED_NFA_OBJECT_V1_ALIGNMENT,
@@ -10552,15 +14640,16 @@ fn lower_native_ordered_nfa_prepared_reported(
 
 fn lower_ordered_nfa_or_runtime_adapter(
     program_bytes: Vec<u8>,
-    native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize)>,
+    native_ordered_nfa: Option<(NativeOrderedNfaProgramView<'_>, usize, bool)>,
     target: Target,
 ) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
-    if let Some((view, max_native_data_bytes)) = native_ordered_nfa
+    if let Some((view, max_native_data_bytes, allow_start_prefix_vector)) = native_ordered_nfa
         && let Some(selected) = lower_native_ordered_nfa_prepared(
             program_bytes.clone(),
             view,
             target,
             max_native_data_bytes,
+            allow_start_prefix_vector,
         )?
     {
         return Ok(selected);
@@ -10943,6 +15032,8 @@ fn lower_native_endpoint_oracle_prepared(
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         composed_prepared,
         Some(mode),
@@ -11289,6 +15380,8 @@ fn lower_native_dynamic_rows_prepared(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -11510,6 +15603,8 @@ fn lower_native_slow_partial_with_data_limit(
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        direct_search_trusted_core: None,
+        complete_span_reduce_source: None,
     }))
 }
 
@@ -12803,6 +16898,8 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -12858,6 +16955,7 @@ fn slow_partial_prepared_outcome(
 ) -> Result<SlowPartialPreparedOutcome, ObjectError> {
     match outcome {
         Ok(lowering) => Ok(lowering),
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => Ok(SlowPartialPreparedOutcome::AllocationFailure),
         Err(ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
@@ -13557,6 +17655,8 @@ fn lower_native_partial_prepared(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         PreparedEntryLayout {
             ordinary_code_size: code_offset,
@@ -13678,6 +17778,7 @@ fn native_module_digest_with_runtime_symbol(
             ))?;
         if ordinary_code_size != code_offset
             || ordered.operation_only == lowering.needs_runtime
+            || (ordered.row_search_only && !ordered.operation_only)
             || ordered.public_entry_offset != code_offset
             || ordered.public_entry_size != code_size
             || ordered.private_entry_offset < code_offset
@@ -13703,6 +17804,10 @@ fn native_module_digest_with_runtime_symbol(
             || ordered.private_entry_size == 0
             || ordered.bulk_gate_entry_size == 0
             || ordered.private_entry_offset == ordered.bulk_gate_entry_offset
+            || (ordered.start_prefix_vector_lowered
+                && (!ordered.start_prefix_lowered
+                    || target.architecture != Architecture::Aarch64
+                    || !target.features.has(CpuFeature::Aarch64Asimd)))
             || !ordered.private_entry_offset.is_multiple_of(match target.architecture {
                 Architecture::X86_64 => 1,
                 Architecture::Aarch64 => 4,
@@ -21001,6 +25106,8 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         report,
     )))
@@ -21073,6 +25180,8 @@ fn lower_optional_native_finite_language_with_data_limit_and_competitor(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         },
         report,
     )))
@@ -21204,6 +25313,7 @@ fn measured_native_dfa_outcome(
     match outcome {
         Ok(Some(lowering)) => Ok(MeasuredNativeDfaOutcome::Lowered(lowering)),
         Ok(None) => Ok(MeasuredNativeDfaOutcome::Declined),
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => {
             Ok(MeasuredNativeDfaOutcome::AllocationFailure)
         }
@@ -21281,6 +25391,7 @@ fn legacy_fixed_k0_lowering_outcome(
             lowering: None,
             may_continue_compilation: true,
         }),
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => Ok(LegacyFixedK0LoweringAttempt {
             lowering: None,
             may_continue_compilation: false,
@@ -21298,6 +25409,26 @@ struct CompilerK0Lowering {
 struct CompilerK0LoweringAttempt {
     lowering: Option<CompilerK0Lowering>,
     may_continue_compilation: bool,
+}
+
+fn compiler_k0_lowering_error(
+    error: ObjectError,
+) -> Result<CompilerK0LoweringAttempt, ObjectError> {
+    match error {
+        ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        } => Ok(CompilerK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: true,
+        }),
+        error if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        ObjectError::Allocation(_) => Ok(CompilerK0LoweringAttempt {
+            lowering: None,
+            may_continue_compilation: false,
+        }),
+        error => Err(error),
+    }
 }
 
 /// Prefer the graph-derived fallback filters, but retry a complete semantic
@@ -21335,18 +25466,7 @@ fn lower_optional_compiler_k0_with_data_limit(
                     }),
                     may_continue_compilation: true,
                 }),
-                Err(ObjectError::Resource {
-                    resource: crate::CompileResource::ProgramBytes,
-                    ..
-                }) => Ok(CompilerK0LoweringAttempt {
-                    lowering: None,
-                    may_continue_compilation: true,
-                }),
-                Err(ObjectError::Allocation(_)) => Ok(CompilerK0LoweringAttempt {
-                    lowering: None,
-                    may_continue_compilation: false,
-                }),
-                Err(error) => Err(error),
+                Err(error) => compiler_k0_lowering_error(error),
             }
         }
         Ok(None)
@@ -21357,11 +25477,7 @@ fn lower_optional_compiler_k0_with_data_limit(
             lowering: None,
             may_continue_compilation: true,
         }),
-        Err(ObjectError::Allocation(_)) => Ok(CompilerK0LoweringAttempt {
-            lowering: None,
-            may_continue_compilation: false,
-        }),
-        Err(error) => Err(error),
+        Err(error) => compiler_k0_lowering_error(error),
     }
 }
 
@@ -21403,11 +25519,27 @@ fn optional_native_lowering_outcome(
 ) -> Result<Option<NativeLowering>, ObjectError> {
     match outcome {
         Ok(lowering) => Ok(lowering),
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
         Err(ObjectError::Allocation(_) | ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
             ..
         }) => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// Preserve the legacy materialized-K0 fallback policy for all established
+/// lowering failures, while keeping the new complete-Span recipe allocation
+/// terminal. The latter is required metadata for a successfully selected
+/// public lowering; losing it and entering a fresh fallback transaction would
+/// violate the allocator-failure boundary.
+fn materialized_native_fallback_outcome(
+    outcome: Result<Option<NativeLowering>, ObjectError>,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    match outcome {
+        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        Ok(lowering) => Ok(lowering),
+        Err(_) => Ok(None),
     }
 }
 
@@ -21528,9 +25660,19 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             required: data.len(),
         });
     }
-    if entry_contract.register_outcome() && layout.partial.is_none() {
+    if entry_contract.register_outcome()
+        && !entry_contract.complete_span_reduce()
+        && layout.partial.is_none()
+    {
         return Err(ObjectError::InvalidModule(
             "trusted prepared core has no partial continuation layout",
+        ));
+    }
+    if entry_contract.complete_span_reduce()
+        && (layout.output != OutputContract::Span || layout.partial.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "complete Span reducer core has an incompatible DFA layout",
         ));
     }
     if entry_contract.propagates_partial_span_window_start()
@@ -21551,7 +25693,8 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             }
             NativeDfaEntryContract::ExactAbsoluteAnchored { .. }
             | NativeDfaEntryContract::PreparedPartialCore
-            | NativeDfaEntryContract::PreparedPartialPropagatedStartCore => {
+            | NativeDfaEntryContract::PreparedPartialPropagatedStartCore
+            | NativeDfaEntryContract::CompleteSpanReduceCoreV1 => {
                 lower_x86_64_dfa_with_entry_contract(layout, target.features, entry_contract)?
             }
         },
@@ -21600,6 +25743,39 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
     {
         return Ok(None);
     }
+    // Retain the private regeneration recipe only while the sole-Count
+    // compile transaction is enabled and after every target-specific gate has
+    // selected this complete public Span lowering. The outer compiler disables
+    // the scope again after recognizing its exact-singleton program fact. This
+    // allocation is not a speculative scanner attempt: if refused, every
+    // optional classifier must propagate the distinct site unchanged instead
+    // of entering a fresh fallback transaction.
+    let complete_span_reduce_source = if complete_span_reduce_recipe_enabled()
+        && entry_contract == NativeDfaEntryContract::Public
+        && layout.output == OutputContract::Span
+        && layout.partial.is_none()
+    {
+        emission.direct_search_trusted_core.as_ref().ok_or(
+            ObjectError::InvalidModule(
+                "complete public Span DFA did not publish its trusted core",
+            ),
+        )?;
+        Some(allocate_complete_span_reduce_source(
+            NativeCompleteSpanReduceSource {
+                layout,
+                aarch64_sve_filter_plan: (target.architecture == Architecture::Aarch64)
+                    .then_some(sve_filter_plan)
+                    .flatten(),
+                aarch64_sve_suffix_kind: (target.architecture == Architecture::Aarch64)
+                    .then_some(sve_suffix_kind)
+                    .flatten(),
+                program_bytes: data.len(),
+                program_sha256: Sha256::digest(&data).into(),
+            },
+        )?)
+    } else {
+        None
+    };
     let start_accelerator = selected_start_accelerator(
         layout,
         target,
@@ -21628,6 +25804,8 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
             .map_or(0, |filter| filter.guaranteed_bytes),
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
+        direct_search_trusted_core: emission.direct_search_trusted_core,
+        complete_span_reduce_source,
     }))
 }
 
@@ -27715,6 +31893,1255 @@ fn pad_native_packed_row(
     Ok(())
 }
 
+const REGEX_SET_EXACT64_AOT_TEXT_SECTION: usize = 0;
+const REGEX_SET_EXACT64_AOT_DATA_SECTION: usize = 1;
+const REGEX_SET_EXACT64_AOT_ENTRY_SYMBOL: usize = 0;
+const REGEX_SET_EXACT64_AOT_TRANSITIONS_SYMBOL: usize = 2;
+const REGEX_SET_EXACT64_AOT_OUTPUTS_SYMBOL: usize = 3;
+
+struct NativeRegexSetExact64Aarch64LoweringV1 {
+    code: Vec<u8>,
+    transition_page: usize,
+    transition_page_offset: usize,
+    output_page: usize,
+    output_page_offset: usize,
+}
+
+fn authenticate_regex_set_exact64_dense_data_v1(
+    graph_identity: crate::RegexSetExact64ArtifactIdentity,
+    all_pattern_mask: u64,
+    layout: &crate::regex_set_exact64_aot::RegexSetExact64DenseLayoutV1,
+    allow_trailing_data: bool,
+) -> Result<(), ObjectError> {
+    if layout.state_count == 0
+        || layout.transition_offset != 32
+        || layout.output_offset < layout.transition_offset
+        || !layout.output_offset.is_multiple_of(core::mem::align_of::<u64>())
+        || layout.data.capacity() != layout.data.len()
+        || layout.data.get(..32) != Some(graph_identity.as_bytes().as_slice())
+        || all_pattern_mask == 0
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact64 native dense header or geometry",
+        ));
+    }
+    let expected_cells = layout
+        .state_count
+        .checked_mul(crate::REGEX_SET_EXACT64_AOT_V1_ALPHABET_LEN)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense transition cells",
+        ))?;
+    let transition_bytes = expected_cells
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense transition bytes",
+        ))?;
+    let transition_end = layout
+        .transition_offset
+        .checked_add(transition_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense transition extent",
+        ))?;
+    let output_bytes = layout
+        .state_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense output bytes",
+        ))?;
+    let output_end = layout
+        .output_offset
+        .checked_add(output_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native dense output extent",
+        ))?;
+    if layout.transition_cells != expected_cells
+        || transition_end > layout.output_offset
+        || if allow_trailing_data {
+            output_end > layout.data.len()
+        } else {
+            output_end != layout.data.len()
+        }
+        || u32::try_from(layout.state_count).is_err()
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact64 native dense extents disagree",
+        ));
+    }
+    for cell in layout.data[layout.transition_offset..transition_end].chunks_exact(4) {
+        let target = <[u8; 4]>::try_from(cell)
+            .map(u32::from_le_bytes)
+            .map_err(|_| ObjectError::InvalidModule("exact64 native dense transition cell"))?;
+        if usize::try_from(target).map_or(true, |target| target >= layout.state_count) {
+            return Err(ObjectError::InvalidModule(
+                "exact64 native dense target is outside the graph",
+            ));
+        }
+    }
+    let mut published = 0_u64;
+    for (state, mask) in layout.data[layout.output_offset..output_end]
+        .chunks_exact(8)
+        .enumerate()
+    {
+        let mask = <[u8; 8]>::try_from(mask)
+            .map(u64::from_le_bytes)
+            .map_err(|_| ObjectError::InvalidModule("exact64 native dense output cell"))?;
+        if mask & !all_pattern_mask != 0 || state == 0 && mask != 0 {
+            return Err(ObjectError::InvalidModule(
+                "exact64 native dense output mask is invalid",
+            ));
+        }
+        published |= mask;
+    }
+    if published != all_pattern_mask {
+        return Err(ObjectError::InvalidModule(
+            "exact64 native dense outputs omit a source bit",
+        ));
+    }
+    Ok(())
+}
+
+fn lower_aarch64_regex_set_exact64_scan_v1(
+    all_pattern_mask: u64,
+) -> Result<NativeRegexSetExact64Aarch64LoweringV1, ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let addressable_haystack = assembler.label()?;
+    let scan = assembler.label()?;
+    let publish = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // Public raw boundary. The output is never touched before `publish`.
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_adds_x_imm(5, 4, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(1, addressable_haystack)?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_adds_x_reg(5, 0, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+
+    assembler.bind(addressable_haystack)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 2)?)?;
+    assembler.instruction(aarch64_add_x_reg(13, 0, 3)?)?;
+    assembler.instruction(aarch64_movz_w(6, 0)?)?;
+    assembler.instruction(aarch64_movz_x(7, 0, 0)?)?;
+    aarch64_load_u64_constant(&mut assembler, 12, all_pattern_mask)?;
+
+    let transition_page = assembler.instruction(0x9000_0008)?; // ADRP X8, transitions
+    let transition_page_offset = assembler.instruction(aarch64_add_x_imm(8, 8, 0)?)?;
+    let output_page = assembler.instruction(0x9000_000b)?; // ADRP X11, outputs
+    let output_page_offset = assembler.instruction(aarch64_add_x_imm(11, 11, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    assembler.branch_cond(AARCH64_HS, publish)?;
+
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_load_byte_post_imm(9, 5, 1)?)?;
+    // X10 = transition_base + state * 1024 + byte * 4. State tokens remain
+    // u32, while the byte offset uses the full address width so a caller-raised
+    // dense-data ceiling cannot silently truncate the row address.
+    assembler.instruction(aarch64_add_x_lsl(10, 8, 6, 10)?)?;
+    assembler.instruction(aarch64_add_x_lsl(10, 10, 9, 2)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 10, 0)?)?;
+    assembler.instruction(aarch64_load_x_lsl3(10, 11, 6)?)?;
+    assembler.instruction(aarch64_orr_x(7, 7, 10)?)?;
+    assembler.instruction(aarch64_cmp_x(7, 12)?)?;
+    assembler.branch_cond(AARCH64_EQ, publish)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, scan)?;
+
+    assembler.bind(publish)?;
+    assembler.instruction(aarch64_store_x(7, 4, 0)?)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_EXACT64_AOT_V1_STATUS_SUCCESS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact64 native success status"))?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_EXACT64_AOT_V1_STATUS_INVALID_ARGUMENT)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact64 native invalid status"))?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        transition_page,
+        transition_page_offset,
+        output_page,
+        output_page_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(NativeRegexSetExact64Aarch64LoweringV1 {
+        code,
+        transition_page: relocation_offsets[0],
+        transition_page_offset: relocation_offsets[1],
+        output_page: relocation_offsets[2],
+        output_page_offset: relocation_offsets[3],
+    })
+}
+
+/// Lower the graph-authenticated dense exact64 table into one scalar AArch64
+/// scan. There are no undefined symbols or semantic runtime edges.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact text/data symbols, four local relocations, and standalone module receipt are one native artifact boundary"
+)]
+pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
+    target: Target,
+    operation_identity: [u8; 32],
+    graph_identity: crate::RegexSetExact64ArtifactIdentity,
+    all_pattern_mask: u64,
+    layout: crate::regex_set_exact64_aot::RegexSetExact64DenseLayoutV1,
+    max_code_bytes: usize,
+) -> Result<CompiledModule, ObjectError> {
+    target.validate()?;
+    if target.architecture != Architecture::Aarch64 || target.abi != CallAbi::Aapcs64 {
+        return Err(ObjectError::InvalidModule(
+            "exact64 native lowering requires a valid AArch64 target",
+        ));
+    }
+    authenticate_regex_set_exact64_dense_data_v1(
+        graph_identity,
+        all_pattern_mask,
+        &layout,
+        false,
+    )?;
+    let lowered = lower_aarch64_regex_set_exact64_scan_v1(all_pattern_mask)?;
+    if lowered.code.len() > max_code_bytes {
+        return Err(ObjectError::Resource {
+            resource: CompileResource::CodeBytes,
+            limit: max_code_bytes,
+            required: lowered.code.len(),
+        });
+    }
+    let transition_bytes = layout
+        .transition_cells
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native transition symbol size",
+        ))?;
+    let output_bytes = layout
+        .state_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 native output symbol size",
+        ))?;
+    let symbols = vec![
+        ModuleSymbol {
+            name: identity_symbol("fre_aot_regex_set_exact64_v1_", &operation_identity)?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(REGEX_SET_EXACT64_AOT_TEXT_SECTION),
+            offset: 0,
+            size: u64::try_from(lowered.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 native text symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_graph_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_AOT_DATA_SECTION),
+            offset: 0,
+            size: 32,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_transitions_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_AOT_DATA_SECTION),
+            offset: offset_u64(
+                layout.transition_offset,
+                "exact64 native transition symbol offset",
+            )?,
+            size: u64::try_from(transition_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 native transition symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_outputs_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_AOT_DATA_SECTION),
+            offset: offset_u64(layout.output_offset, "exact64 native output symbol offset")?,
+            size: u64::try_from(output_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 native output symbol size")
+            })?,
+        },
+    ];
+    let relocations = vec![
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page,
+                "exact64 native transition page relocation",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_EXACT64_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page_offset,
+                "exact64 native transition page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_EXACT64_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_AOT_TEXT_SECTION,
+            offset: offset_u64(lowered.output_page, "exact64 native output page relocation")?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_EXACT64_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.output_page_offset,
+                "exact64 native output page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_EXACT64_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+    ];
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: lowered.code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.regex-set-exact64",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 64,
+                data: layout.data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REGEX_SET_EXACT64_AOT_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+const REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION: usize = 0;
+const REGEX_SET_GRAPH_EXISTS_AOT_DATA_SECTION: usize = 1;
+const REGEX_SET_GRAPH_EXISTS_AOT_ENTRY_SYMBOL: usize = 0;
+const REGEX_SET_GRAPH_EXISTS_AOT_TRANSITIONS_SYMBOL: usize = 2;
+const REGEX_SET_GRAPH_EXISTS_AOT_OUTPUTS_SYMBOL: usize = 3;
+
+struct NativeRegexSetGraphExistsAarch64LoweringV1 {
+    code: Vec<u8>,
+    transition_page: usize,
+    transition_page_offset: usize,
+    output_page: usize,
+    output_page_offset: usize,
+}
+
+/// Lower the generic graph Exists ABI independently of the frozen Exact64 V1
+/// object family. The loop consumes one byte per transition and ORs the
+/// authenticated owner mask for the resulting state into the transactional
+/// result word.
+fn lower_aarch64_regex_set_graph_exists_scan_v1(
+    all_pattern_mask: u64,
+) -> Result<NativeRegexSetGraphExistsAarch64LoweringV1, ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let addressable_haystack = assembler.label()?;
+    let scan = assembler.label()?;
+    let publish = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // Raw ABI: u32 entry(const u8 *haystack, usize haystack_len,
+    //                    usize start, usize end, u64 *output).
+    // The output remains untouched until every pointer/window check succeeds.
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_adds_x_imm(5, 4, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(1, addressable_haystack)?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_adds_x_reg(5, 0, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+
+    assembler.bind(addressable_haystack)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 2)?)?;
+    assembler.instruction(aarch64_add_x_reg(13, 0, 3)?)?;
+    assembler.instruction(aarch64_movz_w(6, 0)?)?;
+    assembler.instruction(aarch64_movz_x(7, 0, 0)?)?;
+    aarch64_load_u64_constant(&mut assembler, 12, all_pattern_mask)?;
+
+    let transition_page = assembler.instruction(0x9000_0008)?; // ADRP X8, transitions
+    let transition_page_offset = assembler.instruction(aarch64_add_x_imm(8, 8, 0)?)?;
+    let output_page = assembler.instruction(0x9000_000b)?; // ADRP X11, outputs
+    let output_page_offset = assembler.instruction(aarch64_add_x_imm(11, 11, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    assembler.branch_cond(AARCH64_HS, publish)?;
+
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_load_byte_post_imm(9, 5, 1)?)?;
+    // A complete row is 256 u32 cells, hence state * 1024 + byte * 4.
+    // State tokens load through W6 and are therefore zero-extended before
+    // participating in the full-width address computation.
+    assembler.instruction(aarch64_add_x_lsl(10, 8, 6, 10)?)?;
+    assembler.instruction(aarch64_add_x_lsl(10, 10, 9, 2)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 10, 0)?)?;
+    assembler.instruction(aarch64_load_x_lsl3(10, 11, 6)?)?;
+    assembler.instruction(aarch64_orr_x(7, 7, 10)?)?;
+    assembler.instruction(aarch64_cmp_x(7, 12)?)?;
+    assembler.branch_cond(AARCH64_EQ, publish)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    assembler.branch_cond(AARCH64_LO, scan)?;
+
+    assembler.bind(publish)?;
+    assembler.instruction(aarch64_store_x(7, 4, 0)?)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_GRAPH_EXISTS_AOT_V1_STATUS_SUCCESS).map_err(|_| {
+            ObjectError::ArithmeticOverflow("generic graph Exists success status")
+        })?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_GRAPH_EXISTS_AOT_V1_STATUS_INVALID_ARGUMENT).map_err(
+            |_| ObjectError::ArithmeticOverflow("generic graph Exists invalid status"),
+        )?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        transition_page,
+        transition_page_offset,
+        output_page,
+        output_page_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(NativeRegexSetGraphExistsAarch64LoweringV1 {
+        code,
+        transition_page: relocation_offsets[0],
+        transition_page_offset: relocation_offsets[1],
+        output_page: relocation_offsets[2],
+        output_page_offset: relocation_offsets[3],
+    })
+}
+
+/// Lower an independently authenticated generic finite-set graph into one
+/// helper-free AArch64 Exists scan. This is a distinct object ABI and symbol
+/// family; the frozen Exact64 V1 lowering and bytes are not consulted.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one standalone text/data object with four internal relocations is a single fail-closed artifact boundary"
+)]
+pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
+    target: Target,
+    operation_identity: [u8; 32],
+    source_graph_schema_version: u32,
+    source_graph_identity: [u8; 32],
+    source_artifact_identity: [u8; 32],
+    pattern_count: u8,
+    all_pattern_mask: u64,
+    image: crate::regex_set_finite64_aot::RegexSetGraphDenseImageV1,
+    max_code_bytes: usize,
+) -> Result<CompiledModule, ObjectError> {
+    target.validate()?;
+    if target.architecture != Architecture::Aarch64 || target.abi != CallAbi::Aapcs64 {
+        return Err(ObjectError::InvalidModule(
+            "generic graph Exists lowering requires a valid AArch64 target",
+        ));
+    }
+    crate::regex_set_finite64_aot::authenticate_dense_image_for_lowering(
+        source_graph_identity,
+        source_artifact_identity,
+        pattern_count,
+        all_pattern_mask,
+        &image,
+    )?;
+    crate::regex_set_finite64_aot::authenticate_operation_identity_for_lowering(
+        target,
+        operation_identity,
+        source_graph_schema_version,
+        source_artifact_identity,
+        source_graph_identity,
+        pattern_count,
+        all_pattern_mask,
+        &image,
+    )?;
+    if u64::try_from(image.data.len()).map_or(true, |bytes| {
+        bytes > crate::REGEX_SET_GRAPH_EXISTS_AOT_V1_MAX_ADDRESSABLE_DATA_BYTES
+    }) {
+        return Err(ObjectError::InvalidModule(
+            "generic graph Exists data exceeds its addressing model",
+        ));
+    }
+    let lowered = lower_aarch64_regex_set_graph_exists_scan_v1(all_pattern_mask)?;
+    if lowered.code.len() > max_code_bytes {
+        return Err(ObjectError::Resource {
+            resource: CompileResource::CodeBytes,
+            limit: max_code_bytes,
+            required: lowered.code.len(),
+        });
+    }
+    let transition_bytes = image
+        .transition_cells
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "generic graph Exists transition symbol size",
+        ))?;
+    let output_bytes = image
+        .state_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "generic graph Exists output symbol size",
+        ))?;
+    let symbols = vec![
+        ModuleSymbol {
+            name: identity_symbol(
+                "fre_aot_regex_set_graph_exists_v1_",
+                &operation_identity,
+            )?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION),
+            offset: 0,
+            size: u64::try_from(lowered.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("generic graph Exists text symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_graph_exists_header_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_GRAPH_EXISTS_AOT_DATA_SECTION),
+            offset: 0,
+            size: u64::try_from(
+                crate::regex_set_finite64_aot::REGEX_SET_GRAPH_EXISTS_AOT_V1_HEADER_BYTES,
+            )
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow("generic graph Exists header symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_graph_exists_transitions_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_GRAPH_EXISTS_AOT_DATA_SECTION),
+            offset: offset_u64(
+                image.transition_offset,
+                "generic graph Exists transition symbol offset",
+            )?,
+            size: u64::try_from(transition_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("generic graph Exists transition symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_graph_exists_outputs_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_GRAPH_EXISTS_AOT_DATA_SECTION),
+            offset: offset_u64(
+                image.output_offset,
+                "generic graph Exists output symbol offset",
+            )?,
+            size: u64::try_from(output_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("generic graph Exists output symbol size")
+            })?,
+        },
+    ];
+    let relocations = vec![
+        ModuleRelocation {
+            section: REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page,
+                "generic graph Exists transition page relocation",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_GRAPH_EXISTS_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page_offset,
+                "generic graph Exists transition page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_GRAPH_EXISTS_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.output_page,
+                "generic graph Exists output page relocation",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_GRAPH_EXISTS_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_GRAPH_EXISTS_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.output_page_offset,
+                "generic graph Exists output page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_GRAPH_EXISTS_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+    ];
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: lowered.code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.regex-set-graph-exists",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 64,
+                data: image.data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REGEX_SET_GRAPH_EXISTS_AOT_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+const REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION: usize = 0;
+const REGEX_SET_EXACT64_FIRST_ANY_AOT_DATA_SECTION: usize = 1;
+const REGEX_SET_EXACT64_FIRST_ANY_AOT_ENTRY_SYMBOL: usize = 0;
+const REGEX_SET_EXACT64_FIRST_ANY_AOT_TRANSITIONS_SYMBOL: usize = 2;
+const REGEX_SET_EXACT64_FIRST_ANY_AOT_OUTPUTS_SYMBOL: usize = 3;
+const REGEX_SET_EXACT64_FIRST_ANY_AOT_ROOT_SKIP_SYMBOL: usize = 4;
+const REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_DENSE_HITS: u16 = 4;
+const REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_BACKOFF_BYTES: u16 = 1024;
+
+struct NativeRegexSetExact64FirstAnyAarch64LoweringV1 {
+    code: Vec<u8>,
+    transition_page: usize,
+    transition_page_offset: usize,
+    output_page: usize,
+    output_page_offset: usize,
+    root_skip_page: Option<usize>,
+    root_skip_page_offset: Option<usize>,
+}
+
+/// Lower the first-any-position ABI without changing the existing complete
+/// mask entry. The returned position is the final byte consumed by the first
+/// state, in scan order, whose authenticated owner mask is nonzero. It is
+/// therefore an in-match byte rather than a half-open endpoint.
+fn lower_aarch64_regex_set_exact64_first_any_scan_v1(
+    root_skip: Option<
+        crate::regex_set_exact64_first_any_aot::RegexSetExact64FirstAnyRootSkipLayoutV1,
+    >,
+) -> Result<NativeRegexSetExact64FirstAnyAarch64LoweringV1, ObjectError> {
+    use crate::regex_set_exact64_first_any_aot::{
+        REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_VECTOR_BYTES_V1,
+    };
+
+    let mut assembler = Aarch64Assembler::new();
+    let addressable_haystack = assembler.label()?;
+    let dispatch = assembler.label()?;
+    let scan = assembler.label()?;
+    let dense_scan = assembler.label()?;
+    let vector_hit = assembler.label()?;
+    let vector_hit_sparse = assembler.label()?;
+    let vector_hit_backoff_to_end = assembler.label()?;
+    let hit = assembler.label()?;
+    let no_match = assembler.label()?;
+    let publish = assembler.label()?;
+    let invalid = assembler.label()?;
+    let root_skip_vector_bytes =
+        u16::try_from(REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_VECTOR_BYTES_V1)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact64 root-skip vector bytes"))?;
+
+    // Public raw boundary: `u32 entry(const u8 *, usize, usize, usize,
+    // u64 *)`. No path touches the output before `publish`.
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_adds_x_imm(5, 4, 8)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(1, addressable_haystack)?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_adds_x_reg(5, 0, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, invalid)?;
+
+    assembler.bind(addressable_haystack)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 2)?)?;
+    assembler.instruction(aarch64_add_x_reg(13, 0, 3)?)?;
+    assembler.instruction(aarch64_movz_w(6, 0)?)?;
+
+    let transition_page = assembler.instruction(0x9000_0008)?; // ADRP X8, transitions
+    let transition_page_offset = assembler.instruction(aarch64_add_x_imm(8, 8, 0)?)?;
+    let output_page = assembler.instruction(0x9000_000b)?; // ADRP X11, outputs
+    let output_page_offset = assembler.instruction(aarch64_add_x_imm(11, 11, 0)?)?;
+    let (root_skip_page, root_skip_page_offset) = if root_skip.is_some() {
+        let page = assembler.instruction(0x9000_000e)?; // ADRP X14, root-skip tables
+        let page_offset = assembler.instruction(aarch64_add_x_imm(14, 14, 0)?)?;
+        assembler.instruction(aarch64_load_pair_q(16, 17, 14, 0)?)?;
+        assembler.instruction(aarch64_load_pair_q(18, 29, 14, 32)?)?;
+        assembler.instruction(aarch64_movi_16b(19, 0x0f)?)?;
+        assembler.instruction(aarch64_movi_16b(31, 64)?)?;
+        // X15 is the exclusive end of a bounded scalar backoff. It begins
+        // empty and is advanced only after one classifier block proves a
+        // dense root-byte population.
+        assembler.instruction(aarch64_add_x_imm(15, 5, 0)?)?;
+        (Some(page), Some(page_offset))
+    } else {
+        (None, None)
+    };
+
+    if root_skip.is_some() {
+        // The exact nibble classifier is consulted only at the AC root. A
+        // clear lane cannot begin any authenticated source literal, so an
+        // entire clear block leaves the semantic state at zero.
+        assembler.bind(dispatch)?;
+        assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+        assembler.branch_cond(AARCH64_HS, no_match)?;
+        assembler.instruction(aarch64_cmp_w_zero(6)?)?;
+        assembler.branch_cond(AARCH64_NE, scan)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 13, 5)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, root_skip_vector_bytes)?)?;
+        assembler.branch_cond(AARCH64_LO, scan)?;
+        assembler.instruction(aarch64_load_q(0, 5)?)?;
+        assembler.instruction(aarch64_ushr_16b_by_4(20, 0)?)?;
+        assembler.instruction(aarch64_and_16b(21, 0, 19)?)?;
+        assembler.instruction(aarch64_tbl1_16b(22, 16, 21)?)?;
+        assembler.instruction(aarch64_tbl1_16b(23, 17, 21)?)?;
+        assembler.instruction(aarch64_cmlt_zero_16b(24, 0)?)?;
+        assembler.instruction(aarch64_bsl_16b(24, 23, 22)?)?;
+        assembler.instruction(aarch64_and_16b(20, 20, 19)?)?;
+        assembler.instruction(aarch64_tbl1_16b(20, 18, 20)?)?;
+        assembler.instruction(aarch64_and_16b(24, 24, 20)?)?;
+        assembler.instruction(aarch64_cmtst_16b(24, 24, 24)?)?;
+        assembler.instruction(aarch64_umaxv_16b(7, 24)?)?;
+        assembler.instruction(aarch64_umov_b0(12, 7)?)?;
+        assembler.instruction(aarch64_cmp_w_zero(12)?)?;
+        assembler.branch_cond(AARCH64_NE, vector_hit)?;
+        assembler.instruction(aarch64_add_x_imm(5, 5, root_skip_vector_bytes)?)?;
+        assembler.branch(dispatch)?;
+
+        assembler.bind(vector_hit)?;
+        // Four or more possible starts in one 16-byte block make repeated
+        // classification more expensive than the unchanged dense AC loop.
+        // Back off for a fixed public distance, then sample density again.
+        // The lane sum is exact because the classifier mask is 0xff/0x00.
+        assembler.instruction(aarch64_ushr_16b_by_7(7, 24)?)?;
+        assembler.instruction(aarch64_addv_16b(7, 7)?)?;
+        assembler.instruction(aarch64_umov_b0(12, 7)?)?;
+        assembler.instruction(aarch64_cmp_w_imm(
+            12,
+            REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_DENSE_HITS,
+        )?)?;
+        assembler.branch_cond(AARCH64_LO, vector_hit_sparse)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 13, 5)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(
+            12,
+            REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_BACKOFF_BYTES,
+        )?)?;
+        assembler.branch_cond(AARCH64_LO, vector_hit_backoff_to_end)?;
+        assembler.instruction(aarch64_add_x_imm(
+            15,
+            5,
+            REGEX_SET_EXACT64_FIRST_ANY_ROOT_SKIP_BACKOFF_BYTES,
+        )?)?;
+        assembler.branch(vector_hit_sparse)?;
+        assembler.bind(vector_hit_backoff_to_end)?;
+        assembler.instruction(aarch64_add_x_imm(15, 13, 0)?)?;
+
+        assembler.bind(vector_hit_sparse)?;
+        assembler.instruction(aarch64_bsl_16b(24, 29, 31)?)?;
+        assembler.instruction(aarch64_uminv_16b(24, 24)?)?;
+        assembler.instruction(aarch64_umov_b0(12, 24)?)?;
+        assembler.instruction(aarch64_add_x_reg(5, 5, 12)?)?;
+    } else {
+        assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+        assembler.branch_cond(AARCH64_HS, no_match)?;
+    }
+
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_load_byte_post_imm(9, 5, 1)?)?;
+    assembler.instruction(aarch64_add_x_lsl(10, 8, 6, 10)?)?;
+    assembler.instruction(aarch64_add_x_lsl(10, 10, 9, 2)?)?;
+    assembler.instruction(aarch64_load_w_imm(6, 10, 0)?)?;
+    assembler.instruction(aarch64_load_x_lsl3(10, 11, 6)?)?;
+    assembler.branch_nonzero_x(10, hit)?;
+    assembler.instruction(aarch64_cmp_x(5, 13)?)?;
+    if root_skip.is_some() {
+        assembler.branch_cond(AARCH64_HS, no_match)?;
+        // A dense classifier block installs X15 at a validated position no
+        // later than the window end. Enter a dedicated scalar loop so the
+        // bounded backoff retains the incumbent's one compare/branch per
+        // byte instead of round-tripping through the vector dispatch.
+        assembler.instruction(aarch64_cmp_x(5, 15)?)?;
+        assembler.branch_cond(AARCH64_LO, dense_scan)?;
+        assembler.branch(dispatch)?;
+
+        assembler.bind(dense_scan)?;
+        assembler.instruction(aarch64_load_byte_post_imm(9, 5, 1)?)?;
+        assembler.instruction(aarch64_add_x_lsl(10, 8, 6, 10)?)?;
+        assembler.instruction(aarch64_add_x_lsl(10, 10, 9, 2)?)?;
+        assembler.instruction(aarch64_load_w_imm(6, 10, 0)?)?;
+        assembler.instruction(aarch64_load_x_lsl3(10, 11, 6)?)?;
+        assembler.branch_nonzero_x(10, hit)?;
+        assembler.instruction(aarch64_cmp_x(5, 15)?)?;
+        assembler.branch_cond(AARCH64_LO, dense_scan)?;
+        assembler.branch(dispatch)?;
+    } else {
+        assembler.branch_cond(AARCH64_LO, scan)?;
+    }
+
+    assembler.bind(no_match)?;
+    aarch64_load_u64_constant(
+        &mut assembler,
+        7,
+        crate::REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH,
+    )?;
+    assembler.branch(publish)?;
+
+    assembler.bind(hit)?;
+    // X5 is one byte past the accepting byte. Convert the live pointer back
+    // into an original-haystack offset, then select that accepting byte.
+    assembler.instruction(aarch64_sub_x_reg(7, 5, 0)?)?;
+    assembler.instruction(aarch64_sub_x_imm(7, 7, 1)?)?;
+
+    assembler.bind(publish)?;
+    assembler.instruction(aarch64_store_x(7, 4, 0)?)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact64 first-any success status"))?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::try_from(crate::REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_INVALID_ARGUMENT)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact64 first-any invalid status"))?,
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let (code, relocation_offsets, root_skip_offsets) = if let (Some(page), Some(page_offset)) =
+        (root_skip_page, root_skip_page_offset)
+    {
+        let mut offsets = [
+            transition_page,
+            transition_page_offset,
+            output_page,
+            output_page_offset,
+            page,
+            page_offset,
+        ];
+        let code = assembler.finish_with_offsets(&mut offsets)?;
+        (
+            code,
+            [offsets[0], offsets[1], offsets[2], offsets[3]],
+            Some([offsets[4], offsets[5]]),
+        )
+    } else {
+        let mut offsets = [
+            transition_page,
+            transition_page_offset,
+            output_page,
+            output_page_offset,
+        ];
+        let code = assembler.finish_with_offsets(&mut offsets)?;
+        (code, offsets, None)
+    };
+    Ok(NativeRegexSetExact64FirstAnyAarch64LoweringV1 {
+        code,
+        transition_page: relocation_offsets[0],
+        transition_page_offset: relocation_offsets[1],
+        output_page: relocation_offsets[2],
+        output_page_offset: relocation_offsets[3],
+        root_skip_page: root_skip_offsets.map(|offsets| offsets[0]),
+        root_skip_page_offset: root_skip_offsets.map(|offsets| offsets[1]),
+    })
+}
+
+/// Lower an independently authenticated LF-free exact64 graph into one
+/// helper-free AArch64 first-any-position scan. Explicit ASIMD targets may
+/// skip exact root-state nonmembers in 16-byte blocks; every candidate and
+/// every non-root byte remains owned by the unchanged dense AC transition.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the separate first-any symbol, dense-data relocations, and standalone receipt must not perturb the existing mask artifact"
+)]
+pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
+    target: Target,
+    operation_identity: [u8; 32],
+    graph_identity: crate::RegexSetExact64ArtifactIdentity,
+    all_pattern_mask: u64,
+    layout: crate::regex_set_exact64_aot::RegexSetExact64DenseLayoutV1,
+    root_skip: Option<
+        crate::regex_set_exact64_first_any_aot::RegexSetExact64FirstAnyRootSkipLayoutV1,
+    >,
+    max_code_bytes: usize,
+) -> Result<CompiledModule, ObjectError> {
+    target.validate()?;
+    if target.architecture != Architecture::Aarch64 || target.abi != CallAbi::Aapcs64 {
+        return Err(ObjectError::InvalidModule(
+            "exact64 first-any lowering requires a valid AArch64 target",
+        ));
+    }
+    authenticate_regex_set_exact64_dense_data_v1(
+        graph_identity,
+        all_pattern_mask,
+        &layout,
+        root_skip.is_some(),
+    )?;
+    if let Some(root_skip) = root_skip {
+        if !target.features.has(CpuFeature::Aarch64Asimd)
+            || !crate::regex_set_exact64_first_any_aot::authenticates_exact_root_skip_tables(
+                &layout,
+                root_skip,
+            )
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact64 first-any root-skip proof does not authenticate",
+            ));
+        }
+    }
+    let lowered = lower_aarch64_regex_set_exact64_first_any_scan_v1(root_skip)?;
+    if lowered.code.len() > max_code_bytes {
+        return Err(ObjectError::Resource {
+            resource: CompileResource::CodeBytes,
+            limit: max_code_bytes,
+            required: lowered.code.len(),
+        });
+    }
+    let transition_bytes = layout
+        .transition_cells
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 first-any transition symbol size",
+        ))?;
+    let output_bytes = layout
+        .state_count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact64 first-any output symbol size",
+        ))?;
+    let mut symbols = vec![
+        ModuleSymbol {
+            name: identity_symbol(
+                "fre_aot_regex_set_exact64_first_any_v1_",
+                &operation_identity,
+            )?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION),
+            offset: 0,
+            size: u64::try_from(lowered.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 first-any text symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_first_any_graph_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_FIRST_ANY_AOT_DATA_SECTION),
+            offset: 0,
+            size: 32,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_first_any_transitions_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_FIRST_ANY_AOT_DATA_SECTION),
+            offset: offset_u64(
+                layout.transition_offset,
+                "exact64 first-any transition symbol offset",
+            )?,
+            size: u64::try_from(transition_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 first-any transition symbol size")
+            })?,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_first_any_outputs_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_FIRST_ANY_AOT_DATA_SECTION),
+            offset: offset_u64(
+                layout.output_offset,
+                "exact64 first-any output symbol offset",
+            )?,
+            size: u64::try_from(output_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 first-any output symbol size")
+            })?,
+        },
+    ];
+    if let Some(root_skip) = root_skip {
+        symbols.push(ModuleSymbol {
+            name: ".Lfre_aot_regex_set_exact64_first_any_root_skip_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(REGEX_SET_EXACT64_FIRST_ANY_AOT_DATA_SECTION),
+            offset: offset_u64(
+                root_skip.table_offset,
+                "exact64 first-any root-skip symbol offset",
+            )?,
+            size: u64::try_from(root_skip.table_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact64 first-any root-skip symbol size")
+            })?,
+        });
+    }
+    let mut relocations = vec![
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page,
+                "exact64 first-any transition page relocation",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_EXACT64_FIRST_ANY_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.transition_page_offset,
+                "exact64 first-any transition page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_EXACT64_FIRST_ANY_AOT_TRANSITIONS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.output_page,
+                "exact64 first-any output page relocation",
+            )?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: REGEX_SET_EXACT64_FIRST_ANY_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
+            offset: offset_u64(
+                lowered.output_page_offset,
+                "exact64 first-any output page-offset relocation",
+            )?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: REGEX_SET_EXACT64_FIRST_ANY_AOT_OUTPUTS_SYMBOL,
+            addend: 0,
+        },
+    ];
+    match (lowered.root_skip_page, lowered.root_skip_page_offset, root_skip) {
+        (Some(page), Some(page_offset), Some(_)) => {
+            relocations.push(ModuleRelocation {
+                section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
+                offset: offset_u64(page, "exact64 first-any root-skip page relocation")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: REGEX_SET_EXACT64_FIRST_ANY_AOT_ROOT_SKIP_SYMBOL,
+                addend: 0,
+            });
+            relocations.push(ModuleRelocation {
+                section: REGEX_SET_EXACT64_FIRST_ANY_AOT_TEXT_SECTION,
+                offset: offset_u64(
+                    page_offset,
+                    "exact64 first-any root-skip page-offset relocation",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: REGEX_SET_EXACT64_FIRST_ANY_AOT_ROOT_SKIP_SYMBOL,
+                addend: 0,
+            });
+        }
+        (None, None, None) => {}
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "exact64 first-any root-skip relocations are incomplete",
+            ));
+        }
+    }
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: lowered.code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.regex-set-exact64-first-any",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 64,
+                data: layout.data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REGEX_SET_EXACT64_FIRST_ANY_AOT_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: if root_skip.is_some() {
+            StartAccelerator::Aarch64Asimd
+        } else {
+            StartAccelerator::None
+        },
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
 const REGEX_REDUX_TEXT_SECTION: usize = 0;
 const REGEX_REDUX_DATA_SECTION: usize = 1;
 const REGEX_REDUX_ENTRY_SYMBOL: usize = 0;
@@ -27828,6 +33255,10 @@ fn native_regex_redux_module(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
         prepared_span_sum_symbol_index: None,
         prepared_grep_count_symbol_index: None,
@@ -27837,6 +33268,10 @@ fn native_regex_redux_module(
         ordered_nfa_bulk_gate_target: None,
         prepared_aggregate_exports: PreparedAggregateExports::NONE,
         prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
         runtime_symbol_index: None,
         runtime_program_symbol_index: None,
         start_accelerator: StartAccelerator::None,
@@ -27847,6 +33282,7 @@ fn native_regex_redux_module(
         exact_finite_exists_leaf_report: None,
         exact_finite_selected_end_teddy_aot_report: None,
         exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
         ordered_finite_language_aot_report: None,
         slow_retained_forward_minimized: false,
         optimizing_fallbacks_may_continue: true,
@@ -27856,6 +33292,7 @@ fn native_regex_redux_module(
         exact_pair_suffix_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
         ordered_nfa_terminal_exact_set_lowered: None,
         ordered_nfa_whole_window_width_gate_lowered: false,
     })
@@ -27891,6 +33328,1288 @@ pub(crate) fn lower_native_regex_redux_operation_v1(
         data.bytes,
         component_entries,
         relocations,
+    )
+}
+
+const WEIGHTED_CAPTURE_TEXT_SECTION: usize = 0;
+const WEIGHTED_CAPTURE_DATA_SECTION: usize = 1;
+const WEIGHTED_CAPTURE_ENTRY_SYMBOL: usize = 0;
+const WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE: usize = 2;
+
+const LINKED_ROW_UNIFORM_TEXT_SECTION: usize = 0;
+const LINKED_ROW_UNIFORM_DATA_SECTION: usize = 1;
+const LINKED_ROW_UNIFORM_REDUCER_SYMBOL: usize = 0;
+const LINKED_ROW_UNIFORM_ROW_SYMBOL: usize = 2;
+const LINKED_ROW_UNIFORM_IDENTITY_SYMBOL: usize = 3;
+
+/// Lower a separately linkable uniform-capture reducer over one strict,
+/// externally authenticated `PreparedSpanSearchV1` row.
+///
+/// The generated Count child uses the same six-register prepared-search call
+/// shape as the private aggregate loop, but its sole call is deliberately an
+/// unresolved edge to the *public* RowSearch entry. That entry therefore
+/// reauthenticates the handle and immutable Ordered-NFA object on every call;
+/// this is not the same-object `PreparedPrivate` topology. The outer capture
+/// wrapper is patched locally to Count and remains the only public entry.
+pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
+    target: Target,
+    domain: NativeUniformCaptureReducerDomain,
+    multiplier: u64,
+    artifact_identity: [u8; 32],
+    proof_identity: [u8; 32],
+    row_entry: &str,
+) -> Result<(CompiledModule, String, String), ObjectError> {
+    if multiplier == 0
+        || artifact_identity == [0; 32]
+        || proof_identity == [0; 32]
+        || !row_entry.starts_with(PREPARED_ENTRY_SYMBOL_PREFIX)
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "linked RowSearch uniform-capture input closure",
+        ));
+    }
+
+    let target_identity = [
+        match target.architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        },
+        match target.operating_system {
+            OperatingSystem::Linux => 1,
+            OperatingSystem::Macos => 2,
+        },
+        match target.abi {
+            CallAbi::SystemV => 1,
+            CallAbi::Aapcs64 => 2,
+        },
+    ];
+    let mut count_identity = Sha256::new();
+    count_identity.update(b"fre-aot-regex/linked-row-uniform-count/v1\0");
+    count_identity.update([domain.identity_tag()]);
+    count_identity.update(artifact_identity);
+    count_identity.update(row_entry.as_bytes());
+    count_identity.update(target_identity);
+    count_identity.update(target.features.bits().to_le_bytes());
+    let count_name = identity_symbol(PREPARED_COUNT_SYMBOL_PREFIX, &count_identity.finalize())?;
+
+    let mut reducer_identity = Sha256::new();
+    reducer_identity.update(b"fre-aot-regex/linked-row-uniform-reducer/v1\0");
+    reducer_identity.update([domain.identity_tag()]);
+    reducer_identity.update(multiplier.to_le_bytes());
+    reducer_identity.update(artifact_identity);
+    reducer_identity.update(proof_identity);
+    reducer_identity.update(count_name.as_bytes());
+    reducer_identity.update(row_entry.as_bytes());
+    reducer_identity.update(target_identity);
+    reducer_identity.update(target.features.bits().to_le_bytes());
+    let reducer_name = identity_symbol(domain.symbol_prefix(), &reducer_identity.finalize())?;
+
+    // `PreparedPrivate` names the register call shape here, not the linked
+    // topology. The external relocation below targets the strict public row,
+    // whose full authentication prologue remains intact and authoritative.
+    let count = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_prepared_span_reduce(
+            PreparedSpanSink::Count,
+            NativeSpanReducerCallKind::PreparedPrivate,
+            false,
+        )?,
+        Architecture::Aarch64 => lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::Count,
+            NativeSpanReducerCallKind::PreparedPrivate,
+            false,
+        )?,
+    };
+    let reducer = match (target.architecture, domain) {
+        (Architecture::X86_64, NativeUniformCaptureReducerDomain::WholeHaystack) => {
+            lower_x86_64_uniform_capture_count(multiplier)?
+        }
+        (Architecture::X86_64, NativeUniformCaptureReducerDomain::ByteSliceLines) => {
+            lower_x86_64_uniform_capture_grep(multiplier)?
+        }
+        (Architecture::Aarch64, NativeUniformCaptureReducerDomain::WholeHaystack) => {
+            lower_aarch64_uniform_capture_count(multiplier)?
+        }
+        (Architecture::Aarch64, NativeUniformCaptureReducerDomain::ByteSliceLines) => {
+            lower_aarch64_uniform_capture_grep(multiplier)?
+        }
+    };
+
+    let alignment_mask = match target.architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let reducer_offset =
+        count
+            .code
+            .len()
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked RowSearch capture reducer alignment",
+            ))?
+            & !alignment_mask;
+    let final_text_len =
+        reducer_offset
+            .checked_add(reducer.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked RowSearch capture reducer extent",
+            ))?;
+    let mut text = Vec::new();
+    text.try_reserve_exact(final_text_len)
+        .map_err(|_| ObjectError::Allocation("linked RowSearch capture reducer text"))?;
+    push_bytes(&mut text, &count.code)?;
+    match target.architecture {
+        Architecture::X86_64 => text.resize(reducer_offset, 0x90),
+        Architecture::Aarch64 => {
+            while text.len() < reducer_offset {
+                push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    push_bytes(&mut text, &reducer.code)?;
+    for &call in &reducer.count_call_offsets {
+        let call = reducer_offset
+            .checked_add(call)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked RowSearch uniform Count call",
+            ))?;
+        match target.architecture {
+            Architecture::X86_64 => patch_x86_64_local_call(&mut text, call, 0)?,
+            Architecture::Aarch64 => patch_aarch64_local_call(&mut text, call, 0)?,
+        }
+    }
+
+    let mut data = Vec::new();
+    data.try_reserve_exact(64)
+        .map_err(|_| ObjectError::Allocation("linked RowSearch capture reducer data"))?;
+    push_bytes(&mut data, &artifact_identity)?;
+    push_bytes(&mut data, &proof_identity)?;
+
+    let symbols = vec![
+        ModuleSymbol {
+            name: reducer_name.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(LINKED_ROW_UNIFORM_TEXT_SECTION),
+            offset: offset_u64(reducer_offset, "linked RowSearch reducer offset")?,
+            size: u64::try_from(reducer.code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("linked RowSearch reducer size"))?,
+        },
+        ModuleSymbol {
+            name: count_name.clone(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Function,
+            section: Some(LINKED_ROW_UNIFORM_TEXT_SECTION),
+            offset: 0,
+            size: u64::try_from(count.code.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("linked RowSearch Count size"))?,
+        },
+        ModuleSymbol {
+            name: owned_string(row_entry, "linked RowSearch entry symbol")?,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        },
+        ModuleSymbol {
+            name: ".Lfre_aot_regex_linked_row_uniform_identity_v1".to_owned(),
+            binding: SymbolBinding::Local,
+            kind: SymbolKind::Object,
+            section: Some(LINKED_ROW_UNIFORM_DATA_SECTION),
+            offset: 0,
+            size: 32,
+        },
+    ];
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(match target.architecture {
+            Architecture::X86_64 => 2,
+            Architecture::Aarch64 => 3,
+        })
+        .map_err(|_| ObjectError::Allocation("linked RowSearch capture relocations"))?;
+    match (target.architecture, count.identity_relocation) {
+        (Architecture::X86_64, Some(NativePreparedIdentityRelocation::X86PcRelative32(offset))) => {
+            relocations.push(ModuleRelocation {
+                section: LINKED_ROW_UNIFORM_TEXT_SECTION,
+                offset: offset_u64(offset, "linked RowSearch Count identity relocation")?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: LINKED_ROW_UNIFORM_IDENTITY_SYMBOL,
+                addend: -4,
+            })
+        }
+        (
+            Architecture::Aarch64,
+            Some(NativePreparedIdentityRelocation::Aarch64Page21PageOff12 { page, page_offset }),
+        ) => relocations.extend([
+            ModuleRelocation {
+                section: LINKED_ROW_UNIFORM_TEXT_SECTION,
+                offset: offset_u64(page, "linked RowSearch Count identity ADRP")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: LINKED_ROW_UNIFORM_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: LINKED_ROW_UNIFORM_TEXT_SECTION,
+                offset: offset_u64(page_offset, "linked RowSearch Count identity ADD")?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: LINKED_ROW_UNIFORM_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+        ]),
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "linked RowSearch Count identity relocation",
+            ));
+        }
+    }
+    relocations.push(ModuleRelocation {
+        section: LINKED_ROW_UNIFORM_TEXT_SECTION,
+        offset: offset_u64(
+            count.prepared_call_offset,
+            "linked RowSearch Count external call",
+        )?,
+        kind: match target.architecture {
+            Architecture::X86_64 => RelocationKind::X86PltRelative32,
+            Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+        },
+        symbol: LINKED_ROW_UNIFORM_ROW_SYMBOL,
+        addend: if target.architecture == Architecture::X86_64 {
+            -4
+        } else {
+            0
+        },
+    });
+
+    let module = CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: text.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.linked-row-uniform-capture",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 16,
+                data: data.into_boxed_slice(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: LINKED_ROW_UNIFORM_REDUCER_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    };
+    Ok((module, count_name, reducer_name))
+}
+
+fn native_weighted_capture_module(
+    target: Target,
+    domain: crate::UniformCaptureReducerDomain,
+    identity: [u8; 32],
+    code: Vec<u8>,
+    component_entries: &[String],
+    relocations: Vec<ModuleRelocation>,
+) -> Result<CompiledModule, ObjectError> {
+    let prefix = match domain {
+        crate::UniformCaptureReducerDomain::WholeHaystack => {
+            "fre_aot_regex_weighted_count_captures_v1_"
+        }
+        crate::UniformCaptureReducerDomain::ByteSliceLinesLfCrLf => {
+            "fre_aot_regex_weighted_grep_captures_v1_"
+        }
+    };
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE + component_entries.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture symbols"))?;
+    symbols.push(ModuleSymbol {
+        name: identity_symbol(prefix, &identity)?,
+        binding: SymbolBinding::Global,
+        kind: SymbolKind::Function,
+        section: Some(WEIGHTED_CAPTURE_TEXT_SECTION),
+        offset: 0,
+        size: u64::try_from(code.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("weighted capture text extent"))?,
+    });
+    symbols.push(ModuleSymbol {
+        name: ".Lfre_aot_regex_weighted_capture_identity_v1".to_owned(),
+        binding: SymbolBinding::Local,
+        kind: SymbolKind::Object,
+        section: Some(WEIGHTED_CAPTURE_DATA_SECTION),
+        offset: 0,
+        size: 32,
+    });
+    for entry in component_entries {
+        symbols.push(ModuleSymbol {
+            name: entry.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        });
+    }
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: ".rodata.fre.weighted-capture",
+                kind: SectionKind::ReadOnlyData,
+                alignment: 16,
+                data: identity.into(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: WEIGHTED_CAPTURE_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+/// Lower one separately linkable weighted row reducer. Its only unresolved
+/// symbols are the ordinary Span component entries in first-source order.
+pub(crate) fn lower_native_weighted_capture_reducer_v1(
+    target: Target,
+    domain: crate::UniformCaptureReducerDomain,
+    identity: [u8; 32],
+    component_entries: &[String],
+    component_weights: &[u64],
+) -> Result<CompiledModule, ObjectError> {
+    if component_entries.is_empty()
+        || component_entries.len() != component_weights.len()
+        || component_entries.len() > crate::REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_MAX_COMPONENTS
+        || component_weights.contains(&0)
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "weighted capture target/component closure",
+        ));
+    }
+    let (code, relocations) = match target.architecture {
+        Architecture::X86_64 => {
+            lower_x86_64_native_weighted_capture_v1(domain, component_weights)?
+        }
+        Architecture::Aarch64 => {
+            lower_aarch64_native_weighted_capture_v1(domain, component_weights)?
+        }
+    };
+    native_weighted_capture_module(
+        target,
+        domain,
+        identity,
+        code,
+        component_entries,
+        relocations,
+    )
+}
+
+fn lower_x86_64_native_weighted_capture_domain_v1(
+    weights: &[u64],
+) -> Result<(Vec<u8>, Vec<usize>), ObjectError> {
+    const FRAME_BYTES: u8 = 40;
+    const SELECTED_START_OFFSET: u8 = 16;
+    const SELECTED_END_OFFSET: u8 = 24;
+    const SELECTED_WEIGHT_OFFSET: u8 = 32;
+    let mut assembler = X86Assembler::new();
+    let search = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+    let mut call_displacements = Vec::new();
+    call_displacements
+        .try_reserve_exact(weights.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture x86 calls"))?;
+
+    x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    assembler.instruction(&[0x55])?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?; // haystack
+    assembler.instruction(&[0x49, 0x89, 0xf5])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xd6])?; // transactional output
+    assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // next window start
+
+    assembler.bind(search)?;
+    assembler.instruction(&[
+        0x48,
+        0xc7,
+        0x44,
+        0x24,
+        SELECTED_START_OFFSET,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+    ])?;
+    for &weight in weights {
+        let next_component = assembler.label()?;
+        assembler.instruction(&[0x4c, 0x89, 0xe7])?; // rdi = haystack
+        assembler.instruction(&[0x4c, 0x89, 0xee])?; // rsi = length
+        assembler.instruction(&[0x48, 0x89, 0xda])?; // rdx = start
+        assembler.instruction(&[0x4c, 0x89, 0xe9])?; // rcx = end
+        assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // r8 = result
+        assembler.instruction(&[0xe8])?;
+        let call = assembler.label()?;
+        assembler.bind(call)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        call_displacements.push(call);
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], next_component)?;
+        assembler.instruction(&[0x83, 0xf8, 1])?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?; // candidate start
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 8])?; // candidate end
+        assembler.instruction(&[0x49, 0x39, 0xd9])?; // start >= window start
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+        assembler.instruction(&[0x4d, 0x39, 0xca])?; // end > start
+        assembler.branch(&[0x0f, 0x86], runtime_failure)?;
+        assembler.instruction(&[0x4d, 0x39, 0xea])?; // end <= length
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, SELECTED_START_OFFSET])?;
+        assembler.instruction(&[0x4d, 0x39, 0xd9])?; // earlier source wins equal start
+        assembler.branch(&[0x0f, 0x83], next_component)?;
+        assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, SELECTED_START_OFFSET])?;
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, SELECTED_END_OFFSET])?;
+        let mut load_weight = vec![0x49, 0xbb];
+        load_weight.extend_from_slice(&weight.to_le_bytes());
+        assembler.instruction(&load_weight)?;
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, SELECTED_WEIGHT_OFFSET])?;
+        assembler.bind(next_component)?;
+    }
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, SELECTED_START_OFFSET])?;
+    assembler.instruction(&[0x48, 0x83, 0xf8, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x4c, 0x03, 0x7c, 0x24, SELECTED_WEIGHT_OFFSET])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x8b, 0x5c, 0x24, SELECTED_END_OFFSET])?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let mut calls = Vec::new();
+    calls
+        .try_reserve_exact(call_displacements.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture x86 call offsets"))?;
+    for call in call_displacements {
+        calls.push(finished.label_offset(call)?);
+    }
+    Ok((finished.code, calls))
+}
+
+fn lower_x86_64_native_weighted_capture_v1(
+    domain: crate::UniformCaptureReducerDomain,
+    weights: &[u64],
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let (private, mut calls) = lower_x86_64_native_weighted_capture_domain_v1(weights)?;
+    let code = if domain == crate::UniformCaptureReducerDomain::WholeHaystack {
+        private
+    } else {
+        let (mut wrapper, private_call) = lower_x86_64_native_capture_grep_wrapper_v1(0)?;
+        let private_offset = wrapper
+            .len()
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow("weighted capture x86 private alignment"))?
+            & !15;
+        wrapper
+            .try_reserve_exact(
+                private_offset
+                    .checked_sub(wrapper.len())
+                    .and_then(|padding| padding.checked_add(private.len()))
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "weighted capture x86 private extent",
+                    ))?,
+            )
+            .map_err(|_| ObjectError::Allocation("weighted capture x86 wrapper"))?;
+        wrapper.resize(private_offset, 0x90);
+        push_bytes(&mut wrapper, &private)?;
+        patch_x86_64_local_call(&mut wrapper, private_call, private_offset)?;
+        for call in &mut calls {
+            *call = private_offset
+                .checked_add(*call)
+                .ok_or(ObjectError::ArithmeticOverflow("weighted capture x86 child call"))?;
+        }
+        wrapper
+    };
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(calls.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture x86 relocations"))?;
+    for (component, call) in calls.into_iter().enumerate() {
+        relocations.push(ModuleRelocation {
+            section: WEIGHTED_CAPTURE_TEXT_SECTION,
+            offset: offset_u64(call, "weighted capture x86 call")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE + component,
+            addend: -4,
+        });
+    }
+    Ok((code, relocations))
+}
+
+fn lower_aarch64_native_weighted_capture_domain_v1(
+    weights: &[u64],
+) -> Result<(Vec<u8>, Vec<usize>), ObjectError> {
+    const FRAME_BYTES: u16 = 144;
+    const RESULT_OFFSET: u16 = 96;
+    const SELECTED_START_OFFSET: u16 = 112;
+    const SELECTED_WEIGHT_OFFSET: u16 = 128;
+    let mut assembler = Aarch64Assembler::new();
+    let search = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+    let mut call_offsets = Vec::new();
+    call_offsets
+        .try_reserve_exact(weights.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture AArch64 calls"))?;
+
+    aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    aarch64_native_capture_reducer_save(&mut assembler, FRAME_BYTES)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+
+    assembler.bind(search)?;
+    aarch64_load_u64_constant(&mut assembler, 5, u64::MAX)?;
+    assembler.instruction(aarch64_store_x(5, 31, SELECTED_START_OFFSET)?)?;
+    for &weight in weights {
+        let next_component = assembler.label()?;
+        assembler.instruction(aarch64_mov_x(0, 19)?)?;
+        assembler.instruction(aarch64_mov_x(1, 20)?)?;
+        assembler.instruction(aarch64_mov_x(2, 23)?)?;
+        assembler.instruction(aarch64_mov_x(3, 20)?)?;
+        assembler.instruction(aarch64_add_x_imm(4, 31, RESULT_OFFSET)?)?;
+        call_offsets.push(assembler.instruction(0x9400_0000)?);
+        assembler.branch_zero_w(0, next_component)?;
+        assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+        assembler.instruction(aarch64_load_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(RESULT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("weighted capture AArch64 result"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 23)?)?;
+        assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 5)?)?;
+        assembler.branch_cond(AARCH64_LS, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 20)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, SELECTED_START_OFFSET)?)?;
+        assembler.instruction(aarch64_cmp_x(5, 7)?)?;
+        assembler.branch_cond(AARCH64_HS, next_component)?;
+        assembler.instruction(aarch64_store_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(SELECTED_START_OFFSET).map_err(|_| {
+                ObjectError::ArithmeticOverflow("weighted capture AArch64 selected span")
+            })?,
+        )?)?;
+        aarch64_load_u64_constant(&mut assembler, 7, weight)?;
+        assembler.instruction(aarch64_store_x(7, 31, SELECTED_WEIGHT_OFFSET)?)?;
+        assembler.bind(next_component)?;
+    }
+    assembler.instruction(aarch64_load_x_imm(5, 31, SELECTED_START_OFFSET)?)?;
+    aarch64_load_u64_constant(&mut assembler, 6, u64::MAX)?;
+    assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_load_x_imm(7, 31, SELECTED_WEIGHT_OFFSET)?)?;
+    assembler.instruction(aarch64_adds_x_reg(22, 22, 7)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_load_x_imm(23, 31, SELECTED_START_OFFSET + 8)?)?;
+    assembler.branch(search)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, FRAME_BYTES)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let code = assembler.finish_with_offsets(&mut call_offsets)?;
+    Ok((code, call_offsets))
+}
+
+fn lower_aarch64_native_weighted_capture_v1(
+    domain: crate::UniformCaptureReducerDomain,
+    weights: &[u64],
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    let (private, mut calls) = lower_aarch64_native_weighted_capture_domain_v1(weights)?;
+    let code = if domain == crate::UniformCaptureReducerDomain::WholeHaystack {
+        private
+    } else {
+        let (mut wrapper, private_call) = lower_aarch64_native_capture_grep_wrapper_v1(0)?;
+        if !wrapper.len().is_multiple_of(4) || !private.len().is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "weighted capture AArch64 instruction alignment",
+            ));
+        }
+        let private_offset = wrapper.len();
+        push_bytes(&mut wrapper, &private)?;
+        patch_aarch64_local_call(&mut wrapper, private_call, private_offset)?;
+        for call in &mut calls {
+            *call = private_offset
+                .checked_add(*call)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "weighted capture AArch64 child call",
+                ))?;
+        }
+        wrapper
+    };
+    let mut relocations = Vec::new();
+    relocations
+        .try_reserve_exact(calls.len())
+        .map_err(|_| ObjectError::Allocation("weighted capture AArch64 relocations"))?;
+    for (component, call) in calls.into_iter().enumerate() {
+        relocations.push(ModuleRelocation {
+            section: WEIGHTED_CAPTURE_TEXT_SECTION,
+            offset: offset_u64(call, "weighted capture AArch64 call")?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: WEIGHTED_CAPTURE_COMPONENT_SYMBOL_BASE + component,
+            addend: 0,
+        });
+    }
+    Ok((code, relocations))
+}
+
+const REBAR_MULTI_GREP_TEXT_SECTION: usize = 0;
+const REBAR_MULTI_GREP_ENTRY_SYMBOL: usize = 0;
+const REBAR_MULTI_GREP_ROW_SYMBOL_BASE: usize = 1;
+
+fn native_rebar_multi_grep_module_v1(
+    target: Target,
+    identity: [u8; 32],
+    code: Vec<u8>,
+    row_entries: &[String],
+    relocations: Vec<ModuleRelocation>,
+    mixed_handle_table: bool,
+) -> Result<CompiledModule, ObjectError> {
+    let entry_name = identity_symbol(
+        if mixed_handle_table {
+            "fre_aot_regex_rebar_mixed_multi_grep_v1_"
+        } else {
+            "fre_aot_regex_rebar_multi_grep_v1_"
+        },
+        &identity,
+    )?;
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(REBAR_MULTI_GREP_ROW_SYMBOL_BASE + row_entries.len())
+        .map_err(|_| ObjectError::Allocation("Rebar multi-grep reducer symbols"))?;
+    symbols.push(ModuleSymbol {
+        name: entry_name,
+        binding: SymbolBinding::Global,
+        kind: SymbolKind::Function,
+        section: Some(REBAR_MULTI_GREP_TEXT_SECTION),
+        offset: 0,
+        size: u64::try_from(code.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("Rebar multi-grep text extent"))?,
+    });
+    for entry in row_entries {
+        symbols.push(ModuleSymbol {
+            name: entry.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        });
+    }
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: if mixed_handle_table {
+                    ".rodata.fre.rebar-mixed-multi-grep"
+                } else {
+                    ".rodata.fre.rebar-multi-grep"
+                },
+                kind: SectionKind::ReadOnlyData,
+                alignment: 1,
+                data: Box::default(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REBAR_MULTI_GREP_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+pub(crate) fn lower_native_rebar_multi_grep_reducer_v1(
+    target: Target,
+    identity: [u8; 32],
+    row_entries: &[String],
+) -> Result<CompiledModule, ObjectError> {
+    if row_entries.is_empty()
+        || row_entries.len() > crate::ORDERED_MANY_AOT_MAX_ROWS
+        || row_entries.iter().any(String::is_empty)
+        || row_entries.iter().enumerate().any(|(row, entry)| {
+            row_entries[..row].iter().any(|prior| prior == entry)
+        })
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "Rebar multi-grep target or row closure",
+        ));
+    }
+    let (code, call_offsets) = match target.architecture {
+        Architecture::X86_64 => {
+            lower_x86_64_native_rebar_multi_grep_v1(row_entries.len(), None)?
+        }
+        Architecture::Aarch64 => {
+            lower_aarch64_native_rebar_multi_grep_v1(row_entries.len(), None)?
+        }
+    };
+    if call_offsets.len() != row_entries.len() {
+        return Err(ObjectError::InvalidModule(
+            "Rebar multi-grep row-call cardinality",
+        ));
+    }
+    let relocations = call_offsets
+        .iter()
+        .enumerate()
+        .map(|(row, &offset)| {
+            Ok(ModuleRelocation {
+                section: REBAR_MULTI_GREP_TEXT_SECTION,
+                offset: offset_u64(offset, "Rebar multi-grep call relocation")?,
+                kind: match target.architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                symbol: REBAR_MULTI_GREP_ROW_SYMBOL_BASE
+                    .checked_add(row)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "Rebar multi-grep row symbol",
+                    ))?,
+                addend: if target.architecture == Architecture::X86_64 {
+                    -4
+                } else {
+                    0
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ObjectError>>()?;
+    native_rebar_multi_grep_module_v1(target, identity, code, row_entries, relocations, false)
+}
+
+pub(crate) fn lower_native_rebar_mixed_multi_grep_reducer_v1(
+    target: Target,
+    identity: [u8; 32],
+    row_entries: &[String],
+    prepared_rows: &[bool],
+) -> Result<CompiledModule, ObjectError> {
+    if row_entries.is_empty()
+        || row_entries.len() > crate::ORDERED_MANY_AOT_MAX_ROWS
+        || row_entries.len() != prepared_rows.len()
+        || !prepared_rows.iter().copied().any(core::convert::identity)
+        || row_entries.iter().any(String::is_empty)
+        || row_entries.iter().enumerate().any(|(row, entry)| {
+            row_entries[..row].iter().any(|prior| prior == entry)
+        })
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "Rebar mixed multi-grep target or row closure",
+        ));
+    }
+    let (code, call_offsets) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_rebar_multi_grep_v1(
+            row_entries.len(),
+            Some(prepared_rows),
+        )?,
+        Architecture::Aarch64 => lower_aarch64_native_rebar_multi_grep_v1(
+            row_entries.len(),
+            Some(prepared_rows),
+        )?,
+    };
+    if call_offsets.len() != row_entries.len() {
+        return Err(ObjectError::InvalidModule(
+            "Rebar mixed multi-grep row-call cardinality",
+        ));
+    }
+    let relocations = call_offsets
+        .iter()
+        .enumerate()
+        .map(|(row, &offset)| {
+            Ok(ModuleRelocation {
+                section: REBAR_MULTI_GREP_TEXT_SECTION,
+                offset: offset_u64(offset, "Rebar mixed multi-grep call relocation")?,
+                kind: match target.architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                symbol: REBAR_MULTI_GREP_ROW_SYMBOL_BASE
+                    .checked_add(row)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "Rebar mixed multi-grep row symbol",
+                    ))?,
+                addend: if target.architecture == Architecture::X86_64 {
+                    -4
+                } else {
+                    0
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ObjectError>>()?;
+    native_rebar_multi_grep_module_v1(
+        target,
+        identity,
+        code,
+        row_entries,
+        relocations,
+        true,
+    )
+}
+
+const REBAR_ROW_SCALAR_TEXT_SECTION: usize = 0;
+const REBAR_ROW_SCALAR_ENTRY_SYMBOL: usize = 0;
+const REBAR_ROW_SCALAR_ROW_SYMBOL_BASE: usize = 1;
+
+fn native_rebar_row_scalar_module_v1(
+    target: Target,
+    identity: [u8; 32],
+    code: Vec<u8>,
+    row_entries: &[String],
+    relocations: Vec<ModuleRelocation>,
+    mixed_handle_table: bool,
+) -> Result<CompiledModule, ObjectError> {
+    let entry_name = identity_symbol(
+        if mixed_handle_table {
+            "fre_aot_regex_rebar_mixed_row_scalar_v1_"
+        } else {
+            "fre_aot_regex_rebar_row_scalar_v1_"
+        },
+        &identity,
+    )?;
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(REBAR_ROW_SCALAR_ROW_SYMBOL_BASE + row_entries.len())
+        .map_err(|_| ObjectError::Allocation("Rebar row-scalar reducer symbols"))?;
+    symbols.push(ModuleSymbol {
+        name: entry_name,
+        binding: SymbolBinding::Global,
+        kind: SymbolKind::Function,
+        section: Some(REBAR_ROW_SCALAR_TEXT_SECTION),
+        offset: 0,
+        size: u64::try_from(code.len())
+            .map_err(|_| ObjectError::ArithmeticOverflow("Rebar row-scalar text extent"))?,
+    });
+    for entry in row_entries {
+        symbols.push(ModuleSymbol {
+            name: entry.clone(),
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: None,
+            offset: 0,
+            size: 0,
+        });
+    }
+    Ok(CompiledModule {
+        target,
+        sections: vec![
+            ModuleSection {
+                name: ".text",
+                kind: SectionKind::Text,
+                alignment: NATIVE_TEXT_LINK_ALIGNMENT_BYTES,
+                data: code.into_boxed_slice(),
+            },
+            ModuleSection {
+                name: if mixed_handle_table {
+                    ".rodata.fre.rebar-mixed-row-scalar"
+                } else {
+                    ".rodata.fre.rebar-row-scalar"
+                },
+                kind: SectionKind::ReadOnlyData,
+                alignment: 1,
+                data: Box::default(),
+            },
+        ]
+        .into_boxed_slice(),
+        symbols: symbols.into_boxed_slice(),
+        relocations: relocations.into_boxed_slice(),
+        entry_symbol_index: REBAR_ROW_SCALAR_ENTRY_SYMBOL,
+        prepared_entry_symbol_index: None,
+        prepared_span_fill_symbol_index: None,
+        prepared_exists_batch_symbol_index: None,
+        direct_exists_batch_symbol_index: None,
+        native_direct_search_trusted_core: None,
+        native_complete_span_reduce_source: None,
+        native_complete_span_reduce_core: None,
+        prepared_count_symbol_index: None,
+        prepared_span_sum_symbol_index: None,
+        prepared_grep_count_symbol_index: None,
+        prepared_bulk_strategy: None,
+        required_prepare_capabilities: 0,
+        native_prepared_bulk_search_target: None,
+        ordered_nfa_bulk_gate_target: None,
+        prepared_aggregate_exports: PreparedAggregateExports::NONE,
+        prepared_aggregate_strategy: None,
+        prepared_count_authenticated_body_offset: None,
+        prepared_span_sum_authenticated_body_offset: None,
+        direct_exact_singleton_count_aot_report: None,
+        direct_exact_singleton_span_sum_aot_report: None,
+        runtime_symbol_index: None,
+        runtime_program_symbol_index: None,
+        start_accelerator: StartAccelerator::None,
+        anchored_prefix_filter_bytes: 0,
+        slow_aot_report: None,
+        slow_context_aot_report: None,
+        compiler_k0_aot_report: None,
+        exact_finite_exists_leaf_report: None,
+        exact_finite_selected_end_teddy_aot_report: None,
+        exact_finite_selected_end_teddy_aot_report_v2: None,
+        exact_finite_selected_end_grep_count_aot_report: None,
+        ordered_finite_language_aot_report: None,
+        slow_retained_forward_minimized: false,
+        optimizing_fallbacks_may_continue: true,
+        bit_parallel_endpoint_oracle_lowered: false,
+        bit_parallel_exact_endpoint_lowered: false,
+        synchronizing_accept_reverse_lowered: false,
+        exact_pair_suffix_lowered: false,
+        ordered_nfa_start_closure_dispatch_lowered: false,
+        ordered_nfa_start_prefix_lowered: false,
+        ordered_nfa_start_prefix_vector_lowered: false,
+        ordered_nfa_terminal_exact_set_lowered: None,
+        ordered_nfa_whole_window_width_gate_lowered: false,
+    })
+}
+
+pub(crate) fn lower_native_rebar_row_scalar_reducer_v1(
+    target: Target,
+    operation: crate::RebarNativeRowScalarOperationV1,
+    identity: [u8; 32],
+    row_entries: &[String],
+) -> Result<CompiledModule, ObjectError> {
+    if row_entries.is_empty()
+        || row_entries.len() > crate::ORDERED_MANY_AOT_MAX_ROWS
+        || row_entries.iter().any(String::is_empty)
+        || row_entries
+            .iter()
+            .enumerate()
+            .any(|(row, entry)| row_entries[..row].iter().any(|prior| prior == entry))
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "Rebar row-scalar target or row closure",
+        ));
+    }
+    let (code, call_offsets) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_rebar_row_scalar_v1(
+            row_entries.len(),
+            operation,
+            None,
+        )?,
+        Architecture::Aarch64 => lower_aarch64_native_rebar_row_scalar_v1(
+            row_entries.len(),
+            operation,
+            None,
+        )?,
+    };
+    if call_offsets.len() != row_entries.len() {
+        return Err(ObjectError::InvalidModule(
+            "Rebar row-scalar row-call cardinality",
+        ));
+    }
+    let relocations = call_offsets
+        .iter()
+        .enumerate()
+        .map(|(row, &offset)| {
+            Ok(ModuleRelocation {
+                section: REBAR_ROW_SCALAR_TEXT_SECTION,
+                offset: offset_u64(offset, "Rebar row-scalar call relocation")?,
+                kind: match target.architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                symbol: REBAR_ROW_SCALAR_ROW_SYMBOL_BASE.checked_add(row).ok_or(
+                    ObjectError::ArithmeticOverflow("Rebar row-scalar row symbol"),
+                )?,
+                addend: if target.architecture == Architecture::X86_64 {
+                    -4
+                } else {
+                    0
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ObjectError>>()?;
+    native_rebar_row_scalar_module_v1(target, identity, code, row_entries, relocations, false)
+}
+
+pub(crate) fn lower_native_rebar_mixed_row_scalar_reducer_v1(
+    target: Target,
+    operation: crate::RebarNativeRowScalarOperationV1,
+    identity: [u8; 32],
+    row_entries: &[String],
+    row_routes: &[crate::RebarMixedNativeRowScalarRouteV1],
+) -> Result<CompiledModule, ObjectError> {
+    if row_entries.is_empty()
+        || row_entries.len() != row_routes.len()
+        || row_entries.len() > crate::ORDERED_MANY_AOT_MAX_ROWS
+        || !row_routes.iter().any(|route| route.is_prepared())
+        || row_entries.iter().any(String::is_empty)
+        || row_entries
+            .iter()
+            .enumerate()
+            .any(|(row, entry)| row_entries[..row].iter().any(|prior| prior == entry))
+        || target.abi
+            != match target.architecture {
+                Architecture::X86_64 => CallAbi::SystemV,
+                Architecture::Aarch64 => CallAbi::Aapcs64,
+            }
+    {
+        return Err(ObjectError::InvalidModule(
+            "Rebar mixed row-scalar target or row closure",
+        ));
+    }
+    let prepared_rows = row_routes
+        .iter()
+        .map(|route| route.is_prepared())
+        .collect::<Vec<_>>();
+    let (code, call_offsets) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_native_rebar_row_scalar_v1(
+            row_entries.len(),
+            operation,
+            Some(&prepared_rows),
+        )?,
+        Architecture::Aarch64 => lower_aarch64_native_rebar_row_scalar_v1(
+            row_entries.len(),
+            operation,
+            Some(&prepared_rows),
+        )?,
+    };
+    if call_offsets.len() != row_entries.len() {
+        return Err(ObjectError::InvalidModule(
+            "Rebar mixed row-scalar row-call cardinality",
+        ));
+    }
+    let relocations = call_offsets
+        .iter()
+        .enumerate()
+        .map(|(row, &offset)| {
+            Ok(ModuleRelocation {
+                section: REBAR_ROW_SCALAR_TEXT_SECTION,
+                offset: offset_u64(offset, "Rebar mixed row-scalar call relocation")?,
+                kind: match target.architecture {
+                    Architecture::X86_64 => RelocationKind::X86PltRelative32,
+                    Architecture::Aarch64 => RelocationKind::Aarch64Branch26,
+                },
+                symbol: REBAR_ROW_SCALAR_ROW_SYMBOL_BASE.checked_add(row).ok_or(
+                    ObjectError::ArithmeticOverflow("Rebar mixed row-scalar row symbol"),
+                )?,
+                addend: if target.architecture == Architecture::X86_64 {
+                    -4
+                } else {
+                    0
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ObjectError>>()?;
+    native_rebar_row_scalar_module_v1(
+        target,
+        identity,
+        code,
+        row_entries,
+        relocations,
+        true,
     )
 }
 
@@ -28957,11 +35676,7 @@ fn lower_x86_64_ordered_nfa_participation_v1(
         (8, header_word),
         (12, 7),
         (32, native_participation_target_word(target)?),
-        (
-            36,
-            u32::try_from(target.features.bits())
-                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA features"))?,
-        ),
+        (36, native_participation_feature_word_v1(target)?),
         (
             40,
             u32::from(crate::NativeParticipationAotStrategyV1::OrderedNfaX86_64 as u16),
@@ -29737,11 +36452,7 @@ fn lower_aarch64_ordered_nfa_participation_v1(
         (8_u16, header_word),
         (12, 7),
         (32, native_participation_target_word(target)?),
-        (
-            36,
-            u32::try_from(target.features.bits())
-                .map_err(|_| ObjectError::ArithmeticOverflow("ordered-NFA features"))?,
-        ),
+        (36, native_participation_feature_word_v1(target)?),
         (
             40,
             u32::from(crate::NativeParticipationAotStrategyV1::OrderedNfaAarch64 as u16),
@@ -39131,6 +45842,13 @@ fn lower_x86_64_dfa_with_entry_contract(
             "x86 fixed candidate retained a moving Teddy scanner",
         ));
     }
+    if entry_contract.complete_span_reduce()
+        && (layout.output != OutputContract::Span || layout.partial.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 complete Span reducer core has an incompatible layout",
+        ));
+    }
     let mut assembler = X86Assembler::new();
     let register_outcome = entry_contract.register_outcome();
     let fixed_candidate = entry_contract.fixed_candidate();
@@ -39171,6 +45889,30 @@ fn lower_x86_64_dfa_with_entry_contract(
     let reverse_continue = assembler.label()?;
     let reverse_finish = assembler.label()?;
     let exact_start_probe_failed = assembler.label()?;
+    let complete_restart = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_loop_head = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_nonempty = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_accepted = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_publish = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_invalid_result = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
 
     let instruction_filter = layout
         .start_filter
@@ -39288,6 +46030,23 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x41, 0x57])?; // push r15
     }
 
+    if entry_contract.complete_span_reduce() {
+        // Private result pointer, Count, SpanSum, last empty endpoint,
+        // iterator flags, and the immutable full-haystack end. Reverse DFA
+        // lowering uses RCX for its selected-start scratch, so every restart
+        // must restore the caller's end before entering the forward graph.
+        // The core makes no calls, so the route-dependent callee-save prefix
+        // above is the only additional stack topology.
+        assembler.instruction(&[0x48, 0x83, 0xec, 48])?;
+        assembler.instruction(&[0x4c, 0x89, 0x04, 0x24])?;
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 8])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 16])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 24])?;
+        assembler.instruction(&[0x89, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 40])?;
+    }
+
     if entry_contract.validates_public_args() {
         // Validate start <= end <= length before touching public result
         // memory. The prepared partial core receives the same facts from its
@@ -39310,8 +46069,14 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x49, 0x89, 0x00])?;
         assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
     }
+    let has_direct_search_trusted_core = entry_contract == NativeDfaEntryContract::Public
+        && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         x86_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
+    }
+    if let Some(restart) = complete_restart {
+        assembler.bind(restart)?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 40])?;
     }
     assembler.instruction(&[0x48, 0x89, 0xd6])?; // mov rsi, rdx (window start)
 
@@ -40093,17 +46858,99 @@ fn lower_x86_64_dfa_with_entry_contract(
             assembler.bind(reverse_finish)?;
             assembler.instruction(&[0x48, 0x83, 0xf9, 0xff])?;
             assembler.branch(&[0x0f, 0x84], invalid)?;
-            assembler.instruction(&[0x49, 0x89, 0x08])?;
+            if register_outcome {
+                assembler.instruction(&[0x49, 0x89, 0xca])?; // r10 = selected start
+            } else {
+                assembler.instruction(&[0x49, 0x89, 0x08])?;
+            }
             assembler.branch(&[0xe9], matched)?;
         }
     }
 
     assembler.bind(no_match)?;
-    assembler.instruction(&[0x31, 0xc0])?;
-    assembler.branch(&[0xe9], done)?;
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(&[0x4c, 0x8b, 0x04, 0x24])?; // result pair
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 8])?; // Count
+        assembler.instruction(&[0x49, 0x89, 0x00])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 16])?; // SpanSum
+        assembler.instruction(&[0x49, 0x89, 0x40, 8])?;
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.branch(&[0xe9], done)?;
+    } else {
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.branch(&[0xe9], done)?;
+    }
     assembler.bind(matched)?;
-    assembler.instruction(&[0xb8, 0x01, 0x00, 0x00, 0x00])?;
-    assembler.branch(&[0xe9], done)?;
+    if let (
+        Some(restart),
+        Some(loop_head),
+        Some(nonempty),
+        Some(accepted),
+        Some(publish),
+        Some(invalid_result),
+    ) = (
+        complete_restart,
+        complete_loop_head,
+        complete_nonempty,
+        complete_accepted,
+        complete_publish,
+        complete_invalid_result,
+    ) {
+        // Reverse DFA lowering owns RCX as selected-start scratch. Recover
+        // the semantic full-haystack end before validating or advancing the
+        // iterator, including the first match before any restart.
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 40])?;
+        assembler.instruction(&[0x49, 0x39, 0xf2])?; // start >= requested start
+        assembler.branch(&[0x0f, 0x82], invalid_result)?;
+        assembler.instruction(&[0x4d, 0x39, 0xd3])?; // end >= start
+        assembler.branch(&[0x0f, 0x82], invalid_result)?;
+        assembler.instruction(&[0x49, 0x39, 0xcb])?; // end <= full length
+        assembler.branch(&[0x0f, 0x87], invalid_result)?;
+        assembler.instruction(&[0x4d, 0x39, 0xda])?; // start != end
+        assembler.branch(&[0x0f, 0x85], nonempty)?;
+        assembler.instruction(&[0x8b, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0xa8, 0x01])?;
+        assembler.branch(&[0x0f, 0x84], accepted)?;
+        assembler.instruction(&[0x4c, 0x3b, 0x5c, 0x24, 24])?;
+        assembler.branch(&[0x0f, 0x85], accepted)?;
+        assembler.instruction(&[0x48, 0x39, 0xce])?; // requested start == end
+        assembler.branch(&[0x0f, 0x84], no_match)?;
+        assembler.instruction(&[0x48, 0x8d, 0x56, 1])?;
+        assembler.branch(&[0xe9], restart)?;
+
+        assembler.bind(nonempty)?;
+        assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+        assembler.branch(&[0xe9], publish)?;
+        assembler.bind(accepted)?;
+        assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+        assembler.bind(publish)?;
+        assembler.instruction(&[0x89, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 24])?;
+        assembler.instruction(&[0x48, 0x83, 0x44, 0x24, 8, 1])?;
+        assembler.instruction(&[0x4c, 0x89, 0xd8])?;
+        assembler.instruction(&[0x49, 0x2b, 0xc2])?;
+        assembler.instruction(&[0x48, 0x01, 0x44, 0x24, 16])?;
+        assembler.instruction(&[0x4c, 0x89, 0xda])?;
+        assembler.branch(&[0xe9], loop_head)?;
+
+        assembler.bind(loop_head)?;
+        assembler.instruction(&[0x8b, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0xa8, 0x02])?;
+        assembler.branch(&[0x0f, 0x84], restart)?;
+        assembler.instruction(&[0x83, 0xe0, 0xfd])?;
+        assembler.instruction(&[0x89, 0x44, 0x24, 32])?;
+        assembler.instruction(&[0x48, 0x39, 0xca])?;
+        assembler.branch(&[0x0f, 0x84], no_match)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, 1])?;
+        assembler.branch(&[0xe9], restart)?;
+
+        assembler.bind(invalid_result)?;
+        assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+        assembler.branch(&[0xe9], done)?;
+    } else {
+        assembler.instruction(&[0xb8, 0x01, 0x00, 0x00, 0x00])?;
+        assembler.branch(&[0xe9], done)?;
+    }
     assembler.bind(selected_end)?;
     if layout.partial.is_some() {
         let mut status = vec![0xb8];
@@ -40114,6 +46961,9 @@ fn lower_x86_64_dfa_with_entry_contract(
     assembler.bind(invalid)?;
     assembler.instruction(&[0xb8, 0x02, 0x00, 0x00, 0x00])?;
     assembler.bind(done)?;
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(&[0x48, 0x83, 0xc4, 48])?;
+    }
     if uses_seeded_reverse {
         assembler.instruction(&[0x41, 0x5f])?; // pop r15
         assembler.instruction(&[0x41, 0x5e])?; // pop r14
@@ -40143,6 +46993,23 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     let mut finished = assembler.finish_with_label_offsets()?;
     let table_displacement = finished.label_offset(table_displacement_label)?;
+    let direct_search_trusted_core_offset = if has_direct_search_trusted_core {
+        let code_offset = table_displacement
+            .checked_sub(6)
+            .ok_or(ObjectError::InvalidModule(
+                "x86 direct search trusted core landmark",
+            ))?;
+        if finished.code.get(code_offset..table_displacement)
+            != Some([0x48, 0x89, 0xd6, 0x4c, 0x8d, 0x0d].as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 direct search trusted core landmark",
+            ));
+        }
+        Some(code_offset)
+    } else {
+        None
+    };
     if let Some(cold_start_label) = adaptive_cold_start {
         let cold_start = finished.label_offset(cold_start_label)?;
         let cold_bytes =
@@ -40172,6 +47039,7 @@ fn lower_x86_64_dfa_with_entry_contract(
     }
 
     let code = finished.code;
+    let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
     let relocations = vec![ModuleRelocation {
             section: TEXT_SECTION,
             offset: offset_u64(table_displacement, "x86 DFA table relocation offset")?,
@@ -40220,6 +47088,28 @@ fn lower_x86_64_dfa_with_entry_contract(
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
+        direct_search_trusted_core: direct_search_trusted_core_offset.map(|code_offset| {
+            NativeDirectSearchTrustedCore {
+                code_offset,
+                output: layout.output,
+                entry_contract: NativeDirectSearchEntryContract::PublicCompleteV1,
+                result_abi: match layout.output {
+                    OutputContract::Exists => NativeDirectSearchResultAbi::ExistsStatusOnlyV1,
+                    OutputContract::Span => NativeDirectSearchResultAbi::SpanMatchedWritesBothV1,
+                    OutputContract::SelectedEnd => {
+                        unreachable!("SelectedEnd cannot publish a direct-search trusted core")
+                    }
+                },
+                entry_code_sha256,
+                prologue: NativeDirectSearchTrustedCorePrologue::X86_64 {
+                    save_rbx: uses_exact_pair_phase_register,
+                    save_r12_r13: retain_vector_candidates
+                        || uses_seeded_reverse
+                        || retains_teddy_candidates,
+                    save_r14_r15: uses_seeded_reverse,
+                },
+            }
+        }),
     })
 }
 
@@ -41588,6 +48478,10 @@ fn lower_x86_64_prepared_span_fill_impl(
             })
             .transpose()?,
         identity_relocation: None,
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
         code: finished.code,
     })
 }
@@ -41599,6 +48493,132 @@ fn lower_x86_64_prepared_span_fill_impl(
 /// call is an artifact-specific prepared target or self-contained ordinary Span
 /// entry. The outer wrapper authenticates the complete immutable artifact
 /// identity before that target can inspect source bytes.
+fn lower_x86_64_complete_span_reduce_export(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if matches!(sink, PreparedSpanSink::Fill { .. }) {
+        return Err(ObjectError::InvalidModule(
+            "x86 complete Span reducer received the Fill sink",
+        ));
+    }
+    let mut assembler = X86Assembler::new();
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    assembler.instruction(&[0x48, 0x8d, 0x05])?;
+    let identity_displacement = assembler.label()?;
+    assembler.bind(identity_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 complete Span reducer identity word",
+            ))?;
+        if word_offset == 0 {
+            assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+        } else {
+            assembler.instruction(&[
+                0x4c,
+                0x8b,
+                0x50,
+                u8::try_from(word_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "x86 complete Span reducer linked identity offset",
+                    )
+                })?,
+            ])?;
+        }
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 complete Span reducer header identity offset",
+            ))?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "x86 complete Span reducer header identity displacement",
+                )
+            })?,
+        ])?;
+        assembler.branch(&[0x0f, 0x85], wrong_identity)?;
+    }
+
+    // One callee-save plus a two-word private result preserves the SysV call
+    // alignment and keeps the public output transactional.
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, 32])?;
+    assembler.instruction(&[0x48, 0x89, 0xcb])?;
+    assembler.instruction(&[0x48, 0x89, 0xf7])?;
+    assembler.instruction(&[0x48, 0x89, 0xd6])?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x48, 0x89, 0xf1])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let prepared_call = assembler.label()?;
+    assembler.bind(prepared_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x85], returned)?;
+    match sink {
+        PreparedSpanSink::Count => {
+            assembler.instruction(&[0x48, 0x8b, 0x14, 0x24])?;
+        }
+        PreparedSpanSink::SpanSum => {
+            assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 8])?;
+        }
+        PreparedSpanSink::Fill { .. } => unreachable!(),
+    }
+    assembler.instruction(&[0x48, 0x89, 0x13])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, 32])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, 0x05, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let prepared_call_offset = finished.label_offset(prepared_call)?;
+    let identity_relocation_offset = finished.label_offset(identity_displacement)?;
+    Ok(NativePreparedBulkWrapper {
+        code: finished.code,
+        prepared_call_offset,
+        ordered_nfa_gate_call_offset: None,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(NativePreparedIdentityRelocation::X86PcRelative32(
+            identity_relocation_offset,
+        )),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "raw ABI validation, exact nullable progress, and transactional scalar publication form one generated leaf"
@@ -41671,6 +48691,27 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
     let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
     let wrong_identity = assembler.label()?;
+    let trusted_core_prologue = match call_kind {
+        NativeSpanReducerCallKind::DirectTrustedCore(
+            prologue @ NativeDirectSearchTrustedCorePrologue::X86_64 { .. },
+        ) => Some(prologue),
+        NativeSpanReducerCallKind::DirectTrustedCore(
+            NativeDirectSearchTrustedCorePrologue::Aarch64,
+        ) => {
+            return Err(ObjectError::InvalidModule(
+                "x86 Span reducer received an AArch64 trusted core",
+            ));
+        }
+        NativeSpanReducerCallKind::PreparedPrivate | NativeSpanReducerCallKind::DirectOrdinary => {
+            None
+        }
+    };
+    let trusted_core_trampoline = trusted_core_prologue
+        .map(|_| assembler.label())
+        .transpose()?;
+    let trusted_core_jump = trusted_core_prologue
+        .map(|_| assembler.label())
+        .transpose()?;
     let terminal_scan = assembler.label()?;
     let terminal_word0 = assembler.label()?;
     let terminal_word1 = assembler.label()?;
@@ -41863,7 +48904,8 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
             assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // private result
             assembler.instruction(&[0x4c, 0x8d, 0x54, 0x24, SESSION_OFFSET])?;
         }
-        NativeSpanReducerCallKind::DirectOrdinary => {
+        NativeSpanReducerCallKind::DirectOrdinary
+        | NativeSpanReducerCallKind::DirectTrustedCore(_) => {
             assembler.instruction(&[0x4c, 0x89, 0xe7])?; // haystack
             assembler.instruction(&[0x4c, 0x89, 0xee])?; // length
             assembler.instruction(&[0x4c, 0x89, 0xf2])?; // window start
@@ -41974,6 +49016,40 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
     assembler.instruction(&[0xb8, 0x03, 0, 0, 0])?;
     assembler.instruction(&[0xc3])?;
 
+    if let (
+        Some(trampoline),
+        Some(core_jump),
+        Some(NativeDirectSearchTrustedCorePrologue::X86_64 {
+            save_rbx,
+            save_r12_r13,
+            save_r14_r15,
+        }),
+    ) = (
+        trusted_core_trampoline,
+        trusted_core_jump,
+        trusted_core_prologue,
+    ) {
+        assembler.bind(trampoline)?;
+        if save_rbx {
+            assembler.instruction(&[0x53])?;
+        }
+        if save_r12_r13 {
+            assembler.instruction(&[0x41, 0x54])?;
+            assembler.instruction(&[0x41, 0x55])?;
+        }
+        if save_r14_r15 {
+            assembler.instruction(&[0x41, 0x56])?;
+            assembler.instruction(&[0x41, 0x57])?;
+        }
+        // The public prologue reaches the post-init landmark with RAX zero
+        // and integer flags produced by that zeroing instruction. Preserve
+        // that complete machine-state contract before sharing the body.
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.instruction(&[0xe9])?;
+        assembler.bind(core_jump)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+    }
+
     let finished = assembler.finish_with_label_offsets()?;
     Ok(NativePreparedBulkWrapper {
         prepared_call_offset: finished.label_offset(prepared_call)?,
@@ -41997,6 +49073,14 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
         identity_relocation: Some(NativePreparedIdentityRelocation::X86PcRelative32(
             finished.label_offset(identity_displacement)?,
         )),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: trusted_core_trampoline
+            .map(|label| finished.label_offset(label))
+            .transpose()?,
+        trusted_core_jump_offset: trusted_core_jump
+            .map(|label| finished.label_offset(label))
+            .transpose()?,
         code: finished.code,
     })
 }
@@ -42250,8 +49334,732 @@ fn lower_x86_64_prepared_grep_count(
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: Some(identity_relocation),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "LF/CRLF traversal, every-row validation, and transactional publication form one auditable native operation"
+)]
+fn lower_x86_64_native_rebar_multi_grep_v1(
+    row_count: usize,
+    prepared_rows: Option<&[bool]>,
+) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
+    const ORDINARY_FRAME_BYTES: u8 = 40;
+    const MIXED_FRAME_BYTES: u8 = 56;
+    const RESULT_END_OFFSET: u8 = 8;
+    const LINE_LENGTH_OFFSET: u8 = 24;
+    const MATCHED_OFFSET: u8 = 32;
+    const HANDLE_TABLE_OFFSET: u8 = 40;
+    if row_count == 0 || prepared_rows.is_some_and(|routes| routes.len() != row_count) {
+        return Err(ObjectError::InvalidModule(
+            "x86 Rebar multi-grep row cardinality",
+        ));
+    }
+    let mut assembler = X86Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let completed_line = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    let frame_bytes = if prepared_rows.is_some() {
+        MIXED_FRAME_BYTES
+    } else {
+        ORDINARY_FRAME_BYTES
+    };
+    if let Some(routes) = prepared_rows {
+        x86_mixed_row_scalar_boundary(&mut assembler, routes, invalid)?;
+    } else {
+        x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    }
+    assembler.instruction(&[0x55])?; // rbp
+    assembler.instruction(&[0x53])?; // rbx
+    assembler.instruction(&[0x41, 0x54])?; // r12
+    assembler.instruction(&[0x41, 0x55])?; // r13
+    assembler.instruction(&[0x41, 0x56])?; // r14
+    assembler.instruction(&[0x41, 0x57])?; // r15
+    assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+    if prepared_rows.is_some() {
+        assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, HANDLE_TABLE_OFFSET])?;
+        assembler.instruction(&[0x49, 0x89, 0xd4])?; // base
+        assembler.instruction(&[0x49, 0x89, 0xcd])?; // complete length
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?; // output
+    } else {
+        assembler.instruction(&[0x49, 0x89, 0xfc])?; // base
+        assembler.instruction(&[0x49, 0x89, 0xf5])?; // complete length
+        assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    }
+    assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // cursor
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(&[0x48, 0x89, 0xdd])?; // line start
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], final_line)?;
+    assembler.instruction(&[0x41, 0x80, 0x3c, 0x1c, 0x0a])?;
+    assembler.branch(&[0x0f, 0x84], found_lf)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(&[0x48, 0x89, 0xd8])?; // line end before LF
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.instruction(&[0x48, 0x39, 0xe8])?;
+    assembler.branch(&[0x0f, 0x84], line_ready)?;
+    assembler.instruction(&[0x41, 0x80, 0x7c, 0x04, 0xff, 0x0d])?;
+    assembler.branch(&[0x0f, 0x85], line_ready)?;
+    assembler.instruction(&[0x48, 0x83, 0xe8, 1])?;
+    assembler.branch(&[0xe9], line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(&[0x48, 0x89, 0xd8])?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(&[0x48, 0x29, 0xe8])?; // line length
+    assembler.instruction(&[
+        0x48,
+        0x89,
+        0x44,
+        0x24,
+        LINE_LENGTH_OFFSET,
+    ])?;
+    assembler.instruction(&[0xc7, 0x44, 0x24, MATCHED_OFFSET, 0, 0, 0, 0])?;
+
+    let mut call_labels = Vec::new();
+    call_labels
+        .try_reserve_exact(row_count)
+        .map_err(|_| ObjectError::Allocation("x86 Rebar multi-grep calls"))?;
+    for row in 0..row_count {
+        let next_row = assembler.label()?;
+        assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0xff, 0xff, 0xff, 0xff])?;
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            RESULT_END_OFFSET,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+        ])?;
+        if prepared_rows.is_some_and(|routes| routes[row]) {
+            assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, HANDLE_TABLE_OFFSET])?;
+            let displacement = row
+                .checked_mul(core::mem::size_of::<usize>())
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 mixed multi-grep handle load",
+                ))?;
+            let mut load_handle = vec![0x48, 0x8b, 0xb8]; // rdi = table[row]
+            load_handle.extend_from_slice(&displacement.to_le_bytes());
+            assembler.instruction(&load_handle)?;
+            assembler.instruction(&[0x49, 0x8d, 0x34, 0x2c])?; // line base
+            assembler.instruction(&[
+                0x48,
+                0x8b,
+                0x54,
+                0x24,
+                LINE_LENGTH_OFFSET,
+            ])?;
+            assembler.instruction(&[0x31, 0xc9])?; // window start
+            assembler.instruction(&[0x49, 0x89, 0xd0])?; // window end
+            assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // result
+        } else {
+            assembler.instruction(&[0x49, 0x8d, 0x3c, 0x2c])?; // base + line start
+            assembler.instruction(&[
+                0x48,
+                0x8b,
+                0x74,
+                0x24,
+                LINE_LENGTH_OFFSET,
+            ])?;
+            assembler.instruction(&[0x31, 0xd2])?;
+            assembler.instruction(&[0x48, 0x89, 0xf1])?;
+            assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+        }
+        assembler.instruction(&[0xe8])?;
+        let call = assembler.label()?;
+        assembler.bind(call)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        call_labels.push(call);
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], next_row)?;
+        assembler.instruction(&[0x83, 0xf8, 1])?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+        assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, RESULT_END_OFFSET])?;
+        assembler.instruction(&[0x48, 0x39, 0xd0])?;
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[
+            0x48,
+            0x3b,
+            0x54,
+            0x24,
+            LINE_LENGTH_OFFSET,
+        ])?;
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0xc7, 0x44, 0x24, MATCHED_OFFSET, 1, 0, 0, 0])?;
+        assembler.bind(next_row)?;
+    }
+    assembler.instruction(&[0x83, 0x7c, 0x24, MATCHED_OFFSET, 0])?;
+    assembler.branch(&[0x0f, 0x84], completed_line)?;
+    assembler.instruction(&[0x49, 0x83, 0xc7, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.bind(completed_line)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let offsets = call_labels
+        .into_iter()
+        .map(|label| finished.label_offset(label))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((finished.code, offsets.into_boxed_slice()))
+}
+
+fn x86_mixed_row_scalar_boundary(
+    assembler: &mut X86Assembler,
+    prepared_rows: &[bool],
+    invalid: X86Label,
+) -> Result<(), ObjectError> {
+    let row_count = u32::try_from(prepared_rows.len())
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 mixed row handle count"))?;
+    let table_bytes = prepared_rows
+        .len()
+        .checked_mul(core::mem::size_of::<usize>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 mixed row handle table extent",
+        ))?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // handle table
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 0x07])?; // table alignment
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let mut exact_count = vec![0x48, 0x81, 0xfe];
+    exact_count.extend_from_slice(&row_count.to_le_bytes());
+    assembler.instruction(&exact_count)?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xf8])?;
+    let mut table_extent = vec![0x48, 0x05];
+    table_extent.extend_from_slice(&table_bytes.to_le_bytes());
+    assembler.instruction(&table_extent)?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    for (row, prepared) in prepared_rows.iter().copied().enumerate() {
+        let displacement = row
+            .checked_mul(core::mem::size_of::<usize>())
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 mixed row handle slot",
+            ))?;
+        let mut load = vec![0x48, 0x8b, 0x87]; // rax = table[row]
+        load.extend_from_slice(&displacement.to_le_bytes());
+        assembler.instruction(&load)?;
+        assembler.instruction(&[0x48, 0x85, 0xc0])?;
+        assembler.branch(
+            if prepared { &[0x0f, 0x84] } else { &[0x0f, 0x85] },
+            invalid,
+        )?;
+    }
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // haystack
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?; // signed-domain length
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x89, 0xd0])?;
+    assembler.instruction(&[0x48, 0x01, 0xc8])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // scalar output
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 8])?;
+    assembler.branch(&[0x0f, 0x82], invalid)?;
+    Ok(())
+}
+
+fn x86_rebar_row_scalar_accumulate(
+    assembler: &mut X86Assembler,
+    operation: crate::RebarNativeRowScalarOperationV1,
+    runtime_failure: X86Label,
+) -> Result<(), ObjectError> {
+    match operation {
+        crate::RebarNativeRowScalarOperationV1::Count => {
+            assembler.instruction(&[0x49, 0x83, 0xc7, 1])?; // total += 1
+        }
+        crate::RebarNativeRowScalarOperationV1::SpanSum => {
+            // Keep RDX live as the selected end: the caller commits it as
+            // both the next search cursor and last-match end after this
+            // checked update. RCX is caller-saved and dead after the row
+            // calls, so it can hold the temporary width.
+            assembler.instruction(&[0x48, 0x89, 0xd1])?; // width = end
+            assembler.instruction(&[0x48, 0x29, 0xc1])?; // width -= start
+            assembler.instruction(&[0x49, 0x01, 0xcf])?; // total += width
+        }
+    }
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered row selection, empty progress, and transactional reduction are one auditable SysV operation"
+)]
+fn lower_x86_64_native_rebar_row_scalar_v1(
+    row_count: usize,
+    operation: crate::RebarNativeRowScalarOperationV1,
+    prepared_rows: Option<&[bool]>,
+) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
+    const ORDINARY_FRAME_BYTES: u8 = 40;
+    const MIXED_FRAME_BYTES: u8 = 56;
+    const RESULT_END_OFFSET: u8 = 8;
+    const SELECTED_START_OFFSET: u8 = 16;
+    const SELECTED_END_OFFSET: u8 = 24;
+    const STATE_OFFSET: u8 = 32;
+    const HANDLE_TABLE_OFFSET: u8 = 40;
+    const HAVE_LAST: u8 = 1;
+    const PENDING_EMPTY: u8 = 2;
+    const HAVE_SELECTED: u8 = 4;
+    if row_count == 0 || prepared_rows.is_some_and(|routes| routes.len() != row_count) {
+        return Err(ObjectError::InvalidModule(
+            "x86 Rebar row-scalar cardinality",
+        ));
+    }
+    let frame_bytes = if prepared_rows.is_some() {
+        MIXED_FRAME_BYTES
+    } else {
+        ORDINARY_FRAME_BYTES
+    };
+    let mut assembler = X86Assembler::new();
+    let iteration = assembler.label()?;
+    let search_rows = assembler.label()?;
+    let rows_complete = assembler.label()?;
+    let empty_match = assembler.label()?;
+    let aggregate_empty = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    if let Some(routes) = prepared_rows {
+        x86_mixed_row_scalar_boundary(&mut assembler, routes, invalid)?;
+    } else {
+        x86_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    }
+    assembler.instruction(&[0x55])?; // rbp
+    assembler.instruction(&[0x53])?; // rbx
+    assembler.instruction(&[0x41, 0x54])?; // r12
+    assembler.instruction(&[0x41, 0x55])?; // r13
+    assembler.instruction(&[0x41, 0x56])?; // r14
+    assembler.instruction(&[0x41, 0x57])?; // r15
+    assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+    if prepared_rows.is_some() {
+        assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, HANDLE_TABLE_OFFSET])?;
+        assembler.instruction(&[0x49, 0x89, 0xd4])?; // base
+        assembler.instruction(&[0x49, 0x89, 0xcd])?; // length
+        assembler.instruction(&[0x4d, 0x89, 0xc6])?; // output
+    } else {
+        assembler.instruction(&[0x49, 0x89, 0xfc])?; // base
+        assembler.instruction(&[0x49, 0x89, 0xf5])?; // length
+        assembler.instruction(&[0x49, 0x89, 0xd6])?; // output
+    }
+    assembler.instruction(&[0x4d, 0x31, 0xff])?; // total
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // next start
+    assembler.instruction(&[0x48, 0x31, 0xed])?; // last end
+    assembler.instruction(&[0xc6, 0x44, 0x24, STATE_OFFSET, 0])?;
+
+    assembler.bind(iteration)?;
+    assembler.instruction(&[0xf6, 0x44, 0x24, STATE_OFFSET, PENDING_EMPTY])?;
+    assembler.branch(&[0x0f, 0x84], search_rows)?;
+    assembler.instruction(&[0x80, 0x64, 0x24, STATE_OFFSET, !PENDING_EMPTY])?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?; // cursor == length
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+
+    assembler.bind(search_rows)?;
+    assembler.instruction(&[0x80, 0x64, 0x24, STATE_OFFSET, !HAVE_SELECTED])?;
+    let mut call_labels = Vec::new();
+    call_labels
+        .try_reserve_exact(row_count)
+        .map_err(|_| ObjectError::Allocation("x86 Rebar row-scalar calls"))?;
+    for row in 0..row_count {
+        let next_row = assembler.label()?;
+        let select_row = assembler.label()?;
+        assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0xff, 0xff, 0xff, 0xff])?;
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            RESULT_END_OFFSET,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+        ])?;
+        if prepared_rows.is_some_and(|routes| routes[row]) {
+            assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, HANDLE_TABLE_OFFSET])?;
+            let displacement = row
+                .checked_mul(core::mem::size_of::<usize>())
+                .and_then(|offset| u32::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 mixed row handle load",
+                ))?;
+            let mut load_handle = vec![0x48, 0x8b, 0xb8]; // rdi = table[row]
+            load_handle.extend_from_slice(&displacement.to_le_bytes());
+            assembler.instruction(&load_handle)?;
+            assembler.instruction(&[0x4c, 0x89, 0xe6])?; // base
+            assembler.instruction(&[0x4c, 0x89, 0xea])?; // length
+            assembler.instruction(&[0x48, 0x89, 0xd9])?; // window start
+            assembler.instruction(&[0x4d, 0x89, 0xe8])?; // window end
+            assembler.instruction(&[0x4c, 0x8d, 0x0c, 0x24])?; // result
+        } else {
+            assembler.instruction(&[0x4c, 0x89, 0xe7])?; // base
+            assembler.instruction(&[0x4c, 0x89, 0xee])?; // length
+            assembler.instruction(&[0x48, 0x89, 0xda])?; // window start
+            assembler.instruction(&[0x4c, 0x89, 0xe9])?; // window end
+            assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // result
+        }
+        assembler.instruction(&[0xe8])?;
+        let call = assembler.label()?;
+        assembler.bind(call)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        call_labels.push(call);
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], next_row)?;
+        assembler.instruction(&[0x83, 0xf8, 1])?;
+        assembler.branch(&[0x0f, 0x85], runtime_failure)?;
+        assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, RESULT_END_OFFSET])?;
+        assembler.instruction(&[0x48, 0x39, 0xd0])?; // start <= end
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0x4c, 0x39, 0xea])?; // end <= length
+        assembler.branch(&[0x0f, 0x87], runtime_failure)?;
+        assembler.instruction(&[0x48, 0x39, 0xd8])?; // start >= requested
+        assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+        assembler.instruction(&[0xf6, 0x44, 0x24, STATE_OFFSET, HAVE_SELECTED])?;
+        assembler.branch(&[0x0f, 0x84], select_row)?;
+        assembler.instruction(&[
+            0x48,
+            0x3b,
+            0x44,
+            0x24,
+            SELECTED_START_OFFSET,
+        ])?;
+        assembler.branch(&[0x0f, 0x83], next_row)?; // later/equal keeps source priority
+        assembler.bind(select_row)?;
+        assembler.instruction(&[
+            0x48,
+            0x89,
+            0x44,
+            0x24,
+            SELECTED_START_OFFSET,
+        ])?;
+        assembler.instruction(&[
+            0x48,
+            0x89,
+            0x54,
+            0x24,
+            SELECTED_END_OFFSET,
+        ])?;
+        assembler.instruction(&[0x80, 0x4c, 0x24, STATE_OFFSET, HAVE_SELECTED])?;
+        assembler.bind(next_row)?;
+    }
+
+    assembler.bind(rows_complete)?;
+    assembler.instruction(&[0xf6, 0x44, 0x24, STATE_OFFSET, HAVE_SELECTED])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[
+        0x48,
+        0x8b,
+        0x44,
+        0x24,
+        SELECTED_START_OFFSET,
+    ])?;
+    assembler.instruction(&[
+        0x48,
+        0x8b,
+        0x54,
+        0x24,
+        SELECTED_END_OFFSET,
+    ])?;
+    assembler.instruction(&[0x48, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x84], empty_match)?;
+
+    x86_rebar_row_scalar_accumulate(&mut assembler, operation, runtime_failure)?;
+    assembler.instruction(&[0x48, 0x89, 0xd3])?; // cursor = end
+    assembler.instruction(&[0x48, 0x89, 0xd5])?; // last = end
+    assembler.instruction(&[0x80, 0x4c, 0x24, STATE_OFFSET, HAVE_LAST])?;
+    assembler.branch(&[0xe9], iteration)?;
+
+    assembler.bind(empty_match)?;
+    assembler.instruction(&[0xf6, 0x44, 0x24, STATE_OFFSET, HAVE_LAST])?;
+    assembler.branch(&[0x0f, 0x84], aggregate_empty)?;
+    assembler.instruction(&[0x48, 0x39, 0xea])?; // end == last end
+    assembler.branch(&[0x0f, 0x85], aggregate_empty)?;
+    assembler.instruction(&[0x4c, 0x39, 0xeb])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
+    assembler.branch(&[0x0f, 0x82], runtime_failure)?;
+    assembler.branch(&[0xe9], iteration)?;
+
+    assembler.bind(aggregate_empty)?;
+    x86_rebar_row_scalar_accumulate(&mut assembler, operation, runtime_failure)?;
+    assembler.instruction(&[0x48, 0x89, 0xd3])?;
+    assembler.instruction(&[0x48, 0x89, 0xd5])?;
+    assembler.instruction(&[
+        0x80,
+        0x4c,
+        0x24,
+        STATE_OFFSET,
+        HAVE_LAST | PENDING_EMPTY,
+    ])?;
+    assembler.branch(&[0xe9], iteration)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x4d, 0x89, 0x3e])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let offsets = call_labels
+        .into_iter()
+        .map(|label| finished.label_offset(label))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((finished.code, offsets.into_boxed_slice()))
+}
+
+/// Emit the exact-finite line-jump reducer. The local ordinary entry returns
+/// one selected endpoint in the still-unclassified suffix; the independently
+/// authenticated CR/LF-free finite-language proof makes that endpoint a
+/// witness for exactly one line. Scanning only from the endpoint to the next
+/// LF skips the rest of the already-counted line without rescanning prior
+/// bytes through either loop.
+#[allow(
+    clippy::too_many_lines,
+    reason = "identity validation, endpoint progress, LF skipping, and failure-atomic publication form one native leaf"
+)]
+fn lower_x86_64_exact_finite_selected_end_grep_count()
+-> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 16;
+
+    let mut assembler = X86Assembler::new();
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let scan_to_lf = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+
+    assembler.instruction(&[0x48, 0x8d, 0x05])?;
+    let identity_displacement = assembler.label()?;
+    assembler.bind(identity_displacement)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 exact-finite GrepCount identity word",
+            ))?;
+        if word_offset == 0 {
+            assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+        } else {
+            assembler.instruction(&[
+                0x4c,
+                0x8b,
+                0x50,
+                u8::try_from(word_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "x86 exact-finite GrepCount linked identity offset",
+                    )
+                })?,
+            ])?;
+        }
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 exact-finite GrepCount header identity offset",
+            ))?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "x86 exact-finite GrepCount header identity displacement",
+                )
+            })?,
+        ])?;
+        assembler.branch(&[0x0f, 0x85], wrong_identity)?;
+    }
+
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x49, 0x89, 0xf4])?; // base
+    assembler.instruction(&[0x49, 0x89, 0xd5])?; // length
+    assembler.instruction(&[0x49, 0x89, 0xcf])?; // output
+    assembler.instruction(&[0x4d, 0x31, 0xf6])?; // cursor
+    assembler.instruction(&[0x48, 0x31, 0xdb])?; // count
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe7])?;
+    assembler.instruction(&[0x4c, 0x89, 0xee])?;
+    assembler.instruction(&[0x4c, 0x89, 0xf2])?;
+    assembler.instruction(&[0x4c, 0x89, 0xe9])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let prepared_call = assembler.label()?;
+    assembler.bind(prepared_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x14, 0x24])?; // selected end
+    assembler.instruction(&[0x4d, 0x39, 0xf2])?;
+    assembler.branch(&[0x0f, 0x86], runtime_failure)?; // end <= cursor
+    assembler.instruction(&[0x4d, 0x39, 0xea])?;
+    assembler.branch(&[0x0f, 0x87], runtime_failure)?; // end > length
+    assembler.instruction(&[0x48, 0x83, 0xc3, 0x01])?;
+    assembler.branch(&[0x0f, 0x82], overflow)?;
+    assembler.instruction(&[0x4d, 0x89, 0xd6])?;
+
+    assembler.bind(scan_to_lf)?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x43, 0x80, 0x3c, 0x34, 0x0a])?;
+    assembler.branch(&[0x0f, 0x84], found_lf)?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.branch(&[0xe9], scan_to_lf)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.instruction(&[0x4d, 0x39, 0xee])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.branch(&[0xe9], search)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x49, 0x89, 0x1f])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(&[0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(&[0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(&[0xb8, PREPARED_INVALID_HANDLE_STATUS, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, PREPARED_INVALID_ARGUMENT_STATUS, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(&[0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let prepared_call_offset = finished.label_offset(prepared_call)?;
+    let identity_relocation = NativePreparedIdentityRelocation::X86PcRelative32(
+        finished.label_offset(identity_displacement)?,
+    );
+    Ok(NativePreparedBulkWrapper {
+        code: finished.code,
+        prepared_call_offset,
+        ordered_nfa_gate_call_offset: None,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(identity_relocation),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
+    })
+}
+
 
 fn x86_native_capture_reducer_boundary(
     assembler: &mut X86Assembler,
@@ -42696,7 +50504,11 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
 ) -> Result<(Vec<u8>, usize), ObjectError> {
     const LINE_START_OFFSET: u8 = 8;
     const SCRATCH_OFFSET: u8 = 16;
-    let frame_bytes = if caller_scratch_bytes == 0 { 16 } else { 32 };
+    // The line traversal keeps its current line start in RBP. RBP is
+    // callee-saved under SysV, so preserve it with the other live registers.
+    // Six pushes leave RSP 8 mod 16; the odd-eight frame sizes restore the
+    // required 16-byte alignment at each private-domain call site.
+    let frame_bytes = if caller_scratch_bytes == 0 { 24 } else { 40 };
     let mut assembler = X86Assembler::new();
     let line_loop = assembler.label()?;
     let scan = assembler.label()?;
@@ -42709,6 +50521,7 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     let invalid = assembler.label()?;
 
     x86_native_capture_reducer_boundary(&mut assembler, caller_scratch_bytes, invalid)?;
+    assembler.instruction(&[0x55])?;
     assembler.instruction(&[0x53])?;
     assembler.instruction(&[0x41, 0x54])?;
     assembler.instruction(&[0x41, 0x55])?;
@@ -42734,7 +50547,10 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     assembler.bind(scan)?;
     assembler.instruction(&[0x4c, 0x39, 0xeb])?;
     assembler.branch(&[0x0f, 0x84], final_line)?;
-    assembler.instruction(&[0x43, 0x80, 0x3c, 0x1c, 0x0a])?;
+    // R12 is the haystack base and RBX is the current scan offset. The REX.B
+    // bit extends the SIB base; REX.X must remain clear so the index is RBX,
+    // not the unrelated caller-saved R11.
+    assembler.instruction(&[0x41, 0x80, 0x3c, 0x1c, 0x0a])?;
     assembler.branch(&[0x0f, 0x84], found_lf)?;
     assembler.instruction(&[0x48, 0x83, 0xc3, 1])?;
     assembler.branch(&[0x0f, 0x82], overflow)?;
@@ -42791,6 +50607,7 @@ fn lower_x86_64_native_capture_grep_wrapper_v1(
     assembler.instruction(&[0x41, 0x5d])?;
     assembler.instruction(&[0x41, 0x5c])?;
     assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0x5d])?;
     assembler.instruction(&[0xc3])?;
     assembler.bind(invalid)?;
     assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
@@ -43210,6 +51027,145 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: None,
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
+        code: finished.code,
+    })
+}
+
+fn lower_x86_64_direct_exists_batch(
+    prologue: NativeDirectSearchTrustedCorePrologue,
+) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 32;
+    let NativeDirectSearchTrustedCorePrologue::X86_64 {
+        save_rbx,
+        save_r12_r13,
+        save_r14_r15,
+    } = prologue
+    else {
+        return Err(ObjectError::InvalidModule(
+            "x86 direct Exists batch has a non-x86 trusted core",
+        ));
+    };
+    let mut assembler = X86Assembler::new();
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let completed_item = assembler.label()?;
+    let complete = assembler.label()?;
+    let late_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+    let trampoline = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xc9])?; // processed
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    let descriptor_count_limit = u64::try_from(isize::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("direct Exists batch descriptor limit"))?
+        / 16;
+    let mut maximum_count = vec![0x49, 0xb8];
+    maximum_count.extend_from_slice(&descriptor_count_limit.to_le_bytes());
+    assembler.instruction(&maximum_count)?;
+    assembler.instruction(&[0x4c, 0x39, 0xc6])?;
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], validated)?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // descriptors
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x40, 0xf6, 0xc7, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // matched bytes
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+
+    assembler.bind(validated)?;
+    assembler.instruction(&[0x53])?;
+    assembler.instruction(&[0x41, 0x54])?;
+    assembler.instruction(&[0x41, 0x55])?;
+    assembler.instruction(&[0x41, 0x56])?;
+    assembler.instruction(&[0x41, 0x57])?;
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x49, 0x89, 0xfc])?;
+    assembler.instruction(&[0x49, 0x89, 0xf5])?;
+    assembler.instruction(&[0x49, 0x89, 0xd6])?;
+    assembler.instruction(&[0x49, 0x89, 0xcf])?;
+    assembler.instruction(&[0x31, 0xdb])?;
+    assembler.instruction(&[0x49, 0xc7, 0x07, 0, 0, 0, 0])?;
+
+    assembler.bind(loop_head)?;
+    assembler.instruction(&[0x4d, 0x85, 0xed])?;
+    assembler.branch(&[0x0f, 0x84], complete)?;
+    assembler.instruction(&[0x49, 0x8b, 0x3c, 0x24])?;
+    assembler.instruction(&[0x49, 0x8b, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], late_invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x88], late_invalid)?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x48, 0x89, 0xf1])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let search_call = assembler.label()?;
+    assembler.bind(search_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x86], completed_item)?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(completed_item)?;
+    assembler.instruction(&[0x41, 0x88, 0x06])?;
+    assembler.instruction(&[0x49, 0x83, 0xc4, 0x10])?;
+    assembler.instruction(&[0x49, 0x83, 0xc6, 0x01])?;
+    assembler.instruction(&[0x49, 0x83, 0xed, 0x01])?;
+    assembler.instruction(&[0x48, 0x83, 0xc3, 0x01])?;
+    assembler.branch(&[0xe9], loop_head)?;
+    assembler.bind(complete)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(late_invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+
+    assembler.bind(returned)?;
+    // `processed` is observable only after this function returns. Publishing
+    // the completed prefix once here avoids a loop-carried store dependency
+    // while preserving the exact prefix on success and every late failure.
+    assembler.instruction(&[0x49, 0x89, 0x1f])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x41, 0x5f])?;
+    assembler.instruction(&[0x41, 0x5e])?;
+    assembler.instruction(&[0x41, 0x5d])?;
+    assembler.instruction(&[0x41, 0x5c])?;
+    assembler.instruction(&[0x5b])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(trampoline)?;
+    if save_rbx {
+        assembler.instruction(&[0x53])?;
+    }
+    if save_r12_r13 {
+        assembler.instruction(&[0x41, 0x54])?;
+        assembler.instruction(&[0x41, 0x55])?;
+    }
+    if save_r14_r15 {
+        assembler.instruction(&[0x41, 0x56])?;
+        assembler.instruction(&[0x41, 0x57])?;
+    }
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0xe9])?;
+    let core_jump = assembler.label()?;
+    assembler.bind(core_jump)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativeDirectExistsBatchWrapper {
+        search_call_offset: finished.label_offset(search_call)?,
+        trampoline_offset: finished.label_offset(trampoline)?,
+        core_jump_offset: finished.label_offset(core_jump)?,
         code: finished.code,
     })
 }
@@ -43375,9 +51331,7 @@ fn lower_aarch64_prepared_span_fill_impl(
     assembler.branch_zero_x(1, invalid)?;
     assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
     assembler.branch_cond(AARCH64_MI, invalid)?;
-    assembler.branch_zero_x(3, invalid)?;
-    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
-    assembler.branch_nonzero_x(7, invalid)?;
+    aarch64_emit_prepared_scalar_output_validation(&mut assembler, invalid)?;
 
     assembler.branch_zero_x(6, invalid)?;
     assembler.instruction(aarch64_and_low_x(7, 6, 3)?)?;
@@ -43603,6 +51557,10 @@ fn lower_aarch64_prepared_span_fill_impl(
                 }
             }),
         identity_relocation: None,
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
 
@@ -43622,6 +51580,322 @@ fn lower_aarch64_prepared_span_reduce(
         None,
         false,
     )
+}
+
+fn aarch64_emit_prepared_scalar_output_validation(
+    assembler: &mut Aarch64Assembler,
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+    Ok(())
+}
+
+fn aarch64_emit_prepared_artifact_identity_validation(
+    assembler: &mut Aarch64Assembler,
+    wrong_identity: Aarch64Label,
+) -> Result<[usize; 2], ObjectError> {
+    let identity_page = assembler.instruction(0x9000_0007)?;
+    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 prepared aggregate identity word",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            7,
+            u16::try_from(word_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 prepared aggregate linked identity offset",
+                )
+            })?,
+        )?)?;
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 prepared aggregate header identity offset",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            0,
+            u16::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 prepared aggregate header identity displacement",
+                )
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, wrong_identity)?;
+    }
+    Ok([identity_page, identity_page_offset])
+}
+
+fn lower_aarch64_complete_span_reduce_export(
+    sink: PreparedSpanSink,
+) -> Result<NativePreparedBulkWrapper, ObjectError> {
+    if matches!(sink, PreparedSpanSink::Fill { .. }) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete Span reducer received the Fill sink",
+        ));
+    }
+    const FRAME_BYTES: u16 = 32;
+    let mut assembler = Aarch64Assembler::new();
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_handle)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    aarch64_emit_prepared_scalar_output_validation(&mut assembler, invalid)?;
+    let [identity_page, identity_page_offset] =
+        aarch64_emit_prepared_artifact_identity_validation(
+            &mut assembler,
+            wrong_identity,
+        )?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 30, 31, 16)?)?;
+    assembler.instruction(aarch64_mov_x(19, 3)?)?;
+    assembler.instruction(aarch64_mov_x(0, 1)?)?;
+    assembler.instruction(aarch64_mov_x(1, 2)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 1)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+    let prepared_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+    assembler.instruction(aarch64_load_x_imm(
+        8,
+        31,
+        match sink {
+            PreparedSpanSink::Count => 0,
+            PreparedSpanSink::SpanSum => 8,
+            PreparedSpanSink::Fill { .. } => unreachable!(),
+        },
+    )?)?;
+    assembler.instruction(aarch64_store_x(8, 19, 0)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 30, 31, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(0, 5)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [prepared_call, identity_page, identity_page_offset];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativePreparedBulkWrapper {
+        code,
+        prepared_call_offset: offsets[0],
+        ordered_nfa_gate_call_offset: None,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(
+            NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+                page: offsets[1],
+                page_offset: offsets[2],
+            },
+        ),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
+    })
+}
+
+fn lower_aarch64_direct_count_cold_long(
+) -> Result<DirectExactSingletonCountColdLong, ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    // The hot wrapper's unsigned threshold deliberately routes every length
+    // with bit 63 set here. Preserve the incumbent's invalid-length precedence
+    // before inspecting the output pointer or prepared handle.
+    assembler.branch_bit_set_x(2, 63, invalid)?;
+    aarch64_emit_prepared_scalar_output_validation(&mut assembler, invalid)?;
+    let [identity_page, identity_page_offset] =
+        aarch64_emit_prepared_artifact_identity_validation(
+            &mut assembler,
+            wrong_identity,
+        )?;
+    assembler.instruction(aarch64_mov_x(0, 1)?)?;
+    assembler.instruction(aarch64_mov_x(1, 2)?)?;
+    assembler.instruction(aarch64_mov_x(2, 3)?)?;
+    let core_branch = assembler.instruction(0x1400_0000)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [identity_page, identity_page_offset, core_branch];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(DirectExactSingletonCountColdLong {
+        code,
+        identity_page_offset: offsets[0],
+        identity_page_off12_offset: offsets[1],
+        core_branch_offset: offsets[2],
+    })
+}
+
+fn lower_aarch64_direct_exact_singleton_span_sum_cold_long(
+) -> Result<DirectExactSingletonSpanSumColdLong, ObjectError> {
+    let mut assembler = Aarch64Assembler::new();
+    let invalid = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    // The hot wrapper's unsigned threshold deliberately routes every length
+    // with bit 63 set here. Preserve the incumbent's invalid-length precedence
+    // before inspecting the output pointer or prepared handle.
+    assembler.branch_bit_set_x(2, 63, invalid)?;
+    aarch64_emit_prepared_scalar_output_validation(&mut assembler, invalid)?;
+    let [identity_page, identity_page_offset] =
+        aarch64_emit_prepared_artifact_identity_validation(
+            &mut assembler,
+            wrong_identity,
+        )?;
+    let wrapper_branch = assembler.instruction(0x1400_0000)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [identity_page, identity_page_offset, wrapper_branch];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(DirectExactSingletonSpanSumColdLong {
+        code,
+        identity_page_offset: offsets[0],
+        identity_page_off12_offset: offsets[1],
+        wrapper_branch_offset: offsets[2],
+    })
+}
+
+/// Lower the private, operation-specific bridge from the authenticated
+/// four-argument prepared `SpanSum` ABI to the three-argument Count-v3 core.
+///
+/// The exact-singleton proof makes every accepted non-overlapping span have
+/// `literal_bytes` bytes, so the result is `count * literal_bytes`. Every
+/// nontrivial product is checked independently; multiplication by one
+/// discharges that overflow proof without arithmetic. The result is not
+/// published until the Count core and every applicable bound check succeed.
+fn lower_aarch64_direct_exact_singleton_span_sum_wrapper(
+    literal_bytes: u8,
+) -> Result<DirectExactSingletonSpanSumWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 48;
+    const COUNT_OFFSET: u16 = 0;
+    if !(1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES)
+        .contains(&usize::from(literal_bytes))
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct SpanSum literal width is unsupported",
+        ));
+    }
+
+    let mut assembler = Aarch64Assembler::new();
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+
+    // The public entry or cold arm has already validated the handle, haystack
+    // extent, output pointer/alignment, and artifact identity. Preserve the
+    // original output and length across Count-v3.
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_mov_x(19, 3)?)?;
+    assembler.instruction(aarch64_mov_x(20, 2)?)?;
+
+    // Count-v3: (haystack, length, private_count_out) -> status.
+    assembler.instruction(aarch64_mov_x(0, 1)?)?;
+    assembler.instruction(aarch64_mov_x(1, 2)?)?;
+    assembler.instruction(aarch64_add_x_imm(2, 31, COUNT_OFFSET)?)?;
+    let count_call = assembler.instruction(0x9400_0000)?;
+    assembler.branch_nonzero_w(0, returned)?;
+
+    assembler.instruction(aarch64_load_x_imm(8, 31, COUNT_OFFSET)?)?;
+    // Width one is already expressed in bytes, so its checked product is the
+    // Count result itself. The common bound below still independently rejects
+    // a corrupt core result larger than the authenticated source extent.
+    if literal_bytes != 1 {
+        assembler.instruction(aarch64_movz_x(9, u16::from(literal_bytes), 0)?)?;
+        assembler.instruction(aarch64_umulh_x(10, 8, 9)?)?;
+        assembler.branch_nonzero_x(10, overflow)?;
+        assembler.instruction(aarch64_mul_x(8, 8, 9)?)?;
+    }
+    // Redundant for a correct Count-v3 core, but independently authenticate
+    // the semantic invariant SpanSum <= haystack length at the seam.
+    assembler.instruction(aarch64_cmp_x(8, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, overflow)?;
+    assembler.instruction(aarch64_store_x(8, 19, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = [count_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(DirectExactSingletonSpanSumWrapper {
+        code,
+        count_call_offset: offsets[0],
+    })
+}
+
+/// Regenerate and byte-authenticate the operation-specific wrapper after its
+/// sole local call has been bound to the independently audited Count-v3 core.
+pub(crate) fn authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+    literal_bytes: u8,
+    wrapper_offset: usize,
+    core_offset: usize,
+    embedded: &[u8],
+) -> Result<[u8; 32], ObjectError> {
+    let mut expected =
+        lower_aarch64_direct_exact_singleton_span_sum_wrapper(literal_bytes)?;
+    let call_offset = wrapper_offset
+        .checked_add(expected.count_call_offset)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "direct SpanSum wrapper call offset",
+        ))?;
+    let call = aarch64_local_call_instruction(call_offset, core_offset)?.ok_or(
+        ObjectError::InvalidModule("direct SpanSum wrapper call is out of range"),
+    )?;
+    let call_end = expected.count_call_offset.checked_add(4).ok_or(
+        ObjectError::ArithmeticOverflow("direct SpanSum wrapper call extent"),
+    )?;
+    expected
+        .code
+        .get_mut(expected.count_call_offset..call_end)
+        .ok_or(ObjectError::InvalidModule(
+            "direct SpanSum wrapper call escapes regenerated code",
+        ))?
+        .copy_from_slice(&call.to_le_bytes());
+    if embedded != expected.code.as_slice() {
+        return Err(ObjectError::InvalidModule(
+            "direct SpanSum embedded wrapper authentication failed",
+        ));
+    }
+    Ok(Sha256::digest(embedded).into())
 }
 
 #[allow(
@@ -43664,6 +51938,21 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
             "AArch64 prepared scalar reducer received the Fill sink",
         ));
     }
+    let trusted_core = match call_kind {
+        NativeSpanReducerCallKind::DirectTrustedCore(
+            NativeDirectSearchTrustedCorePrologue::Aarch64,
+        ) => true,
+        NativeSpanReducerCallKind::DirectTrustedCore(
+            NativeDirectSearchTrustedCorePrologue::X86_64 { .. },
+        ) => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 Span reducer received an x86 trusted core",
+            ));
+        }
+        NativeSpanReducerCallKind::PreparedPrivate | NativeSpanReducerCallKind::DirectOrdinary => {
+            false
+        }
+    };
     let frame_bytes = if terminal_exact_set.is_some() {
         TERMINAL_FRAME_BYTES
     } else {
@@ -43684,6 +51973,7 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
     let invalid_handle = assembler.label()?;
     let invalid = assembler.label()?;
     let wrong_identity = assembler.label()?;
+    let authenticated_body = assembler.label()?;
     let terminal_scan = assembler.label()?;
     let terminal_word0 = assembler.label()?;
     let terminal_word1 = assembler.label()?;
@@ -43695,9 +51985,7 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
     assembler.branch_zero_x(1, invalid)?;
     assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
     assembler.branch_cond(AARCH64_MI, invalid)?;
-    assembler.branch_zero_x(3, invalid)?;
-    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
-    assembler.branch_nonzero_x(7, invalid)?;
+    aarch64_emit_prepared_scalar_output_validation(&mut assembler, invalid)?;
 
     let ordered_gate_sites = (ordered_nfa_gate && !required_ordered_nfa_gate)
         .then(|| aarch64_emit_ordered_nfa_operation_gate(&mut assembler, true))
@@ -43708,40 +51996,13 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
 
     // Authenticate the exact linked artifact before either local call shape
     // can inspect source bytes.
-    let identity_page = assembler.instruction(0x9000_0007)?;
-    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
-    for identity_word in 0_usize..4 {
-        let word_offset = identity_word
-            .checked_mul(core::mem::size_of::<u64>())
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "AArch64 prepared aggregate identity word",
-            ))?;
-        assembler.instruction(aarch64_load_x_imm(
-            8,
-            7,
-            u16::try_from(word_offset).map_err(|_| {
-                ObjectError::ArithmeticOverflow(
-                    "AArch64 prepared aggregate linked identity offset",
-                )
-            })?,
-        )?)?;
-        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
-            .checked_add(word_offset)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "AArch64 prepared aggregate header identity offset",
-            ))?;
-        assembler.instruction(aarch64_load_x_imm(
-            9,
-            0,
-            u16::try_from(header_offset).map_err(|_| {
-                ObjectError::ArithmeticOverflow(
-                    "AArch64 prepared aggregate header identity displacement",
-                )
-            })?,
-        )?)?;
-        assembler.instruction(aarch64_cmp_x(9, 8)?)?;
-        assembler.branch_cond(AARCH64_NE, wrong_identity)?;
-    }
+    let [identity_page, identity_page_offset] =
+        aarch64_emit_prepared_artifact_identity_validation(
+            &mut assembler,
+            wrong_identity,
+        )?;
+
+    assembler.bind(authenticated_body)?;
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(aarch64_store_pair_x(
@@ -43836,7 +52097,8 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
             assembler.instruction(aarch64_add_x_imm(5, 31, 0)?)?;
             assembler.instruction(aarch64_add_x_imm(6, 31, SESSION_OFFSET)?)?;
         }
-        NativeSpanReducerCallKind::DirectOrdinary => {
+        NativeSpanReducerCallKind::DirectOrdinary
+        | NativeSpanReducerCallKind::DirectTrustedCore(_) => {
             assembler.instruction(aarch64_mov_x(0, 20)?)?; // haystack
             assembler.instruction(aarch64_mov_x(1, 21)?)?; // length
             assembler.instruction(aarch64_mov_x(2, 23)?)?; // window start
@@ -43925,7 +52187,25 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
     assembler.instruction(aarch64_movz_w(0, 3)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let trusted_core_trampoline = if trusted_core {
+        // The public prologue's last flag-setting instruction before the
+        // post-init landmark is its successful non-null haystack check.
+        // Result stores do not alter NZCV, so recreate those flags exactly.
+        let trampoline = assembler.instruction(0xf100_001f)?; // cmp x0, #0
+        let branch = assembler.instruction(0x1400_0000)?;
+        Some((trampoline, branch))
+    } else {
+        None
+    };
+
     let mut offsets = vec![prepared_call, identity_page, identity_page_offset];
+    let trusted_core_indices = trusted_core_trampoline.map(|(trampoline, branch)| {
+        let trampoline_index = offsets.len();
+        offsets.push(trampoline);
+        let branch_index = offsets.len();
+        offsets.push(branch);
+        (trampoline_index, branch_index)
+    });
     let ordered_gate_indices = ordered_gate_sites.map(|(call, fallback, identity)| {
         let call_index = offsets.len();
         offsets.push(call);
@@ -43945,7 +52225,10 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
         offsets.push(call);
         index
     });
-    let code = assembler.finish_with_offsets(&mut offsets)?;
+    let (code, authenticated_body_offset) = assembler.finish_with_offsets_and_label(
+        &mut offsets,
+        (call_kind == NativeSpanReducerCallKind::DirectOrdinary).then_some(authenticated_body),
+    )?;
     Ok(NativePreparedBulkWrapper {
         code,
         prepared_call_offset: offsets[0],
@@ -43968,6 +52251,15 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
                 page_offset: offsets[2],
             },
         ),
+        authenticated_body_offset,
+        // The follow-on exact-singleton Count-v3/SpanSum installers
+        // authenticate and rewrite the legacy DirectOrdinary wrapper byte for
+        // byte. A trusted-core trampoline is a different incumbent shape, so
+        // decline those optional follow-ons by withholding their body seam.
+        trusted_core: None,
+        trusted_core_trampoline_offset: trusted_core_indices
+            .map(|(trampoline, _)| offsets[trampoline]),
+        trusted_core_jump_offset: trusted_core_indices.map(|(_, branch)| offsets[branch]),
     })
 }
 
@@ -44006,8 +52298,8 @@ fn lower_aarch64_prepared_grep_count(
     call_kind: NativeSpanReducerCallKind,
     required_ordered_nfa: bool,
 ) -> Result<NativePreparedBulkWrapper, ObjectError> {
-    const FRAME_BYTES: u16 = 112;
-    const SESSION_OFFSET: u16 = 96;
+    const FRAME_BYTES: u16 = 128;
+    const SESSION_OFFSET: u16 = 112;
     if required_ordered_nfa && call_kind != NativeSpanReducerCallKind::PreparedPrivate {
         return Err(ObjectError::InvalidModule(
             "required Ordered-NFA GrepCount has no private prepared target",
@@ -44016,7 +52308,8 @@ fn lower_aarch64_prepared_grep_count(
 
     let mut assembler = Aarch64Assembler::new();
     let line_loop = assembler.label()?;
-    let scan = assembler.label()?;
+    let scan_words = assembler.label()?;
+    let scan_bytes = assembler.label()?;
     let found_lf = assembler.label()?;
     let final_line = assembler.label()?;
     let line_ready = assembler.label()?;
@@ -44081,7 +52374,8 @@ fn lower_aarch64_prepared_grep_count(
     assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
     assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
     assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
-    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_store_pair_x(27, 28, 31, 80)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 96)?)?;
     assembler.instruction(aarch64_mov_x(19, 0)?)?;
     assembler.instruction(aarch64_mov_x(20, 1)?)?;
     assembler.instruction(aarch64_mov_x(21, 2)?)?;
@@ -44090,16 +52384,40 @@ fn lower_aarch64_prepared_grep_count(
     assembler.instruction(aarch64_movz_x(24, 0, 0)?)?;
     assembler.branch_zero_x(21, finished)?;
 
+    // Preserve the two byte-lane constants across the local search calls. On
+    // long lines, the classic zero-byte test rejects eight bytes at a time;
+    // a candidate word falls back to the exact byte loop, which preserves the
+    // first-LF and CRLF semantics without an out-of-bounds vector tail.
+    assembler.instruction(aarch64_cmp_x_imm(21, 8)?)?;
+    assembler.branch_cond(AARCH64_LO, line_loop)?;
+    aarch64_load_u64_constant(&mut assembler, 27, 0x0a0a_0a0a_0a0a_0a0a)?;
+    aarch64_load_u64_constant(&mut assembler, 28, 0x0101_0101_0101_0101)?;
+
     assembler.bind(line_loop)?;
     assembler.instruction(aarch64_mov_x(25, 23)?)?;
-    assembler.bind(scan)?;
+    assembler.bind(scan_words)?;
+    assembler.instruction(aarch64_add_x_imm(8, 23, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 21)?)?;
+    assembler.branch_cond(AARCH64_HI, scan_bytes)?;
+    assembler.instruction(aarch64_add_x_reg(9, 20, 23)?)?;
+    assembler.instruction(aarch64_load_x_imm(10, 9, 0)?)?;
+    assembler.instruction(aarch64_eor_x(9, 10, 27)?)?;
+    assembler.instruction(aarch64_sub_x_reg(10, 9, 28)?)?;
+    assembler.instruction(aarch64_bic_x(10, 10, 9)?)?;
+    assembler.instruction(aarch64_add_x_lsl(9, 31, 28, 7)?)?;
+    assembler.instruction(aarch64_tst_x(10, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, scan_bytes)?;
+    assembler.instruction(aarch64_mov_x(23, 8)?)?;
+    assembler.branch(scan_words)?;
+
+    assembler.bind(scan_bytes)?;
     assembler.instruction(aarch64_cmp_x(23, 21)?)?;
     assembler.branch_cond(AARCH64_EQ, final_line)?;
     assembler.instruction(aarch64_load_byte_reg(8, 20, 23)?)?;
     assembler.instruction(aarch64_cmp_w_imm(8, 10)?)?;
     assembler.branch_cond(AARCH64_EQ, found_lf)?;
     assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
-    assembler.branch(scan)?;
+    assembler.branch(scan_bytes)?;
 
     assembler.bind(found_lf)?;
     assembler.instruction(aarch64_mov_x(26, 23)?)?;
@@ -44120,7 +52438,7 @@ fn lower_aarch64_prepared_grep_count(
     assembler.instruction(aarch64_add_x_reg(8, 20, 25)?)?;
     match call_kind {
         NativeSpanReducerCallKind::PreparedPrivate => {
-            assembler.instruction(aarch64_store_pair_x(31, 31, 31, 96)?)?;
+            assembler.instruction(aarch64_store_pair_x(31, 31, 31, 112)?)?;
             assembler.instruction(aarch64_mov_x(0, 19)?)?;
             assembler.instruction(aarch64_mov_x(1, 8)?)?;
             assembler.instruction(aarch64_mov_x(2, 26)?)?;
@@ -44135,6 +52453,11 @@ fn lower_aarch64_prepared_grep_count(
             assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
             assembler.instruction(aarch64_mov_x(3, 26)?)?;
             assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+        }
+        NativeSpanReducerCallKind::DirectTrustedCore(_) => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 GrepCount cannot target a direct-search trusted core",
+            ));
         }
     }
     let prepared_call = assembler.instruction(0x9400_0000)?;
@@ -44163,7 +52486,8 @@ fn lower_aarch64_prepared_grep_count(
     assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
     assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
     assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
-    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_load_pair_x(27, 28, 31, 80)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 96)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
     assembler.bind(invalid_handle)?;
@@ -44195,8 +52519,615 @@ fn lower_aarch64_prepared_grep_count(
                 page_offset: offsets[2],
             },
         ),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
     })
 }
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "LF/CRLF traversal, every-row validation, and transactional publication form one auditable AAPCS64 operation"
+)]
+fn lower_aarch64_native_rebar_multi_grep_v1(
+    row_count: usize,
+    prepared_rows: Option<&[bool]>,
+) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
+    const ORDINARY_FRAME_BYTES: u16 = 112;
+    const MIXED_FRAME_BYTES: u16 = 128;
+    const ORDINARY_RESULT_OFFSET: u16 = 96;
+    const MIXED_HANDLE_TABLE_OFFSET: u16 = 96;
+    const MIXED_RESULT_OFFSET: u16 = 112;
+    if row_count == 0 || prepared_rows.is_some_and(|routes| routes.len() != row_count) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 Rebar multi-grep row cardinality",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let line_loop = assembler.label()?;
+    let scan = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let final_line = assembler.label()?;
+    let line_ready = assembler.label()?;
+    let completed_line = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    let frame_bytes = if prepared_rows.is_some() {
+        MIXED_FRAME_BYTES
+    } else {
+        ORDINARY_FRAME_BYTES
+    };
+    let result_offset = if prepared_rows.is_some() {
+        MIXED_RESULT_OFFSET
+    } else {
+        ORDINARY_RESULT_OFFSET
+    };
+    if let Some(routes) = prepared_rows {
+        aarch64_mixed_row_scalar_boundary(&mut assembler, routes, invalid)?;
+    } else {
+        aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    }
+    aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
+    if prepared_rows.is_some() {
+        assembler.instruction(aarch64_store_x(0, 31, MIXED_HANDLE_TABLE_OFFSET)?)?;
+        assembler.instruction(aarch64_mov_x(19, 2)?)?;
+        assembler.instruction(aarch64_mov_x(20, 3)?)?;
+        assembler.instruction(aarch64_mov_x(21, 4)?)?;
+    } else {
+        assembler.instruction(aarch64_mov_x(19, 0)?)?;
+        assembler.instruction(aarch64_mov_x(20, 1)?)?;
+        assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    }
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.branch_zero_x(20, finished)?;
+
+    assembler.bind(line_loop)?;
+    assembler.instruction(aarch64_mov_x(24, 23)?)?;
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, final_line)?;
+    assembler.instruction(aarch64_load_byte_reg(5, 19, 23)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(5, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, found_lf)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(25, 24)?)?;
+    assembler.branch_cond(AARCH64_EQ, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(5, 25, 1)?)?;
+    assembler.instruction(aarch64_load_byte_reg(6, 19, 5)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(6, 13)?)?;
+    assembler.branch_cond(AARCH64_NE, line_ready)?;
+    assembler.instruction(aarch64_sub_x_imm(25, 25, 1)?)?;
+    assembler.branch(line_ready)?;
+
+    assembler.bind(final_line)?;
+    assembler.instruction(aarch64_mov_x(25, 23)?)?;
+    assembler.bind(line_ready)?;
+    assembler.instruction(aarch64_sub_x_reg(26, 25, 24)?)?;
+    assembler.instruction(aarch64_movz_x(27, 0, 0)?)?;
+
+    let mut call_offsets = Vec::new();
+    call_offsets
+        .try_reserve_exact(row_count)
+        .map_err(|_| ObjectError::Allocation("AArch64 Rebar multi-grep calls"))?;
+    for row in 0..row_count {
+        let next_row = assembler.label()?;
+        assembler.instruction(0x9280_0005)?; // movn x5, #0
+        assembler.instruction(aarch64_store_pair_x(
+            5,
+            5,
+            31,
+            i16::try_from(result_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 grep result offset"))?,
+        )?)?;
+        if prepared_rows.is_some_and(|routes| routes[row]) {
+            let handle_offset = row
+                .checked_mul(core::mem::size_of::<usize>())
+                .and_then(|offset| u16::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 mixed multi-grep handle load",
+                ))?;
+            assembler.instruction(aarch64_load_x_imm(
+                0,
+                31,
+                MIXED_HANDLE_TABLE_OFFSET,
+            )?)?;
+            assembler.instruction(aarch64_load_x_imm(0, 0, handle_offset)?)?;
+            assembler.instruction(aarch64_add_x_reg(1, 19, 24)?)?;
+            assembler.instruction(aarch64_mov_x(2, 26)?)?;
+            assembler.instruction(aarch64_movz_x(3, 0, 0)?)?;
+            assembler.instruction(aarch64_mov_x(4, 26)?)?;
+            assembler.instruction(aarch64_add_x_imm(5, 31, result_offset)?)?;
+        } else {
+            assembler.instruction(aarch64_add_x_reg(0, 19, 24)?)?;
+            assembler.instruction(aarch64_mov_x(1, 26)?)?;
+            assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+            assembler.instruction(aarch64_mov_x(3, 26)?)?;
+            assembler.instruction(aarch64_add_x_imm(4, 31, result_offset)?)?;
+        }
+        call_offsets.push(assembler.instruction(0x9400_0000)?);
+        assembler.branch_zero_w(0, next_row)?;
+        assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+        assembler.instruction(aarch64_load_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(result_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 grep result offset"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 26)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_movz_x(27, 1, 0)?)?;
+        assembler.bind(next_row)?;
+    }
+    assembler.branch_zero_x(27, completed_line)?;
+    assembler.instruction(aarch64_adds_x_imm(22, 22, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.bind(completed_line)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch(line_loop)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = call_offsets;
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok((code, offsets.into_boxed_slice()))
+}
+
+fn aarch64_mixed_row_scalar_boundary(
+    assembler: &mut Aarch64Assembler,
+    prepared_rows: &[bool],
+    invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let row_count = u16::try_from(prepared_rows.len())
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 mixed row handle count"))?;
+    let table_bytes = prepared_rows
+        .len()
+        .checked_mul(core::mem::size_of::<usize>())
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 mixed row handle table extent",
+        ))?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 0, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_movz_x(5, row_count, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(1, 5)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(aarch64_movz_x(5, table_bytes, 0)?)?;
+    assembler.instruction(aarch64_add_x_reg(5, 0, 5)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 0)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    for (row, prepared) in prepared_rows.iter().copied().enumerate() {
+        let offset = row
+            .checked_mul(core::mem::size_of::<usize>())
+            .and_then(|offset| u16::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 mixed row handle slot",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(5, 0, offset)?)?;
+        if prepared {
+            assembler.branch_zero_x(5, invalid)?;
+        } else {
+            assembler.branch_nonzero_x(5, invalid)?;
+        }
+    }
+    assembler.branch_zero_x(2, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(3, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.instruction(aarch64_add_x_reg(5, 2, 3)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 2)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    assembler.branch_zero_x(4, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.branch_nonzero_x(5, invalid)?;
+    assembler.instruction(aarch64_add_x_imm(5, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(5, 4)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid)?;
+    Ok(())
+}
+
+fn aarch64_rebar_row_scalar_accumulate(
+    assembler: &mut Aarch64Assembler,
+    operation: crate::RebarNativeRowScalarOperationV1,
+    runtime_failure: Aarch64Label,
+) -> Result<(), ObjectError> {
+    match operation {
+        crate::RebarNativeRowScalarOperationV1::Count => {
+            assembler.instruction(aarch64_adds_x_imm(22, 22, 1)?)?;
+        }
+        crate::RebarNativeRowScalarOperationV1::SpanSum => {
+            assembler.instruction(aarch64_sub_x_reg(5, 28, 27)?)?;
+            assembler.instruction(aarch64_adds_x_reg(22, 22, 5)?)?;
+        }
+    }
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered row selection, empty progress, and transactional reduction are one auditable AAPCS64 operation"
+)]
+fn lower_aarch64_native_rebar_row_scalar_v1(
+    row_count: usize,
+    operation: crate::RebarNativeRowScalarOperationV1,
+    prepared_rows: Option<&[bool]>,
+) -> Result<(Vec<u8>, Box<[usize]>), ObjectError> {
+    const ORDINARY_FRAME_BYTES: u16 = 112;
+    const MIXED_FRAME_BYTES: u16 = 128;
+    const ORDINARY_RESULT_OFFSET: u16 = 96;
+    const MIXED_HANDLE_TABLE_OFFSET: u16 = 96;
+    const MIXED_RESULT_OFFSET: u16 = 112;
+    if row_count == 0 || prepared_rows.is_some_and(|routes| routes.len() != row_count) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 Rebar row-scalar cardinality",
+        ));
+    }
+    let frame_bytes = if prepared_rows.is_some() {
+        MIXED_FRAME_BYTES
+    } else {
+        ORDINARY_FRAME_BYTES
+    };
+    let result_offset = if prepared_rows.is_some() {
+        MIXED_RESULT_OFFSET
+    } else {
+        ORDINARY_RESULT_OFFSET
+    };
+    let mut assembler = Aarch64Assembler::new();
+    let iteration = assembler.label()?;
+    let search_rows = assembler.label()?;
+    let empty_match = assembler.label()?;
+    let aggregate_empty = assembler.label()?;
+    let finished = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    if let Some(routes) = prepared_rows {
+        aarch64_mixed_row_scalar_boundary(&mut assembler, routes, invalid)?;
+    } else {
+        aarch64_native_capture_reducer_boundary(&mut assembler, 0, invalid)?;
+    }
+    aarch64_native_capture_reducer_save(&mut assembler, frame_bytes)?;
+    if prepared_rows.is_some() {
+        assembler.instruction(aarch64_store_x(0, 31, MIXED_HANDLE_TABLE_OFFSET)?)?;
+        assembler.instruction(aarch64_mov_x(19, 2)?)?; // base
+        assembler.instruction(aarch64_mov_x(20, 3)?)?; // length
+        assembler.instruction(aarch64_mov_x(21, 4)?)?; // output
+    } else {
+        assembler.instruction(aarch64_mov_x(19, 0)?)?; // base
+        assembler.instruction(aarch64_mov_x(20, 1)?)?; // length
+        assembler.instruction(aarch64_mov_x(21, 2)?)?; // output
+    }
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?; // total
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?; // next start
+    assembler.instruction(aarch64_movz_x(24, 0, 0)?)?; // last end
+    assembler.instruction(aarch64_movz_x(25, 0, 0)?)?; // have last
+    assembler.instruction(aarch64_movz_x(26, 0, 0)?)?; // pending empty
+
+    assembler.bind(iteration)?;
+    assembler.branch_zero_x(26, search_rows)?;
+    assembler.instruction(aarch64_movz_x(26, 0, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+
+    assembler.bind(search_rows)?;
+    assembler.instruction(0x9280_001b)?; // movn x27, #0: no selected row
+    let mut call_offsets = Vec::new();
+    call_offsets
+        .try_reserve_exact(row_count)
+        .map_err(|_| ObjectError::Allocation("AArch64 Rebar row-scalar calls"))?;
+    for row in 0..row_count {
+        let next_row = assembler.label()?;
+        assembler.instruction(0x9280_0005)?; // movn x5, #0
+        assembler.instruction(aarch64_store_pair_x(
+            5,
+            5,
+            31,
+            i16::try_from(result_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 row-scalar result offset")
+            })?,
+        )?)?;
+        if prepared_rows.is_some_and(|routes| routes[row]) {
+            let handle_offset = row
+                .checked_mul(core::mem::size_of::<usize>())
+                .and_then(|offset| u16::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 mixed row handle load",
+                ))?;
+            assembler.instruction(aarch64_load_x_imm(
+                0,
+                31,
+                MIXED_HANDLE_TABLE_OFFSET,
+            )?)?;
+            assembler.instruction(aarch64_load_x_imm(0, 0, handle_offset)?)?;
+            assembler.instruction(aarch64_mov_x(1, 19)?)?;
+            assembler.instruction(aarch64_mov_x(2, 20)?)?;
+            assembler.instruction(aarch64_mov_x(3, 23)?)?;
+            assembler.instruction(aarch64_mov_x(4, 20)?)?;
+            assembler.instruction(aarch64_add_x_imm(5, 31, result_offset)?)?;
+        } else {
+            assembler.instruction(aarch64_mov_x(0, 19)?)?;
+            assembler.instruction(aarch64_mov_x(1, 20)?)?;
+            assembler.instruction(aarch64_mov_x(2, 23)?)?;
+            assembler.instruction(aarch64_mov_x(3, 20)?)?;
+            assembler.instruction(aarch64_add_x_imm(4, 31, result_offset)?)?;
+        }
+        call_offsets.push(assembler.instruction(0x9400_0000)?);
+        assembler.branch_zero_w(0, next_row)?;
+        assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, runtime_failure)?;
+        assembler.instruction(aarch64_load_pair_x(
+            5,
+            6,
+            31,
+            i16::try_from(result_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 row-scalar result offset")
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(5, 6)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(6, 20)?)?;
+        assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(5, 23)?)?;
+        assembler.branch_cond(AARCH64_LO, runtime_failure)?;
+        assembler.instruction(aarch64_cmp_x(5, 27)?)?;
+        assembler.branch_cond(AARCH64_HS, next_row)?; // tie preserves source priority
+        assembler.instruction(aarch64_mov_x(27, 5)?)?;
+        assembler.instruction(aarch64_mov_x(28, 6)?)?;
+        assembler.bind(next_row)?;
+    }
+    assembler.instruction(0x9280_0005)?; // movn x5, #0
+    assembler.instruction(aarch64_cmp_x(27, 5)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_cmp_x(27, 28)?)?;
+    assembler.branch_cond(AARCH64_EQ, empty_match)?;
+
+    aarch64_rebar_row_scalar_accumulate(&mut assembler, operation, runtime_failure)?;
+    assembler.instruction(aarch64_mov_x(23, 28)?)?;
+    assembler.instruction(aarch64_mov_x(24, 28)?)?;
+    assembler.instruction(aarch64_movz_x(25, 1, 0)?)?;
+    assembler.branch(iteration)?;
+
+    assembler.bind(empty_match)?;
+    assembler.branch_zero_x(25, aggregate_empty)?;
+    assembler.instruction(aarch64_cmp_x(28, 24)?)?;
+    assembler.branch_cond(AARCH64_NE, aggregate_empty)?;
+    assembler.instruction(aarch64_cmp_x(23, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, runtime_failure)?;
+    assembler.branch(iteration)?;
+
+    assembler.bind(aggregate_empty)?;
+    aarch64_rebar_row_scalar_accumulate(&mut assembler, operation, runtime_failure)?;
+    assembler.instruction(aarch64_mov_x(23, 28)?)?;
+    assembler.instruction(aarch64_mov_x(24, 28)?)?;
+    assembler.instruction(aarch64_movz_x(25, 1, 0)?)?;
+    assembler.instruction(aarch64_movz_x(26, 1, 0)?)?;
+    assembler.branch(iteration)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(22, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.bind(returned)?;
+    aarch64_native_capture_reducer_epilogue(&mut assembler, frame_bytes)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = call_offsets;
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok((code, offsets.into_boxed_slice()))
+}
+
+/// AAPCS64 lowering of the exact-finite `SelectedEnd` line-jump reducer.
+#[allow(
+    clippy::too_many_lines,
+    reason = "identity validation, endpoint progress, LF skipping, and failure-atomic publication form one native leaf"
+)]
+fn lower_aarch64_exact_finite_selected_end_grep_count()
+-> Result<NativePreparedBulkWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 80;
+
+    let mut assembler = Aarch64Assembler::new();
+    let search = assembler.label()?;
+    let matched = assembler.label()?;
+    let scan_to_lf = assembler.label()?;
+    let found_lf = assembler.label()?;
+    let finished = assembler.label()?;
+    let overflow = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid_handle = assembler.label()?;
+    let invalid = assembler.label()?;
+    let runtime_failure = assembler.label()?;
+    let wrong_identity = assembler.label()?;
+
+    assembler.branch_zero_x(0, invalid_handle)?;
+    assembler.branch_zero_x(1, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(7, 3, 3)?)?;
+    assembler.branch_nonzero_x(7, invalid)?;
+
+    let identity_page = assembler.instruction(0x9000_0007)?;
+    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 exact-finite GrepCount identity word",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            7,
+            u16::try_from(word_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 exact-finite GrepCount linked identity offset",
+                )
+            })?,
+        )?)?;
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 exact-finite GrepCount header identity offset",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            0,
+            u16::try_from(header_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow(
+                    "AArch64 exact-finite GrepCount header identity displacement",
+                )
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, wrong_identity)?;
+    }
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 64)?)?;
+    assembler.instruction(aarch64_mov_x(19, 1)?)?;
+    assembler.instruction(aarch64_mov_x(20, 2)?)?;
+    assembler.instruction(aarch64_mov_x(21, 3)?)?;
+    assembler.instruction(aarch64_movz_x(22, 0, 0)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.branch_zero_x(20, finished)?;
+
+    assembler.bind(search)?;
+    assembler.instruction(aarch64_store_x(31, 31, 0)?)?;
+    assembler.instruction(aarch64_mov_x(0, 19)?)?;
+    assembler.instruction(aarch64_mov_x(1, 20)?)?;
+    assembler.instruction(aarch64_mov_x(2, 22)?)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+    let prepared_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch_zero_w(0, finished)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_x_imm(24, 31, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(24, 22)?)?;
+    assembler.branch_cond(AARCH64_LS, runtime_failure)?;
+    assembler.instruction(aarch64_cmp_x(24, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, runtime_failure)?;
+    assembler.instruction(aarch64_adds_x_imm(23, 23, 1)?)?;
+    assembler.branch_cond(AARCH64_HS, overflow)?;
+    assembler.instruction(aarch64_mov_x(22, 24)?)?;
+
+    assembler.bind(scan_to_lf)?;
+    assembler.instruction(aarch64_cmp_x(22, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 19, 22)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(8, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, found_lf)?;
+    assembler.instruction(aarch64_add_x_imm(22, 22, 1)?)?;
+    assembler.branch(scan_to_lf)?;
+
+    assembler.bind(found_lf)?;
+    assembler.instruction(aarch64_add_x_imm(22, 22, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(22, 20)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.branch(search)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_store_x(23, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(overflow)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+    )?)?;
+    assembler.branch(returned)?;
+    assembler.bind(runtime_failure)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+    )?)?;
+
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 64)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid_handle)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_INVALID_HANDLE_STATUS),
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_INVALID_ARGUMENT_STATUS),
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(wrong_identity)?;
+    assembler.instruction(aarch64_movz_w(
+        0,
+        u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+    )?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut offsets = vec![prepared_call, identity_page, identity_page_offset];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    Ok(NativePreparedBulkWrapper {
+        code,
+        prepared_call_offset: offsets[0],
+        ordered_nfa_gate_call_offset: None,
+        bulk_runtime_fallback_offset: None,
+        compatibility_identity_relocation: None,
+        identity_relocation: Some(NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+            page: offsets[1],
+            page_offset: offsets[2],
+        }),
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
+    })
+}
+
 
 fn aarch64_native_capture_reducer_boundary(
     assembler: &mut Aarch64Assembler,
@@ -45092,6 +54023,142 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
         bulk_runtime_fallback_offset: None,
         compatibility_identity_relocation: None,
         identity_relocation: None,
+        authenticated_body_offset: None,
+        trusted_core: None,
+        trusted_core_trampoline_offset: None,
+        trusted_core_jump_offset: None,
+    })
+}
+
+fn lower_aarch64_direct_exists_batch(
+    prologue: NativeDirectSearchTrustedCorePrologue,
+) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 96;
+    if prologue != NativeDirectSearchTrustedCorePrologue::Aarch64 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Exists batch has a non-AArch64 trusted core",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let validated = assembler.label()?;
+    let loop_head = assembler.label()?;
+    let completed_item = assembler.label()?;
+    let complete = assembler.label()?;
+    let late_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(3, invalid)?;
+    assembler.instruction(aarch64_and_low_x(4, 3, 3)?)?;
+    assembler.branch_nonzero_x(4, invalid)?;
+    let descriptor_count_limit = u64::try_from(isize::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("direct Exists batch descriptor limit"))?
+        / 16;
+    aarch64_load_u64_constant(&mut assembler, 4, descriptor_count_limit)?;
+    assembler.instruction(aarch64_cmp_x(1, 4)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.branch_zero_x(1, validated)?;
+    assembler.branch_zero_x(0, invalid)?;
+    assembler.instruction(aarch64_and_low_x(4, 0, 3)?)?;
+    assembler.branch_nonzero_x(4, invalid)?;
+    assembler.branch_zero_x(2, invalid)?;
+
+    assembler.bind(validated)?;
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_store_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_store_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_mov_x(22, 3)?)?;
+    assembler.instruction(aarch64_movz_x(23, 0, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 22, 0)?)?;
+
+    assembler.bind(loop_head)?;
+    assembler.branch_zero_x(20, complete)?;
+    assembler.instruction(aarch64_load_x_imm(24, 19, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(25, 19, 8)?)?;
+    assembler.branch_zero_x(24, late_invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(25, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, late_invalid)?;
+    assembler.instruction(aarch64_mov_x(0, 24)?)?;
+    assembler.instruction(aarch64_mov_x(1, 25)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 25)?)?;
+    // ADD (immediate) names SP for register 31; a MOV-register alias would
+    // name XZR and pass a null result pointer to the direct search.
+    assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+    let search_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_LS, completed_item)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(completed_item)?;
+    assembler.instruction(aarch64_store_byte(0, 21, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(19, 19, 16)?)?;
+    assembler.instruction(aarch64_add_x_imm(21, 21, 1)?)?;
+    assembler.instruction(aarch64_sub_x_imm(20, 20, 1)?)?;
+    assembler.instruction(aarch64_add_x_imm(23, 23, 1)?)?;
+    assembler.branch(loop_head)?;
+    assembler.bind(complete)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(late_invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+
+    assembler.bind(returned)?;
+    // Publish the completed prefix exactly once at the ABI return boundary;
+    // X23 remains the authoritative count on success and late failures.
+    assembler.instruction(aarch64_store_x(23, 22, 0)?)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 22, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(23, 24, 31, 48)?)?;
+    assembler.instruction(aarch64_load_pair_x(25, 26, 31, 64)?)?;
+    assembler.instruction(aarch64_load_pair_x(29, 30, 31, 80)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let trampoline_offset = assembler.code.len();
+    assembler.instruction(0xf100_001f)?; // cmp x0, #0
+    let core_jump = assembler.instruction(0x1400_0000)?;
+    if core_jump != trampoline_offset.saturating_add(4) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Exists trampoline is not cmp-and-branch",
+        ));
+    }
+
+    let mut offsets = [search_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    let core_jump_offset = code
+        .len()
+        .checked_sub(4)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 direct Exists trampoline is absent",
+        ))?;
+    let trampoline_offset = core_jump_offset
+        .checked_sub(4)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 direct Exists trampoline cmp is absent",
+        ))?;
+    if code.get(trampoline_offset..core_jump_offset)
+        != Some(0xf100_001f_u32.to_le_bytes().as_slice())
+        || code.get(core_jump_offset..) != Some(0x1400_0000_u32.to_le_bytes().as_slice())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Exists trampoline was rewritten",
+        ));
+    }
+    Ok(NativeDirectExistsBatchWrapper {
+        code,
+        search_call_offset: offsets[0],
+        trampoline_offset,
+        core_jump_offset,
     })
 }
 
@@ -45132,6 +54199,44 @@ fn patch_x86_64_local_call(
     code.get_mut(displacement_offset..instruction_end_offset)
         .ok_or(ObjectError::InvalidModule(
             "x86 local call displacement is outside code",
+        ))?
+        .copy_from_slice(&displacement.to_le_bytes());
+    Ok(())
+}
+
+fn patch_x86_64_local_jump(
+    code: &mut [u8],
+    displacement_offset: usize,
+    target: usize,
+) -> Result<(), ObjectError> {
+    let instruction_end_offset = displacement_offset
+        .checked_add(4)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 local jump instruction end",
+        ))?;
+    if displacement_offset
+        .checked_sub(1)
+        .and_then(|opcode| code.get(opcode))
+        != Some(&0xe9)
+        || code.get(displacement_offset..instruction_end_offset) != Some(&[0, 0, 0, 0])
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 local jump placeholder is malformed",
+        ));
+    }
+    let target = i64::try_from(target)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 local jump target"))?;
+    let instruction_end = i64::try_from(instruction_end_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 local jump source"))?;
+    let displacement = target
+        .checked_sub(instruction_end)
+        .and_then(|displacement| i32::try_from(displacement).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 local jump displacement",
+        ))?;
+    code.get_mut(displacement_offset..instruction_end_offset)
+        .ok_or(ObjectError::InvalidModule(
+            "x86 local jump displacement is outside code",
         ))?
         .copy_from_slice(&displacement.to_le_bytes());
     Ok(())
@@ -53941,10 +63046,31 @@ impl Aarch64Assembler {
     }
 
     fn finish_with_offsets(
-        mut self,
+        self,
         relocation_offsets: &mut [usize],
     ) -> Result<Vec<u8>, ObjectError> {
+        self.finish_with_offsets_and_label(relocation_offsets, None)
+            .map(|(code, _)| code)
+    }
+
+    fn finish_with_offsets_and_label(
+        mut self,
+        relocation_offsets: &mut [usize],
+        tracked_label: Option<Aarch64Label>,
+    ) -> Result<(Vec<u8>, Option<usize>), ObjectError> {
         let optimized = self.control_flow_optimized(relocation_offsets)?;
+        let tracked_offset = tracked_label
+            .map(|label| {
+                optimized
+                    .labels
+                    .get(label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule(
+                        "tracked AArch64 label is unbound",
+                    ))
+            })
+            .transpose()?;
         self.code = optimized.code;
         self.labels = optimized.labels;
         self.fixups = optimized.fixups;
@@ -53984,7 +63110,7 @@ impl Aarch64Assembler {
             self.code[fixup.instruction..end].copy_from_slice(&patched.to_le_bytes());
         }
         relocation_offsets.copy_from_slice(&optimized.relocation_offsets);
-        Ok(self.code)
+        Ok((self.code, tracked_offset))
     }
 }
 
@@ -54045,6 +63171,15 @@ fn aarch64_cmp_x_imm(register: u8, immediate: u16) -> Result<u32, ObjectError> {
         return Err(ObjectError::InvalidModule("AArch64 CMP X immediate"));
     }
     Ok(0xf100_001f | (u32::from(immediate) << 10) | aarch64_reg(register, 5)?)
+}
+
+fn aarch64_cmp_x_imm_lsl12(register: u8, immediate: u16) -> Result<u32, ObjectError> {
+    if immediate > 0x0fff {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 CMP X shifted immediate",
+        ));
+    }
+    Ok(0xf140_001f | (u32::from(immediate) << 10) | aarch64_reg(register, 5)?)
 }
 
 fn aarch64_csel_x(
@@ -54228,6 +63363,15 @@ fn aarch64_orr_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
 fn aarch64_eor_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x4a00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_eor_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0xca00_0000
             | aarch64_reg(right, 16)?
             | aarch64_reg(left, 5)?
             | aarch64_reg(destination, 0)?,
@@ -56691,8 +65835,18 @@ fn aarch64_sve_ld1b_predicated(
 }
 
 fn aarch64_sve_ld1rqb(destination: u8, base: u8) -> Result<u32, ObjectError> {
+    aarch64_sve_ld1rqb_imm(destination, base, 0)
+}
+
+fn aarch64_sve_ld1rqb_imm(destination: u8, base: u8, byte_offset: i16) -> Result<u32, ObjectError> {
+    // LD1RQB's signed imm4 is scaled by the fixed 16-byte replicated block.
+    if !(-128..=112).contains(&byte_offset) || byte_offset % 16 != 0 {
+        return Err(ObjectError::InvalidModule("SVE LD1RQB immediate"));
+    }
+    let immediate = u32::try_from(i32::from(byte_offset / 16).rem_euclid(16))
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE LD1RQB immediate"))?;
     // LD1RQB repeats one exact 16-byte set in every architectural segment.
-    Ok(0xa400_2000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
+    Ok(0xa400_2000 | (immediate << 16) | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_sve_dup_b_imm(destination: u8, immediate: u8) -> Result<u32, ObjectError> {
@@ -57078,6 +66232,14 @@ fn aarch64_ld1_three_16b(first_destination: u8, base: u8) -> Result<u32, ObjectE
 
 fn aarch64_ushr_16b_by_4(destination: u8, source: u8) -> Result<u32, ObjectError> {
     Ok(0x6f0c_0400 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_ushr_16b_by_7(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x6f09_0400 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_addv_16b(destination: u8, source: u8) -> Result<u32, ObjectError> {
+    Ok(0x4e31_b800 | aarch64_reg(source, 5)? | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_tbl1_16b(
@@ -59234,36 +68396,57 @@ fn aarch64_emit_mandatory_teddy_sve_constants(
 ) -> Result<(), ObjectError> {
     assembler.instruction(aarch64_sve_ptrue_b())?;
     aarch64_set_table_address(assembler, 12, teddy.table_base)?;
-    let table_count = teddy
-        .plan
-        .columns()
-        .checked_mul(2)
-        .ok_or(ObjectError::ArithmeticOverflow(
-            "AArch64 SVE Teddy table count",
-        ))?;
+    let table_count =
+        teddy
+            .plan
+            .columns()
+            .checked_mul(2)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 SVE Teddy table count",
+            ))?;
     for table in 0..table_count {
         let register = 16_u8
             .checked_add(table)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "AArch64 SVE Teddy constant register",
             ))?;
-        assembler.instruction(aarch64_sve_ld1rqb(register, 12)?)?;
-        if table.checked_add(1) != Some(table_count) {
-            assembler.instruction(aarch64_add_x_imm(12, 12, 16)?)?;
-        }
+        let byte_offset =
+            i16::from(table)
+                .checked_mul(16)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 SVE Teddy constant offset",
+                ))?;
+        assembler.instruction(aarch64_sve_ld1rqb_imm(register, 12, byte_offset)?)?;
     }
     Ok(())
 }
 
 /// Produce one exact 16-lane correlated candidate mask in V24.
+///
+/// Columns are intersected in the stable bucket-aware order shared with the
+/// scalable batch scanner. After the two most selective columns, an empty
+/// V24 is an authoritative miss because every remaining operation can only
+/// clear bucket bits. The reduction borrows V7/W12 without changing V24, so
+/// surviving bucket identities remain exact until the final CMTST converts
+/// them to the ff/00 lane mask required by first-lane selection. A caller may
+/// supply a zero-initialized scratch W register to make the first surviving
+/// pair switch later blocks directly to the full-column path; callers that
+/// re-enter after external verification leave this disabled.
 fn aarch64_emit_mandatory_teddy_asimd_candidates(
     assembler: &mut Aarch64Assembler,
     teddy: NativeMandatoryTeddyLayout,
+    miss: Aarch64Label,
+    dense_mode_register: Option<u8>,
 ) -> Result<(), ObjectError> {
-    for column in 0..usize::from(teddy.plan.columns()) {
-        let scan_offset = u8::try_from(column).map_err(|_| {
-            ObjectError::ArithmeticOverflow("AArch64 mandatory Teddy scan offset")
-        })?;
+    let plan = aarch64_mandatory_teddy_column_plan(&teddy.plan)?;
+    let suffix = assembler.label()?;
+    let activate_dense = dense_mode_register
+        .map(|_| assembler.label())
+        .transpose()?;
+    for (index, &scan_offset) in plan.column_order[..usize::from(teddy.plan.columns())]
+        .iter()
+        .enumerate()
+    {
         aarch64_emit_start_filter_address(assembler, scan_offset)?;
         assembler.instruction(aarch64_load_q(0, 12)?)?;
         assembler.instruction(aarch64_ushr_16b_by_4(25, 0)?)?;
@@ -59281,10 +68464,27 @@ fn aarch64_emit_mandatory_teddy_asimd_candidates(
         assembler.instruction(aarch64_tbl1_16b(28, low, 27)?)?;
         assembler.instruction(aarch64_tbl1_16b(7, high, 25)?)?;
         assembler.instruction(aarch64_and_16b(28, 28, 7)?)?;
-        if column == 0 {
+        if index == 0 {
             assembler.instruction(aarch64_orr_16b(24, 28, 28)?)?;
         } else {
             assembler.instruction(aarch64_and_16b(24, 24, 28)?)?;
+        }
+        if index == 1 {
+            if let Some(register) = dense_mode_register {
+                assembler.branch_nonzero_w(register, suffix)?;
+            }
+            assembler.instruction(aarch64_umaxv_16b(7, 24)?)?;
+            assembler.instruction(aarch64_umov_b0(12, 7)?)?;
+            assembler.branch_nonzero_w(12, activate_dense.unwrap_or(suffix))?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+            assembler.branch(miss)?;
+            if let (Some(register), Some(activate_dense)) =
+                (dense_mode_register, activate_dense)
+            {
+                assembler.bind(activate_dense)?;
+                assembler.instruction(aarch64_movz_w(register, 1)?)?;
+            }
+            assembler.bind(suffix)?;
         }
     }
     // Table bytes are bucket identities, not boolean bytes. Convert every
@@ -59357,23 +68557,23 @@ const AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS: [u8; 4] = [24, 25, 27,
 const AARCH64_MANDATORY_TEDDY_SVE_SINGLE_PREFIX_EXPECTED_HITS: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Aarch64MandatoryTeddySveBatchPlan {
+struct Aarch64MandatoryTeddyColumnPlan {
     column_order: [u8; 4],
     single_prefix_max_vector_bytes: Option<u16>,
 }
 
-fn aarch64_mandatory_teddy_sve_column_union_frequency(
+fn aarch64_mandatory_teddy_column_union_frequency(
     plan: &MandatoryTeddyPlan,
     column: usize,
 ) -> Result<u16, ObjectError> {
     let bank = plan.bank(0).ok_or(ObjectError::InvalidModule(
-        "AArch64 SVE Teddy batch has no mask bank",
+        "AArch64 Teddy column plan has no mask bank",
     ))?;
     let low = bank.low(column).ok_or(ObjectError::InvalidModule(
-        "AArch64 SVE Teddy batch has no low table",
+        "AArch64 Teddy column plan has no low table",
     ))?;
     let high = bank.high(column).ok_or(ObjectError::InvalidModule(
-        "AArch64 SVE Teddy batch has no high table",
+        "AArch64 Teddy column plan has no high table",
     ))?;
     let mut frequency = 0_u16;
     for byte in u8::MIN..=u8::MAX {
@@ -59384,6 +68584,14 @@ fn aarch64_mandatory_teddy_sve_column_union_frequency(
         }
     }
     Ok(frequency)
+}
+
+#[cfg(test)]
+fn aarch64_mandatory_teddy_sve_column_union_frequency(
+    plan: &MandatoryTeddyPlan,
+    column: usize,
+) -> Result<u16, ObjectError> {
+    aarch64_mandatory_teddy_column_union_frequency(plan, column)
 }
 
 /// Order the four possible fingerprint columns so the first two form the
@@ -59397,32 +68605,32 @@ fn aarch64_mandatory_teddy_sve_column_union_frequency(
     clippy::too_many_lines,
     reason = "one bounded planner keeps pair scoring, orientation, and VL admission auditable together"
 )]
-fn aarch64_mandatory_teddy_sve_batch_plan(
+fn aarch64_mandatory_teddy_column_plan(
     plan: &MandatoryTeddyPlan,
-) -> Result<Aarch64MandatoryTeddySveBatchPlan, ObjectError> {
+) -> Result<Aarch64MandatoryTeddyColumnPlan, ObjectError> {
     let columns = usize::from(plan.columns());
     if plan.bank_count() != 1
         || !(3..=4).contains(&columns)
         || !(1..=8).contains(&plan.bucket_count())
     {
         return Err(ObjectError::InvalidModule(
-            "AArch64 SVE Teddy batch does not have a slim 3/4-column plan",
+            "AArch64 Teddy column plan does not have a slim 3/4-column shape",
         ));
     }
     let bank = plan.bank(0).ok_or(ObjectError::InvalidModule(
-        "AArch64 SVE Teddy batch has no mask bank",
+        "AArch64 Teddy column plan has no mask bank",
     ))?;
     let mut frequency = [[0_u16; 8]; 4];
     let mut union_frequency = [0_u16; 4];
     for (column, frequencies) in frequency[..columns].iter_mut().enumerate() {
         let low = bank.low(column).ok_or(ObjectError::InvalidModule(
-            "AArch64 SVE Teddy batch has no low table",
+            "AArch64 Teddy column plan has no low table",
         ))?;
         let high = bank.high(column).ok_or(ObjectError::InvalidModule(
-            "AArch64 SVE Teddy batch has no high table",
+            "AArch64 Teddy column plan has no high table",
         ))?;
         union_frequency[column] =
-            aarch64_mandatory_teddy_sve_column_union_frequency(plan, column)?;
+            aarch64_mandatory_teddy_column_union_frequency(plan, column)?;
         for byte in u8::MIN..=u8::MAX {
             let buckets = low[usize::from(byte & 0x0f)] & high[usize::from(byte >> 4)];
             for (bucket, units) in frequencies
@@ -59431,10 +68639,10 @@ fn aarch64_mandatory_teddy_sve_batch_plan(
                 .enumerate()
             {
                 let bit = 1_u8.checked_shl(u32::try_from(bucket).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch bucket")
+                    ObjectError::ArithmeticOverflow("AArch64 Teddy column-plan bucket")
                 })?)
                 .ok_or(ObjectError::ArithmeticOverflow(
-                    "AArch64 SVE Teddy batch bucket bit",
+                    "AArch64 Teddy column-plan bucket bit",
                 ))?;
                 if buckets & bit != 0 {
                     *units = units
@@ -59490,7 +68698,7 @@ fn aarch64_mandatory_teddy_sve_batch_plan(
     let first_frequency = union_frequency[first];
     if first_frequency == 0 {
         return Err(ObjectError::InvalidModule(
-            "AArch64 SVE Teddy batch has an empty first column",
+            "AArch64 Teddy column plan has an empty first column",
         ));
     }
     let expected_hits_per_vector_byte = u32::try_from(
@@ -59520,10 +68728,17 @@ fn aarch64_mandatory_teddy_sve_batch_plan(
         .then(|| u16::try_from(rounded.min(u32::from(AARCH64_SVE_MAX_VECTOR_BYTES))))
         .transpose()
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy singleton vector bound"))?;
-    Ok(Aarch64MandatoryTeddySveBatchPlan {
+    Ok(Aarch64MandatoryTeddyColumnPlan {
         column_order: order,
         single_prefix_max_vector_bytes,
     })
+}
+
+#[cfg(test)]
+fn aarch64_mandatory_teddy_sve_batch_plan(
+    plan: &MandatoryTeddyPlan,
+) -> Result<Aarch64MandatoryTeddyColumnPlan, ObjectError> {
+    aarch64_mandatory_teddy_column_plan(plan)
 }
 
 #[allow(
@@ -59645,7 +68860,7 @@ fn aarch64_emit_mandatory_teddy_sve_batch4_candidates(
     let batch_vectors = u8::try_from(AARCH64_MANDATORY_TEDDY_SVE_BATCH_BUCKET_REGISTERS.len())
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 SVE Teddy batch vectors"))?;
     let batch_suffix = assembler.label()?;
-    let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&teddy.plan)?;
+    let batch_plan = aarch64_mandatory_teddy_column_plan(&teddy.plan)?;
     if single_prefix && batch_plan.single_prefix_max_vector_bytes.is_none() {
         return Err(ObjectError::InvalidModule(
             "AArch64 SVE Teddy singleton prefix was not admitted",
@@ -59866,6 +69081,11 @@ fn aarch64_emit_dynamic_correlated_prefix_gate(
         )?,
     )?;
     assembler.instruction(aarch64_movi_16b(26, 0x0f)?)?;
+    // The root gate returns after its first exact fingerprint candidate, so
+    // W11 is free for one call-local density observation. A selected-pair
+    // survivor switches later blocks to the full scan, avoiding the
+    // horizontal reduction on dense input while sparse misses retain it.
+    assembler.instruction(aarch64_movz_w(11, 0)?)?;
     assembler.bind(vector)?;
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
     let required = u16::from(
@@ -59883,7 +69103,7 @@ fn aarch64_emit_dynamic_correlated_prefix_gate(
     ))?;
     assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
     assembler.branch_cond(AARCH64_LO, scalar)?;
-    aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy)?;
+    aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy, vector, Some(11))?;
     assembler.branch_cond(AARCH64_NE, vector_candidate)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
     assembler.branch(vector)?;
@@ -59966,7 +69186,7 @@ fn aarch64_emit_mandatory_teddy_suffix_prepass(
                 ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
             assembler.branch_cond(AARCH64_LO, scalar)?;
-            aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy)?;
+            aarch64_emit_mandatory_teddy_asimd_candidates(assembler, teddy, vector, None)?;
             assembler.branch_cond(AARCH64_NE, vector_hit)?;
             assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
             assembler.branch(vector)?;
@@ -60741,6 +69961,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             "AArch64 fixed candidate retained a moving Teddy scanner",
         ));
     }
+    if entry_contract.complete_span_reduce()
+        && (layout.output != OutputContract::Span || layout.partial.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete Span reducer core has an incompatible layout",
+        ));
+    }
     if sve_suffix_kind.is_some()
         && layout
             .suffix_filter
@@ -60794,6 +70021,43 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let reverse_continue = assembler.label()?;
     let reverse_finish = assembler.label()?;
     let exact_start_probe_failed = assembler.label()?;
+    let complete_restart = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_loop_head = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_nonempty = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_accepted = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_publish = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_invalid_result = entry_contract
+        .complete_span_reduce()
+        .then(|| assembler.label())
+        .transpose()?;
+
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(aarch64_sub_x_imm(31, 31, 48)?)?;
+        assembler.instruction(aarch64_store_x(4, 31, 0)?)?;
+        assembler.instruction(aarch64_movz_x(8, 0, 0)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 8)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 16)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 24)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
+        // Keep the semantic full-haystack end independent of every scanner
+        // scratch register and reload it at restart and result validation.
+        assembler.instruction(aarch64_store_x(3, 31, 40)?)?;
+    }
 
     if entry_contract.validates_public_args() {
         assembler.instruction(0xf100_003f)?; // cmp length, #0
@@ -60814,8 +70078,14 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
         assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
     }
+    let has_direct_search_trusted_core = entry_contract == NativeDfaEntryContract::Public
+        && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         aarch64_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
+    }
+    if let Some(restart) = complete_restart {
+        assembler.bind(restart)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
     }
     assembler.instruction(aarch64_mov_x(9, 2)?)?;
 
@@ -60971,6 +70241,18 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let use_asimd_exact_product_residual_batch =
         use_asimd_exact_product_multicolumn_batch
             || use_asimd_exact_product_scalar_residual_batch;
+    // A residual prefix guard prevents publishing a candidate from the
+    // general 64-byte batch: the graph-selected columns are necessary but
+    // not sufficient. They can still reject the whole batch transactionally.
+    // A nonempty conjunction leaves X2 untouched and replays the established
+    // 16-byte retained-candidate loop, which remains solely responsible for
+    // selecting and authenticating candidates.
+    let use_asimd_residual_reject_batch = use_asimd_filter
+        && retain_vector_candidates
+        && !use_asimd_exact_product_residual_batch
+        && prefix_relation_vector.is_none()
+        && vector_filter.is_some()
+        && layout.start_filter.is_some_and(use_aarch64_filter_batch);
     let use_asimd_relation_batch = use_asimd_filter
         && !retain_vector_candidates
         && prefix_relation_vector.is_some()
@@ -60980,8 +70262,12 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         && (!retain_vector_candidates || use_asimd_exact_product_residual_batch)
         && (prefix_relation_vector.is_none() || use_asimd_relation_batch)
         && layout.start_filter.is_some_and(use_aarch64_filter_batch);
-    let use_asimd_multicolumn_batch = use_asimd_batch && vector_filter.is_some();
+    let use_asimd_filter_batch = use_asimd_batch || use_asimd_residual_reject_batch;
+    let use_asimd_multicolumn_batch = use_asimd_filter_batch && vector_filter.is_some();
     let filter_single_vector_loop = use_asimd_exact_product_residual_batch
+        .then(|| assembler.label())
+        .transpose()?;
+    let filter_residual_reject_batch_hit = use_asimd_residual_reject_batch
         .then(|| assembler.label())
         .transpose()?;
     if use_asimd_sparse_lookup
@@ -61235,7 +70521,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             if use_asimd_filter {
                 assembler.bind(filter_vector)?;
                 assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-                if use_asimd_batch {
+                if use_asimd_filter_batch {
                     let batch_bytes = u16::from(maximum_scan_offset)
                         .checked_add(AARCH64_BATCH_BYTES)
                         .ok_or(ObjectError::ArithmeticOverflow(
@@ -61262,7 +70548,9 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                             first_register,
                         )?
                     };
-                    filter_batch_first_candidates = Some(first_candidates);
+                    if use_asimd_batch {
+                        filter_batch_first_candidates = Some(first_candidates);
+                    }
                     aarch64_emit_candidate_batch_any(&mut assembler, first_candidates)?;
                     assembler.branch_cond(
                         AARCH64_NE,
@@ -61330,13 +70618,15 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 assembler.branch(filter_single_vector_loop.unwrap_or(filter_vector))?;
 
                 if let Some(vector_filter) = vector_filter {
-                    if use_asimd_batch {
+                    if use_asimd_filter_batch {
                         assembler.bind(filter_batch_primary_hit)?;
                         aarch64_emit_vector_filter_secondary_batch(&mut assembler, vector_filter)?;
                         aarch64_emit_candidate_batch_any(&mut assembler, 24)?;
                         assembler.branch_cond(
                             AARCH64_NE,
-                            if use_exact_asimd_lane {
+                            if let Some(hit) = filter_residual_reject_batch_hit {
+                                hit
+                            } else if use_exact_asimd_lane {
                                 filter_batch_hit
                             } else {
                                 filter_scalar
@@ -61344,6 +70634,15 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                         )?;
                         assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
                         assembler.branch(filter_vector)?;
+                    }
+                    if let Some(hit) = filter_residual_reject_batch_hit {
+                        assembler.bind(hit)?;
+                        // Batch helpers borrow X12 for source addresses and
+                        // reductions. Restore the incumbent loop's remaining
+                        // byte count without moving X2, then replay exactly
+                        // the same 16-byte candidate-selection path.
+                        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+                        assembler.branch(filter_single_vector)?;
                     }
 
                     assembler.bind(filter_single_primary_hit)?;
@@ -61932,17 +71231,100 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             assembler.bind(reverse_finish)?;
             assembler.instruction(aarch64_cmp_x(10, 13)?)?;
             assembler.branch_cond(AARCH64_EQ, invalid)?;
-            assembler.instruction(aarch64_store_x(10, 4, 0)?)?;
+            if register_outcome {
+                assembler.instruction(aarch64_mov_x(6, 10)?)?;
+            } else {
+                assembler.instruction(aarch64_store_x(10, 4, 0)?)?;
+            }
             assembler.branch(matched)?;
         }
     }
 
     assembler.bind(no_match)?;
-    assembler.instruction(aarch64_movz_w(0, 0)?)?;
-    assembler.branch(done)?;
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(10, 31, 8)?)?;
+        assembler.instruction(aarch64_store_x(10, 8, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(10, 31, 16)?)?;
+        assembler.instruction(aarch64_store_x(10, 8, 8)?)?;
+        assembler.instruction(aarch64_movz_w(0, 0)?)?;
+        assembler.branch(done)?;
+    } else {
+        assembler.instruction(aarch64_movz_w(0, 0)?)?;
+        assembler.branch(done)?;
+    }
     assembler.bind(matched)?;
-    assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.branch(done)?;
+    if let (
+        Some(restart),
+        Some(loop_head),
+        Some(nonempty),
+        Some(accepted),
+        Some(publish),
+        Some(invalid_result),
+    ) = (
+        complete_restart,
+        complete_loop_head,
+        complete_nonempty,
+        complete_accepted,
+        complete_publish,
+        complete_invalid_result,
+    ) {
+        // Keep the validation/result ABI independent of future scanner
+        // scratch-register changes and symmetric with the x86 core.
+        assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
+        assembler.instruction(aarch64_cmp_x(6, 9)?)?;
+        assembler.branch_cond(AARCH64_LO, invalid_result)?;
+        assembler.instruction(aarch64_cmp_x(7, 6)?)?;
+        assembler.branch_cond(AARCH64_LO, invalid_result)?;
+        assembler.instruction(aarch64_cmp_x(7, 3)?)?;
+        assembler.branch_cond(AARCH64_HI, invalid_result)?;
+        assembler.instruction(aarch64_cmp_x(6, 7)?)?;
+        assembler.branch_cond(AARCH64_NE, nonempty)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+        assembler.branch_bit_clear_w(8, 0, accepted)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 24)?)?;
+        assembler.instruction(aarch64_cmp_x(8, 7)?)?;
+        assembler.branch_cond(AARCH64_NE, accepted)?;
+        assembler.instruction(aarch64_cmp_x(9, 3)?)?;
+        assembler.branch_cond(AARCH64_EQ, no_match)?;
+        assembler.instruction(aarch64_add_x_imm(2, 9, 1)?)?;
+        assembler.branch(restart)?;
+
+        assembler.bind(nonempty)?;
+        assembler.instruction(aarch64_movz_w(8, 1)?)?;
+        assembler.branch(publish)?;
+        assembler.bind(accepted)?;
+        assembler.instruction(aarch64_movz_w(8, 3)?)?;
+        assembler.bind(publish)?;
+        assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
+        assembler.instruction(aarch64_store_x(7, 31, 24)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 8)?)?;
+        assembler.instruction(aarch64_add_x_imm(8, 8, 1)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 8)?)?;
+        assembler.instruction(aarch64_sub_x_reg(10, 7, 6)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 16)?)?;
+        assembler.instruction(aarch64_add_x_reg(8, 8, 10)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 16)?)?;
+        assembler.instruction(aarch64_mov_x(2, 7)?)?;
+        assembler.branch(loop_head)?;
+
+        assembler.bind(loop_head)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+        assembler.branch_bit_clear_w(8, 1, restart)?;
+        assembler.instruction(aarch64_and_low_w(8, 8, 1)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(AARCH64_EQ, no_match)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(restart)?;
+
+        assembler.bind(invalid_result)?;
+        assembler.instruction(aarch64_movz_w(0, 3)?)?;
+        assembler.branch(done)?;
+    } else {
+        assembler.instruction(aarch64_movz_w(0, 1)?)?;
+        assembler.branch(done)?;
+    }
     assembler.bind(selected_end)?;
     if layout.partial.is_some() {
         assembler.instruction(aarch64_movz_w(
@@ -61955,10 +71337,31 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     assembler.bind(invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
     assembler.bind(done)?;
+    if entry_contract.complete_span_reduce() {
+        assembler.instruction(aarch64_add_x_imm(31, 31, 48)?)?;
+    }
     assembler.instruction(0xd65f_03c0)?;
 
     let mut relocation_offsets = [table_page, table_page_offset];
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
+    let direct_search_trusted_core_offset = if has_direct_search_trusted_core {
+        let code_offset = relocation_offsets[0]
+            .checked_sub(4)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 direct search trusted core landmark",
+            ))?;
+        if code.get(code_offset..relocation_offsets[0])
+            != Some(aarch64_mov_x(9, 2)?.to_le_bytes().as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 direct search trusted core landmark",
+            ));
+        }
+        Some(code_offset)
+    } else {
+        None
+    };
     let relocations = vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
@@ -62030,6 +71433,22 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
+        direct_search_trusted_core: direct_search_trusted_core_offset.map(|code_offset| {
+            NativeDirectSearchTrustedCore {
+                code_offset,
+                output: layout.output,
+                entry_contract: NativeDirectSearchEntryContract::PublicCompleteV1,
+                result_abi: match layout.output {
+                    OutputContract::Exists => NativeDirectSearchResultAbi::ExistsStatusOnlyV1,
+                    OutputContract::Span => NativeDirectSearchResultAbi::SpanMatchedWritesBothV1,
+                    OutputContract::SelectedEnd => {
+                        unreachable!("SelectedEnd cannot publish a direct-search trusted core")
+                    }
+                },
+                entry_code_sha256,
+                prologue: NativeDirectSearchTrustedCorePrologue::Aarch64,
+            }
+        }),
     })
 }
 
@@ -63052,6 +72471,234 @@ fn patch_aarch64_local_call(
         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 local call immediate"))?;
     slot.copy_from_slice(&(0x9400_0000 | immediate).to_le_bytes());
     Ok(())
+}
+
+fn patch_aarch64_local_branch(
+    code: &mut [u8],
+    instruction_offset: usize,
+    target: usize,
+) -> Result<(), ObjectError> {
+    let end = instruction_offset
+        .checked_add(4)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 local branch instruction end",
+        ))?;
+    let slot = code
+        .get_mut(instruction_offset..end)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 local branch is outside code",
+        ))?;
+    let instruction = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+    if instruction != 0x1400_0000 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 local branch placeholder is malformed",
+        ));
+    }
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, 26)? {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 local branch is out of range",
+        ));
+    }
+    let modulus = 1_i64 << 26;
+    let immediate = u32::try_from(words.rem_euclid(modulus))
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 local branch immediate"))?;
+    slot.copy_from_slice(&(0x1400_0000 | immediate).to_le_bytes());
+    Ok(())
+}
+
+fn aarch64_local_branch_instruction(
+    instruction_offset: usize,
+    target: usize,
+) -> Result<Option<u32>, ObjectError> {
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, 26)? {
+        return Ok(None);
+    }
+    let modulus = 1_i64 << 26;
+    let immediate = u32::try_from(words.rem_euclid(modulus)).map_err(|_| {
+        ObjectError::ArithmeticOverflow("AArch64 direct Count-v3 tail branch immediate")
+    })?;
+    Ok(Some(0x1400_0000 | immediate))
+}
+
+fn aarch64_local_cond_branch_instruction(
+    instruction_offset: usize,
+    target: usize,
+    condition: u8,
+) -> Result<Option<u32>, ObjectError> {
+    if condition > 15 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Count-v3 conditional branch condition",
+        ));
+    }
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, 19)? {
+        return Ok(None);
+    }
+    let modulus = 1_i64 << 19;
+    let immediate = u32::try_from(words.rem_euclid(modulus)).map_err(|_| {
+        ObjectError::ArithmeticOverflow(
+            "AArch64 direct Count-v3 conditional branch immediate",
+        )
+    })?;
+    Ok(Some(
+        0x5400_0000 | (immediate << 5) | u32::from(condition),
+    ))
+}
+
+/// Return the immediate-field shift and width for every direct AArch64 branch
+/// shape whose target is encoded relative to the instruction address.
+fn aarch64_direct_branch_immediate_shape(instruction: u32) -> Option<(u8, u8)> {
+    if instruction & 0xfc00_0000 == 0x1400_0000
+        || instruction & 0xfc00_0000 == 0x9400_0000
+    {
+        Some((0, 26)) // B or BL.
+    } else if instruction & 0xff00_0010 == 0x5400_0000
+        || instruction & 0x7e00_0000 == 0x3400_0000
+    {
+        Some((5, 19)) // B.cond or CBZ/CBNZ.
+    } else if instruction & 0x7e00_0000 == 0x3600_0000 {
+        Some((5, 14)) // TBZ/TBNZ.
+    } else {
+        None
+    }
+}
+
+/// Decode one direct AArch64 branch target from a module-relative instruction
+/// offset. This is deliberately limited to the complete immediate branch
+/// family above; register-indirect branches are position independent.
+pub(crate) fn aarch64_direct_branch_target(
+    instruction_offset: usize,
+    instruction: u32,
+) -> Result<Option<usize>, ObjectError> {
+    let Some((shift, bits)) = aarch64_direct_branch_immediate_shape(instruction) else {
+        return Ok(None);
+    };
+    let immediate_mask = (1_u32 << bits) - 1;
+    let immediate = (instruction >> shift) & immediate_mask;
+    let sign_bit = 1_u32 << (bits - 1);
+    let signed_words = if immediate & sign_bit == 0 {
+        i64::from(immediate)
+    } else {
+        i64::from(immediate) - (1_i64 << bits)
+    };
+    let instruction_offset = i64::try_from(instruction_offset).map_err(|_| {
+        ObjectError::ArithmeticOverflow("AArch64 direct branch instruction offset")
+    })?;
+    let displacement = signed_words.checked_mul(4).ok_or(
+        ObjectError::ArithmeticOverflow("AArch64 direct branch displacement"),
+    )?;
+    let target = instruction_offset.checked_add(displacement).ok_or(
+        ObjectError::ArithmeticOverflow("AArch64 direct branch target"),
+    )?;
+    Ok(Some(usize::try_from(target).map_err(|_| {
+        ObjectError::InvalidModule("AArch64 direct branch target is negative")
+    })?))
+}
+
+fn aarch64_prepared_signed_length_check(
+    code: &[u8],
+    authenticated_body_offset: usize,
+) -> Result<(usize, usize), ObjectError> {
+    let compare = aarch64_cmp_x_imm(2, 0)?;
+    let invalid_return = [aarch64_movz_w(0, 2)?, 0xd65f_03c0];
+    let mut invalid_return_bytes = [0_u8; 8];
+    for (slot, instruction) in invalid_return_bytes
+        .chunks_exact_mut(4)
+        .zip(invalid_return)
+    {
+        slot.copy_from_slice(&instruction.to_le_bytes());
+    }
+    let mut found = None;
+    for compare_offset in (0..authenticated_body_offset.saturating_sub(4)).step_by(4) {
+        let branch_offset = compare_offset.checked_add(4).ok_or(
+            ObjectError::ArithmeticOverflow("AArch64 prepared length branch offset"),
+        )?;
+        let branch_end = branch_offset.checked_add(4).ok_or(
+            ObjectError::ArithmeticOverflow("AArch64 prepared length branch extent"),
+        )?;
+        let Some(compare_bytes) = code.get(compare_offset..branch_offset) else {
+            continue;
+        };
+        let Some(branch_bytes) = code.get(branch_offset..branch_end) else {
+            continue;
+        };
+        let compare_word = u32::from_le_bytes(compare_bytes.try_into().map_err(|_| {
+            ObjectError::InvalidModule("AArch64 prepared length compare is truncated")
+        })?);
+        let branch_word = u32::from_le_bytes(branch_bytes.try_into().map_err(|_| {
+            ObjectError::InvalidModule("AArch64 prepared length branch is truncated")
+        })?);
+        if compare_word != compare
+            || branch_word & 0xff00_001f
+                != 0x5400_0000 | u32::from(AARCH64_MI)
+        {
+            continue;
+        }
+        let Some(target) = aarch64_direct_branch_target(branch_offset, branch_word)? else {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 prepared length branch has no direct target",
+            ));
+        };
+        let target_end = target.checked_add(8).ok_or(
+            ObjectError::ArithmeticOverflow("AArch64 prepared invalid return extent"),
+        )?;
+        if code.get(target..target_end) != Some(invalid_return_bytes.as_slice()) {
+            continue;
+        }
+        if found.replace((compare_offset, branch_offset)).is_some() {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 prepared wrapper has duplicate signed-length checks",
+            ));
+        }
+    }
+    found.ok_or(ObjectError::InvalidModule(
+        "AArch64 prepared wrapper signed-length check is absent",
+    ))
+}
+
+/// Preserve an authenticated direct-branch opcode while retargeting its
+/// immediate from a relocated instruction address. `None` is the ordinary
+/// numeric-range decline; malformed/non-branch input is terminal.
+pub(crate) fn aarch64_relocate_direct_branch_instruction(
+    instruction_offset: usize,
+    target: usize,
+    instruction: u32,
+) -> Result<Option<u32>, ObjectError> {
+    let Some((shift, bits)) = aarch64_direct_branch_immediate_shape(instruction) else {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct branch relocation received a non-branch",
+        ));
+    };
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, bits)? {
+        return Ok(None);
+    }
+    let modulus = 1_i64 << bits;
+    let immediate = u32::try_from(words.rem_euclid(modulus)).map_err(|_| {
+        ObjectError::ArithmeticOverflow("AArch64 relocated direct branch immediate")
+    })?;
+    let immediate_mask = ((1_u32 << bits) - 1) << shift;
+    Ok(Some(
+        (instruction & !immediate_mask) | (immediate << shift),
+    ))
+}
+
+/// Identify the remaining AArch64 instruction classes whose result depends on
+/// their address. A relocated authenticated body must reject these unless a
+/// dedicated relocation rule is added.
+pub(crate) const fn aarch64_is_pc_relative_address_or_literal(instruction: u32) -> bool {
+    instruction & 0x1f00_0000 == 0x1000_0000 // ADR or ADRP.
+        || instruction & 0x3b00_0000 == 0x1800_0000 // Load literal family.
+}
+
+fn aarch64_local_call_instruction(
+    instruction_offset: usize,
+    target: usize,
+) -> Result<Option<u32>, ObjectError> {
+    Ok(aarch64_local_branch_instruction(instruction_offset, target)?
+        .map(|instruction| instruction | 0x8000_0000))
 }
 
 #[allow(
@@ -70655,6 +80302,172 @@ mod tests {
     // than both the primary-only and fully refined incumbent extremes.
     const MANDATORY_TEDDY_STRUCTURAL_PATTERN: &str = r"(?:\x00\x00\x00|\x01\x01\x01|\x02\x02\x02|\x03\x03\x03|\x04\x04\x04|\x0e\x0e\x0e|\x0f\x0f\x0f|\x10\x10\x10|\x11\x11\x11|\x14\x14\x14|\x15\x15\x15|\x16\x16\x16|\x17\x17\x17|\x1c\x1c\x1c|\x1d\x1d\x1d|\x1e\x1e\x1e|\x1f\x1f\x1f){2}";
 
+    #[test]
+    fn row_scalar_span_sum_preserves_selected_end_on_both_isas() {
+        let (x86, calls) = lower_x86_64_native_rebar_row_scalar_v1(
+            2,
+            crate::RebarNativeRowScalarOperationV1::SpanSum,
+            None,
+        )
+        .expect("lower x86 SpanSum row reducer");
+        assert_eq!(calls.len(), 2);
+        let x86_accumulate = [
+            0x48, 0x89, 0xd1, // RCX = selected end
+            0x48, 0x29, 0xc1, // RCX -= selected start
+            0x49, 0x01, 0xcf, // total += width
+        ];
+        let x86_sites = x86
+            .windows(x86_accumulate.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == x86_accumulate).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(x86_sites.len(), 2, "positive and empty aggregation tails");
+        for offset in x86_sites {
+            let branch = offset + x86_accumulate.len();
+            let branch_bytes = if x86[branch] == 0x72 {
+                2
+            } else {
+                assert_eq!(&x86[branch..][..2], &[0x0f, 0x82]);
+                6
+            };
+            let committed = branch + branch_bytes;
+            assert_eq!(
+                &x86[committed..][..6],
+                &[
+                    0x48, 0x89, 0xd3, // cursor = selected end
+                    0x48, 0x89, 0xd5, // last end = selected end
+                ],
+            );
+        }
+        assert!(
+            !x86.windows(3).any(|bytes| bytes == [0x48, 0x29, 0xc2]),
+            "SpanSum must not turn the selected-end register into a width",
+        );
+
+        let (aarch64, calls) = lower_aarch64_native_rebar_row_scalar_v1(
+            2,
+            crate::RebarNativeRowScalarOperationV1::SpanSum,
+            None,
+        )
+        .expect("lower AArch64 SpanSum row reducer");
+        assert_eq!(calls.len(), 2);
+        let words = aarch64
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let aarch64_accumulate = [
+            aarch64_sub_x_reg(5, 28, 27).unwrap(),
+            aarch64_adds_x_reg(22, 22, 5).unwrap(),
+        ];
+        let aarch64_sites = words
+            .windows(aarch64_accumulate.len())
+            .enumerate()
+            .filter_map(|(offset, instructions)| {
+                (instructions == aarch64_accumulate).then_some(offset)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aarch64_sites.len(),
+            2,
+            "positive and empty aggregation tails",
+        );
+        for offset in aarch64_sites {
+            assert_eq!(words[offset + 2] & 0xff00_0010, 0x5400_0000);
+            assert_eq!(words[offset + 2] & 0xf, u32::from(AARCH64_HS));
+            assert_eq!(words[offset + 3], aarch64_mov_x(23, 28).unwrap());
+            assert_eq!(words[offset + 4], aarch64_mov_x(24, 28).unwrap());
+        }
+    }
+
+    #[test]
+    fn aarch64_mixed_row_boundary_accepts_the_public_row_limit() {
+        let mut prepared_rows = vec![false; crate::ORDERED_MANY_AOT_MAX_ROWS];
+        prepared_rows[crate::ORDERED_MANY_AOT_MAX_ROWS - 1] = true;
+        let mut assembler = Aarch64Assembler::new();
+        let invalid = assembler.label().expect("allocate invalid label");
+        aarch64_mixed_row_scalar_boundary(&mut assembler, &prepared_rows, invalid)
+            .expect("lower maximum-cardinality mixed handle boundary");
+        assembler.bind(invalid).expect("bind invalid label");
+        assembler
+            .instruction(0xd65f_03c0)
+            .expect("append return instruction");
+        assert!(
+            !assembler
+                .finish()
+                .expect("finish maximum-cardinality boundary")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn x86_capture_grep_wrapper_preserves_rbp_and_aligns_private_calls() {
+        for (caller_scratch_bytes, frame_bytes) in [(0, 24_u8), (64, 40_u8)] {
+            let (code, private_call) =
+                lower_x86_64_native_capture_grep_wrapper_v1(caller_scratch_bytes)
+                    .expect("lower x86 capture grep wrapper");
+            let prologue = [
+                0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec,
+                frame_bytes,
+            ];
+            let epilogue = [
+                0x48, 0x83, 0xc4, frame_bytes, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c,
+                0x5b, 0x5d, 0xc3,
+            ];
+            assert_eq!(
+                code.windows(prologue.len())
+                    .filter(|window| *window == prologue)
+                    .count(),
+                1,
+                "one RBP-preserving prologue for caller scratch {caller_scratch_bytes}",
+            );
+            assert_eq!(
+                code.windows(epilogue.len())
+                    .filter(|window| *window == epilogue)
+                    .count(),
+                1,
+                "one RBP-restoring epilogue for caller scratch {caller_scratch_bytes}",
+            );
+            assert!(private_call > 0);
+            assert_eq!(code.get(private_call - 1), Some(&0xe8));
+            assert_eq!(frame_bytes % 16, 8);
+            let common_addressing_forms: &[&[u8]] = &[
+                &[0x48, 0x89, 0x5c, 0x24, 0x08], // [RSP+8] <- RBX line start
+                &[0x48, 0x8b, 0x6c, 0x24, 0x08], // RBP <- [RSP+8]
+                &[0x41, 0x80, 0x3c, 0x1c, 0x0a], // cmp byte [R12+RBX], LF
+                &[0x43, 0x80, 0x7c, 0x1c, 0xff, 0x0d], // cmp byte [R12+R11-1], CR
+                &[0x49, 0x8d, 0x3c, 0x2c],       // RDI <- R12+RBP
+                &[0x4c, 0x03, 0x3c, 0x24],       // R15 += [RSP]
+                &[0x4d, 0x89, 0x3e],             // [R14] <- R15
+            ];
+            for &form in common_addressing_forms {
+                assert!(
+                    code.windows(form.len()).any(|window| window == form),
+                    "missing x86 capture Grep addressing form {form:02x?}",
+                );
+            }
+            assert!(!code.windows(5).any(|window| {
+                window == [0x43, 0x80, 0x3c, 0x1c, 0x0a]
+            }));
+            let scratch_addressing_forms: &[&[u8]] = if caller_scratch_bytes == 0 {
+                &[&[0x48, 0x8d, 0x14, 0x24]] // RDX <- &count at [RSP]
+            } else {
+                &[
+                    &[0x48, 0x89, 0x54, 0x24, 0x10], // [RSP+16] <- RDX
+                    &[0x48, 0x89, 0x4c, 0x24, 0x18], // [RSP+24] <- RCX
+                    &[0x48, 0x8b, 0x54, 0x24, 0x10], // RDX <- [RSP+16]
+                    &[0x48, 0x8b, 0x4c, 0x24, 0x18], // RCX <- [RSP+24]
+                    &[0x4c, 0x8d, 0x04, 0x24],       // R8 <- &count at [RSP]
+                ]
+            };
+            for &form in scratch_addressing_forms {
+                assert!(
+                    code.windows(form.len()).any(|window| window == form),
+                    "missing x86 capture Grep scratch addressing form {form:02x?}",
+                );
+            }
+        }
+    }
+
     fn exact_one_byte_pattern(bytes: impl IntoIterator<Item = u8>) -> String {
         let mut pattern = String::from("(?-u:");
         for (index, byte) in bytes.into_iter().enumerate() {
@@ -70693,6 +80506,464 @@ mod tests {
                 .contains(&crate::OptimizationPass::ExactFiniteExistsByteSetLowering),
         );
         compiled
+    }
+
+    fn aarch64_direct_branch_target(code: &[u8], instruction_offset: usize) -> usize {
+        let instruction = u32::from_le_bytes(
+            code[instruction_offset..instruction_offset + 4]
+                .try_into()
+                .expect("complete AArch64 direct branch"),
+        );
+        assert!(matches!(instruction >> 26, 0b000101 | 0b100101));
+        let immediate = i64::from(instruction & 0x03ff_ffff);
+        let signed_words = (immediate << 38) >> 38;
+        let source = i64::try_from(instruction_offset).expect("AArch64 source offset");
+        usize::try_from(source + signed_words * 4).expect("AArch64 branch target")
+    }
+
+    #[test]
+    fn direct_exists_batch_calls_only_an_authenticated_trusted_core() {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let ordinary = compile(
+                CompileRequest::new("needle", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .expect("ordinary direct Exists fixture");
+            let trusted_core = ordinary
+                .module()
+                .native_direct_search_trusted_core
+                .expect("compiler-authenticated direct Exists core");
+            let entry = &ordinary.module().symbols[ordinary.module().entry_symbol_index];
+            let entry_start = usize::try_from(entry.offset).expect("ordinary entry start");
+            let entry_end = entry_start
+                .checked_add(usize::try_from(entry.size).expect("ordinary entry size"))
+                .expect("ordinary entry end");
+            assert!((entry_start..entry_end).contains(&trusted_core.code_offset));
+            assert!(trusted_core.code_offset > entry_start);
+            let ordinary_text = ordinary.module().sections[TEXT_SECTION].bytes();
+            match target.architecture {
+                Architecture::X86_64 => assert_eq!(
+                    ordinary_text
+                        .get(trusted_core.code_offset..trusted_core.code_offset + 3),
+                    Some([0x48, 0x89, 0xd6].as_slice()),
+                ),
+                Architecture::Aarch64 => assert_eq!(
+                    ordinary_text
+                        .get(trusted_core.code_offset..trusted_core.code_offset + 4),
+                    Some(aarch64_mov_x(9, 2).unwrap().to_le_bytes().as_slice()),
+                ),
+            }
+
+            let appended = ordinary
+                .module()
+                .clone()
+                .append_direct_exists_batch(OutputContract::Exists)
+                .expect("append authenticated direct Exists batch")
+                .expect("eligible authenticated direct Exists batch");
+            let batch_name = appended
+                .direct_exists_batch_symbol()
+                .expect("direct Exists batch symbol");
+            let batch = appended
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == batch_name)
+                .expect("direct Exists batch symbol record");
+            let batch_start = usize::try_from(batch.offset).expect("batch start");
+            let wrapper = match target.architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_direct_exists_batch(trusted_core.prologue)
+                }
+                Architecture::Aarch64 => {
+                    lower_aarch64_direct_exists_batch(trusted_core.prologue)
+                }
+            }
+            .expect("lower authenticated wrapper shape");
+            assert_eq!(
+                usize::try_from(batch.size).expect("batch size"),
+                wrapper.code.len()
+            );
+            let text = appended.sections[TEXT_SECTION].bytes();
+
+            match target.architecture {
+                Architecture::X86_64 => {
+                    let call_displacement = batch_start + wrapper.search_call_offset;
+                    assert_eq!(text[call_displacement - 1], 0xe8);
+                    let displacement = i64::from(i32::from_le_bytes(
+                        text[call_displacement..call_displacement + 4]
+                            .try_into()
+                            .expect("x86 call displacement"),
+                    ));
+                    let call_target = usize::try_from(
+                        i64::try_from(call_displacement + 4).expect("x86 call source")
+                            + displacement,
+                    )
+                    .expect("x86 call target");
+                    assert_eq!(call_target, batch_start + wrapper.trampoline_offset);
+                    assert_ne!(call_target, entry_start);
+
+                    let jump_displacement = batch_start + wrapper.core_jump_offset;
+                    assert_eq!(text[jump_displacement - 1], 0xe9);
+                    let displacement = i64::from(i32::from_le_bytes(
+                        text[jump_displacement..jump_displacement + 4]
+                            .try_into()
+                            .expect("x86 trusted-core jump displacement"),
+                    ));
+                    let jump_target = usize::try_from(
+                        i64::try_from(jump_displacement + 4).expect("x86 jump source")
+                            + displacement,
+                    )
+                    .expect("x86 jump target");
+                    assert_eq!(jump_target, trusted_core.code_offset);
+                }
+                Architecture::Aarch64 => {
+                    let call = batch_start + wrapper.search_call_offset;
+                    let trampoline = batch_start + wrapper.trampoline_offset;
+                    assert_eq!(aarch64_direct_branch_target(text, call), trampoline);
+                    assert_ne!(trampoline, entry_start);
+                    let jump = batch_start + wrapper.core_jump_offset;
+                    assert_eq!(jump, trampoline + 4);
+                    assert_eq!(
+                        text.get(trampoline..jump),
+                        Some(0xf100_001f_u32.to_le_bytes().as_slice()),
+                    );
+                    assert_eq!(aarch64_direct_branch_target(text, jump), trusted_core.code_offset);
+                }
+            }
+
+            let mut forged = ordinary.module().clone();
+            let mut forged_core = trusted_core;
+            forged_core.code_offset = entry_end;
+            forged.native_direct_search_trusted_core = Some(forged_core);
+            assert!(matches!(
+                forged.append_direct_exists_batch(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct search trusted core contract is inconsistent"
+                ))
+            ));
+
+            let mut wrong_architecture = ordinary.module().clone();
+            let mut wrong_core = trusted_core;
+            wrong_core.prologue = match target.architecture {
+                Architecture::X86_64 => NativeDirectSearchTrustedCorePrologue::Aarch64,
+                Architecture::Aarch64 => NativeDirectSearchTrustedCorePrologue::X86_64 {
+                    save_rbx: false,
+                    save_r12_r13: false,
+                    save_r14_r15: false,
+                },
+            };
+            wrong_architecture.native_direct_search_trusted_core = Some(wrong_core);
+            assert!(matches!(
+                wrong_architecture.append_direct_exists_batch(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct search trusted core contract is inconsistent"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn direct_span_aggregate_trusted_core_receipt_is_output_bound_and_tamper_evident() {
+        let exports = PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM);
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let ordinary = compile(
+                CompileRequest::new("[ab]+z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("ordinary direct Span fixture");
+            let serialized = ordinary
+                .program()
+                .serialize()
+                .expect("serialize Span fixture");
+            let identity = ordinary.program().artifact_identity();
+            let core = ordinary
+                .module()
+                .native_direct_search_trusted_core
+                .expect("authenticated direct Span core");
+            assert_eq!(core.output, OutputContract::Span);
+            assert_eq!(
+                core.entry_contract,
+                NativeDirectSearchEntryContract::PublicCompleteV1,
+            );
+            assert_eq!(
+                core.result_abi,
+                NativeDirectSearchResultAbi::SpanMatchedWritesBothV1,
+            );
+
+            let aggregate = ordinary
+                .module()
+                .clone()
+                .append_prepared_aggregate_exports(exports, identity, &serialized)
+                .expect("append authenticated direct Span aggregate");
+            assert!(aggregate.uses_direct_span_trusted_core_aggregate());
+
+            for mutation in 0..3 {
+                let mut forged = ordinary.module().clone();
+                let mut forged_core = core;
+                match mutation {
+                    0 => forged_core.output = OutputContract::Exists,
+                    1 => {
+                        forged_core.result_abi = NativeDirectSearchResultAbi::ExistsStatusOnlyV1;
+                    }
+                    2 => forged_core.entry_code_sha256[0] ^= 1,
+                    _ => unreachable!(),
+                }
+                forged.native_direct_search_trusted_core = Some(forged_core);
+                assert!(matches!(
+                    forged.append_prepared_aggregate_exports(exports, identity, &serialized),
+                    Err(ObjectError::InvalidModule(
+                        "direct search trusted core contract is inconsistent"
+                            | "direct search trusted core entry identity is inconsistent"
+                    ))
+                ));
+            }
+
+            let mut forged_landmark = ordinary.module().clone();
+            let entry = &forged_landmark.symbols[forged_landmark.entry_symbol_index];
+            let entry_start = usize::try_from(entry.offset).expect("Span entry start");
+            let entry_size = usize::try_from(entry.size).expect("Span entry size");
+            let entry_end = entry_start.checked_add(entry_size).expect("Span entry end");
+            forged_landmark.sections[TEXT_SECTION].data[core.code_offset] ^= 1;
+            let mut forged_core = core;
+            forged_core.entry_code_sha256 = Sha256::digest(
+                &forged_landmark.sections[TEXT_SECTION].data[entry_start..entry_end],
+            )
+            .into();
+            forged_landmark.native_direct_search_trusted_core = Some(forged_core);
+            assert!(matches!(
+                forged_landmark.append_prepared_aggregate_exports(exports, identity, &serialized,),
+                Err(ObjectError::InvalidModule(
+                    "direct search trusted core landmark is malformed"
+                ))
+            ));
+
+            let ordinary_aggregate = ordinary
+                .module()
+                .clone()
+                .without_direct_span_trusted_core_for_aggregate()
+                .expect("remove only Span core metadata")
+                .append_prepared_aggregate_exports(exports, identity, &serialized)
+                .expect("append legacy DirectOrdinary aggregate");
+            assert!(!ordinary_aggregate.uses_direct_span_trusted_core_aggregate());
+            assert_eq!(
+                ordinary_aggregate.prepared_aggregate_strategy(),
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+        }
+    }
+
+    #[test]
+    fn direct_span_aggregate_trampolines_reproduce_core_entry_machine_state() {
+        for save_rbx in [false, true] {
+            for save_r12_r13 in [false, true] {
+                for save_r14_r15 in [false, true] {
+                    if save_r14_r15 && !save_r12_r13 {
+                        continue;
+                    }
+                    let wrapper = lower_x86_64_prepared_span_reduce(
+                        PreparedSpanSink::Count,
+                        NativeSpanReducerCallKind::DirectTrustedCore(
+                            NativeDirectSearchTrustedCorePrologue::X86_64 {
+                                save_rbx,
+                                save_r12_r13,
+                                save_r14_r15,
+                            },
+                        ),
+                        false,
+                    )
+                    .expect("x86 direct Span trusted-core wrapper");
+                    let trampoline = wrapper
+                        .trusted_core_trampoline_offset
+                        .expect("x86 Span trampoline");
+                    let jump = wrapper.trusted_core_jump_offset.expect("x86 Span jump");
+                    let mut expected = Vec::new();
+                    if save_rbx {
+                        expected.push(0x53);
+                    }
+                    if save_r12_r13 {
+                        expected.extend_from_slice(&[0x41, 0x54, 0x41, 0x55]);
+                    }
+                    if save_r14_r15 {
+                        expected.extend_from_slice(&[0x41, 0x56, 0x41, 0x57]);
+                    }
+                    expected.extend_from_slice(&[0x31, 0xc0, 0xe9]);
+                    assert_eq!(&wrapper.code[trampoline..jump], expected);
+                    assert_eq!(
+                        wrapper.code.get(jump..jump + 4),
+                        Some([0, 0, 0, 0].as_slice()),
+                    );
+                }
+            }
+        }
+
+        let wrapper = lower_aarch64_prepared_span_reduce(
+            PreparedSpanSink::SpanSum,
+            NativeSpanReducerCallKind::DirectTrustedCore(
+                NativeDirectSearchTrustedCorePrologue::Aarch64,
+            ),
+            false,
+        )
+        .expect("AArch64 direct Span trusted-core wrapper");
+        let trampoline = wrapper
+            .trusted_core_trampoline_offset
+            .expect("AArch64 Span trampoline");
+        let jump = wrapper.trusted_core_jump_offset.expect("AArch64 Span jump");
+        assert_eq!(jump, trampoline + 4);
+        assert_eq!(
+            wrapper.code.get(trampoline..jump),
+            Some(0xf100_001f_u32.to_le_bytes().as_slice()),
+        );
+        assert_eq!(
+            wrapper.code.get(jump..jump + 4),
+            Some(0x1400_0000_u32.to_le_bytes().as_slice()),
+        );
+        assert_eq!(wrapper.authenticated_body_offset, None);
+    }
+
+    #[test]
+    fn x86_direct_exists_trampoline_reproduces_authenticated_callee_saves() {
+        for save_rbx in [false, true] {
+            for save_r12_r13 in [false, true] {
+                for save_r14_r15 in [false, true] {
+                    let wrapper = lower_x86_64_direct_exists_batch(
+                        NativeDirectSearchTrustedCorePrologue::X86_64 {
+                            save_rbx,
+                            save_r12_r13,
+                            save_r14_r15,
+                        },
+                    )
+                    .expect("x86 trusted-core wrapper");
+                    let mut expected = Vec::new();
+                    if save_rbx {
+                        expected.extend_from_slice(&[0x53]);
+                    }
+                    if save_r12_r13 {
+                        expected.extend_from_slice(&[0x41, 0x54, 0x41, 0x55]);
+                    }
+                    if save_r14_r15 {
+                        expected.extend_from_slice(&[0x41, 0x56, 0x41, 0x57]);
+                    }
+                    expected.extend_from_slice(&[0x31, 0xc0, 0xe9]);
+                    assert_eq!(
+                        &wrapper.code[wrapper.trampoline_offset..wrapper.core_jump_offset],
+                        expected,
+                    );
+                    assert_eq!(
+                        wrapper
+                            .code
+                            .get(wrapper.core_jump_offset..wrapper.core_jump_offset + 4),
+                        Some([0, 0, 0, 0].as_slice()),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_exists_batch_publishes_only_statuses_proved_boolean() {
+        let x86 = lower_x86_64_direct_exists_batch(
+            NativeDirectSearchTrustedCorePrologue::X86_64 {
+                save_rbx: false,
+                save_r12_r13: false,
+                save_r14_r15: false,
+            },
+        )
+        .expect("x86 direct Exists batch");
+        let x86_stores = x86
+            .code
+            .windows(3)
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == [0x41, 0x88, 0x06]).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(x86_stores.len(), 1);
+        let x86_compare = x86.code[..x86_stores[0]]
+            .windows(3)
+            .rposition(|bytes| bytes == [0x83, 0xf8, 0x01])
+            .expect("x86 Boolean proof precedes matched-byte store");
+        let conditional = x86_compare + 3;
+        if x86.code[conditional] == 0x77 {
+            // The assembler may invert JBE + JMP into one relaxed JA over
+            // the Boolean publication block.
+            assert_eq!(x86_stores[0], conditional + 2);
+        } else {
+            let conditional_bytes = if x86.code[conditional] == 0x76 {
+                2
+            } else {
+                assert_eq!(&x86.code[conditional..conditional + 2], &[0x0f, 0x86]);
+                6
+            };
+            let rejected = conditional + conditional_bytes;
+            let rejected_bytes = match x86.code[rejected] {
+                0xeb => 2,
+                0xe9 => 5,
+                opcode => panic!("unexpected x86 rejected-status branch {opcode:#x}"),
+            };
+            assert_eq!(x86_stores[0], rejected + rejected_bytes);
+        }
+
+        let aarch64 = lower_aarch64_direct_exists_batch(
+            NativeDirectSearchTrustedCorePrologue::Aarch64,
+        )
+        .expect("AArch64 direct Exists batch");
+        let words = aarch64
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let store = aarch64_store_byte(0, 21, 0).expect("AArch64 matched-byte store");
+        let stores = words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &word)| (word == store).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1);
+        let compare = words
+            .iter()
+            .position(|&word| word == aarch64_cmp_w_imm(0, 1).unwrap())
+            .expect("AArch64 status <= 1 comparison");
+        let condition = words[compare + 1] & 0xff00_001f;
+        if condition == 0x5400_0000 | u32::from(AARCH64_HI) {
+            // As on x86, branch relaxation can invert the condition so the
+            // proved Boolean publication becomes the fallthrough block.
+            assert_eq!(stores[0], compare + 2);
+        } else {
+            assert_eq!(condition, 0x5400_0000 | u32::from(AARCH64_LS));
+            assert_eq!(words[compare + 2] >> 26, 0b000101);
+            assert_eq!(stores[0], compare + 3);
+        }
+    }
+
+    #[test]
+    fn aarch64_prepared_grep_count_rejects_lf_free_words_before_scalar_tail() {
+        let wrapper = lower_aarch64_prepared_grep_count(
+            NativeSpanReducerCallKind::DirectOrdinary,
+            false,
+        )
+        .expect("lower direct AArch64 GrepCount");
+        let words = wrapper
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&aarch64_eor_x(9, 10, 27).unwrap()));
+        assert!(words.contains(&aarch64_sub_x_reg(10, 9, 28).unwrap()));
+        assert!(words.contains(&aarch64_bic_x(10, 10, 9).unwrap()));
+        assert!(words.contains(&aarch64_add_x_lsl(9, 31, 28, 7).unwrap()));
+        assert!(words.contains(&aarch64_tst_x(10, 9).unwrap()));
+        assert!(words.contains(&aarch64_load_pair_x(27, 28, 31, 80).unwrap()));
+        assert!(words.contains(&aarch64_load_pair_x(29, 30, 31, 96).unwrap()));
+        assert_eq!(aarch64_eor_x(9, 10, 27).unwrap(), 0xca1b_0149);
     }
 
     #[test]
@@ -71180,6 +81451,7 @@ mod tests {
             view,
             target,
             usize::MAX,
+            true,
         )
         .expect("digest lowering")
         .expect("digest Ordered-NFA admission");
@@ -71188,6 +81460,18 @@ mod tests {
         let no_kind = native_module_digest(&program_bytes, target, &lowering, None)
             .expect("incumbent digest stream");
         assert_ne!(digest, no_kind);
+        let mut forged_vector = layout;
+        let PreparedEntryKind::OrderedNfa(mut ordered) = forged_vector.kind else {
+            panic!("digest fixture lost Ordered-NFA layout");
+        };
+        ordered.start_prefix_vector_lowered = true;
+        forged_vector.kind = PreparedEntryKind::OrderedNfa(ordered);
+        assert!(matches!(
+            native_module_digest(&program_bytes, target, &lowering, Some(forged_vector)),
+            Err(ObjectError::InvalidModule(
+                "Ordered-NFA digest layout is inconsistent"
+            ))
+        ));
         let mut shifted = layout;
         let PreparedEntryKind::OrderedNfa(mut ordered) = shifted.kind else {
             panic!("digest fixture lost Ordered-NFA layout");
@@ -71375,6 +81659,77 @@ mod tests {
                 "V2 retained a data relocation on {target:?}",
             );
         }
+    }
+
+    #[test]
+    fn aarch64_ordered_nfa_terminal_asimd_requires_the_target_feature() {
+        const PATTERN: &str =
+            r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x01-\x08])\b";
+        let scalar_target = Target::aarch64_linux();
+        assert_eq!(scalar_target.features, FeatureSet::EMPTY);
+        let asimd_target = scalar_target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("ASIMD target");
+        let compile_target = |target| {
+            let request = CompileRequest::new(PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                });
+            let mut slow_limits = SlowAotLimits::default();
+            slow_limits.determinize.max_states = 0;
+            slow_limits.determinize.max_transitions = 0;
+            slow_limits.determinize.max_work = 0;
+            crate::compile_with_slow_aot_limits(request, slow_limits)
+                .expect("sparse-terminal Ordered-NFA fixture")
+        };
+        let scalar = compile_target(scalar_target);
+        let asimd = compile_target(asimd_target);
+        for compiled in [&scalar, &asimd] {
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert!(compiled.module().has_ordered_nfa_terminal_range_object());
+            assert!(!compiled.module().has_ordered_nfa_start_prefix_vector());
+        }
+
+        let text_words = |compiled: &CompiledRegex| {
+            compiled.module().sections()[TEXT_SECTION]
+                .data
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let scalar_words = text_words(&scalar);
+        let asimd_words = text_words(&asimd);
+        let terminal_asimd_words = [
+            aarch64_ld1_four_16b(24, 12).unwrap(),
+            aarch64_load_q(24, 12).unwrap(),
+            aarch64_cmhs_16b(5, 24, 16).unwrap(),
+            aarch64_and_16b(5, 5, 6).unwrap(),
+            aarch64_umaxv_16b(7, 24).unwrap(),
+            0x4e18_3f0c, // umov x12, v24.d[1]
+            0x4e08_3f0c, // umov x12, v24.d[0]
+        ];
+        assert!(terminal_asimd_words
+            .iter()
+            .all(|instruction| !scalar_words.contains(instruction)));
+        assert!(terminal_asimd_words
+            .iter()
+            .all(|instruction| asimd_words.contains(instruction)));
+        assert!(
+            asimd.module().sections()[TEXT_SECTION].data.len()
+                > scalar.module().sections()[TEXT_SECTION].data.len(),
+            "the ASIMD target must retain the additive terminal scanner",
+        );
+        assert_eq!(
+            scalar.module().sections()[PROGRAM_SECTION].data,
+            asimd.module().sections()[PROGRAM_SECTION].data,
+            "target feature selection must not alter the retained Ordered-NFA graph",
+        );
     }
 
     #[test]
@@ -72541,35 +82896,305 @@ mod tests {
         );
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the test decoder checks already-bounded generated branch immediates",
+    )]
+    fn x86_required_reducer_branch_target(
+        code: &[u8],
+        instruction: usize,
+    ) -> (Option<u8>, usize, usize) {
+        let opcode = code[instruction];
+        let (condition, displacement, end) = match opcode {
+            0xeb | 0x70..=0x7f => (
+                (opcode != 0xeb).then_some(opcode & 0x0f),
+                isize::from(i8::from_le_bytes([code[instruction + 1]])),
+                instruction + 2,
+            ),
+            0xe9 => (
+                None,
+                isize::try_from(i32::from_le_bytes(
+                    code[instruction + 1..instruction + 5]
+                        .try_into()
+                        .expect("x86 rel32 branch"),
+                ))
+                .expect("x86 rel32 fits isize"),
+                instruction + 5,
+            ),
+            0x0f if matches!(code[instruction + 1], 0x80..=0x8f) => (
+                Some(code[instruction + 1] & 0x0f),
+                isize::try_from(i32::from_le_bytes(
+                    code[instruction + 2..instruction + 6]
+                        .try_into()
+                        .expect("x86 conditional rel32 branch"),
+                ))
+                .expect("x86 conditional rel32 fits isize"),
+                instruction + 6,
+            ),
+            _ => panic!("unexpected x86 branch opcode {opcode:#x} at {instruction}"),
+        };
+        let target = end
+            .checked_add_signed(displacement)
+            .expect("x86 generated branch target");
+        assert!(target < code.len(), "x86 branch target escapes reducer");
+        (condition, target, end)
+    }
+
+    fn x86_required_ordered_nfa_reducer_is_closed(
+        wrapper: &NativePreparedBulkWrapper,
+        grep_count: bool,
+    ) {
+        let gate = wrapper
+            .ordered_nfa_gate_call_offset
+            .expect("required x86 Ordered-NFA gate call");
+        let Some(NativePreparedIdentityRelocation::X86PcRelative32(identity)) =
+            wrapper.identity_relocation
+        else {
+            panic!("required x86 reducer identity relocation");
+        };
+        assert!(gate < identity);
+        assert!(identity < wrapper.prepared_call_offset);
+        assert_eq!(wrapper.bulk_runtime_fallback_offset, None);
+        assert_eq!(wrapper.compatibility_identity_relocation, None);
+
+        let mut cursor = wrapper
+            .prepared_call_offset
+            .checked_add(4)
+            .expect("x86 private call extent");
+        let terminal = if grep_count {
+            assert_eq!(
+                wrapper.code.get(cursor..cursor + 3),
+                Some([0x83, 0xf8, 0x01].as_slice()),
+            );
+            cursor += 3;
+            let (condition, _, end) = x86_required_reducer_branch_target(&wrapper.code, cursor);
+            assert_eq!(condition, Some(4), "status one must enter matched-line");
+            cursor = end;
+            assert_eq!(
+                wrapper.code.get(cursor..cursor + 2),
+                Some([0x85, 0xc0].as_slice()),
+            );
+            cursor += 2;
+            let (condition, _, end) = x86_required_reducer_branch_target(&wrapper.code, cursor);
+            assert_eq!(condition, Some(4), "status zero must complete the line");
+            let (condition, target, _) = x86_required_reducer_branch_target(&wrapper.code, end);
+            assert_eq!(condition, None, "every other private status is terminal");
+            target
+        } else {
+            assert_eq!(
+                wrapper.code.get(cursor..cursor + 2),
+                Some([0x85, 0xc0].as_slice()),
+            );
+            cursor += 2;
+            let (condition, _, end) = x86_required_reducer_branch_target(&wrapper.code, cursor);
+            assert_eq!(condition, Some(4), "status zero must finish the reduction");
+            cursor = end;
+            assert_eq!(
+                wrapper.code.get(cursor..cursor + 3),
+                Some([0x83, 0xf8, 0x01].as_slice()),
+            );
+            cursor += 3;
+            let (condition, target, end) =
+                x86_required_reducer_branch_target(&wrapper.code, cursor);
+            match condition {
+                // The assembler may retain JE matched + JMP error or invert
+                // the pair to JNE error with matched as fallthrough.
+                Some(4) => {
+                    let (jump_condition, error, _) =
+                        x86_required_reducer_branch_target(&wrapper.code, end);
+                    assert_eq!(jump_condition, None);
+                    error
+                }
+                Some(5) => target,
+                other => panic!("unexpected x86 private-status condition {other:?}"),
+            }
+        };
+        let frame = if grep_count { 48_u8 } else { 64_u8 };
+        let expected: [u8; 14] = [
+            0x48, 0x83, 0xc4, frame, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5b,
+            0xc3,
+        ];
+        assert_eq!(
+            wrapper.code.get(terminal..terminal + expected.len()),
+            Some(expected.as_slice()),
+            "a non-Boolean private status must reach the epilogue unchanged",
+        );
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the test decoder checks one bounded AArch64 branch immediate",
+    )]
+    fn aarch64_test_branch_target(
+        code: &[u8],
+        instruction: usize,
+    ) -> (Option<u8>, usize) {
+        let word = u32::from_le_bytes(
+            code[instruction..instruction + 4]
+                .try_into()
+                .expect("AArch64 branch instruction"),
+        );
+        let (condition, signed) = if word & 0xfc00_0000 == 0x1400_0000 {
+            let immediate =
+                i32::try_from(word & 0x03ff_ffff).expect("AArch64 B immediate");
+            (None, (immediate << 6) >> 6)
+        } else {
+            assert_eq!(
+                word & 0xff00_0010,
+                0x5400_0000,
+                "AArch64 B.cond expected",
+            );
+            let immediate =
+                i32::try_from((word >> 5) & 0x0007_ffff).expect("AArch64 B.cond immediate");
+            (
+                Some(u8::try_from(word & 0x0f).expect("AArch64 condition")),
+                (immediate << 13) >> 13,
+            )
+        };
+        let target = instruction
+            .checked_add_signed(
+                isize::try_from(signed)
+                    .expect("AArch64 branch immediate fits isize")
+                    .checked_mul(4)
+                    .expect("AArch64 branch byte displacement"),
+            )
+            .expect("AArch64 generated branch target");
+        assert!(target < code.len(), "AArch64 branch target escapes reducer");
+        (condition, target)
+    }
+
+    fn aarch64_required_ordered_nfa_reducer_is_closed(
+        wrapper: &NativePreparedBulkWrapper,
+        grep_count: bool,
+        terminal_exact_set: bool,
+    ) {
+        let gate = wrapper
+            .ordered_nfa_gate_call_offset
+            .expect("required AArch64 Ordered-NFA gate call");
+        let Some(NativePreparedIdentityRelocation::Aarch64Page21PageOff12 {
+            page,
+            page_offset,
+        }) = wrapper.identity_relocation
+        else {
+            panic!("required AArch64 reducer identity relocation");
+        };
+        assert!(gate < page);
+        assert!(page <= page_offset);
+        assert!(page_offset < wrapper.prepared_call_offset);
+        assert_eq!(wrapper.bulk_runtime_fallback_offset, None);
+        assert_eq!(wrapper.compatibility_identity_relocation, None);
+
+        let private_status_branch = wrapper
+            .prepared_call_offset
+            .checked_add(if grep_count { 16 } else { 12 })
+            .expect("AArch64 private status branch");
+        let (condition, target) =
+            aarch64_test_branch_target(&wrapper.code, private_status_branch);
+        let terminal = if grep_count {
+            assert_eq!(condition, None, "every other private status is terminal");
+            target
+        } else {
+            match condition {
+                // The assembler may retain B.EQ matched + B error or invert
+                // the pair to B.NE error with matched as fallthrough.
+                Some(AARCH64_EQ) => {
+                    let (jump_condition, error) = aarch64_test_branch_target(
+                        &wrapper.code,
+                        private_status_branch + 4,
+                    );
+                    assert_eq!(jump_condition, None);
+                    error
+                }
+                Some(AARCH64_NE) => target,
+                other => panic!("unexpected AArch64 private-status condition {other:?}"),
+            }
+        };
+        let expected = if grep_count {
+            vec![
+                aarch64_load_pair_x(19, 20, 31, 16).unwrap(),
+                aarch64_load_pair_x(21, 22, 31, 32).unwrap(),
+                aarch64_load_pair_x(23, 24, 31, 48).unwrap(),
+                aarch64_load_pair_x(25, 26, 31, 64).unwrap(),
+                aarch64_load_pair_x(27, 28, 31, 80).unwrap(),
+                aarch64_load_pair_x(29, 30, 31, 96).unwrap(),
+                aarch64_add_x_imm(31, 31, 128).unwrap(),
+                0xd65f_03c0,
+            ]
+        } else {
+            vec![
+                aarch64_load_pair_x(19, 20, 31, 16).unwrap(),
+                aarch64_load_pair_x(21, 22, 31, 32).unwrap(),
+                aarch64_load_pair_x(23, 24, 31, 48).unwrap(),
+                aarch64_load_pair_x(25, 26, 31, 64).unwrap(),
+                aarch64_load_pair_x(29, 30, 31, 80).unwrap(),
+                aarch64_add_x_imm(
+                    31,
+                    31,
+                    if terminal_exact_set { 128 } else { 112 },
+                )
+                .unwrap(),
+                0xd65f_03c0,
+            ]
+        };
+        let actual = wrapper.code[terminal..]
+            .chunks_exact(4)
+            .take(expected.len())
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual, expected,
+            "a non-Boolean private status must reach the epilogue unchanged",
+        );
+    }
+
     #[test]
     fn required_ordered_nfa_scalar_gate_has_no_compatibility_edge_cross_isa() {
         for sink in [PreparedSpanSink::Count, PreparedSpanSink::SpanSum] {
-            let x86 = lower_x86_64_required_ordered_nfa_span_reduce(sink, None)
+            for terminal_exact_set in [None, Some([0x8000_0000_0000_0001; 4])] {
+                let x86 = lower_x86_64_required_ordered_nfa_span_reduce(
+                    sink,
+                    terminal_exact_set,
+                )
                 .expect("x86 required Ordered-NFA scalar reducer");
-            assert!(x86.ordered_nfa_gate_call_offset.is_some());
-            assert_eq!(x86.bulk_runtime_fallback_offset, None);
-            assert_eq!(x86.compatibility_identity_relocation, None);
-            assert!(x86.identity_relocation.is_some());
-            assert!(x86.code.windows(6).any(|window| {
-                window == [0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3]
-            }));
+                x86_required_ordered_nfa_reducer_is_closed(&x86, false);
+                assert!(x86.code.windows(6).any(|window| {
+                    window == [0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3]
+                }));
 
-            let aarch64 = lower_aarch64_required_ordered_nfa_span_reduce(sink, None)
+                let aarch64 = lower_aarch64_required_ordered_nfa_span_reduce(
+                    sink,
+                    terminal_exact_set,
+                )
                 .expect("AArch64 required Ordered-NFA scalar reducer");
-            assert!(aarch64.ordered_nfa_gate_call_offset.is_some());
-            assert_eq!(aarch64.bulk_runtime_fallback_offset, None);
-            assert_eq!(aarch64.compatibility_identity_relocation, None);
-            assert!(aarch64.identity_relocation.is_some());
-            let status_three = aarch64_movz_w(0, 3)
-                .expect("AArch64 status-three instruction")
-                .to_le_bytes();
-            assert!(
-                aarch64
-                    .code
-                    .windows(status_three.len())
-                    .any(|window| window == status_three),
-            );
+                aarch64_required_ordered_nfa_reducer_is_closed(
+                    &aarch64,
+                    false,
+                    terminal_exact_set.is_some(),
+                );
+                let status_three = aarch64_movz_w(0, 3)
+                    .expect("AArch64 status-three instruction")
+                    .to_le_bytes();
+                assert!(
+                    aarch64
+                        .code
+                        .windows(status_three.len())
+                        .any(|window| window == status_three),
+                );
+            }
         }
+
+        let x86_grep = lower_x86_64_prepared_grep_count(
+            NativeSpanReducerCallKind::PreparedPrivate,
+            true,
+        )
+        .expect("x86 required Ordered-NFA GrepCount reducer");
+        x86_required_ordered_nfa_reducer_is_closed(&x86_grep, true);
+        let aarch64_grep = lower_aarch64_prepared_grep_count(
+            NativeSpanReducerCallKind::PreparedPrivate,
+            true,
+        )
+        .expect("AArch64 required Ordered-NFA GrepCount reducer");
+        aarch64_required_ordered_nfa_reducer_is_closed(&aarch64_grep, true, false);
     }
 
     #[test]
@@ -74611,6 +85236,8 @@ mod tests {
                 .map_or(0, |filter| filter.guaranteed_bytes),
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         })
     }
 
@@ -75005,6 +85632,8 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -75256,6 +85885,8 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             },
             LinkedHybridSparseNativeFixture {
                 byte_cells,
@@ -75426,6 +86057,8 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -75580,6 +86213,8 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             },
             LinkedSparseNativeFixture {
                 byte_cells,
@@ -77248,20 +87883,30 @@ mod tests {
             .ordered_finite_language_aot
             .expect("early finite receipt")
             .native_data_bytes;
+        let bounded_limit = finite_bytes
+            .checked_sub(1)
+            .expect("finite image is nonempty");
+        // The cap excludes the initially preferred layout, but the portfolio
+        // now retains a smaller authenticated layout for the same finite
+        // language. Resource fallback must compare that alternative before
+        // returning to the complete semantic DFA.
         let bounded = crate::compile_with_slow_aot_limits(
             CompileRequest::new(variable_pattern, Target::x86_64_linux())
                 .mode(CompileMode::Optimizing)
                 .output(OutputContract::Span),
             SlowAotLimits {
-                max_native_data_bytes: finite_bytes
-                    .checked_sub(1)
-                    .expect("finite image is nonempty"),
+                max_native_data_bytes: bounded_limit,
                 ..SlowAotLimits::default()
             },
         )
-        .expect("finite data decline preserves complete semantic DFA");
+        .expect("bounded finite portfolio preserves the complete semantic DFA");
         assert_eq!(bounded.receipt().engine, EngineKind::OrderedDfa);
-        assert!(bounded.receipt().ordered_finite_language_aot.is_none());
+        let bounded_finite = bounded
+            .receipt()
+            .ordered_finite_language_aot
+            .expect("the smaller finite layout fits after the incumbent layout is capped");
+        assert!(bounded_finite.native_data_bytes < finite_bytes);
+        assert!(bounded_finite.native_data_bytes <= bounded_limit);
         assert!(bounded.module().required_runtime_symbol().is_none());
     }
 
@@ -78266,6 +88911,16 @@ mod tests {
                     // while no-row products use it only through the faster
                     // portable exact-product route.
                     let direct = compiled.module().start_accelerator() != StartAccelerator::None;
+                    // A scanner-free Span keeps the ordinary runtime adapter
+                    // authoritative while publishing the native Ordered-NFA
+                    // V15 prepared surface. The exact-product route has
+                    // priority over the endpoint-oracle portfolio, so these
+                    // fixtures must never compose an endpoint oracle too.
+                    let ordered_nfa_v15 = compiled.module().required_prepare_capabilities()
+                        == PREPARED_CAPABILITY_ORDERED_NFA_V15;
+                    assert_eq!(ordered_nfa_v15, !direct && output == OutputContract::Span);
+                    assert!(!compiled.module().has_bit_parallel_endpoint_oracle());
+                    let native_instruction_selection = direct || ordered_nfa_v15;
                     assert_eq!(compiled.receipt().runtime_helper_required, !direct);
                     assert_eq!(compiled.module().required_runtime_symbol().is_some(), !direct);
                     assert_eq!(compiled.module().required_runtime_program().is_some(), !direct);
@@ -78274,7 +88929,8 @@ mod tests {
                             .receipt()
                             .passes
                             .contains(&crate::OptimizationPass::TargetInstructionSelection),
-                        direct
+                        native_instruction_selection,
+                        "a runtime-backed Span may still own the native Ordered-NFA V15 surface"
                     );
                     assert_eq!(
                         compiled
@@ -78489,6 +89145,261 @@ mod tests {
                 >= 2,
             "the ASIMD batch must load both primary and secondary columns"
         );
+    }
+
+    #[test]
+    fn residual_prefix_asimd_batch_rejects_only_and_replays_the_incumbent() {
+        fn direct_branch_target(words: &[u32], instruction: usize) -> Option<usize> {
+            let word = *words.get(instruction)?;
+            if word & 0xfc00_0000 != 0x1400_0000 {
+                return None;
+            }
+            let immediate = i64::from(word & 0x03ff_ffff);
+            let signed = if immediate & (1_i64 << 25) != 0 {
+                immediate - (1_i64 << 26)
+            } else {
+                immediate
+            };
+            usize::try_from(i64::try_from(instruction).ok()?.checked_add(signed)?).ok()
+        }
+
+        // A generated, identity-independent finite shape: a long exact
+        // prefix plus variable-width exact leaves. The graph can select
+        // several necessary byte columns, but no fixed-width exact-product
+        // proof permits the batch to publish a candidate.
+        let pattern = "source_derived_shared_prefix_(?:alpha|bravo|charlie|delta)";
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile residual-prefix ASIMD probe");
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedDfa);
+        let (_, layout) = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().expect("native DFA view"),
+            Architecture::Aarch64,
+        )
+        .unwrap();
+        assert!(layout.has_prefix_guard());
+        assert_eq!(layout.exact_prefix_match_width, None);
+        assert!(layout.prefix_relation.is_none());
+        let primary = layout.start_filter.expect("rare primary column");
+        assert!(use_aarch64_filter_batch(primary));
+        let vector = layout.vector_filter.expect("graph-selected conjunction");
+        assert!(vector.columns().len() >= 2);
+        let coverage = derive_native_vector_guard_coverage(layout, false, Some(vector))
+            .expect("vector guard coverage");
+        assert!(coverage.has_rejectable_residual(layout).unwrap());
+
+        let emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            layout,
+            FeatureSet::of(CpuFeature::Aarch64Asimd),
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            emission.conjunction,
+            Some(NativeVectorConjunctionEmission {
+                filter: vector,
+                coverage,
+                batch_vectors: 4,
+            })
+        );
+        let words = emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(
+            words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()),
+            "a fully rejected conjunction must advance one 64-byte batch"
+        );
+        assert!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_ld1_four_16b(16, 12).unwrap())
+                .count()
+                >= 2,
+            "the rejection proof must intersect primary and secondary 64-byte masks"
+        );
+
+        let maximum_scan_offset = vector.max_scan_offset();
+        let incumbent_bound = aarch64_cmp_x_imm(
+            12,
+            u16::from(maximum_scan_offset).checked_add(16).unwrap(),
+        )
+        .unwrap();
+        let restore_remaining = aarch64_sub_x_reg(12, 3, 2).unwrap();
+        assert!(
+            words.windows(2).enumerate().any(|(index, pair)| {
+                pair[0] == restore_remaining
+                    && direct_branch_target(&words, index + 1)
+                        .and_then(|target| words.get(target))
+                        .is_some_and(|&word| word == incumbent_bound)
+            }),
+            "a possible batch hit must keep X2, restore X12, and replay the unchanged 16-byte loop"
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes the rejection-only ASIMD batch natively"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the focused native differential keeps fixture generation and execution together"
+    )]
+    fn linked_residual_prefix_asimd_batch_agrees_with_portable_program() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        const PATTERN: &str = "source_derived_shared_prefix_(?:alpha|bravo|charlie|delta)";
+        const LITERALS: [&[u8]; 4] = [
+            b"source_derived_shared_prefix_alpha",
+            b"source_derived_shared_prefix_bravo",
+            b"source_derived_shared_prefix_charlie",
+            b"source_derived_shared_prefix_delta",
+        ];
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let compiled = compile(
+            CompileRequest::new(PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile linked residual-prefix probe");
+        let (_, layout) = build_native_dfa_table_for_architecture(
+            compiled.program().native_dfa_view().expect("native DFA view"),
+            Architecture::Aarch64,
+        )
+        .unwrap();
+        assert_eq!(layout.exact_prefix_match_width, None);
+        let vector = layout.vector_filter.expect("graph-selected conjunction");
+        let coverage = derive_native_vector_guard_coverage(layout, false, Some(vector))
+            .expect("vector guard coverage");
+        assert!(coverage.has_rejectable_residual(layout).unwrap());
+        let emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            layout,
+            FeatureSet::of(CpuFeature::Aarch64Asimd),
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        assert_eq!(emission.conjunction.unwrap().batch_vectors, 4);
+
+        let mut fixtures = vec![vec![b'x'; 384], {
+            let mut decoys = Vec::new();
+            for _ in 0..12 {
+                decoys.extend_from_slice(b"source_derived_shared_prefix_omega");
+            }
+            decoys
+        }];
+        for (index, offset) in [
+            0_usize, 15, 16, 47, 63, 64, 65, 127, 128, 191, 192, 255, 256, 320,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let literal = LITERALS[index % LITERALS.len()];
+            let mut haystack = vec![b'x'; 384];
+            haystack[offset..offset + literal.len()].copy_from_slice(literal);
+            fixtures.push(haystack);
+        }
+        let mut false_then_match = vec![b'x'; 384];
+        false_then_match[0..34].copy_from_slice(b"source_derived_shared_prefix_omega");
+        false_then_match[63..97].copy_from_slice(b"source_derived_shared_prefix_omega");
+        false_then_match[128..LITERALS[2].len() + 128].copy_from_slice(LITERALS[2]);
+        fixtures.push(false_then_match);
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-asimd-residual-reject-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let object = directory.join("residual.o");
+        fs::write(&object, compiled.object()).unwrap();
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n",
+        );
+        let symbol = compiled.module().entry_symbol();
+        writeln!(
+            source,
+            "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+        )
+        .unwrap();
+        for (fixture, haystack) in fixtures.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{fixture}[]={{{bytes}}};").unwrap();
+            let mut windows = Vec::new();
+            for start in 0..=haystack.len() {
+                windows.push((start, haystack.len()));
+            }
+            for end in 0..=haystack.len() {
+                windows.push((0, end));
+            }
+            let boundaries = [
+                0_usize, 1, 14, 15, 16, 17, 46, 47, 48, 62, 63, 64, 65, 66, 126, 127,
+                128, 129, 190, 191, 192, 193, 254, 255, 256, 257, 319, 320, 321, 383, 384,
+            ];
+            for &start in &boundaries {
+                for &end in &boundaries {
+                    if start <= end && end <= haystack.len() {
+                        windows.push((start, end));
+                    }
+                }
+            }
+            windows.sort_unstable();
+            windows.dedup();
+            writeln!(source, "static const size_t w{fixture}[][3]={{").unwrap();
+            for (start, end) in windows {
+                let MatchResult::Exists(found) = compiled
+                    .search(haystack, SearchWindow::new(start, end))
+                    .unwrap()
+                else {
+                    panic!("Exists contract returned another result shape");
+                };
+                writeln!(source, "{{{start},{end},{}}},", u8::from(found)).unwrap();
+            }
+            source.push_str("};\n");
+        }
+        source.push_str("int main(void){size_t r[2];uint32_t s;size_t i;\n");
+        for (fixture, haystack) in fixtures.iter().enumerate() {
+            writeln!(
+                source,
+                "for(i=0;i<sizeof(w{fixture})/sizeof(w{fixture}[0]);i++){{r[0]=99;r[1]=99;s={symbol}(h{fixture},{},w{fixture}[i][0],w{fixture}[i][1],r);if(s!=w{fixture}[i][2]||r[0]!=0||r[1]!=0){{fprintf(stderr,\"fixture {fixture} window %zu status %u result %zu %zu\\n\",i,s,r[0],r[1]);return 1;}}}}",
+                haystack.len()
+            )
+            .unwrap();
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("residual.c");
+        let executable = directory.join("residual");
+        fs::write(&c_path, source).unwrap();
+        let status = Command::new("clang")
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let output = Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -84725,7 +95636,7 @@ mod tests {
                 FeatureSet::of(CpuFeature::X86Avx2),
                 StartAccelerator::X86Avx2,
                 4,
-                8,
+                9,
             ),
             (avx512, StartAccelerator::X86Avx512Bw, 4, 0),
         ] {
@@ -85532,7 +96443,7 @@ mod tests {
                 assert_eq!(
                     x86_avx2_identity_guard_cleanup_count(&emission.code),
                     if features.has(CpuFeature::X86Avx2) {
-                        8 - usize::from(output != OutputContract::Exists)
+                        9 - usize::from(output != OutputContract::Exists)
                     } else {
                         0
                     },
@@ -85554,7 +96465,8 @@ mod tests {
                         .iter()
                         .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
                         .count(),
-                    1
+                    2,
+                    "the public search and private frozen-session entry each authenticate the exact root"
                 );
                 assert_eq!(
                     emission
@@ -86115,7 +97027,8 @@ mod tests {
                         .iter()
                         .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
                         .count(),
-                    2
+                    4,
+                    "the public search and private frozen-session entry each use one ADRP/ADD identity pair"
                 );
                 assert_eq!(
                     emission
@@ -86394,18 +97307,26 @@ mod tests {
             output: OutputContract,
         ) {
             let context = format!("{target:?}/{output:?}");
-            let frame_open = aarch64_sub_x_imm(31, 31, 112).unwrap();
-            let frame_close = aarch64_add_x_imm(31, 31, 112).unwrap();
+            let frame_open_instruction = aarch64_sub_x_imm(31, 31, 112).unwrap();
+            let frame_close_instruction = aarch64_add_x_imm(31, 31, 112).unwrap();
             let restore_link = aarch64_load_x_imm(30, 31, 104).unwrap();
             let return_instruction = 0xd65f_03c0;
-            let opens = words
+            let bulk_entry_bytes = emission
+                .bulk_frozen_session_entry_offset
+                .expect("rooted immutable entry has a private frozen session");
+            assert_eq!(bulk_entry_bytes % 4, 0, "{context}: aligned bulk entry");
+            let bulk_entry = bulk_entry_bytes / 4;
+            let (public_words, private_words) = words.split_at(bulk_entry);
+            let opens = public_words
                 .iter()
                 .enumerate()
-                .filter_map(|(index, &word)| (word == frame_open).then_some(index))
+                .filter_map(|(index, &word)| {
+                    (word == frame_open_instruction).then_some(index)
+                })
                 .collect::<Vec<_>>();
-            assert_eq!(opens.len(), 1, "{context}: one frame allocation");
-            let frame_open = opens[0];
-            let frozen_guard = words
+            assert_eq!(opens.len(), 1, "{context}: one public frame allocation");
+            let public_frame_open = opens[0];
+            let frozen_guard = public_words
                 .iter()
                 .enumerate()
                 .filter_map(|(index, &word)| {
@@ -86428,25 +97349,36 @@ mod tests {
                 PREPARED_FALLBACK_RUNTIME_SYMBOL,
                 &context,
             );
-            assert_eq!(words[deopt] & 0xfc00_0000, 0x1400_0000, "{context}");
-            assert_eq!(words[fallback] & 0xfc00_0000, 0x1400_0000, "{context}");
+            assert_eq!(
+                public_words[deopt] & 0xfc00_0000,
+                0x1400_0000,
+                "{context}"
+            );
+            assert_eq!(
+                public_words[fallback] & 0xfc00_0000,
+                0x1400_0000,
+                "{context}"
+            );
 
             let mut ordinary_returns = 0;
             let mut frozen_fallbacks = 0;
             let mut adaptive_deopts = 0;
-            for (close, _) in words
+            for (close, _) in public_words
                 .iter()
                 .enumerate()
-                .filter(|&(_, &word)| word == frame_close)
+                .filter(|&(_, &word)| word == frame_close_instruction)
             {
-                assert!(frame_open < close, "{context}: close before frame allocation");
+                assert!(
+                    public_frame_open < close,
+                    "{context}: close before frame allocation"
+                );
                 assert_eq!(
-                    words.get(close.wrapping_sub(1)),
+                    public_words.get(close.wrapping_sub(1)),
                     Some(&restore_link),
                     "{context}: frame close without link-register restore"
                 );
                 let terminal = close + 1;
-                if words.get(terminal) == Some(&return_instruction) {
+                if public_words.get(terminal) == Some(&return_instruction) {
                     assert!(
                         close < frozen_guard,
                         "{context}: ordinary return follows the frozen fallback"
@@ -86458,7 +97390,7 @@ mod tests {
                         "{context}: adaptive deopt precedes frozen authentication"
                     );
                     adaptive_deopts += 1;
-                } else if aarch64_unconditional_target(words, terminal) == Some(fallback) {
+                } else if aarch64_unconditional_target(public_words, terminal) == Some(fallback) {
                     assert!(
                         frozen_guard < close,
                         "{context}: frozen fallback precedes its authentication"
@@ -86474,17 +97406,54 @@ mod tests {
                 "{context}: authenticated frozen fallback exit"
             );
             assert_eq!(adaptive_deopts, 1, "{context}: adaptive deopt exit");
-            for (return_index, _) in words
+            for (return_index, _) in public_words
                 .iter()
                 .enumerate()
                 .filter(|&(_, &word)| word == return_instruction)
             {
                 assert_eq!(
-                    words.get(return_index.wrapping_sub(1)),
-                    Some(&frame_close),
+                    public_words.get(return_index.wrapping_sub(1)),
+                    Some(&frame_close_instruction),
                     "{context}: framed return without frame close"
                 );
             }
+
+            // The frozen-session entry is a second caller with the same frame
+            // ABI. Its selected path jumps back into the fully audited public
+            // compact bodies above; its local decline must close exactly one
+            // private frame before re-entering the public entry.
+            assert_eq!(
+                private_words
+                    .iter()
+                    .filter(|&&word| word == frame_open_instruction)
+                    .count(),
+                1,
+                "{context}: one private frozen-session frame allocation"
+            );
+            let private_closes = private_words
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &word)| {
+                    (word == frame_close_instruction).then_some(bulk_entry + index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                private_closes.len(),
+                1,
+                "{context}: one private frozen-session frame close"
+            );
+            let private_close = private_closes[0];
+            assert_eq!(
+                words.get(private_close.wrapping_sub(1)),
+                Some(&restore_link),
+                "{context}: private frame close without link-register restore"
+            );
+            let public_reentry = aarch64_unconditional_target(words, private_close + 1)
+                .expect("private frozen-session fallback branch");
+            assert!(
+                public_reentry < bulk_entry,
+                "{context}: private fallback must re-enter the public entry"
+            );
         }
 
         let filter = dynamic_root_test_filter(b"a", 1);
@@ -86522,7 +97491,7 @@ mod tests {
                 assert_eq!(
                     x86_avx2_identity_guard_cleanup_count(&code),
                     if features.has(CpuFeature::X86Avx2) {
-                        7
+                        8
                     } else {
                         0
                     },
@@ -87099,7 +98068,7 @@ mod tests {
                 assert_eq!(
                     x86_avx2_identity_guard_cleanup_count(&root.code),
                     if features.has(CpuFeature::X86Avx2) {
-                        8 - usize::from(output != OutputContract::Exists)
+                        9 - usize::from(output != OutputContract::Exists)
                     } else {
                         0
                     },
@@ -96079,6 +107048,8 @@ int main(void){{
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                direct_search_trusted_core: None,
+                complete_span_reduce_source: None,
             };
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
@@ -96110,6 +107081,266 @@ int main(void){{
             emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
                 .unwrap_or_else(|error| panic!("large slow object {target:?}: {error}"));
         }
+    }
+
+    #[test]
+    fn complete_span_recipe_scope_is_nested_unwind_safe_and_thread_local() {
+        assert!(!complete_span_reduce_recipe_enabled());
+        with_complete_span_reduce_recipe(|| {
+            assert!(complete_span_reduce_recipe_enabled());
+            with_complete_span_reduce_recipe(|| {
+                assert!(complete_span_reduce_recipe_enabled());
+            });
+            assert!(complete_span_reduce_recipe_enabled());
+            without_complete_span_reduce_recipe(|| {
+                assert!(!complete_span_reduce_recipe_enabled());
+                with_complete_span_reduce_recipe(|| {
+                    assert!(complete_span_reduce_recipe_enabled());
+                });
+                assert!(!complete_span_reduce_recipe_enabled());
+            });
+            assert!(complete_span_reduce_recipe_enabled());
+            let other = std::thread::spawn(complete_span_reduce_recipe_enabled)
+                .join()
+                .expect("recipe policy isolation thread");
+            assert!(!other);
+        });
+        assert!(!complete_span_reduce_recipe_enabled());
+
+        let unwind = std::panic::catch_unwind(|| {
+            with_complete_span_reduce_recipe(|| {
+                assert!(complete_span_reduce_recipe_enabled());
+                panic!("synthetic recipe scope unwind");
+            });
+        });
+        assert!(unwind.is_err());
+        assert!(!complete_span_reduce_recipe_enabled());
+    }
+
+    #[test]
+    fn complete_span_recipe_allocation_is_terminal_end_to_end_and_across_classifiers() {
+        let target = Target::x86_64_linux();
+        let request = || {
+            CompileRequest::new("[ab]+z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let fixture = without_complete_span_reduce_source_allocation_attempt(|| {
+            compile(request())
+        })
+        .expect("ordinary public Span allocation fixture");
+        assert!(!fixture.module().has_complete_span_reduce_source_for_test());
+        let program = fixture.program();
+        let view = program
+            .native_dfa_view()
+            .expect("complete public Span allocation view");
+        assert_eq!(view.output, OutputContract::Span);
+        assert!(view.partial_discovered_states.is_none());
+
+        // The actual public Count entry enables the recipe for the full
+        // compile-and-append transaction. The fail-once seam must escape
+        // exactly, without a second recipe attempt or a later fallback.
+        let public_count = with_complete_span_reduce_source_allocation_failure(|| {
+            crate::compile_with_prepared_aggregate_exports(
+                request(),
+                PreparedAggregateExports::COUNT,
+            )
+        });
+        assert!(matches!(
+            public_count,
+            Err(CompileError::Object(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            ))),
+        ));
+
+        // Every excluded public operation retains ce964 allocation behavior.
+        for exports in [
+            PreparedAggregateExports::SPAN_SUM,
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM),
+        ] {
+            let excluded = without_complete_span_reduce_source_allocation_attempt(|| {
+                crate::compile_with_prepared_aggregate_exports(request(), exports)
+            })
+            .expect("excluded aggregate must not allocate a complete recipe");
+            assert!(!excluded.module().uses_complete_span_reduce_aggregate());
+            assert!(!excluded.module().has_complete_span_reduce_source_for_test());
+        }
+        let exact_singleton = without_complete_span_reduce_source_allocation_attempt(|| {
+            crate::compile_with_prepared_aggregate_exports(
+                CompileRequest::new("abc", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::COUNT,
+            )
+        })
+        .expect("exact singleton must retain its incumbent allocation behavior");
+        assert!(!exact_singleton
+            .module()
+            .has_complete_span_reduce_source_for_test());
+
+        let low_level = without_complete_span_reduce_source_allocation_attempt(|| {
+            CompiledModule::lower_optimizing(program, target)
+        })
+        .expect("unscoped low-level lowering");
+        assert_eq!(&low_level, fixture.module());
+        assert!(!low_level.has_complete_span_reduce_source_for_test());
+
+        let ordinary = with_complete_span_reduce_source_allocation_failure(|| {
+            with_complete_span_reduce_recipe(|| CompiledModule::lower(program, target))
+        });
+        assert!(matches!(
+            ordinary,
+            Err(CompileError::Object(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            ))),
+        ));
+
+        let optimizing = with_complete_span_reduce_source_allocation_failure(|| {
+            with_complete_span_reduce_recipe(|| {
+                CompiledModule::lower_optimizing(program, target)
+            })
+        });
+        assert!(matches!(
+            optimizing,
+            Err(CompileError::Object(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            ))),
+        ));
+
+        let optional = with_complete_span_reduce_source_allocation_failure(|| {
+            with_complete_span_reduce_recipe(|| {
+                lower_optional_native_dfa_with_data_limit(view, target, usize::MAX)
+            })
+        });
+        assert!(matches!(
+            optional,
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+
+        // This is the former `unwrap_or(None)` path. If it swallowed the
+        // injected selected-recipe failure, the native owner would be removed
+        // and the generic fallback transaction below would allocate and
+        // succeed. It must instead return the exact failure immediately.
+        let serialized = program.serialize().expect("serialize allocation fixture");
+        let materialized = with_complete_span_reduce_source_allocation_failure(|| {
+            with_complete_span_reduce_recipe(|| {
+                CompiledModule::lower_serialized(
+                    serialized,
+                    Some(view),
+                    true,
+                    program.native_context_program_view(),
+                    program.native_bit_parallel_exists_view(),
+                    program.native_bit_parallel_endpoint_oracle_view(),
+                    program.native_partial_dfa_view(),
+                    program.native_dynamic_rows_view(),
+                    None,
+                    target,
+                )
+            })
+        });
+        assert!(matches!(
+            materialized,
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+
+        let source_failure = || {
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE,
+            ))
+        };
+        assert!(matches!(
+            optional_native_lowering_outcome(source_failure()),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            measured_native_dfa_outcome(source_failure(), false, usize::MAX),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            legacy_fixed_k0_lowering_outcome(source_failure()),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            compiler_k0_lowering_error(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE,
+            )),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            materialized_native_fallback_outcome(source_failure()),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            exact_finite_teddy_incumbent_outcome(source_failure(), usize::MAX),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+        assert!(matches!(
+            slow_partial_prepared_outcome(Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE,
+            ))),
+            Err(ObjectError::Allocation(
+                COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+            )),
+        ));
+
+        // Preserve the established optional policy for every older allocation
+        // site; only the newly required selected-layout receipt is terminal.
+        assert!(matches!(
+            optional_native_lowering_outcome(Err(ObjectError::Allocation(
+                "synthetic optional native allocation",
+            ))),
+            Ok(None),
+        ));
+        assert!(matches!(
+            materialized_native_fallback_outcome(Err(ObjectError::Allocation(
+                "synthetic materialized fallback allocation",
+            ))),
+            Ok(None),
+        ));
+        assert!(matches!(
+            measured_native_dfa_outcome(
+                Err(ObjectError::Allocation(
+                    "synthetic measured native allocation",
+                )),
+                false,
+                usize::MAX,
+            ),
+            Ok(MeasuredNativeDfaOutcome::AllocationFailure),
+        ));
+        let legacy = legacy_fixed_k0_lowering_outcome(Err(ObjectError::Allocation(
+            "synthetic legacy K0 allocation",
+        )))
+        .expect("legacy K0 allocation classification");
+        assert!(legacy.lowering.is_none());
+        assert!(!legacy.may_continue_compilation);
+        let compiler = compiler_k0_lowering_error(ObjectError::Allocation(
+            "synthetic compiler K0 allocation",
+        ))
+        .expect("compiler K0 allocation classification");
+        assert!(compiler.lowering.is_none());
+        assert!(!compiler.may_continue_compilation);
+        assert!(matches!(
+            slow_partial_prepared_outcome(Err(ObjectError::Allocation(
+                "synthetic prepared native allocation",
+            ))),
+            Ok(SlowPartialPreparedOutcome::AllocationFailure),
+        ));
     }
 
     #[test]
@@ -96614,17 +107845,21 @@ int main(void){{
                 module.required_prepared_fallback_runtime_symbol(),
                 Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
             );
+            // The static prefix now owns the eager authenticated V1
+            // preflight/recovery pair. Its ordinary holes still enter the
+            // persistent prepared fallback asserted above, while the older
+            // lazy V3 recovery must not coexist with this selected route.
             assert_eq!(
                 module.required_prepared_preflight_runtime_symbol(),
-                None
+                Some(SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME)
             );
             assert_eq!(
                 module.required_prepared_span_recovery_runtime_symbol(),
-                None
+                Some(SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME)
             );
             assert_eq!(
                 module.required_prepared_lazy_static_prefix_span_recovery_runtime_symbol(),
-                Some(SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+                None
             );
             assert!(module.sections()[PROGRAM_SECTION]
                 .bytes()
@@ -97385,7 +108620,17 @@ int main(void){{
                 assert_eq!(fallback_module.anchored_prefix_filter_bytes(), 0);
                 assert_eq!(
                     fallback_module.symbols().len(),
-                    if retains_continuation_tail { 15 } else { 11 }
+                    (if retains_continuation_tail { 15 } else { 11 })
+                        + usize::from(output != OutputContract::SelectedEnd),
+                    "the stable prepared layout plus its contract-specific frozen bulk export"
+                );
+                assert_eq!(
+                    fallback_module.prepared_exists_batch_symbol().is_some(),
+                    output == OutputContract::Exists
+                );
+                assert_eq!(
+                    fallback_module.prepared_span_fill_symbol().is_some(),
+                    output == OutputContract::Span
                 );
                 assert_eq!(
                     fallback_module.symbols()[PARTIAL_NATIVE_CORE_SYMBOL].section,
@@ -112998,6 +124243,10 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_entry_symbol_index: Some(PREPARED_ENTRY_SYMBOL),
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
+                direct_exists_batch_symbol_index: None,
+                native_direct_search_trusted_core: None,
+                native_complete_span_reduce_source: None,
+                native_complete_span_reduce_core: None,
                 prepared_count_symbol_index: None,
                 prepared_span_sum_symbol_index: None,
                 prepared_grep_count_symbol_index: None,
@@ -113007,6 +124256,10 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 ordered_nfa_bulk_gate_target: None,
                 prepared_aggregate_exports: PreparedAggregateExports::NONE,
                 prepared_aggregate_strategy: None,
+                prepared_count_authenticated_body_offset: None,
+                prepared_span_sum_authenticated_body_offset: None,
+                direct_exact_singleton_count_aot_report: None,
+                direct_exact_singleton_span_sum_aot_report: None,
                 runtime_symbol_index: None,
                 runtime_program_symbol_index: None,
                 start_accelerator: StartAccelerator::None,
@@ -113017,6 +124270,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 exact_finite_exists_leaf_report: None,
                 exact_finite_selected_end_teddy_aot_report: None,
                 exact_finite_selected_end_teddy_aot_report_v2: None,
+                exact_finite_selected_end_grep_count_aot_report: None,
                 ordered_finite_language_aot_report: None,
                 slow_retained_forward_minimized: false,
                 optimizing_fallbacks_may_continue: true,
@@ -113026,6 +124280,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 exact_pair_suffix_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
                 ordered_nfa_start_prefix_lowered: false,
+                ordered_nfa_start_prefix_vector_lowered: false,
                 ordered_nfa_terminal_exact_set_lowered: None,
                 ordered_nfa_whole_window_width_gate_lowered: false,
             };
@@ -113326,6 +124581,10 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_entry_symbol_index: None,
             prepared_span_fill_symbol_index: None,
             prepared_exists_batch_symbol_index: None,
+            direct_exists_batch_symbol_index: None,
+            native_direct_search_trusted_core: None,
+            native_complete_span_reduce_source: None,
+            native_complete_span_reduce_core: None,
             prepared_count_symbol_index: None,
             prepared_span_sum_symbol_index: None,
             prepared_grep_count_symbol_index: None,
@@ -113335,6 +124594,10 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             ordered_nfa_bulk_gate_target: None,
             prepared_aggregate_exports: PreparedAggregateExports::NONE,
             prepared_aggregate_strategy: None,
+            prepared_count_authenticated_body_offset: None,
+            prepared_span_sum_authenticated_body_offset: None,
+            direct_exact_singleton_count_aot_report: None,
+            direct_exact_singleton_span_sum_aot_report: None,
             runtime_symbol_index: None,
             runtime_program_symbol_index: None,
             start_accelerator: StartAccelerator::None,
@@ -113345,6 +124608,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             exact_finite_exists_leaf_report: None,
             exact_finite_selected_end_teddy_aot_report: None,
             exact_finite_selected_end_teddy_aot_report_v2: None,
+            exact_finite_selected_end_grep_count_aot_report: None,
             ordered_finite_language_aot_report: None,
             slow_retained_forward_minimized: false,
             optimizing_fallbacks_may_continue: true,
@@ -113354,6 +124618,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             exact_pair_suffix_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
             ordered_nfa_start_prefix_lowered: false,
+            ordered_nfa_start_prefix_vector_lowered: false,
             ordered_nfa_terminal_exact_set_lowered: None,
             ordered_nfa_whole_window_width_gate_lowered: false,
         };
@@ -115860,7 +127125,23 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .unwrap();
         assert!(frame_position < flag_position);
         assert!(flag_position < minimum_position);
-        assert_eq!(words.iter().filter(|&&word| word == arm_minimum).count(), 1);
+        assert_eq!(
+            words[..=minimum_position]
+                .iter()
+                .filter(|&&word| word == arm_minimum)
+                .count(),
+            1,
+            "the V12 crossover owns the first minimum-width comparison; later compact bodies may encode the same instruction"
+        );
+        assert_eq!(
+            words
+                .get(minimum_position + 1)
+                .copied()
+                .expect("V12 minimum-width conditional crossover edge")
+                & 0xff00_001f,
+            0x5400_0000 | u32::from(AARCH64_LO),
+            "the V12 minimum-width comparison must retain its conditional crossover edge"
+        );
     }
 
     #[test]
@@ -116059,7 +127340,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 );
                 assert_eq!(
                     byte_occurrences(&emission.code, &x86_v12_flag),
-                    1,
+                    1 + usize::from(root.is_some()),
                     "x86 {context}: exact V12 flag selector"
                 );
                 assert_eq!(
@@ -116237,7 +127518,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 );
                 assert_eq!(
                     word_occurrences(&words, &arm_v12_flag),
-                    1,
+                    1 + usize::from(root.is_some()),
                     "AArch64 {context}: exact V12 flag selector"
                 );
                 assert_eq!(
@@ -120953,6 +132234,28 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(aarch64_sve_ld1b_vl(7, 12, 3).unwrap(), 0xa403_a187);
         assert_eq!(aarch64_sve_ld1b_predicated(24, 1, 6).unwrap(), 0xa400_a4d8);
         assert_eq!(aarch64_sve_ld1rqb(16, 12).unwrap(), 0xa400_2190);
+        assert_eq!(
+            (0_u8..8)
+                .map(|table| {
+                    aarch64_sve_ld1rqb_imm(16 + table, 12, i16::from(table) * 16).unwrap()
+                })
+                .collect::<Vec<_>>(),
+            [
+                0xa400_2190,
+                0xa401_2191,
+                0xa402_2192,
+                0xa403_2193,
+                0xa404_2194,
+                0xa405_2195,
+                0xa406_2196,
+                0xa407_2197,
+            ],
+        );
+        assert_eq!(aarch64_sve_ld1rqb_imm(24, 12, -16).unwrap(), 0xa40f_2198);
+        assert_eq!(aarch64_sve_ld1rqb_imm(24, 12, -128).unwrap(), 0xa408_2198);
+        for invalid in [-144_i16, -127, -1, 1, 15, 113, 128] {
+            assert!(aarch64_sve_ld1rqb_imm(16, 12, invalid).is_err());
+        }
         assert_eq!(aarch64_sve_dup_b_imm(16, 0x00).unwrap(), 0x2538_c010);
         assert_eq!(aarch64_sve_dup_b_imm(17, 0x7f).unwrap(), 0x2538_cff1);
         assert_eq!(aarch64_sve_dup_b_imm(18, 0x80).unwrap(), 0x2538_d012);
@@ -122967,7 +134270,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
             || Err(CompileError::InternalInvariant("unexpected width retry")),
-            || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+            |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
             || Err(CompileError::InternalInvariant("unexpected start retry")),
             || Err(CompileError::InternalInvariant("unexpected terminal retry")),
             || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -123011,7 +134314,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
             || Err(CompileError::InternalInvariant("unexpected width retry")),
-            || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+            |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
             || Err(CompileError::InternalInvariant("unexpected start retry")),
             || Err(CompileError::InternalInvariant("unexpected terminal retry")),
             || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -123112,7 +134415,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
                 || Err(CompileError::InternalInvariant("unexpected width retry")),
-                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
                 || Err(CompileError::InternalInvariant("unexpected start retry")),
                 || Err(CompileError::InternalInvariant("unexpected terminal retry")),
                 || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -123209,7 +134512,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
                 || Err(CompileError::InternalInvariant("unexpected width retry")),
-                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
                 || Err(CompileError::InternalInvariant("unexpected start retry")),
                 || Err(CompileError::InternalInvariant("unexpected terminal retry")),
                 || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -123237,6 +134540,261 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             emit_object(&module, object_format, usize::MAX).unwrap(),
             incumbent_object
         );
+    }
+
+    #[test]
+    fn aarch64_ordered_nfa_prefix_simd_object_limit_restores_scalar_prefix() {
+        let scalar_target = Target::aarch64_linux();
+        let target = scalar_target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let pattern = r"Q?Q?Q?Q?Q?Q?Q?Q?Zx";
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+        )
+        .expect("sparse-prefix Ordered-NFA fixture");
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+
+        let feature_empty =
+            CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                compiled.program(),
+                scalar_target,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                usize::MAX,
+            )
+            .expect("feature-empty prefix module");
+        let feature_empty_scalar =
+            CompiledModule::lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+                compiled.program(),
+                scalar_target,
+                usize::MAX,
+                PreparedOrderedNfaV15Surface::Compatibility,
+            )
+            .expect("feature-empty scalar-prefix module");
+        assert!(feature_empty.has_ordered_nfa_start_prefix());
+        assert!(!feature_empty.has_ordered_nfa_start_prefix_vector());
+        assert!(!feature_empty_scalar.has_ordered_nfa_start_prefix_vector());
+        let feature_empty_object = emit_object(
+            &feature_empty,
+            ObjectFormat::for_target(scalar_target),
+            usize::MAX,
+        )
+        .unwrap();
+        let feature_empty_scalar_object = emit_object(
+            &feature_empty_scalar,
+            ObjectFormat::for_target(scalar_target),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            feature_empty_object,
+            feature_empty_scalar_object,
+            "feature-empty AArch64 must be byte-identical to the scalar-prefix incumbent",
+        );
+
+        let feature_empty_without_prefix =
+            CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+                compiled.program(),
+                scalar_target,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                usize::MAX,
+            )
+            .expect("feature-empty no-prefix module");
+        let feature_empty_without_prefix_object = emit_object(
+            &feature_empty_without_prefix,
+            ObjectFormat::for_target(scalar_target),
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(feature_empty_without_prefix_object.len() < feature_empty_object.len());
+        let scalar_rebuild_calls = std::cell::Cell::new(0_u8);
+        let decline_retry = crate::emit_with_ordered_nfa_accelerator_retries(
+            feature_empty.clone(),
+            ObjectFormat::for_target(scalar_target),
+            feature_empty_without_prefix_object.len(),
+            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            |retain_scalar_prefix| {
+                if retain_scalar_prefix {
+                    scalar_rebuild_calls.set(scalar_rebuild_calls.get() + 1);
+                    return Err(CompileError::InternalInvariant(
+                        "feature-empty target attempted a redundant scalar-prefix rebuild",
+                    ));
+                }
+                Ok(feature_empty_without_prefix.clone())
+            },
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected edge retry")),
+        )
+        .expect("feature-empty prefix decline retry");
+        let crate::FinalObjectAttempt::Fit { module, object } = decline_retry else {
+            panic!("feature-empty no-prefix object did not fit its exact ceiling");
+        };
+        assert_eq!(scalar_rebuild_calls.get(), 0);
+        assert!(!module.has_ordered_nfa_start_prefix());
+        assert_eq!(object, feature_empty_without_prefix_object);
+
+        let common_compiled = compile(
+            CompileRequest::new(r"a?a?a?a?a?a?a?a?Zx", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+        )
+        .expect("common-byte prefix Ordered-NFA fixture");
+        assert_eq!(common_compiled.receipt().engine, EngineKind::OrderedNfa);
+        let common = CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+            common_compiled.program(),
+            target,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            usize::MAX,
+        )
+        .expect("common-byte prefix module");
+        let common_scalar =
+            CompiledModule::lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+                common_compiled.program(),
+                target,
+                usize::MAX,
+                PreparedOrderedNfaV15Surface::Compatibility,
+            )
+            .expect("common-byte scalar-prefix module");
+        assert!(common.has_ordered_nfa_start_prefix());
+        assert!(!common.has_ordered_nfa_start_prefix_vector());
+        assert_eq!(
+            emit_object(&common, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+            emit_object(
+                &common_scalar,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap(),
+            "ASIMD common-byte admission decline must be the exact scalar-prefix object",
+        );
+
+        let vector = CompiledModule::lower_prepared_ordered_nfa_v15_with_native_data_limit(
+            compiled.program(),
+            target,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            usize::MAX,
+        )
+        .expect("vector-prefix module");
+        let scalar =
+            CompiledModule::lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+                compiled.program(),
+                target,
+                usize::MAX,
+                PreparedOrderedNfaV15Surface::Compatibility,
+            )
+            .expect("scalar-prefix module");
+        assert!(vector.has_ordered_nfa_start_prefix());
+        assert!(scalar.has_ordered_nfa_start_prefix());
+        assert!(vector.has_ordered_nfa_start_prefix_vector());
+        assert!(!scalar.has_ordered_nfa_start_prefix_vector());
+        assert_eq!(
+            vector.sections()[PROGRAM_SECTION].data,
+            scalar.sections()[PROGRAM_SECTION].data,
+            "SIMD ablation must not alter retained graph bytes",
+        );
+        assert!(
+            vector.sections()[TEXT_SECTION].data.len() > scalar.sections()[TEXT_SECTION].data.len(),
+            "sparse exact prefix must select additive ASIMD text",
+        );
+
+        let format = ObjectFormat::for_target(target);
+        let vector_object = emit_object(&vector, format, usize::MAX).unwrap();
+        let scalar_object = emit_object(&scalar, format, usize::MAX).unwrap();
+        assert!(scalar_object.len() < vector_object.len());
+        let retry = crate::emit_with_ordered_nfa_accelerator_retries(
+            vector.clone(),
+            format,
+            scalar_object.len(),
+            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            || {
+                Err(CompileError::InternalInvariant(
+                    "unexpected terminal-set retry",
+                ))
+            },
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            |retain_scalar_prefix| {
+                if retain_scalar_prefix {
+                    Ok(scalar.clone())
+                } else {
+                    Err(CompileError::InternalInvariant(
+                        "scalar prefix should fit before prefix removal",
+                    ))
+                }
+            },
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected edge retry")),
+        )
+        .expect("exact scalar-prefix object retry");
+        let crate::FinalObjectAttempt::Fit { module, object } = retry else {
+            panic!("scalar prefix did not fit its exact object ceiling");
+        };
+        assert!(module.has_ordered_nfa_start_prefix());
+        assert!(!module.has_ordered_nfa_start_prefix_vector());
+        assert_eq!(object, scalar_object);
+
+        let allocation = crate::emit_with_ordered_nfa_accelerator_retries(
+            vector,
+            format,
+            scalar_object.len(),
+            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            || {
+                Err(CompileError::InternalInvariant(
+                    "unexpected terminal-set retry",
+                ))
+            },
+            || Err(CompileError::InternalInvariant("unexpected width retry")),
+            |_| Err(ObjectError::Allocation("prefix-SIMD scalar rebuild seam").into()),
+            || Err(CompileError::InternalInvariant("unexpected start retry")),
+            || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+            || Err(CompileError::InternalInvariant("unexpected edge retry")),
+        );
+        let Err(allocation) = allocation else {
+            panic!("allocator failure was not terminal");
+        };
+        assert!(matches!(
+            allocation,
+            CompileError::Object(ObjectError::Allocation("prefix-SIMD scalar rebuild seam"))
+        ));
     }
 
     #[test]
@@ -123303,7 +134861,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
                 || Err(CompileError::InternalInvariant("unexpected width retry")),
-                || Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
                 || Err(CompileError::InternalInvariant("unexpected start retry")),
                 || Err(CompileError::InternalInvariant("unexpected terminal retry")),
                 || Err(CompileError::InternalInvariant("unexpected scalar retry")),
@@ -125261,6 +136819,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            direct_search_trusted_core: None,
+            complete_span_reduce_source: None,
         };
         let base = native_module_digest(program, target, &lowering, None).unwrap();
         let mut legacy = Sha256::new();
@@ -126952,6 +138512,319 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one bounded oracle ties nonchronological planning to the exact ASIMD miss CFG"
+    )]
+    fn aarch64_asimd_teddy_stages_the_best_pair_without_losing_bucket_identity() {
+        fn conditional_target(words: &[u32], branch: usize) -> usize {
+            let encoded = (words[branch] >> 5) & 0x7_ffff;
+            let signed = (i32::try_from(encoded).unwrap() << 13) >> 13;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .unwrap()
+        }
+
+        fn direct_target(words: &[u32], branch: usize) -> usize {
+            let encoded = words[branch] & 0x03ff_ffff;
+            let signed = (i32::try_from(encoded).unwrap() << 6) >> 6;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .unwrap()
+        }
+
+        fn emit(plan: MandatoryTeddyPlan) -> Vec<u32> {
+            let table_end = u32::from(plan.columns()) * 32;
+            let teddy = NativeMandatoryTeddyLayout {
+                plan,
+                isa: MandatoryTeddyIsa::Aarch64Asimd,
+                vector_bytes: 16,
+                table_base: 0,
+                nibble_mask_offset: table_end,
+                table_end,
+            };
+            let mut assembler = Aarch64Assembler::new();
+            let reloop = assembler.label().unwrap();
+            assembler.bind(reloop).unwrap();
+            aarch64_emit_mandatory_teddy_asimd_candidates(&mut assembler, teddy, reloop, None)
+                .unwrap();
+            assembler
+                .finish()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect()
+        }
+
+        let literals: [&[u8]; 4] = [b"aaa\x01", b"aaa\x02", b"aaa\x03", b"aaa\x04"];
+        let portfolio = mandatory_teddy::derive_exact_prefixes(&literals, 4)
+            .expect("public four-literal Teddy portfolio");
+        let three = portfolio
+            .plans()
+            .copied()
+            .find(|plan| plan.columns() == 3 && plan.bank_count() == 1)
+            .expect("three-column slim plan");
+        let four = portfolio
+            .plans()
+            .copied()
+            .find(|plan| plan.columns() == 4 && plan.bank_count() == 1)
+            .expect("four-column slim plan");
+        let four_order = aarch64_mandatory_teddy_column_plan(&four)
+            .unwrap()
+            .column_order;
+        assert_eq!(
+            four_order,
+            [3, 0, 1, 2],
+            "the rare final control byte must lead the stable best pair"
+        );
+
+        // Deterministic shape-equivalent windows prove that changing column
+        // order preserves the exact bucket result. In particular, zero after
+        // the selected pair is always zero after every remaining AND.
+        let mut random = 0x243f_6a88_85a3_08d3_u64;
+        for plan in [three, four] {
+            let column_plan = aarch64_mandatory_teddy_column_plan(&plan).unwrap();
+            let columns = usize::from(plan.columns());
+            let bank = plan.bank(0).unwrap();
+            for _ in 0..65_536 {
+                let mut window = [0_u8; 4];
+                for byte in &mut window[..columns] {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    *byte = random.to_le_bytes()[0];
+                }
+                let mut reordered = u8::MAX;
+                let mut selected_pair = 0_u8;
+                for (rank, &column) in column_plan.column_order[..columns].iter().enumerate() {
+                    let byte = window[usize::from(column)];
+                    reordered &= bank.low(usize::from(column)).unwrap()
+                        [usize::from(byte & 0x0f)]
+                        & bank.high(usize::from(column)).unwrap()[usize::from(byte >> 4)];
+                    if rank == 1 {
+                        selected_pair = reordered;
+                    }
+                }
+                assert_eq!(
+                    u16::from(reordered),
+                    plan.candidate_buckets(&window[..columns])
+                );
+                if selected_pair == 0 {
+                    assert_eq!(reordered, 0, "a cleared bucket bit cannot reappear");
+                }
+            }
+
+            let words = emit(plan);
+            let order = &column_plan.column_order[..columns];
+            let table_positions = order
+                .iter()
+                .map(|&column| {
+                    let low = 16 + column * 2;
+                    words
+                        .iter()
+                        .position(|&word| {
+                            word == aarch64_tbl1_16b(28, low, 27).unwrap()
+                        })
+                        .expect("planned low-nibble table lookup")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                table_positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "machine-code table registers must follow the planned logical columns"
+            );
+
+            let reduction = words
+                .windows(2)
+                .position(|window| {
+                    window
+                        == [
+                            aarch64_umaxv_16b(7, 24).unwrap(),
+                            aarch64_umov_b0(12, 7).unwrap(),
+                        ]
+                })
+                .expect("selected-pair zero reduction");
+            assert!(table_positions[1] < reduction);
+            assert!(reduction < table_positions[2]);
+            let nonempty = reduction + 2;
+            assert_eq!(words[nonempty] & 0xff00_001f, 0x3500_000c);
+            assert_eq!(words[nonempty + 1], aarch64_add_x_imm(2, 2, 16).unwrap());
+            assert_eq!(words[nonempty + 2] & 0xfc00_0000, 0x1400_0000);
+            assert_eq!(
+                conditional_target(&words, nonempty),
+                nonempty + 3,
+                "a surviving pair must skip the miss-only ADD/branch"
+            );
+            assert_eq!(
+                direct_target(&words, nonempty + 2),
+                0,
+                "the empty-pair edge must advance once and re-enter the vector bound"
+            );
+
+            let cmtst = words
+                .iter()
+                .position(|&word| word == aarch64_cmtst_16b(24, 24, 24).unwrap())
+                .expect("final identity-to-lane conversion");
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_cmtst_16b(24, 24, 24).unwrap())
+                    .count(),
+                1
+            );
+            assert!(cmtst > *table_positions.last().unwrap());
+            assert_eq!(
+                &words[cmtst + 1..cmtst + 4],
+                &[
+                    aarch64_umaxv_16b(7, 24).unwrap(),
+                    aarch64_umov_b0(12, 7).unwrap(),
+                    aarch64_cmp_w_zero(12).unwrap(),
+                ],
+                "both three- and four-column hit paths must publish the final mask"
+            );
+        }
+    }
+
+    #[test]
+    fn aarch64_asimd_teddy_staging_is_used_by_dynamic_and_suffix_callers() {
+        fn words(code: &[u8]) -> Vec<u32> {
+            code.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect()
+        }
+
+        fn conditional_target(words: &[u32], branch: usize) -> usize {
+            let encoded = (words[branch] >> 5) & 0x7_ffff;
+            let signed = (i32::try_from(encoded).unwrap() << 13) >> 13;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .unwrap()
+        }
+
+        fn direct_target(words: &[u32], branch: usize) -> usize {
+            let encoded = words[branch] & 0x03ff_ffff;
+            let signed = (i32::try_from(encoded).unwrap() << 6) >> 6;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .unwrap()
+        }
+
+        fn adaptive_pair(words: &[u32]) -> Option<usize> {
+            words.windows(7).position(|window| {
+                window[0] & 0xff00_001f == 0x3500_000b
+                    && window[1] == aarch64_umaxv_16b(7, 24).unwrap()
+                    && window[2] == aarch64_umov_b0(12, 7).unwrap()
+                    && window[3] & 0xff00_001f == 0x3500_000c
+                    && window[4] == aarch64_add_x_imm(2, 2, 16).unwrap()
+                    && window[5] & 0xfc00_0000 == 0x1400_0000
+                    && window[6] == aarch64_movz_w(11, 1).unwrap()
+            })
+        }
+
+        fn assert_staged_caller(words: &[u32], label: &str) {
+            assert!(words.windows(5).any(|window| {
+                window[0] == aarch64_umaxv_16b(7, 24).unwrap()
+                    && window[1] == aarch64_umov_b0(12, 7).unwrap()
+                    && window[2] & 0xff00_001f == 0x3500_000c
+                    && window[3] == aarch64_add_x_imm(2, 2, 16).unwrap()
+                    && window[4] & 0xfc00_0000 == 0x1400_0000
+            }), "{label} has no selected-pair miss edge");
+            assert!(words.windows(4).any(|window| {
+                window
+                    == [
+                        aarch64_cmtst_16b(24, 24, 24).unwrap(),
+                        aarch64_umaxv_16b(7, 24).unwrap(),
+                        aarch64_umov_b0(12, 7).unwrap(),
+                        aarch64_cmp_w_zero(12).unwrap(),
+                    ]
+            }), "{label} has no final exact lane-mask publication");
+            assert!(words.windows(4).any(|window| {
+                window
+                    == [
+                        aarch64_bsl_16b(24, 29, 31).unwrap(),
+                        aarch64_uminv_16b(24, 24).unwrap(),
+                        aarch64_umov_b0(12, 24).unwrap(),
+                        aarch64_add_x_reg(2, 2, 12).unwrap(),
+                    ]
+            }), "{label} final hit does not reach first-lane selection");
+        }
+
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let suffix = compile(
+            CompileRequest::new(MANDATORY_TEDDY_STRUCTURAL_PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let suffix_lowering = lower_native_dfa(suffix.program().native_dfa_view().unwrap(), target)
+            .unwrap()
+            .expect("native mandatory-suffix Teddy");
+        let suffix_words = words(&suffix_lowering.code);
+        assert_staged_caller(&suffix_words, "mandatory suffix");
+        assert_eq!(
+            adaptive_pair(&suffix_words),
+            None,
+            "a verifier-reentrant suffix cannot retain density state"
+        );
+
+        let dynamic = compile(
+            CompileRequest::new("(?:goo|bar|baz){2,4}Q", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+        )
+        .unwrap();
+        let dynamic_view = dynamic
+            .program()
+            .native_dynamic_rows_view()
+            .expect("dynamic correlated-prefix rows");
+        assert_eq!(
+            dynamic_view
+                .correlated_prefix_requirement
+                .expect("correlated-prefix receipt")
+                .teddy_plan
+                .columns(),
+            4
+        );
+        let (dynamic_lowering, _) = lower_native_dynamic_rows_prepared(
+            dynamic.program().serialize().unwrap(),
+            dynamic_view,
+            target,
+        )
+        .unwrap();
+        let dynamic_words = words(&dynamic_lowering.code);
+        assert_staged_caller(&dynamic_words, "dynamic prefix");
+        let adaptive = adaptive_pair(&dynamic_words)
+            .expect("dynamic prefix must retain one call-local density bit");
+        assert_eq!(
+            conditional_target(&dynamic_words, adaptive),
+            adaptive + 7,
+            "dense blocks must bypass the horizontal reduction"
+        );
+        assert_eq!(
+            conditional_target(&dynamic_words, adaptive + 3),
+            adaptive + 6,
+            "the first surviving pair must activate dense mode"
+        );
+        let vector = direct_target(&dynamic_words, adaptive + 5);
+        let initialize = dynamic_words[..adaptive]
+            .iter()
+            .rposition(|&word| word == aarch64_movz_w(11, 0).unwrap())
+            .expect("dynamic prefix density state initialization");
+        assert!(
+            initialize < vector && vector < adaptive,
+            "the miss backedge must preserve, rather than reset, density state"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one structural test authenticates ASIMD, SVE and SVE2-TBL receipts together"
     )]
     fn aarch64_mandatory_teddy_is_transactional_and_uses_tbl_on_every_tier() {
@@ -127068,7 +138941,19 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     assert!(words.contains(&aarch64_cmtst_16b(24, 24, 24).unwrap()));
                 }
                 MandatoryTeddyIsa::Aarch64Sve | MandatoryTeddyIsa::Aarch64Sve2 => {
-                    assert!(words.contains(&aarch64_sve_ld1rqb(16, 12).unwrap()));
+                    let table_count = teddy.plan.columns() * 2;
+                    let constant_loads = (0..table_count)
+                        .map(|table| {
+                            aarch64_sve_ld1rqb_imm(16 + table, 12, i16::from(table) * 16).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        words
+                            .windows(constant_loads.len())
+                            .filter(|window| *window == constant_loads)
+                            .count(),
+                        1,
+                    );
                     assert!(words.contains(&aarch64_sve_tbl_b(7, 16, 5).unwrap()));
                     assert!(words.contains(&aarch64_sve_cmpne_zero_b(1, 6).unwrap()));
                     let mut candidate_assembler = Aarch64Assembler::new();
@@ -138800,5 +150685,92 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             "fre-aot-x86-macos-bundle",
             "native-x86-macos-differential-ok",
         );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links a maximum-weight reducer to a fake Span child on the host ISA"]
+    fn linked_weighted_capture_reducer_checked_add_is_transactional() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let child = "fre_aot_regex_weighted_overflow_fake_child".to_owned();
+        let module = lower_native_weighted_capture_reducer_v1(
+            target,
+            crate::UniformCaptureReducerDomain::WholeHaystack,
+            [0x5a; 32],
+            core::slice::from_ref(&child),
+            &[u64::MAX],
+        )
+        .expect("lower maximum-weight reducer");
+        let object = emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+            .expect("emit maximum-weight reducer");
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-weighted-capture-overflow-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create overflow linker directory");
+        let object_path = directory.join("reducer.o");
+        fs::write(&object_path, object).expect("write maximum-weight reducer");
+        let source = format!(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <limits.h>\n\
+             extern uint32_t {entry}(const unsigned char*,size_t,uint64_t*);\n\
+             uint32_t {child}(const unsigned char*h,size_t n,size_t s,size_t e,size_t*r){{\
+             (void)h;if(s>e||e>n)return 9;if(s==e)return 0;r[0]=s;r[1]=s+1;return 1;}}\n\
+             int main(void){{static const unsigned char h[2]={{0,0}};uint64_t v=7;\
+             uint32_t s={entry}(h,2,&v);if(s!=3||v!=7)return 10;\
+             v=8;s={entry}(h,1,&v);if(s!=0||v!=UINT64_MAX)return 11;return 0;}}\n",
+            entry = module.entry_symbol(),
+        );
+        let c_path = directory.join("overflow.c");
+        let executable = directory.join("overflow");
+        fs::write(&c_path, source).expect("write overflow C harness");
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let output = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("link overflow reducer harness");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute overflow reducer harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).expect("remove overflow linker directory");
     }
 }

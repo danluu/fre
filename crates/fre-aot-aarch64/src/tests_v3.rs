@@ -622,7 +622,114 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
             .count(),
         2
     );
-    assert_eq!(periodic.build_receipt().audit.staged_filter_checks, 0);
+    assert_eq!(periodic.build_receipt().audit.staged_filter_checks, 1);
+    let decoded = decoded_v3(&periodic);
+    let early_nonempty_test = decoded
+        .windows(3)
+        .position(|window| {
+            window[0]
+                == DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                    destination: 0,
+                    source: 24,
+                }
+                && window[1]
+                    == DecodedInstructionV3::MoveVectorByteTo32 {
+                        destination: 6,
+                        source: 0,
+                    }
+                && window[2]
+                    == DecodedInstructionV3::CompareImmediate64 {
+                        register: 6,
+                        immediate: 0,
+                    }
+        })
+        .expect("periodic first-primary early-nonempty test");
+    let early_branch = early_nonempty_test + 3;
+    assert!(matches!(
+        decoded[early_branch],
+        DecodedInstructionV3::BranchCondition {
+            condition: crate::ConditionV3::NotEqual,
+            ..
+        }
+    ));
+    let early_target = usize::try_from(branch_target_v3(&decoded, early_branch) / 4).unwrap();
+    assert_eq!(
+        decoded[early_target],
+        DecodedInstructionV3::AddImmediate64 {
+            destination: 16,
+            source: 8,
+            immediate: 64,
+        }
+    );
+    assert_eq!(
+        decoded[early_target + 1],
+        DecodedInstructionV3::LoadVectors4x128 {
+            first_destination: 0,
+            base: 16,
+        }
+    );
+    let early_rejoin = early_target + 6;
+    let primary_test = decoded
+        .windows(3)
+        .position(|window| {
+            window[0]
+                == DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                    destination: 0,
+                    source: 0,
+                }
+                && window[1]
+                    == DecodedInstructionV3::MoveVectorByteTo32 {
+                        destination: 6,
+                        source: 0,
+                    }
+                && window[2]
+                    == DecodedInstructionV3::CompareImmediate64 {
+                        register: 6,
+                        immediate: 0,
+                    }
+        })
+        .expect("periodic 128-start primary-column absence test");
+    let skip = primary_test + 3;
+    assert!(matches!(
+        decoded[skip],
+        DecodedInstructionV3::BranchCondition {
+            condition: crate::ConditionV3::Equal,
+            ..
+        }
+    ));
+    let empty = usize::try_from(branch_target_v3(&decoded, skip) / 4).unwrap();
+    assert_eq!(
+        decoded[empty],
+        DecodedInstructionV3::AddImmediate64 {
+            destination: 3,
+            source: 3,
+            immediate: 128,
+        }
+    );
+    assert!(decoded[skip + 1..empty].iter().any(|instruction| {
+        *instruction
+            == DecodedInstructionV3::LoadVectors4x128 {
+                first_destination: 0,
+                base: 9,
+            }
+    }));
+    assert!(matches!(
+        decoded[skip + 1],
+        DecodedInstructionV3::Branch { .. }
+    ));
+    let second_columns = early_rejoin;
+    assert_eq!(
+        decoded[second_columns],
+        DecodedInstructionV3::LoadVectors4x128 {
+            first_destination: 0,
+            base: 9,
+        }
+    );
+    assert_eq!(
+        branch_target_v3(&decoded, skip + 1),
+        u32::try_from(second_columns * 4).unwrap(),
+        "the full primary reduction must skip the duplicate dense materialization",
+    );
     assert_eq!(
         audit_count_image_v3(&periodic_program, periodic_optimized.recipe(), &periodic).unwrap(),
         periodic.build_receipt().audit

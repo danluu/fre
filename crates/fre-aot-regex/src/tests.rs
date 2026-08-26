@@ -11,14 +11,2548 @@ use sha2::{Digest, Sha256};
 use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage,
-    DeterminizeLimits, EngineKind, EngineSelectionReason, EntryAbi, FeatureSet,
+    DeterminizeLimits, EngineKind, EngineSelectionReason, EntryAbi,
+    ExactFiniteGrepCountCompileError, FeatureSet, IndependentExistsBatchCompileError,
     PreparedAggregateExports, PreparedAggregateStrategy,
-    PreparedBulkStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    PreparedBulkStrategy, DirectExistsBatchStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
+    compile_with_exact_finite_selected_end_grep_count, compile_with_independent_exists_batch,
     compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
+    independent_exists_batch_append_outcome, independent_exists_batch_object_outcome,
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
+
+#[test]
+fn independent_exists_batch_allocator_failure_is_terminal_at_both_optional_seams() {
+    const APPEND_SITE: &str = "injected direct Exists batch append allocation";
+    const OBJECT_SITE: &str = "injected direct Exists batch object allocation";
+
+    assert!(matches!(
+        independent_exists_batch_append_outcome(Err(ObjectError::Allocation(APPEND_SITE))),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(APPEND_SITE))
+        ))
+    ));
+    assert!(matches!(
+        independent_exists_batch_object_outcome(Err(ObjectError::Allocation(OBJECT_SITE))),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(OBJECT_SITE))
+        ))
+    ));
+
+    // An object-byte resource report is not a generic optional-candidate
+    // decline. It remains terminal at append and is authorized only after the
+    // completed additive module reaches final object emission.
+    assert!(matches!(
+        independent_exists_batch_append_outcome(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 31,
+            required: 32,
+        })),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit: 31,
+                required: 32,
+            })
+        ))
+    ));
+    assert!(
+        independent_exists_batch_object_outcome(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 31,
+            required: 32,
+        }))
+        .expect("final ObjectBytes cap is the sole optional resource decline")
+        .is_none()
+    );
+}
+
+#[test]
+fn independent_exists_batch_is_opt_in_authenticated_and_resource_atomic() {
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let request = CompileRequest::new("needle", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists);
+        let ordinary = compile(request.clone()).expect("ordinary direct Exists artifact");
+        assert!(ordinary.module().prepared_entry_symbol().is_none());
+        assert!(ordinary.module().direct_exists_batch_symbol().is_none());
+        let batched = compile_with_independent_exists_batch(request.clone())
+            .expect("direct Exists batch artifact");
+        let repeated = compile_with_independent_exists_batch(request.clone())
+            .expect("deterministic direct Exists batch artifact");
+        assert_eq!(batched.object(), repeated.object());
+        assert_eq!(batched.module(), repeated.module());
+        assert_eq!(
+            batched.module().direct_exists_batch_strategy(),
+            Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop)
+        );
+        let batch_symbol = batched
+            .module()
+            .direct_exists_batch_symbol()
+            .expect("handle-free direct batch symbol");
+        assert!(batch_symbol.starts_with("fre_aot_regex_is_match_batch_v1_"));
+        assert!(batched.module().prepared_exists_batch_symbol().is_none());
+        assert!(batched.module().required_runtime_symbols().next().is_none());
+        assert_eq!(batched.receipt().passes, ordinary.receipt().passes);
+        assert_eq!(
+            ordinary.program().serialize().expect("ordinary program bytes"),
+            batched.program().serialize().expect("batched program bytes")
+        );
+        assert_eq!(
+            ordinary.receipt().automaton_sha256,
+            batched.receipt().automaton_sha256
+        );
+        assert_eq!(
+            ordinary.receipt().program_sha256,
+            batched.receipt().program_sha256
+        );
+        assert_eq!(
+            ordinary.module().entry_symbol(),
+            batched.module().entry_symbol()
+        );
+
+        let ordinary_text = ordinary
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("ordinary text");
+        let batched_text = batched
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("batched text");
+        let ordinary_entry = ordinary
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == ordinary.module().entry_symbol())
+            .expect("ordinary entry extent");
+        let entry_start = usize::try_from(ordinary_entry.offset).expect("entry start");
+        let entry_size = usize::try_from(ordinary_entry.size).expect("entry size");
+        let entry_end = entry_start.checked_add(entry_size).expect("entry end");
+        assert_eq!(
+            ordinary_text.bytes().get(entry_start..entry_end),
+            batched_text.bytes().get(entry_start..entry_end),
+            "additive batch changed the ordinary entry"
+        );
+        let ordinary_data = ordinary
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::ReadOnlyData)
+            .expect("ordinary data");
+        let batched_data = batched
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::ReadOnlyData)
+            .expect("batched data");
+        assert_eq!(ordinary_data.bytes(), batched_data.bytes());
+        if let Some(mut expected) = ordinary.receipt().exact_single_literal_aot {
+            expected.native_code_sha256 = Sha256::digest(batched_text.bytes()).into();
+            assert_eq!(batched.receipt().exact_single_literal_aot, Some(expected));
+        }
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = ordinary.object().len();
+        let declined = compile_with_independent_exists_batch(request.limits(limits))
+            .expect("optional batch object-byte decline");
+        assert_eq!(declined.object(), ordinary.object());
+        assert_eq!(declined.module(), ordinary.module());
+        assert_eq!(declined.receipt().object_sha256, ordinary.receipt().object_sha256);
+        assert!(declined.module().direct_exists_batch_symbol().is_none());
+    }
+
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let request = CompileRequest::new("(?-u:a|b)", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists);
+        let ordinary = compile(request.clone()).expect("exact byte-set Exists artifact");
+        assert!(ordinary.receipt().exact_finite_exists_byte_set_aot.is_some());
+        let declined = compile_with_independent_exists_batch(request)
+            .expect("trusted-core-ineligible exact byte-set decline");
+        assert_eq!(declined.object(), ordinary.object());
+        assert_eq!(declined.module(), ordinary.module());
+        assert_eq!(declined.receipt(), ordinary.receipt());
+        assert!(declined.module().direct_exists_batch_symbol().is_none());
+    }
+
+    assert!(matches!(
+        compile_with_independent_exists_batch(
+            CompileRequest::new("needle", Target::x86_64_linux())
+                .output(OutputContract::Span)
+        ),
+        Err(IndependentExistsBatchCompileError::RequiresExists {
+            actual: OutputContract::Span
+        })
+    ));
+}
+
+#[test]
+fn direct_exact_singleton_count_selects_for_every_supported_width_and_format() {
+    for target in [Target::aarch64_linux(), Target::aarch64_macos()].map(|target| {
+        target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("valid AArch64 ASIMD target")
+    }) {
+        for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+            let pattern = "a".repeat(width);
+            let ordinary = compile(
+                CompileRequest::new(pattern.clone(), target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile exact-singleton ordinary control");
+            let none = compile_with_prepared_aggregate_exports(
+                CompileRequest::new(pattern.clone(), target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::NONE,
+            )
+            .expect("compile exact-singleton NONE control");
+            assert_eq!(ordinary.object(), none.object());
+            assert_eq!(ordinary.program().serialize().unwrap(), none.program().serialize().unwrap());
+
+            let compiled = compile_with_prepared_aggregate_exports(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::COUNT,
+            )
+            .expect("compile direct exact-singleton Count");
+            assert!(
+                !compiled.module().uses_direct_span_trusted_core_aggregate(),
+                "the exact-singleton follow-on must retain its authenticated DirectOrdinary incumbent",
+            );
+            let report = compiled
+                .module()
+                .direct_exact_singleton_count_aot_report()
+                .expect("direct exact-singleton Count selection");
+            assert_eq!(usize::from(report.literal_bytes), width);
+            assert_eq!(
+                report.successor_mode,
+                crate::DirectExactSingletonCountSuccessorMode::NonOverlapping,
+            );
+            let has_short_fallback = matches!(width, 2 | 4);
+            assert_eq!(
+                report.selection_basis,
+                if has_short_fallback {
+                    crate::DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominanceWithShortIncumbent
+                } else {
+                    crate::DirectExactSingletonCountSelectionBasis::StructuralSingleScanDominance
+                },
+            );
+            assert_eq!(
+                report.short_fallback_max_bytes,
+                has_short_fallback
+                    .then_some(crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES),
+            );
+            assert_eq!(
+                report.copied_incumbent_body_offset.is_some(),
+                false,
+            );
+            assert_eq!(
+                report.copied_incumbent_body_bytes.is_some(),
+                false,
+            );
+            assert_eq!(report.cold_long_offset.is_some(), has_short_fallback);
+            assert_eq!(report.cold_long_bytes.is_some(), has_short_fallback);
+            assert_eq!(
+                report.core_alignment_bytes,
+                crate::direct_count_v3::DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
+            );
+            assert!(
+                report
+                    .core_offset
+                    .is_multiple_of(report.core_alignment_bytes),
+            );
+            assert_eq!(report.incumbent_cost.scan_passes, 1);
+            assert_eq!(report.selected_cost.scan_passes, 1);
+            assert_eq!(report.incumbent_cost.native_calls_per_match, 1);
+            assert_eq!(report.selected_cost.native_calls_per_match, 0);
+            assert_eq!(
+                report.incumbent_cost.internal_span_publications_per_match,
+                1,
+            );
+            assert_eq!(report.selected_cost.internal_span_publications_per_match, 0);
+            assert_eq!(report.incumbent_cost.unresolved_runtime_helpers, 0);
+            assert_eq!(report.selected_cost.unresolved_runtime_helpers, 0);
+            assert!(report.core_bytes != 0);
+            assert_eq!(compiled.receipt().prepared_aggregate_exports, PreparedAggregateExports::COUNT);
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            match target.operating_system {
+                OperatingSystem::Linux => assert_eq!(&compiled.object()[..4], b"\x7fELF"),
+                OperatingSystem::Macos => assert_eq!(&compiled.object()[..4], &0xfeed_facf_u32.to_le_bytes()),
+            }
+        }
+    }
+    let semantic_singleton = compile_with_prepared_aggregate_exports(
+        CompileRequest::new(
+            "a|a",
+            direct_count_asimd_target(OperatingSystem::Linux),
+        )
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::Span),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile semantic exact-singleton Count");
+    assert_eq!(
+        semantic_singleton
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .map(|report| report.literal_bytes),
+        Some(1),
+    );
+}
+
+fn direct_count_asimd_target(operating_system: OperatingSystem) -> Target {
+    let target = match operating_system {
+        OperatingSystem::Linux => Target::aarch64_linux(),
+        OperatingSystem::Macos => Target::aarch64_macos(),
+    };
+    target
+        .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        .expect("valid AArch64 ASIMD target")
+}
+
+fn direct_count_request(
+    pattern: impl Into<String>,
+    target: Target,
+    mode: CompileMode,
+    max_object_bytes: usize,
+) -> CompileRequest {
+    let limits = CompileLimitsV1 {
+        max_object_bytes,
+        ..CompileLimitsV1::default()
+    };
+    CompileRequest::new(pattern, target)
+        .mode(mode)
+        .output(OutputContract::Span)
+        .limits(limits)
+}
+
+fn compile_count_with_direct_candidate_declined(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> crate::CompiledRegex {
+    let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+        crate::direct_count_v3::DirectExactSingletonCountTestPreparation::Decline,
+    );
+    compile_with_prepared_aggregate_exports(request, exports)
+        .expect("compile forced direct Count-v3 incumbent")
+}
+
+fn compile_span_sum_with_direct_candidate_declined(
+    request: CompileRequest,
+) -> crate::CompiledRegex {
+    compile_span_sum_exports_with_direct_candidate_declined(
+        request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+}
+
+fn compile_span_sum_exports_with_direct_candidate_declined(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> crate::CompiledRegex {
+    let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+        crate::direct_count_v3::DirectExactSingletonCountTestPreparation::Decline,
+    );
+    compile_with_prepared_aggregate_exports(request, exports)
+        .expect("compile forced direct SpanSum incumbent")
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_declines_without_changing_ineligible_incumbents() {
+    let asimd = direct_count_asimd_target(OperatingSystem::Linux);
+    let default_cap = CompileLimitsV1::default().max_object_bytes;
+    let cases = [
+        (
+            "a|b",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a?",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "^a",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a{33}",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a",
+            Target::aarch64_linux(),
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a",
+            Target::x86_64_linux(),
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a",
+            asimd,
+            CompileMode::Fast,
+            PreparedAggregateExports::SPAN_SUM,
+        ),
+        (
+            "a",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::SPAN_SUM.union(PreparedAggregateExports::COUNT),
+        ),
+    ];
+    for (pattern, target, mode, exports) in cases {
+        let request = direct_count_request(pattern, target, mode, default_cap);
+        let incumbent = compile_span_sum_exports_with_direct_candidate_declined(
+            request.clone(),
+            exports,
+        );
+        let declined = compile_with_prepared_aggregate_exports(request, exports)
+            .expect("compile ineligible direct SpanSum incumbent");
+        assert_eq!(declined.object(), incumbent.object());
+        assert_eq!(declined.module(), incumbent.module());
+        assert!(declined
+            .module()
+            .direct_exact_singleton_span_sum_aot_report()
+            .is_none());
+    }
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_selects_with_the_count_gate_policy() {
+    for target in [Target::aarch64_linux(), Target::aarch64_macos()].map(|target| {
+        target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("valid AArch64 ASIMD target")
+    }) {
+        let mut width_two_wrapper_bytes = None;
+        for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+            let compiled = compile_with_prepared_aggregate_exports(
+                direct_count_request(
+                    "a".repeat(width),
+                    target,
+                    CompileMode::Optimizing,
+                    CompileLimitsV1::default().max_object_bytes,
+                ),
+                PreparedAggregateExports::SPAN_SUM,
+            )
+            .expect("compile direct exact-singleton SpanSum");
+            assert!(
+                !compiled.module().uses_direct_span_trusted_core_aggregate(),
+                "the exact-singleton SpanSum follow-on must retain its DirectOrdinary incumbent",
+            );
+            let report = compiled
+                .module()
+                .direct_exact_singleton_span_sum_aot_report()
+                .expect("direct exact-singleton SpanSum selection");
+            let gated = matches!(width, 2 | 4);
+            assert_eq!(
+                report.schema_version,
+                crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_AOT_SCHEMA_VERSION,
+            );
+            assert_eq!(usize::from(report.literal_bytes), width);
+            assert_eq!(
+                report.successor_mode,
+                crate::DirectExactSingletonSpanSumSuccessorMode::NonOverlapping,
+            );
+            assert_eq!(
+                report.selection_basis,
+                if gated {
+                    crate::DirectExactSingletonSpanSumSelectionBasis::ExactWidthCountCompositionWithShortIncumbent
+                } else {
+                    crate::DirectExactSingletonSpanSumSelectionBasis::ExactWidthCountComposition
+                },
+            );
+            assert_eq!(
+                report.short_fallback_max_bytes,
+                gated.then_some(
+                    crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
+                ),
+            );
+            assert_eq!(report.cold_long_offset.is_some(), gated);
+            assert_eq!(report.cold_long_bytes.is_some(), gated);
+            if gated {
+                assert_eq!(
+                    report.cold_long_offset.unwrap() + report.cold_long_bytes.unwrap(),
+                    report.wrapper_offset,
+                );
+            }
+            let wrapper_end = report
+                .wrapper_offset
+                .checked_add(report.wrapper_bytes)
+                .expect("SpanSum wrapper extent");
+            assert_eq!(
+                wrapper_end.checked_add(report.wrapper_to_core_padding_bytes),
+                Some(report.core_offset),
+            );
+            assert_eq!(
+                report.core_alignment_bytes,
+                crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+            );
+            assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+            assert!(report.wrapper_to_core_padding_bytes < report.core_alignment_bytes);
+            assert!(report.wrapper_to_core_padding_bytes.is_multiple_of(4));
+            let text = compiled
+                .module()
+                .sections()
+                .iter()
+                .find(|section| section.kind == SectionKind::Text)
+                .expect("direct SpanSum text section");
+            assert_eq!(
+                usize::try_from(text.alignment).expect("text alignment"),
+                report.text_section_alignment_bytes,
+            );
+            assert!(
+                report
+                    .text_section_alignment_bytes
+                    .is_multiple_of(report.core_alignment_bytes),
+            );
+            assert!(
+                text.bytes()[wrapper_end..report.core_offset]
+                    .chunks_exact(4)
+                    .all(|word| word == 0xd503_201f_u32.to_le_bytes()),
+            );
+            let wrapper = &text.bytes()[report.wrapper_offset..wrapper_end];
+            assert!(wrapper.len().is_multiple_of(4));
+            let wrapper_words = wrapper
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("AArch64 word")))
+                .collect::<Vec<_>>();
+            const UMULH_COUNT_WIDTH: u32 = 0x9bc9_7d0a; // UMULH X10,X8,X9
+            const MUL_COUNT_WIDTH: u32 = 0x9b09_7d08; // MUL X8,X8,X9
+            for product_word in [UMULH_COUNT_WIDTH, MUL_COUNT_WIDTH] {
+                assert_eq!(
+                    wrapper_words
+                        .iter()
+                        .filter(|&&word| word == product_word)
+                        .count(),
+                    if width == 1 { 0 } else { 1 },
+                );
+            }
+            if width == 1 {
+                assert!(
+                    crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+                        1,
+                        report.wrapper_offset,
+                        report.core_offset,
+                        wrapper,
+                    )
+                    .is_ok(),
+                );
+                assert!(
+                    crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+                        2,
+                        report.wrapper_offset,
+                        report.core_offset,
+                        wrapper,
+                    )
+                    .is_err(),
+                );
+            }
+            if width == 2 {
+                width_two_wrapper_bytes = Some(wrapper.len());
+                assert!(
+                    crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+                        2,
+                        report.wrapper_offset,
+                        report.core_offset,
+                        wrapper,
+                    )
+                    .is_ok(),
+                );
+                assert!(
+                    crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+                        3,
+                        report.wrapper_offset,
+                        report.core_offset,
+                        wrapper,
+                    )
+                    .is_err(),
+                    "equal-length wrappers must still bind the literal-width immediate",
+                );
+            }
+            if width == 3 {
+                assert_eq!(
+                    width_two_wrapper_bytes,
+                    Some(wrapper.len()),
+                    "the width-2/width-3 rejection must exercise equal-length topology",
+                );
+            }
+            assert_eq!(report.incumbent_strategy, PreparedAggregateStrategy::NativeFused);
+            assert_eq!(report.incumbent_cost.scan_passes, 1);
+            assert_eq!(report.selected_cost.scan_passes, 1);
+            assert_eq!(report.incumbent_cost.native_scan_entries_per_operation, 1);
+            assert_eq!(report.selected_cost.native_scan_entries_per_operation, 1);
+            assert_eq!(report.incumbent_cost.native_calls_per_match, 1);
+            assert_eq!(report.selected_cost.native_calls_per_match, 0);
+            assert_eq!(report.incumbent_cost.internal_span_publications_per_match, 1);
+            assert_eq!(report.selected_cost.internal_span_publications_per_match, 0);
+            assert_eq!(report.incumbent_cost.unresolved_runtime_helpers, 0);
+            assert_eq!(report.selected_cost.unresolved_runtime_helpers, 0);
+            assert_ne!(report.wrapper_bytes, 0);
+            assert_ne!(report.core_bytes, 0);
+            assert!(compiled
+                .module()
+                .direct_exact_singleton_count_aot_report()
+                .is_none());
+            assert!(compiled.module().required_runtime_symbols().next().is_none());
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_exports,
+                PreparedAggregateExports::SPAN_SUM,
+            );
+            assert_eq!(
+                compiled.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            match target.operating_system {
+                OperatingSystem::Linux => assert_eq!(&compiled.object()[..4], b"\x7fELF"),
+                OperatingSystem::Macos => assert_eq!(
+                    &compiled.object()[..4],
+                    &0xfeed_facf_u32.to_le_bytes(),
+                ),
+            }
+        }
+    }
+
+    for target in [Target::x86_64_linux(), Target::x86_64_macos()] {
+        let request = direct_count_request(
+            "abcdefgh",
+            target,
+            CompileMode::Optimizing,
+            CompileLimitsV1::default().max_object_bytes,
+        );
+        let incumbent = compile_span_sum_with_direct_candidate_declined(request.clone());
+        let declined = compile_with_prepared_aggregate_exports(
+            request,
+            PreparedAggregateExports::SPAN_SUM,
+        )
+        .expect("compile x86 direct SpanSum decline");
+        assert_eq!(declined.object(), incumbent.object());
+        assert_eq!(declined.module(), incumbent.module());
+        assert!(declined
+            .module()
+            .direct_exact_singleton_span_sum_aot_report()
+            .is_none());
+    }
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_object_cap_and_allocator_failure_are_fail_closed() {
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let default_cap = CompileLimitsV1::default().max_object_bytes;
+    let request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        default_cap,
+    );
+    let incumbent = compile_span_sum_with_direct_candidate_declined(request.clone());
+    let selected = compile_with_prepared_aggregate_exports(
+        request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("compile selected direct SpanSum");
+    assert!(selected.object().len() > incumbent.object().len());
+    assert!(selected
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .is_some());
+
+    let candidate_cap = selected.object().len() - 1;
+    assert!(candidate_cap >= incumbent.object().len());
+    let capped_request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        candidate_cap,
+    );
+    let capped_incumbent =
+        compile_span_sum_with_direct_candidate_declined(capped_request.clone());
+    let capped = compile_with_prepared_aggregate_exports(
+        capped_request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("proven final direct SpanSum object cap rolls back");
+    assert_eq!(capped.object(), capped_incumbent.object());
+    assert_eq!(capped.module(), capped_incumbent.module());
+    assert!(capped
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .is_none());
+
+    let gated_request = direct_count_request(
+        "aa",
+        target,
+        CompileMode::Optimizing,
+        default_cap,
+    );
+    let gated_incumbent =
+        compile_span_sum_with_direct_candidate_declined(gated_request.clone());
+    let gated_selected = compile_with_prepared_aggregate_exports(
+        gated_request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("compile selected gated direct SpanSum");
+    assert!(gated_selected.object().len() > gated_incumbent.object().len());
+    let gated_cap = gated_selected.object().len() - 1;
+    assert!(gated_cap >= gated_incumbent.object().len());
+    let capped_gated_request = direct_count_request(
+        "aa",
+        target,
+        CompileMode::Optimizing,
+        gated_cap,
+    );
+    let capped_gated_incumbent =
+        compile_span_sum_with_direct_candidate_declined(capped_gated_request.clone());
+    let capped_gated = compile_with_prepared_aggregate_exports(
+        capped_gated_request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("proven final gated SpanSum object cap rolls back");
+    assert_eq!(capped_gated.object(), capped_gated_incumbent.object());
+    assert_eq!(capped_gated.module(), capped_gated_incumbent.module());
+    assert!(capped_gated
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .is_none());
+
+    let low_cap = incumbent.object().len() - 1;
+    let error = compile_with_prepared_aggregate_exports(
+        direct_count_request(
+            "abcdefgh",
+            target,
+            CompileMode::Optimizing,
+            low_cap,
+        ),
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect_err("incumbent SpanSum object cap remains terminal");
+    assert!(matches!(
+        error,
+        CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        }) if limit == low_cap && required == incumbent.object().len()
+    ));
+
+    {
+        let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+            crate::direct_count_v3::DirectExactSingletonCountTestPreparation::AllocationFailure,
+        );
+        let error = compile_with_prepared_aggregate_exports(
+            direct_count_request(
+                "abcdefgh",
+                target,
+                CompileMode::Optimizing,
+                default_cap,
+            ),
+            PreparedAggregateExports::SPAN_SUM,
+        )
+        .expect_err("direct SpanSum candidate allocator failure is terminal");
+        assert!(matches!(
+            error,
+            CompileError::Object(ObjectError::Allocation(
+                "injected direct Count-v3 candidate"
+            ))
+        ));
+    }
+    {
+        let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+            crate::direct_count_v3::DirectExactSingletonCountTestPreparation::UnsupportedBackendFailure,
+        );
+        let error = compile_with_prepared_aggregate_exports(
+            direct_count_request(
+                "abcdefgh",
+                target,
+                CompileMode::Optimizing,
+                default_cap,
+            ),
+            PreparedAggregateExports::SPAN_SUM,
+        )
+        .expect_err("direct SpanSum backend failure is terminal");
+        assert!(matches!(
+            error,
+            CompileError::Object(ObjectError::InvalidModule(
+                "direct Count-v3 backend rejected authenticated target tuple"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_authenticates_incumbent_wrapper_and_core() {
+    let target = direct_count_asimd_target(OperatingSystem::Macos);
+    let incumbent = compile_span_sum_with_direct_candidate_declined(direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    ));
+    let literal = incumbent
+        .program()
+        .native_exact_singleton_count_literal()
+        .expect("authenticated SpanSum singleton witness");
+    let artifact_identity = incumbent.program().artifact_identity();
+    let candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        artifact_identity,
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare direct SpanSum Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported direct SpanSum Count-v3 core declined")
+        }
+    };
+
+    let mut wrong_identity = incumbent.module().clone();
+    assert!(wrong_identity
+        .install_direct_exact_singleton_span_sum(literal, [7; 32], &candidate)
+        .is_err());
+    let wrong_candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        [7; 32],
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare differently bound direct SpanSum Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported differently bound direct SpanSum core declined")
+        }
+    };
+    let mut wrong_binding = incumbent.module().clone();
+    assert!(wrong_binding
+        .install_direct_exact_singleton_span_sum(
+            literal,
+            artifact_identity,
+            &wrong_candidate,
+        )
+        .is_err());
+
+    let span_sum = incumbent
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| {
+            symbol.binding == crate::SymbolBinding::Global
+                && symbol.kind == crate::SymbolKind::Function
+                && symbol
+                    .name
+                    .starts_with("fre_aot_regex_span_sum_exclusive_v1_")
+        })
+        .expect("incumbent SpanSum symbol");
+    let symbol_start = usize::try_from(span_sum.offset).expect("SpanSum symbol start");
+    let symbol_end = usize::try_from(span_sum.offset + span_sum.size)
+        .expect("SpanSum symbol end");
+    let mut tampered_incumbent = incumbent.module().clone();
+    assert!(tampered_incumbent.test_flip_text_byte(symbol_end - 1));
+    assert!(tampered_incumbent
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .is_err());
+    let mut tampered_relocation = incumbent.module().clone();
+    assert!(tampered_relocation
+        .test_flip_text_relocation_addend_in_range(symbol_start, symbol_end));
+    assert!(tampered_relocation
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .is_err());
+
+    let mut selected = incumbent.module().clone();
+    let rollback = selected
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .expect("install authenticated direct SpanSum composition")
+        .expect("selected direct SpanSum rollback checkpoint");
+    let report = *selected
+        .direct_exact_singleton_span_sum_aot_report()
+        .expect("selected direct SpanSum report");
+    let text_index = selected
+        .sections()
+        .iter()
+        .position(|section| section.kind == SectionKind::Text)
+        .expect("selected direct SpanSum text section");
+    let text = selected.sections()[text_index].bytes();
+    let wrapper_end = report
+        .wrapper_offset
+        .checked_add(report.wrapper_bytes)
+        .expect("selected direct SpanSum wrapper extent");
+    let core_end = report
+        .core_offset
+        .checked_add(report.core_bytes)
+        .expect("selected direct SpanSum core extent");
+    assert_eq!(
+        wrapper_end.checked_add(report.wrapper_to_core_padding_bytes),
+        Some(report.core_offset),
+    );
+    assert_eq!(
+        report.core_alignment_bytes,
+        crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+    );
+    assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+    assert_eq!(
+        usize::try_from(selected.sections()[text_index].alignment)
+            .expect("selected text alignment"),
+        report.text_section_alignment_bytes,
+    );
+    assert!(
+        text[wrapper_end..report.core_offset]
+            .chunks_exact(4)
+            .all(|word| word == 0xd503_201f_u32.to_le_bytes()),
+    );
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&text[report.wrapper_offset..wrapper_end])),
+        report.wrapper_sha256,
+    );
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&text[report.core_offset..core_end])),
+        report.core_sha256,
+    );
+    candidate
+        .authenticate_embedded(
+            literal,
+            report.core_offset,
+            &text[report.core_offset..core_end],
+        )
+        .expect("authenticate final-offset direct SpanSum Count-v3 core");
+    let mut tampered_core = text[report.core_offset..core_end].to_vec();
+    tampered_core[0] ^= 1;
+    assert!(candidate
+        .authenticate_embedded(literal, report.core_offset, &tampered_core)
+        .is_err());
+    assert_eq!(
+        crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+            report.literal_bytes,
+            report.wrapper_offset,
+            report.core_offset,
+            &text[report.wrapper_offset..wrapper_end],
+        )
+        .expect("authenticate embedded direct SpanSum wrapper"),
+        report.wrapper_sha256,
+    );
+    let mut tampered_wrapper = text[report.wrapper_offset..wrapper_end].to_vec();
+    tampered_wrapper[0] ^= 1;
+    assert!(
+        crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+            report.literal_bytes,
+            report.wrapper_offset,
+            report.core_offset,
+            &tampered_wrapper,
+        )
+        .is_err(),
+    );
+    assert!(selected.relocations().iter().all(|relocation| {
+        usize::try_from(relocation.offset)
+            .map_or(true, |offset| !(report.wrapper_offset..core_end).contains(&offset))
+    }));
+    assert!(selected.symbols().iter().all(|symbol| {
+        symbol.section != Some(text_index)
+            || usize::try_from(symbol.offset + symbol.size)
+                .is_ok_and(|end| end <= report.wrapper_offset)
+    }));
+    selected
+        .rollback_direct_exact_singleton_span_sum(rollback)
+        .expect("restore exact ungated SpanSum incumbent");
+    assert_eq!(&selected, incumbent.module());
+}
+
+#[test]
+fn direct_exact_singleton_count_declines_without_changing_every_ineligible_incumbent() {
+    let asimd = direct_count_asimd_target(OperatingSystem::Linux);
+    let default_cap = CompileLimitsV1::default().max_object_bytes;
+    let cases = [
+        ("a|b", asimd, CompileMode::Optimizing, PreparedAggregateExports::COUNT),
+        ("a?", asimd, CompileMode::Optimizing, PreparedAggregateExports::COUNT),
+        ("^a", asimd, CompileMode::Optimizing, PreparedAggregateExports::COUNT),
+        ("", asimd, CompileMode::Optimizing, PreparedAggregateExports::COUNT),
+        (
+            "a{33}",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::COUNT,
+        ),
+        (
+            "a",
+            Target::aarch64_linux(),
+            CompileMode::Optimizing,
+            PreparedAggregateExports::COUNT,
+        ),
+        (
+            "a",
+            Target::x86_64_linux(),
+            CompileMode::Optimizing,
+            PreparedAggregateExports::COUNT,
+        ),
+        ("a", asimd, CompileMode::Fast, PreparedAggregateExports::COUNT),
+        (
+            "a",
+            asimd,
+            CompileMode::Optimizing,
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM),
+        ),
+    ];
+    for (pattern, target, mode, exports) in cases {
+        let request = direct_count_request(pattern, target, mode, default_cap);
+        let incumbent = compile_count_with_direct_candidate_declined(request.clone(), exports);
+        let compiled = compile_with_prepared_aggregate_exports(request, exports)
+            .expect("compile ineligible direct Count-v3 case");
+        assert_eq!(compiled.object(), incumbent.object(), "pattern {pattern:?}");
+        assert_eq!(compiled.module(), incumbent.module(), "pattern {pattern:?}");
+        assert!(
+            compiled
+                .module()
+                .direct_exact_singleton_count_aot_report()
+                .is_none(),
+            "pattern {pattern:?}",
+        );
+    }
+}
+
+#[test]
+fn direct_exact_singleton_count_object_cap_decline_is_incumbent_exact_and_allocation_is_terminal() {
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let default_cap = CompileLimitsV1::default().max_object_bytes;
+    let default_request =
+        direct_count_request("abcdefgh", target, CompileMode::Optimizing, default_cap);
+    let incumbent = compile_count_with_direct_candidate_declined(
+        default_request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let selected = compile_with_prepared_aggregate_exports(
+        default_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile selected direct Count-v3 control");
+    assert!(selected.object().len() > incumbent.object().len());
+    assert!(
+        selected
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .is_some(),
+    );
+    let exact_selected = compile_with_prepared_aggregate_exports(
+        direct_count_request(
+            "abcdefgh",
+            target,
+            CompileMode::Optimizing,
+            selected.object().len(),
+        ),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("exact selected direct Count-v3 object cap");
+    assert_eq!(exact_selected.object(), selected.object());
+
+    let candidate_cap = selected.object().len() - 1;
+    assert!(candidate_cap >= incumbent.object().len());
+    let capped_request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        candidate_cap,
+    );
+    let capped_incumbent = compile_count_with_direct_candidate_declined(
+        capped_request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let capped_literal = capped_incumbent
+        .program()
+        .native_exact_singleton_count_literal()
+        .expect("capped incumbent exact-singleton witness");
+    assert!(matches!(
+        crate::direct_count_v3::prepare_direct_exact_singleton_count(
+            capped_literal,
+            capped_incumbent.program().artifact_identity(),
+            target,
+            candidate_cap,
+        )
+        .expect("prepare candidate below its completed module cap"),
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(_),
+    ));
+    let capped = compile_with_prepared_aggregate_exports(
+        capped_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("final direct Count-v3 object cap declines to incumbent");
+    assert_eq!(capped.object(), capped_incumbent.object());
+    assert_eq!(capped.module(), capped_incumbent.module());
+    assert!(
+        capped
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .is_none(),
+    );
+
+    let gated_request =
+        direct_count_request("aa", target, CompileMode::Optimizing, default_cap);
+    let gated_incumbent = compile_count_with_direct_candidate_declined(
+        gated_request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let gated_selected = compile_with_prepared_aggregate_exports(
+        gated_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile selected short-gated Count-v3 control");
+    assert!(gated_selected
+        .module()
+        .direct_exact_singleton_count_aot_report()
+        .is_some_and(|report| report.short_fallback_max_bytes.is_some()));
+    let gated_cap = gated_selected.object().len() - 1;
+    assert!(gated_cap >= gated_incumbent.object().len());
+    let capped_gated_request =
+        direct_count_request("aa", target, CompileMode::Optimizing, gated_cap);
+    let capped_gated_incumbent = compile_count_with_direct_candidate_declined(
+        capped_gated_request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let capped_gated = compile_with_prepared_aggregate_exports(
+        capped_gated_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("short-gated Count-v3 object cap declines to incumbent");
+    assert_eq!(capped_gated.object(), capped_gated_incumbent.object());
+    assert_eq!(capped_gated.module(), capped_gated_incumbent.module());
+    assert!(capped_gated
+        .module()
+        .direct_exact_singleton_count_aot_report()
+        .is_none());
+
+    let low_cap = incumbent.object().len() - 1;
+    let low_request =
+        direct_count_request("abcdefgh", target, CompileMode::Optimizing, low_cap);
+    let low_error = compile_with_prepared_aggregate_exports(
+        low_request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect_err("incumbent object cap remains terminal");
+    assert!(matches!(
+        low_error,
+        CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        }) if limit == low_cap && required == incumbent.object().len()
+    ));
+
+    let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+        crate::direct_count_v3::DirectExactSingletonCountTestPreparation::AllocationFailure,
+    );
+    let allocation_error = compile_with_prepared_aggregate_exports(
+        direct_count_request("abcdefgh", target, CompileMode::Optimizing, default_cap),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect_err("candidate allocation failure must remain terminal");
+    assert!(matches!(
+        allocation_error,
+        CompileError::Object(ObjectError::Allocation(
+            "injected direct Count-v3 candidate"
+        ))
+    ));
+}
+
+#[test]
+fn direct_count_final_object_decline_requires_a_proven_numeric_cap() {
+    assert!(crate::is_proven_object_byte_limit(&ObjectError::Resource {
+        resource: CompileResource::ObjectBytes,
+        limit: 4095,
+        required: 4096,
+    }));
+    assert!(!crate::is_proven_object_byte_limit(&ObjectError::Resource {
+        resource: CompileResource::ObjectBytes,
+        limit: 4096,
+        required: 4096,
+    }));
+    assert!(!crate::is_proven_object_byte_limit(&ObjectError::Allocation(
+        "object output bytes",
+    )));
+}
+
+#[test]
+fn direct_exact_singleton_count_backend_unsupported_is_terminal() {
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    );
+    let incumbent = compile_count_with_direct_candidate_declined(
+        request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    assert!(!incumbent.object().is_empty());
+    assert!(
+        incumbent
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .is_none(),
+    );
+
+    let _guard = crate::direct_count_v3::test_direct_exact_singleton_count_preparation(
+        crate::direct_count_v3::DirectExactSingletonCountTestPreparation::UnsupportedBackendFailure,
+    );
+    let error = compile_with_prepared_aggregate_exports(
+        request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect_err("backend contract failure must not return the incumbent");
+    assert!(matches!(
+        error,
+        CompileError::Object(ObjectError::InvalidModule(
+            "direct Count-v3 backend rejected authenticated target tuple"
+        ))
+    ));
+}
+
+#[test]
+fn direct_exact_singleton_count_authenticates_incumbent_core_and_symbol_surface() {
+    let target = direct_count_asimd_target(OperatingSystem::Macos);
+    let request = direct_count_request(
+        "abcdefgh",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    );
+    let incumbent = compile_count_with_direct_candidate_declined(
+        request,
+        PreparedAggregateExports::COUNT,
+    );
+    let literal = incumbent
+        .program()
+        .native_exact_singleton_count_literal()
+        .expect("authenticated singleton witness");
+    let artifact_identity = incumbent.program().artifact_identity();
+    let mut candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        artifact_identity,
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare audited direct Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported direct Count-v3 core declined")
+        }
+    };
+    candidate
+        .authenticate_embedded(literal, 0, &candidate.code)
+        .expect("authenticate untouched direct Count-v3 core");
+    assert!(
+        candidate
+            .authenticate_embedded(literal, 4, &candidate.code)
+            .is_err(),
+        "a byte-identical core at a merely instruction-aligned offset must fail",
+    );
+    let mut tampered_core = candidate.code.to_vec();
+    tampered_core[0] ^= 1;
+    assert!(
+        candidate
+            .authenticate_embedded(literal, 0, &tampered_core)
+            .is_err(),
+    );
+
+    let canonical_strategy = candidate.canonical_recipe[13];
+    candidate.canonical_recipe[13] = if canonical_strategy == 1 { 2 } else { 1 };
+    let mut tampered_recipe_strategy = incumbent.module().clone();
+    assert!(tampered_recipe_strategy
+        .install_direct_exact_singleton_count(literal, artifact_identity, &candidate)
+        .is_err());
+    candidate.canonical_recipe[13] = canonical_strategy;
+
+    candidate.recipe_identity[0] ^= 1;
+    let mut tampered_recipe_identity = incumbent.module().clone();
+    assert!(tampered_recipe_identity
+        .install_direct_exact_singleton_count(literal, artifact_identity, &candidate)
+        .is_err());
+    candidate.recipe_identity[0] ^= 1;
+
+    let mut wrong_identity = incumbent.module().clone();
+    assert!(wrong_identity
+        .install_direct_exact_singleton_count(literal, [7; 32], &candidate)
+        .is_err());
+
+    let wrong_candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        [7; 32],
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare differently bound direct Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported differently bound direct Count-v3 core declined")
+        }
+    };
+    let mut wrong_candidate_binding = incumbent.module().clone();
+    assert!(wrong_candidate_binding
+        .install_direct_exact_singleton_count(literal, artifact_identity, &wrong_candidate)
+        .is_err());
+
+    let mut tampered_incumbent = incumbent.module().clone();
+    let count = tampered_incumbent
+        .symbols()
+        .iter()
+        .find(|symbol| {
+            symbol.binding == crate::SymbolBinding::Global
+                && symbol.kind == crate::SymbolKind::Function
+                && symbol.name.starts_with("fre_aot_regex_count_exclusive_v1_")
+        })
+        .expect("incumbent Count symbol");
+    let tamper_offset = usize::try_from(count.offset + count.size - 1)
+        .expect("incumbent Count tamper offset");
+    assert!(tampered_incumbent.test_flip_text_byte(tamper_offset));
+    assert!(tampered_incumbent
+        .install_direct_exact_singleton_count(literal, artifact_identity, &candidate)
+        .is_err());
+
+    let mut selected = incumbent.module().clone();
+    assert!(selected
+        .install_direct_exact_singleton_count(literal, artifact_identity, &candidate)
+        .expect("install authenticated direct Count-v3 core")
+        .is_some());
+    let report = *selected
+        .direct_exact_singleton_count_aot_report()
+        .expect("selected direct Count-v3 report");
+    let text_index = selected
+        .sections()
+        .iter()
+        .position(|section| section.kind == SectionKind::Text)
+        .expect("selected text section index");
+    let text = &selected.sections()[text_index];
+    let core_end = report.core_offset + report.core_bytes;
+    assert_eq!(
+        report.core_alignment_bytes,
+        crate::direct_count_v3::DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
+    );
+    assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&text.bytes()[report.core_offset..core_end])),
+        report.core_sha256,
+    );
+    assert!(selected.relocations().iter().all(|relocation| {
+        usize::try_from(relocation.offset)
+            .map_or(true, |offset| !(report.core_offset..core_end).contains(&offset))
+    }));
+    assert!(selected.symbols().iter().all(|symbol| {
+        symbol.section != Some(text_index)
+            || usize::try_from(symbol.offset + symbol.size)
+                .is_ok_and(|end| end <= report.core_offset)
+    }));
+    assert!(selected.symbols().iter().all(|symbol| {
+        !symbol.name.contains("fre_aot_count") && symbol.section.is_some()
+    }));
+}
+
+#[test]
+fn direct_exact_singleton_count_short_gate_preserves_the_hot_incumbent_layout() {
+    fn signed_target(instruction_offset: usize, immediate: u32, bits: u32) -> usize {
+        let shift = 64 - bits;
+        let words = ((u64::from(immediate) << shift) as i64) >> shift;
+        usize::try_from(
+            i64::try_from(instruction_offset).expect("instruction offset fits i64")
+                + words * 4,
+        )
+        .expect("local branch target is nonnegative")
+    }
+
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let request = direct_count_request(
+        "aa",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    );
+    let incumbent = compile_count_with_direct_candidate_declined(
+        request.clone(),
+        PreparedAggregateExports::COUNT,
+    );
+    let selected = compile_with_prepared_aggregate_exports(
+        request,
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile cold-long direct Count-v3");
+    let report = selected
+        .module()
+        .direct_exact_singleton_count_aot_report()
+        .expect("cold-long direct Count-v3 report");
+    let short_max = report
+        .short_fallback_max_bytes
+        .expect("periodic width-two short fallback");
+    assert_eq!(
+        short_max,
+        crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
+    );
+    assert_eq!(report.copied_incumbent_body_offset, None);
+    assert_eq!(report.copied_incumbent_body_bytes, None);
+    let cold_offset = report.cold_long_offset.expect("cold-long offset");
+    let cold_bytes = report.cold_long_bytes.expect("cold-long bytes");
+
+    let selected_text = selected
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .expect("selected text")
+        .bytes();
+    let incumbent_text = incumbent
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .expect("incumbent text")
+        .bytes();
+    assert_eq!(cold_offset, incumbent_text.len());
+    assert_eq!(cold_offset + cold_bytes, report.core_offset);
+    assert_eq!(
+        report.core_alignment_bytes,
+        crate::direct_count_v3::DIRECT_EXACT_SINGLETON_COUNT_CORE_ALIGNMENT_BYTES,
+    );
+    assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+    assert_eq!(
+        &selected_text[report.authenticated_wrapper_body_offset..cold_offset],
+        &incumbent_text[report.authenticated_wrapper_body_offset..],
+        "the established authenticated body must stay byte-for-byte in place",
+    );
+
+    let differences = selected_text[..cold_offset]
+        .chunks_exact(4)
+        .zip(incumbent_text.chunks_exact(4))
+        .enumerate()
+        .filter_map(|(index, (selected, incumbent))| {
+            (selected != incumbent).then_some((index * 4, selected, incumbent))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(differences.len(), 2, "only the signed-length pair changes");
+    assert_eq!(differences[1].0, differences[0].0 + 4);
+    let branch_offset = differences[1].0;
+    let incumbent_compare =
+        u32::from_le_bytes(differences[0].2.try_into().expect("incumbent compare"));
+    let incumbent_branch =
+        u32::from_le_bytes(differences[1].2.try_into().expect("incumbent branch"));
+    assert_eq!(incumbent_compare, 0xf100_001f | (2 << 5));
+    assert_eq!(incumbent_branch & 0xff00_001f, 0x5400_0004);
+
+    let selected_compare =
+        u32::from_le_bytes(differences[0].1.try_into().expect("selected compare"));
+    let selected_branch =
+        u32::from_le_bytes(differences[1].1.try_into().expect("selected branch"));
+    let direct_min = short_max.checked_add(1).expect("short threshold successor");
+    assert!(direct_min.is_multiple_of(1 << 12));
+    assert_eq!(
+        selected_compare,
+        0xf140_001f | ((direct_min >> 12) << 10) | (2 << 5),
+    );
+    assert_eq!(selected_branch & 0xff00_001f, 0x5400_0002);
+    assert_eq!(
+        signed_target(branch_offset, (selected_branch >> 5) & 0x7ffff, 19),
+        cold_offset,
+    );
+
+    let cold_words = selected_text[cold_offset..report.core_offset]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("cold instruction")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cold_words[0] & 0xfff8_001f,
+        0xb7f8_0002,
+        "cold path must reject bit-63 lengths first",
+    );
+    let direct_windows = cold_words
+        .windows(4)
+        .enumerate()
+        .filter(|(_, words)| {
+            words[0] == 0xaa01_03e0
+                && words[1] == 0xaa02_03e1
+                && words[2] == 0xaa03_03e2
+                && words[3] & 0xfc00_0000 == 0x1400_0000
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(direct_windows.len(), 1, "one audited direct tail exists");
+    let (direct_index, direct_words) = direct_windows[0];
+    let direct_branch_offset = cold_offset + (direct_index + 3) * 4;
+    assert_eq!(
+        signed_target(
+            direct_branch_offset,
+            direct_words[3] & 0x03ff_ffff,
+            26,
+        ),
+        report.core_offset,
+    );
+
+    let incumbent_relocations = incumbent.module().relocations();
+    let selected_relocations = selected.module().relocations();
+    assert_eq!(selected_relocations.len(), incumbent_relocations.len() + 2);
+    assert_eq!(
+        &selected_relocations[..incumbent_relocations.len()],
+        incumbent_relocations,
+    );
+    let mut identity_symbols = selected
+        .module()
+        .symbols()
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity")
+        .map(|(index, _)| index);
+    let identity_symbol = identity_symbols
+        .next()
+        .expect("unique prepared aggregate identity symbol");
+    assert!(identity_symbols.next().is_none());
+    for (relocation, kind) in selected_relocations[incumbent_relocations.len()..]
+        .iter()
+        .zip([
+            crate::RelocationKind::Aarch64Page21,
+            crate::RelocationKind::Aarch64PageOff12,
+        ])
+    {
+        assert_eq!(relocation.section, incumbent_relocations[0].section);
+        assert_eq!(relocation.kind, kind);
+        assert_eq!(relocation.symbol, identity_symbol);
+        assert_eq!(relocation.addend, 0);
+        assert!((cold_offset..report.core_offset).contains(
+            &usize::try_from(relocation.offset).expect("cold relocation offset"),
+        ));
+    }
+
+    let selected_count_name = selected
+        .module()
+        .prepared_count_symbol()
+        .expect("selected Count symbol");
+    let selected_count = selected
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == selected_count_name)
+        .expect("selected Count symbol record");
+    let incumbent_count_name = incumbent
+        .module()
+        .prepared_count_symbol()
+        .expect("incumbent Count symbol");
+    let incumbent_count = incumbent
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == incumbent_count_name)
+        .expect("incumbent Count symbol record");
+    assert_eq!(selected_count.offset, incumbent_count.offset);
+    assert_eq!(
+        selected_count.size,
+        incumbent_count.size + u64::try_from(cold_bytes).expect("cold size"),
+    );
+    assert_eq!(
+        usize::try_from(selected_count.offset + selected_count.size)
+            .expect("selected Count extent"),
+        report.core_offset,
+    );
+}
+
+#[test]
+fn direct_exact_singleton_span_sum_cold_gate_is_additive_authenticated_and_relocatable() {
+    let target = direct_count_asimd_target(OperatingSystem::Linux);
+    let request = direct_count_request(
+        "aa",
+        target,
+        CompileMode::Optimizing,
+        CompileLimitsV1::default().max_object_bytes,
+    );
+    let incumbent = compile_span_sum_with_direct_candidate_declined(request.clone());
+    let selected = compile_with_prepared_aggregate_exports(
+        request,
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("compile cold-long direct SpanSum");
+    let report = selected
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .expect("cold-long direct SpanSum report");
+    let cold_offset = report.cold_long_offset.expect("SpanSum cold-long offset");
+    let cold_bytes = report.cold_long_bytes.expect("SpanSum cold-long bytes");
+    assert_eq!(
+        report.short_fallback_max_bytes,
+        Some(crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES),
+    );
+    assert_eq!(cold_offset + cold_bytes, report.wrapper_offset);
+    let wrapper_end = report
+        .wrapper_offset
+        .checked_add(report.wrapper_bytes)
+        .expect("cold-gated SpanSum wrapper extent");
+    assert_eq!(
+        wrapper_end.checked_add(report.wrapper_to_core_padding_bytes),
+        Some(report.core_offset),
+    );
+    assert_eq!(
+        report.core_alignment_bytes,
+        crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+    );
+    assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+
+    let selected_text = selected
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .expect("selected SpanSum text")
+        .bytes();
+    let incumbent_text = incumbent
+        .module()
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .expect("incumbent SpanSum text")
+        .bytes();
+    assert_eq!(cold_offset, incumbent_text.len());
+    assert_eq!(
+        &selected_text[report.authenticated_wrapper_body_offset..cold_offset],
+        &incumbent_text[report.authenticated_wrapper_body_offset..],
+        "the established authenticated SpanSum body stays byte-for-byte in place",
+    );
+    let differences = selected_text[..cold_offset]
+        .chunks_exact(4)
+        .zip(incumbent_text.chunks_exact(4))
+        .enumerate()
+        .filter_map(|(index, (selected, incumbent))| {
+            (selected != incumbent).then_some(index * 4)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(differences.len(), 2, "only the signed-length pair changes");
+    assert_eq!(differences[1], differences[0] + 4);
+
+    let cold_words = selected_text[cold_offset..report.wrapper_offset]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("cold instruction")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cold_words[0] & 0xfff8_001f,
+        0xb7f8_0002,
+        "cold path must reject bit-63 lengths before output/identity",
+    );
+    let wrapper_branches = cold_words
+        .iter()
+        .enumerate()
+        .filter(|(_, instruction)| **instruction & 0xfc00_0000 == 0x1400_0000)
+        .collect::<Vec<_>>();
+    assert_eq!(wrapper_branches.len(), 1);
+    let (branch_index, branch) = wrapper_branches[0];
+    assert_eq!(
+        crate::module::aarch64_direct_branch_target(
+            cold_offset + branch_index * 4,
+            *branch,
+        )
+        .expect("decode cold SpanSum wrapper branch"),
+        Some(report.wrapper_offset),
+    );
+    assert!(
+        selected_text[wrapper_end..report.core_offset]
+            .chunks_exact(4)
+            .all(|word| word == 0xd503_201f_u32.to_le_bytes()),
+    );
+    assert_eq!(
+        crate::module::authenticate_aarch64_direct_exact_singleton_span_sum_wrapper(
+            report.literal_bytes,
+            report.wrapper_offset,
+            report.core_offset,
+            &selected_text[report.wrapper_offset..wrapper_end],
+        )
+        .expect("authenticate embedded checked SpanSum wrapper"),
+        report.wrapper_sha256,
+    );
+    let wrapper_words = selected_text[report.wrapper_offset..wrapper_end]
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("wrapper instruction")))
+        .collect::<Vec<_>>();
+    assert!(wrapper_words.contains(&(0x9bc0_7c00 | (9 << 16) | (8 << 5) | 10)));
+    assert!(wrapper_words.contains(&(0x9b00_7c00 | (9 << 16) | (8 << 5) | 8)));
+
+    let incumbent_relocations = incumbent.module().relocations();
+    let selected_relocations = selected.module().relocations();
+    assert_eq!(selected_relocations.len(), incumbent_relocations.len() + 2);
+    assert_eq!(
+        &selected_relocations[..incumbent_relocations.len()],
+        incumbent_relocations,
+    );
+    let mut identity_symbols = selected
+        .module()
+        .symbols()
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.name == ".Lfre_aot_regex_prepared_aggregate_identity")
+        .map(|(index, _)| index);
+    let identity_symbol = identity_symbols
+        .next()
+        .expect("unique prepared aggregate identity symbol");
+    assert!(identity_symbols.next().is_none());
+    for (relocation, kind) in selected_relocations[incumbent_relocations.len()..]
+        .iter()
+        .zip([
+            crate::RelocationKind::Aarch64Page21,
+            crate::RelocationKind::Aarch64PageOff12,
+        ])
+    {
+        assert_eq!(relocation.kind, kind);
+        assert_eq!(relocation.symbol, identity_symbol);
+        assert_eq!(relocation.addend, 0);
+        assert!((cold_offset..report.wrapper_offset).contains(
+            &usize::try_from(relocation.offset).expect("cold relocation offset"),
+        ));
+    }
+
+    let selected_name = selected
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("selected SpanSum symbol");
+    let selected_symbol = selected
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == selected_name)
+        .expect("selected SpanSum symbol record");
+    let incumbent_name = incumbent
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("incumbent SpanSum symbol");
+    let incumbent_symbol = incumbent
+        .module()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == incumbent_name)
+        .expect("incumbent SpanSum symbol record");
+    assert_eq!(selected_symbol.offset, incumbent_symbol.offset);
+    assert_eq!(
+        selected_symbol.size,
+        incumbent_symbol.size
+            + u64::try_from(
+                cold_bytes + report.wrapper_bytes + report.wrapper_to_core_padding_bytes,
+            )
+            .expect("selected size delta"),
+    );
+    assert_eq!(
+        usize::try_from(selected_symbol.offset + selected_symbol.size)
+            .expect("selected SpanSum extent"),
+        report.core_offset,
+    );
+
+    let literal = incumbent
+        .program()
+        .native_exact_singleton_count_literal()
+        .expect("authenticated SpanSum singleton witness");
+    let artifact_identity = incumbent.program().artifact_identity();
+    let candidate = match crate::direct_count_v3::prepare_direct_exact_singleton_count(
+        literal,
+        artifact_identity,
+        target,
+        CompileLimitsV1::default().max_object_bytes,
+    )
+    .expect("prepare direct SpanSum Count-v3 core") {
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+            candidate
+        }
+        crate::direct_count_v3::DirectExactSingletonCountPreparation::Declined => {
+            panic!("supported direct SpanSum Count-v3 core declined")
+        }
+    };
+    let mut tampered = incumbent.module().clone();
+    let tamper_offset = usize::try_from(incumbent_symbol.offset + incumbent_symbol.size - 1)
+        .expect("incumbent SpanSum tamper offset");
+    assert!(tampered.test_flip_text_byte(tamper_offset));
+    assert!(tampered
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .is_err());
+
+    candidate
+        .authenticate_embedded(
+            literal,
+            report.core_offset,
+            &selected_text[report.core_offset..report.core_offset + report.core_bytes],
+        )
+        .expect("authenticate gated final-offset Count-v3 core");
+    let mut rollback_module = incumbent.module().clone();
+    let rollback = rollback_module
+        .install_direct_exact_singleton_span_sum(literal, artifact_identity, &candidate)
+        .expect("install gated direct SpanSum for rollback")
+        .expect("gated direct SpanSum selected");
+    rollback_module
+        .rollback_direct_exact_singleton_span_sum(rollback)
+        .expect("restore exact gated SpanSum incumbent");
+    assert_eq!(&rollback_module, incumbent.module());
+}
+
+#[test]
+fn direct_count_aarch64_relocation_covers_every_immediate_branch_family() {
+    let fixtures = [
+        (0x1400_0000_u32, 0x03ff_ffff_u32), // B.
+        (0x9400_0000_u32, 0x03ff_ffff_u32), // BL.
+        (0x5400_0001_u32, 0x00ff_ffe0_u32), // B.ne.
+        (0x3400_0005_u32, 0x00ff_ffe0_u32), // CBZ w5.
+        (0xb500_0006_u32, 0x00ff_ffe0_u32), // CBNZ x6.
+        (0x3600_0007_u32, 0x0007_ffe0_u32), // TBZ w7.
+        (0xb700_0008_u32, 0x0007_ffe0_u32), // TBNZ x8, #63.
+    ];
+    for (opcode, immediate_mask) in fixtures {
+        let forward = crate::module::aarch64_relocate_direct_branch_instruction(
+            0x100,
+            0x180,
+            opcode,
+        )
+        .expect("encode forward direct branch")
+        .expect("forward branch is in range");
+        assert_eq!(forward & !immediate_mask, opcode & !immediate_mask);
+        assert_eq!(
+            crate::module::aarch64_direct_branch_target(0x100, forward)
+                .expect("decode forward direct branch"),
+            Some(0x180),
+        );
+
+        let backward = crate::module::aarch64_relocate_direct_branch_instruction(
+            0x280,
+            0x180,
+            forward,
+        )
+        .expect("encode backward direct branch")
+        .expect("backward branch is in range");
+        assert_eq!(backward & !immediate_mask, opcode & !immediate_mask);
+        assert_eq!(
+            crate::module::aarch64_direct_branch_target(0x280, backward)
+                .expect("decode backward direct branch"),
+            Some(0x180),
+        );
+    }
+    assert!(
+        crate::module::aarch64_relocate_direct_branch_instruction(
+            0,
+            1_usize << 30,
+            0x1400_0000,
+        )
+        .expect("numeric branch range check")
+        .is_none(),
+    );
+    assert!(crate::module::aarch64_is_pc_relative_address_or_literal(
+        0x1000_0000,
+    ));
+    assert!(crate::module::aarch64_is_pc_relative_address_or_literal(
+        0x9000_0000,
+    ));
+    assert!(crate::module::aarch64_is_pc_relative_address_or_literal(
+        0x5800_0000,
+    ));
+    assert!(!crate::module::aarch64_is_pc_relative_address_or_literal(
+        0xaa01_03e0,
+    ));
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes all 32 direct exact-singleton SpanSum widths"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linked differential authenticates the public SpanSum wrapper, checked composition, Count-v3 core, and non-overlap semantics together"
+)]
+fn linked_host_direct_exact_singleton_span_sum_matches_generated_nonoverlap_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn initializer(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    let operating_system = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Macos
+    };
+    let target = direct_count_asimd_target(operating_system);
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-direct-span-sum-singleton-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create direct SpanSum linker directory");
+    let mut source = format!(
+        "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n#define IDENTITY_OFFSET {}U\nstatic const uint8_t empty_hay[1]={{0}};\n",
+        crate::FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+    );
+    source.push_str(
+        "static uint64_t reference_nonoverlap_span_sum_a(const uint8_t *hay,size_t len,size_t width){size_t offset=0U;uint64_t total=0U;while(offset+width<=len){size_t index=0U;while(index<width&&hay[offset+index]=='a')index++;if(index==width){total+=(uint64_t)width;offset+=width;}else{offset++;}}return total;}\n",
+    );
+    let mut objects = Vec::new();
+    for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+        let pattern = format!("(?-u:{})", "\\x61".repeat(width));
+        let compiled = compile_with_prepared_aggregate_exports(
+            direct_count_request(
+                pattern,
+                target,
+                CompileMode::Optimizing,
+                CompileLimitsV1::default().max_object_bytes,
+            ),
+            PreparedAggregateExports::SPAN_SUM,
+        )
+        .expect("compile linked direct SpanSum width");
+        let report = compiled
+            .module()
+            .direct_exact_singleton_span_sum_aot_report()
+            .expect("linked width selected direct SpanSum");
+        assert_eq!(usize::from(report.literal_bytes), width);
+        assert_eq!(
+            report.core_alignment_bytes,
+            crate::DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+        );
+        assert!(report.core_offset.is_multiple_of(report.core_alignment_bytes));
+        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        let entry = compiled
+            .module()
+            .prepared_span_sum_symbol()
+            .expect("linked direct SpanSum symbol");
+        let object = directory.join(format!("span-sum-{width}.o"));
+        fs::write(&object, compiled.object()).expect("write direct SpanSum object");
+        objects.push(object);
+
+        let identity = initializer(&compiled.program().artifact_identity());
+        let negative = initializer(&vec![b'b'; width.saturating_mul(2).max(1)]);
+        let mut early = vec![b'a'; width];
+        early.push(b'b');
+        let mut late = vec![b'b'; 7];
+        late.extend(std::iter::repeat_n(b'a', width));
+        let dense = vec![b'a'; width * 4 - 1];
+        let overlap = vec![b'a'; width + 3];
+        let early_initializer = initializer(&early);
+        let late_initializer = initializer(&late);
+        let dense_initializer = initializer(&dense);
+        let overlap_initializer = initializer(&overlap);
+        let overlap_sum = ((width + 3) / width) * width;
+        write!(
+            &mut source,
+            r#"
+extern uint32_t {entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t identity_{width}[32]={{{identity}}};
+static const uint8_t negative_{width}[]={{{negative}}};
+static const uint8_t early_{width}[]={{{early_initializer}}};
+static const uint8_t late_{width}[]={{{late_initializer}}};
+static const uint8_t dense_{width}[]={{{dense_initializer}}};
+static const uint8_t overlap_{width}[]={{{overlap_initializer}}};
+static int check_span_sum_{width}(void){{
+  uint8_t handle[IDENTITY_OFFSET+32U];
+  uint8_t wrong[IDENTITY_OFFSET+32U];
+  uint8_t misaligned[16];
+  uint64_t out=99U;
+  memset(handle,0,sizeof(handle));memset(wrong,0,sizeof(wrong));
+  memcpy(handle+IDENTITY_OFFSET,identity_{width},32U);
+  if({entry}(handle,empty_hay,0U,&out)!=0U||out!=0U)return 1;
+  out=99U;if({entry}(handle,negative_{width},sizeof(negative_{width}),&out)!=0U||out!=0U)return 2;
+  out=99U;if({entry}(handle,early_{width},sizeof(early_{width}),&out)!=0U||out!={width}U)return 3;
+  out=99U;if({entry}(handle,late_{width},sizeof(late_{width}),&out)!=0U||out!={width}U)return 4;
+  out=99U;if({entry}(handle,dense_{width},sizeof(dense_{width}),&out)!=0U||out!=3U*{width}U)return 5;
+  out=99U;if({entry}(handle,overlap_{width},sizeof(overlap_{width}),&out)!=0U||out!={overlap_sum}U)return 6;
+  if({width}U==1U){{
+    out=99U;if({entry}(0,early_{width},sizeof(early_{width}),&out)!=5U||out!=99U)return 7;
+    out=99U;if({entry}(wrong,early_{width},sizeof(early_{width}),&out)!=3U||out!=99U)return 8;
+    out=99U;if({entry}(handle,0,sizeof(early_{width}),&out)!=2U||out!=99U)return 9;
+    out=99U;if({entry}(handle,early_{width},(size_t)-1,&out)!=2U||out!=99U)return 10;
+    if({entry}(handle,early_{width},sizeof(early_{width}),0)!=2U)return 11;
+    if({entry}(handle,early_{width},sizeof(early_{width}),(uint64_t *)(void *)(misaligned+1))!=2U)return 12;
+  }}
+  uint8_t exhaustive[10];
+  for(size_t exhaustive_len=0U;exhaustive_len<=sizeof(exhaustive);exhaustive_len++){{
+    uint32_t combinations=1U<<(uint32_t)exhaustive_len;
+    for(uint32_t mask=0U;mask<combinations;mask++){{
+      for(size_t index=0U;index<exhaustive_len;index++)exhaustive[index]=((mask>>index)&1U)!=0U?'a':'b';
+      uint64_t expected=reference_nonoverlap_span_sum_a(exhaustive,exhaustive_len,{width}U);
+      out=99U;
+      if({entry}(handle,exhaustive,exhaustive_len,&out)!=0U||out!=expected)return 13;
+    }}
+  }}
+  return 0;
+}}
+"#,
+        )
+        .expect("write direct SpanSum C fixture");
+    }
+    source.push_str("int main(void){\n");
+    for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+        write!(
+            &mut source,
+            "int status_{width}=check_span_sum_{width}();if(status_{width}!=0)return {width}*100+status_{width};\n",
+        )
+        .expect("write direct SpanSum C main");
+    }
+    source.push_str("return 0;}\n");
+    let c_path = directory.join("direct-span-sum.c");
+    let executable = directory.join("direct-span-sum");
+    fs::write(&c_path, source).expect("write direct SpanSum C source");
+    let mut linker = Command::new(if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    });
+    linker.arg("-O2").arg(&c_path);
+    linker.args(&objects).arg("-o").arg(&executable);
+    let status = linker.status().expect("link direct SpanSum differential");
+    assert!(status.success(), "direct SpanSum differential failed to link");
+    let result = Command::new(&executable)
+        .output()
+        .expect("run direct SpanSum differential");
+    assert!(
+        result.status.success(),
+        "direct SpanSum differential status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove direct SpanSum linker directory");
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes both direct SpanSum cold-gate routes"]
+fn linked_host_direct_exact_singleton_span_sum_cold_gate_matches_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn initializer(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    let operating_system = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Macos
+    };
+    let target = direct_count_asimd_target(operating_system);
+    let compiled = compile_with_prepared_aggregate_exports(
+        direct_count_request(
+            "(?-u:\\x61\\x61)",
+            target,
+            CompileMode::Optimizing,
+            CompileLimitsV1::default().max_object_bytes,
+        ),
+        PreparedAggregateExports::SPAN_SUM,
+    )
+    .expect("compile linked cold-gate direct SpanSum");
+    let report = compiled
+        .module()
+        .direct_exact_singleton_span_sum_aot_report()
+        .expect("linked cold-gate direct SpanSum selected");
+    let short_max = report
+        .short_fallback_max_bytes
+        .expect("linked SpanSum short threshold");
+    assert_eq!(
+        short_max,
+        crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
+    );
+    assert!(compiled.module().required_runtime_symbols().next().is_none());
+    let entry = compiled
+        .module()
+        .prepared_span_sum_symbol()
+        .expect("linked direct SpanSum symbol");
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-direct-span-sum-cold-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create direct SpanSum linker directory");
+    let object = directory.join("span-sum.o");
+    fs::write(&object, compiled.object()).expect("write direct SpanSum object");
+    let identity = initializer(&compiled.program().artifact_identity());
+    let source = format!(
+        r#"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#define IDENTITY_OFFSET {identity_offset}U
+#define SHORT_MAX {short_max}U
+extern uint32_t {entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t identity[32]={{{identity}}};
+static uint64_t reference_span_sum(const uint8_t *hay,size_t len){{
+  size_t offset=0U;uint64_t total=0U;
+  while(offset+2U<=len){{
+    if(hay[offset]=='a'&&hay[offset+1U]=='a'){{total+=2U;offset+=2U;}}
+    else offset++;
+  }}
+  return total;
+}}
+int main(void){{
+  uint8_t handle[IDENTITY_OFFSET+32U];
+  uint8_t wrong[IDENTITY_OFFSET+32U];
+  uint8_t misaligned[16];
+  static uint8_t hay[SHORT_MAX+3U];
+  memset(handle,0,sizeof(handle));memset(wrong,0,sizeof(wrong));
+  memcpy(handle+IDENTITY_OFFSET,identity,32U);
+  for(size_t index=0U;index<sizeof(hay);index++)hay[index]=(index%7U)==3U?'b':'a';
+  const size_t lengths[6]={{0U,1U,2U,SHORT_MAX,SHORT_MAX+1U,SHORT_MAX+2U}};
+  for(size_t index=0U;index<6U;index++){{
+    uint64_t out=UINT64_C(0x1122334455667788);
+    uint64_t expected=reference_span_sum(hay,lengths[index]);
+    if({entry}(handle,hay,lengths[index],&out)!=0U||out!=expected)return 1;
+  }}
+  uint64_t out=UINT64_C(0x1122334455667788);
+  if({entry}(wrong,hay,SHORT_MAX,&out)!=3U||out!=UINT64_C(0x1122334455667788))return 2;
+  out=UINT64_C(0x1122334455667788);
+  if({entry}(wrong,hay,SHORT_MAX+1U,&out)!=3U||out!=UINT64_C(0x1122334455667788))return 3;
+  out=UINT64_C(0x1122334455667788);
+  if({entry}(0,hay,SHORT_MAX+1U,&out)!=5U||out!=UINT64_C(0x1122334455667788))return 4;
+  if({entry}(handle,hay,SHORT_MAX+1U,0)!=2U)return 5;
+  if({entry}(handle,hay,SHORT_MAX+1U,(uint64_t *)(void *)(misaligned+1))!=2U)return 6;
+  const size_t invalid[3]={{SIZE_MAX,((size_t)UINT64_C(1))<<63,((((size_t)UINT64_C(1))<<63)+SHORT_MAX)}};
+  for(size_t index=0U;index<3U;index++){{
+    out=UINT64_C(0x1122334455667788);
+    if({entry}(wrong,hay,invalid[index],&out)!=2U||out!=UINT64_C(0x1122334455667788))return 7;
+    if({entry}(handle,hay,invalid[index],0)!=2U)return 8;
+  }}
+  return 0;
+}}
+"#,
+        identity_offset = crate::FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+    );
+    let c_path = directory.join("direct-span-sum.c");
+    let executable = directory.join("direct-span-sum");
+    fs::write(&c_path, source).expect("write direct SpanSum C source");
+    let mut linker = Command::new(if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    });
+    let status = linker
+        .arg("-O2")
+        .arg(&c_path)
+        .arg(&object)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("link direct SpanSum differential");
+    assert!(status.success(), "direct SpanSum differential failed to link");
+    let result = Command::new(&executable)
+        .output()
+        .expect("run direct SpanSum differential");
+    assert!(
+        result.status.success(),
+        "direct SpanSum differential status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove direct SpanSum linker directory");
+}
+
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes all 32 direct exact-singleton Count widths"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linked differential authenticates the public wrapper, Count-v3 core, and non-overlap semantics together"
+)]
+fn linked_host_direct_exact_singleton_count_matches_generated_nonoverlap_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn initializer(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    let operating_system = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Macos
+    };
+    let target = direct_count_asimd_target(operating_system);
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-direct-count-singleton-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create direct Count linker directory");
+    let mut source = format!(
+        "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n#define IDENTITY_OFFSET {}U\nstatic const uint8_t empty_hay[1]={{0}};\n",
+        crate::FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+    );
+    source.push_str(
+        "static uint64_t reference_nonoverlap_a(const uint8_t *hay,size_t len,size_t width){size_t offset=0U;uint64_t count=0U;while(offset+width<=len){size_t index=0U;while(index<width&&hay[offset+index]=='a')index++;if(index==width){count++;offset+=width;}else{offset++;}}return count;}\n",
+    );
+    let mut objects = Vec::new();
+    for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+        let pattern = format!("(?-u:{})", "\\x61".repeat(width));
+        let compiled = compile_with_prepared_aggregate_exports(
+            direct_count_request(
+                pattern,
+                target,
+                CompileMode::Optimizing,
+                CompileLimitsV1::default().max_object_bytes,
+            ),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("compile linked direct Count-v3 width");
+        let report = compiled
+            .module()
+            .direct_exact_singleton_count_aot_report()
+            .expect("linked width selected direct Count-v3");
+        assert_eq!(usize::from(report.literal_bytes), width);
+        assert!(compiled.module().required_runtime_symbols().next().is_none());
+        let entry = compiled
+            .module()
+            .prepared_count_symbol()
+            .expect("linked direct Count-v3 symbol");
+        let object = directory.join(format!("count-{width}.o"));
+        fs::write(&object, compiled.object()).expect("write direct Count-v3 object");
+        objects.push(object);
+
+        let identity = initializer(&compiled.program().artifact_identity());
+        let negative = initializer(&vec![b'b'; width.saturating_mul(2).max(1)]);
+        let mut early = vec![b'a'; width];
+        early.push(b'b');
+        let mut late = vec![b'b'; 7];
+        late.extend(std::iter::repeat_n(b'a', width));
+        let dense = vec![b'a'; width * 4 - 1];
+        let overlap = vec![b'a'; width + 3];
+        let early_initializer = initializer(&early);
+        let late_initializer = initializer(&late);
+        let dense_initializer = initializer(&dense);
+        let overlap_initializer = initializer(&overlap);
+        let overlap_count = (width + 3) / width;
+        let short_max = crate::DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES;
+        let boundary_bytes = short_max + 2;
+        write!(
+            &mut source,
+            r#"
+extern uint32_t {entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t identity_{width}[32]={{{identity}}};
+static const uint8_t negative_{width}[]={{{negative}}};
+static const uint8_t early_{width}[]={{{early_initializer}}};
+static const uint8_t late_{width}[]={{{late_initializer}}};
+static const uint8_t dense_{width}[]={{{dense_initializer}}};
+static const uint8_t overlap_{width}[]={{{overlap_initializer}}};
+static int check_{width}(void){{
+  uint8_t handle[IDENTITY_OFFSET+32U];
+  uint8_t wrong[IDENTITY_OFFSET+32U];
+  uint8_t misaligned[16];
+  uint64_t out=99U;
+  memset(handle,0,sizeof(handle));memset(wrong,0,sizeof(wrong));
+  memcpy(handle+IDENTITY_OFFSET,identity_{width},32U);
+  if({entry}(handle,empty_hay,0U,&out)!=0U||out!=0U)return 1;
+  out=99U;if({entry}(handle,negative_{width},sizeof(negative_{width}),&out)!=0U||out!=0U)return 2;
+  out=99U;if({entry}(handle,early_{width},sizeof(early_{width}),&out)!=0U||out!=1U)return 3;
+  out=99U;if({entry}(handle,late_{width},sizeof(late_{width}),&out)!=0U||out!=1U)return 4;
+  out=99U;if({entry}(handle,dense_{width},sizeof(dense_{width}),&out)!=0U||out!=3U)return 5;
+  out=99U;if({entry}(handle,overlap_{width},sizeof(overlap_{width}),&out)!=0U||out!={overlap_count}U)return 6;
+  if({width}U==1U||{width}U==2U||{width}U==4U){{
+    out=99U;if({entry}(0,early_{width},sizeof(early_{width}),&out)!=5U||out!=99U)return 7;
+    out=99U;if({entry}(wrong,early_{width},sizeof(early_{width}),&out)!=3U||out!=99U)return 8;
+    out=99U;if({entry}(handle,0,sizeof(early_{width}),&out)!=2U||out!=99U)return 9;
+    out=99U;if({entry}(handle,early_{width},(size_t)-1,&out)!=2U||out!=99U)return 10;
+    if({entry}(handle,early_{width},sizeof(early_{width}),0)!=2U)return 11;
+    if({entry}(handle,early_{width},sizeof(early_{width}),(uint64_t *)(void *)(misaligned+1))!=2U)return 12;
+    const size_t invalid_lengths[3]={{SIZE_MAX,((size_t)UINT64_C(1))<<63,((((size_t)UINT64_C(1))<<63)+8191U)}};
+    for(size_t invalid_index=0U;invalid_index<3U;invalid_index++){{
+      out=99U;
+      if({entry}(handle,early_{width},invalid_lengths[invalid_index],&out)!=2U||out!=99U)return 15;
+      out=99U;
+      if({entry}(wrong,early_{width},invalid_lengths[invalid_index],&out)!=2U||out!=99U)return 19;
+    }}
+  }}
+  uint8_t exhaustive[10];
+  for(size_t exhaustive_len=0U;exhaustive_len<=sizeof(exhaustive);exhaustive_len++){{
+    uint32_t combinations=1U<<(uint32_t)exhaustive_len;
+    for(uint32_t mask=0U;mask<combinations;mask++){{
+      for(size_t index=0U;index<exhaustive_len;index++)exhaustive[index]=((mask>>index)&1U)!=0U?'a':'b';
+      uint64_t expected=reference_nonoverlap_a(exhaustive,exhaustive_len,{width}U);
+      out=99U;
+      if({entry}(handle,exhaustive,exhaustive_len,&out)!=0U||out!=expected)return 13;
+    }}
+  }}
+  uint8_t boundary[{boundary_bytes}U];
+  for(size_t index=0U;index<sizeof(boundary);index++)boundary[index]=(index%7U)==3U?'b':'a';
+  const size_t boundary_lengths[3]={{{short_max}U,{short_max}U+1U,{short_max}U+2U}};
+  for(size_t index=0U;index<3U;index++){{
+    size_t boundary_len=boundary_lengths[index];
+    uint64_t expected=reference_nonoverlap_a(boundary,boundary_len,{width}U);
+    out=99U;
+    if({entry}(handle,boundary,boundary_len,&out)!=0U||out!=expected)return 14;
+  }}
+  if({width}U==2U||{width}U==4U){{
+    out=99U;if({entry}(wrong,boundary,{short_max}U+1U,&out)!=3U||out!=99U)return 16;
+    if({entry}(handle,boundary,{short_max}U+1U,0)!=2U)return 17;
+    if({entry}(handle,boundary,{short_max}U+1U,(uint64_t *)(void *)(misaligned+1))!=2U)return 18;
+  }}
+  return 0;
+}}
+"#,
+        )
+        .expect("write direct Count-v3 C fixture");
+    }
+    source.push_str("int main(void){\n");
+    for width in 1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES {
+        write!(
+            &mut source,
+            "int status_{width}=check_{width}();if(status_{width}!=0)return {width}*100+status_{width};\n",
+        )
+        .expect("write direct Count-v3 C main");
+    }
+    source.push_str("return 0;}\n");
+    let c_path = directory.join("direct-count.c");
+    let executable = directory.join("direct-count");
+    fs::write(&c_path, source).expect("write direct Count-v3 C source");
+    let mut linker = Command::new(if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    });
+    linker.arg("-O2").arg(&c_path);
+    linker.args(&objects).arg("-o").arg(&executable);
+    let status = linker.status().expect("link direct Count-v3 differential");
+    assert!(status.success(), "direct Count-v3 differential failed to link");
+    let result = Command::new(&executable)
+        .output()
+        .expect("run direct Count-v3 differential");
+    assert!(
+        result.status.success(),
+        "direct Count-v3 differential status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove direct Count-v3 linker directory");
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes focused PeriodicRun staged wide paths"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linked fixture keeps all staged wide outcomes beside its independent non-overlap oracle"
+)]
+fn linked_host_direct_exact_singleton_count_periodic_wide_stage_matches_independent_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn initializer(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte}U"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    let literal = b"aeaeaeaeae";
+    let kernel = fre_kernel_ir::build_exact_aggregate::<fre_kernel_ir::Count>(
+        literal,
+        fre_kernel_ir::ValidateLimits::default(),
+    )
+    .expect("build focused periodic Count program");
+    let optimized = fre_aot_optimizer::optimize_count_v3(
+        &kernel,
+        fre_aot_optimizer::CountV3TuningClass::GenericAarch64,
+        fre_aot_optimizer::CountV3OptimizerLimits::default(),
+    )
+    .expect("optimize focused periodic Count program");
+    assert_eq!(
+        optimized.recipe().strategy(),
+        fre_aot_optimizer::CountV3Strategy::PeriodicRun,
+    );
+    let filters = optimized.recipe().filter_offsets();
+    assert_eq!(filters.len(), 2);
+    let primary = literal[usize::from(filters[0])];
+    let secondary = literal[usize::from(filters[1])];
+    assert_ne!(primary, secondary);
+    let absent = (0..=u8::MAX)
+        .find(|byte| !literal.contains(byte))
+        .expect("focused periodic literal omits a byte");
+
+    let operating_system = if cfg!(target_os = "linux") {
+        OperatingSystem::Linux
+    } else {
+        OperatingSystem::Macos
+    };
+    let target = direct_count_asimd_target(operating_system);
+    let pattern = format!(
+        "(?-u:{})",
+        literal
+            .iter()
+            .map(|byte| format!(r"\x{byte:02x}"))
+            .collect::<String>(),
+    );
+    let compiled = compile_with_prepared_aggregate_exports(
+        direct_count_request(
+            pattern,
+            target,
+            CompileMode::Optimizing,
+            CompileLimitsV1::default().max_object_bytes,
+        ),
+        PreparedAggregateExports::COUNT,
+    )
+    .expect("compile focused periodic direct Count-v3");
+    let report = compiled
+        .module()
+        .direct_exact_singleton_count_aot_report()
+        .expect("focused periodic direct Count-v3 selected");
+    assert_eq!(usize::from(report.literal_bytes), literal.len());
+    assert!(compiled.module().required_runtime_symbols().next().is_none());
+    let entry = compiled
+        .module()
+        .prepared_count_symbol()
+        .expect("focused periodic direct Count-v3 symbol");
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-direct-count-periodic-wide-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create focused periodic linker directory");
+    let object = directory.join("count.o");
+    fs::write(&object, compiled.object()).expect("write focused periodic Count-v3 object");
+
+    let identity = initializer(&compiled.program().artifact_identity());
+    let literal_initializer = initializer(literal);
+    let source = format!(
+        r#"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#define IDENTITY_OFFSET {identity_offset}U
+extern uint32_t {entry}(void *,const uint8_t *,size_t,uint64_t *);
+static const uint8_t identity[32]={{{identity}}};
+static const uint8_t literal[]={{{literal_initializer}}};
+static uint64_t reference_nonoverlap(const uint8_t *hay,size_t len){{
+  size_t offset=0U;uint64_t count=0U;
+  while(offset+sizeof(literal)<=len){{
+    size_t index=0U;
+    while(index<sizeof(literal)&&hay[offset+index]==literal[index])index++;
+    if(index==sizeof(literal)){{count++;offset+=sizeof(literal);}}else{{offset++;}}
+  }}
+  return count;
+}}
+int main(void){{
+  uint8_t handle[IDENTITY_OFFSET+32U];
+  uint8_t primary_absent[384];
+  uint8_t primary_only[384];
+  uint8_t late_complete[384];
+  uint64_t expected=0U;
+  uint64_t out=99U;
+  memset(handle,0,sizeof(handle));
+  memcpy(handle+IDENTITY_OFFSET,identity,32U);
+  memset(primary_absent,{absent}U,sizeof(primary_absent));
+  memset(primary_only,{primary}U,sizeof(primary_only));
+  memset(late_complete,{absent}U,sizeof(late_complete));
+  memcpy(late_complete+150U,literal,sizeof(literal));
+  memcpy(late_complete+150U+sizeof(literal),literal,sizeof(literal));
+  expected=reference_nonoverlap(primary_absent,sizeof(primary_absent));
+  if(expected!=0U)return 1;
+  if({entry}(handle,primary_absent,sizeof(primary_absent),&out)!=0U||out!=expected)return 2;
+  expected=reference_nonoverlap(primary_only,sizeof(primary_only));out=99U;
+  if(expected!=0U)return 3;
+  if({entry}(handle,primary_only,sizeof(primary_only),&out)!=0U||out!=expected)return 4;
+  expected=reference_nonoverlap(late_complete,sizeof(late_complete));out=99U;
+  if(expected!=2U)return 5;
+  if({entry}(handle,late_complete,sizeof(late_complete),&out)!=0U||out!=expected)return 6;
+  return 0;
+}}
+"#,
+        identity_offset = crate::FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+    );
+    let c_path = directory.join("periodic-wide.c");
+    let executable = directory.join("periodic-wide");
+    fs::write(&c_path, source).expect("write focused periodic Count-v3 C fixture");
+    let mut linker = Command::new(if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    });
+    let status = linker
+        .arg("-O2")
+        .arg(&c_path)
+        .arg(&object)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("link focused periodic Count-v3 differential");
+    assert!(
+        status.success(),
+        "focused periodic Count-v3 differential failed to link"
+    );
+    let result = Command::new(&executable)
+        .output()
+        .expect("run focused periodic Count-v3 differential");
+    assert!(
+        result.status.success(),
+        "focused periodic Count-v3 differential status={:?}, stdout={}, stderr={}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    fs::remove_dir_all(directory).expect("remove focused periodic linker directory");
+}
 
 fn generated_prefix_dictionary(roots: usize, children_per_root: usize) -> String {
     let mut pattern = String::from("(?-u:");
@@ -42,6 +2576,18 @@ fn generated_prefix_dictionary(roots: usize, children_per_root: usize) -> String
             write!(&mut pattern, "{scrambled_child:016x}")
                 .expect("writing to a String cannot fail");
         }
+    }
+    pattern.push(')');
+    pattern
+}
+
+fn generated_folded_captured_dictionary(arms: usize) -> String {
+    let mut pattern = String::from("(?i-u:");
+    for arm in 0..arms {
+        if arm != 0 {
+            pattern.push('|');
+        }
+        write!(&mut pattern, "(shared-prefix-{arm:04x})").expect("writing to a String cannot fail");
     }
     pattern.push(')');
     pattern
@@ -1986,6 +4532,45 @@ fn embedded_literal_trie_matches_rust_across_modes_outputs_and_windows() {
 }
 
 #[test]
+#[ignore = "one generated 1,024-arm AOT receipt and object gate"]
+fn generated_folded_byte_token_trie_emits_a_compact_authenticated_aot_object() {
+    const ARMS: usize = 1_024;
+    let pattern = generated_folded_captured_dictionary(ARMS);
+    let compiled = compile(
+        CompileRequest::new(&pattern, Target::aarch64_macos())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists),
+    )
+    .expect("generated folded-arm AOT compilation");
+    let receipt = compiled.receipt();
+    assert_eq!(receipt.source_bytes, pattern.len());
+    assert!(receipt.thompson_states < 4_096, "{receipt:#?}");
+    assert!(receipt.thompson_edges < 8_192, "{receipt:#?}");
+    assert!(!compiled.object().is_empty());
+    assert_eq!(receipt.object_bytes, compiled.object().len());
+    let object_sha256: [u8; 32] = Sha256::digest(compiled.object()).into();
+    assert_eq!(receipt.object_sha256, object_sha256);
+    assert_eq!(
+        compiled
+            .search(
+                b"xxSHARED-PREFIX-03FFyy",
+                SearchWindow::full(b"xxSHARED-PREFIX-03FFyy"),
+            )
+            .expect("generated folded positive search"),
+        MatchResult::Exists(true),
+    );
+    assert_eq!(
+        compiled
+            .search(
+                b"xxshared-prefix-zzzz",
+                SearchWindow::full(b"xxshared-prefix-zzzz"),
+            )
+            .expect("generated folded negative search"),
+        MatchResult::Exists(false),
+    );
+}
+
+#[test]
 fn all_configured_line_terminators_match_rust_for_every_window() {
     let pattern = r"(?m:^a$)";
     let mut lf_digest = None;
@@ -2832,6 +5417,502 @@ fn objects_and_receipts_are_deterministic() {
 #[test]
 #[allow(
     clippy::too_many_lines,
+    reason = "one cross-target audit keeps proof admission, additive identity, local relocation, receipts, and exact-base decline together"
+)]
+fn exact_finite_selected_end_grep_count_is_authenticated_additive_and_resource_atomic() {
+    let request = |target| {
+        CompileRequest::new("alpha|alphabet|beta", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+    };
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let ordinary = compile(request(target)).expect("ordinary SelectedEnd object");
+        assert!(
+            ordinary
+                .module()
+                .exact_finite_selected_end_grep_count_aot_report()
+                .is_none()
+        );
+        assert!(ordinary.module().prepared_grep_count_symbol().is_none());
+
+        let compiled = compile_with_exact_finite_selected_end_grep_count(request(target))
+            .expect("exact-finite line-jump GrepCount object");
+        let repeated = compile_with_exact_finite_selected_end_grep_count(request(target))
+            .expect("deterministic exact-finite line-jump GrepCount object");
+        assert_eq!(compiled.object(), repeated.object());
+        assert_eq!(compiled.module(), repeated.module());
+        assert_eq!(compiled.receipt(), repeated.receipt());
+        assert_eq!(
+            compiled.program().serialize().expect("additive program"),
+            ordinary.program().serialize().expect("ordinary program"),
+        );
+        assert_eq!(
+            compiled.module().entry_symbol(),
+            ordinary.module().entry_symbol()
+        );
+        assert_eq!(
+            compiled.module().prepared_aggregate_exports(),
+            PreparedAggregateExports::GREP_COUNT,
+        );
+        assert_eq!(
+            compiled.module().prepared_aggregate_strategy(),
+            Some(PreparedAggregateStrategy::NativeFused),
+        );
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_exports,
+            PreparedAggregateExports::GREP_COUNT,
+        );
+        assert_eq!(
+            compiled.receipt().prepared_aggregate_strategy,
+            Some(PreparedAggregateStrategy::NativeFused),
+        );
+        assert_eq!(compiled.receipt().required_prepare_capabilities, 0);
+        assert!(!compiled.receipt().runtime_helper_required);
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            compiled
+                .receipt()
+                .passes
+                .contains(&OptimizationPass::PreparedAggregateLowering)
+        );
+
+        let report = compiled
+            .module()
+            .exact_finite_selected_end_grep_count_aot_report()
+            .copied()
+            .expect("authenticated line-jump report");
+        assert_eq!(
+            report.artifact_identity,
+            compiled.program().artifact_identity()
+        );
+        assert_eq!(report.output, OutputContract::SelectedEnd);
+        assert_eq!(report.source_count, 3);
+        assert_eq!(report.source_bytes, 17);
+        assert_eq!(report.maximum_width, 8);
+
+        let text = compiled
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("line-jump text");
+        let ordinary_text = ordinary
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("ordinary text");
+        let ordinary_entry = ordinary
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == ordinary.module().entry_symbol())
+            .expect("ordinary entry record");
+        let ordinary_start = usize::try_from(ordinary_entry.offset).expect("ordinary offset");
+        let ordinary_size = usize::try_from(ordinary_entry.size).expect("ordinary size");
+        let ordinary_end = ordinary_start
+            .checked_add(ordinary_size)
+            .expect("ordinary extent");
+        assert_eq!(report.ordinary_entry_offset, ordinary_start);
+        assert_eq!(
+            text.bytes().get(ordinary_start..ordinary_end),
+            ordinary_text.bytes().get(ordinary_start..ordinary_end),
+            "additive reducer changed its local ordinary target",
+        );
+        assert_eq!(
+            report.ordinary_entry_sha256,
+            <[u8; 32]>::from(Sha256::digest(
+                ordinary_text
+                    .bytes()
+                    .get(ordinary_start..ordinary_end)
+                    .expect("ordinary entry bytes"),
+            )),
+        );
+
+        let reducer_name = compiled
+            .module()
+            .prepared_grep_count_symbol()
+            .expect("line-jump GrepCount symbol");
+        let reducer = compiled
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == reducer_name)
+            .expect("line-jump GrepCount record");
+        let reducer_start = usize::try_from(reducer.offset).expect("reducer offset");
+        let reducer_size = usize::try_from(reducer.size).expect("reducer size");
+        let reducer_end = reducer_start
+            .checked_add(reducer_size)
+            .expect("reducer extent");
+        assert_eq!(report.reducer_entry_offset, reducer_start);
+        assert_eq!(
+            report.reducer_code_sha256,
+            <[u8; 32]>::from(Sha256::digest(
+                text.bytes()
+                    .get(reducer_start..reducer_end)
+                    .expect("reducer bytes"),
+            )),
+        );
+        assert!((reducer_start..reducer_end).contains(&report.local_call_offset));
+        let local_target = match target.architecture {
+            Architecture::X86_64 => {
+                assert_eq!(text.bytes()[report.local_call_offset - 1], 0xe8);
+                let displacement = i32::from_le_bytes(
+                    text.bytes()[report.local_call_offset..report.local_call_offset + 4]
+                        .try_into()
+                        .expect("x86 local-call displacement"),
+                );
+                usize::try_from(
+                    i64::try_from(report.local_call_offset + 4)
+                        .expect("x86 call site")
+                        .checked_add(i64::from(displacement))
+                        .expect("x86 local-call target"),
+                )
+                .expect("non-negative x86 local-call target")
+            }
+            Architecture::Aarch64 => {
+                let instruction = u32::from_le_bytes(
+                    text.bytes()[report.local_call_offset..report.local_call_offset + 4]
+                        .try_into()
+                        .expect("AArch64 local-call instruction"),
+                );
+                assert_eq!(instruction & 0xfc00_0000, 0x9400_0000);
+                let words = ((instruction << 6) as i32) >> 6;
+                usize::try_from(
+                    i64::try_from(report.local_call_offset)
+                        .expect("AArch64 call site")
+                        .checked_add(i64::from(words) * 4)
+                        .expect("AArch64 local-call target"),
+                )
+                .expect("non-negative AArch64 local-call target")
+            }
+        };
+        assert_eq!(local_target, ordinary_start);
+
+        let identity_index = compiled
+            .module()
+            .symbols()
+            .iter()
+            .position(|symbol| symbol.name == ".Lfre_aot_regex_exact_finite_grep_count_identity")
+            .expect("line-jump identity symbol");
+        let identity = &compiled.module().symbols()[identity_index];
+        let identity_section = identity.section.expect("identity data section");
+        let identity_start = usize::try_from(identity.offset).expect("identity offset");
+        assert_eq!(
+            &compiled.module().sections()[identity_section].data
+                [identity_start..identity_start + 32],
+            compiled.program().artifact_identity(),
+        );
+        let reducer_relocations = compiled
+            .module()
+            .relocations()
+            .iter()
+            .filter(|relocation| {
+                relocation.section == reducer.section.expect("reducer text section")
+                    && relocation.offset >= reducer.offset
+                    && relocation.offset < reducer.offset + reducer.size
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reducer_relocations.len(),
+            match target.architecture {
+                Architecture::X86_64 => 1,
+                Architecture::Aarch64 => 2,
+            },
+        );
+        assert!(
+            reducer_relocations
+                .iter()
+                .all(|relocation| relocation.symbol == identity_index)
+        );
+
+        let serialized = compiled.program().serialize().expect("preparation bytes");
+        let (program_name, program_len) = compiled
+            .module()
+            .required_runtime_program()
+            .expect("line-jump preparation program");
+        assert_eq!(program_len, serialized.len());
+        let program = compiled
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == program_name)
+            .expect("preparation program record");
+        let program_section = program.section.expect("preparation data section");
+        let program_start = usize::try_from(program.offset).expect("program offset");
+        assert_eq!(
+            &compiled.module().sections()[program_section].data
+                [program_start..program_start + program_len],
+            serialized,
+        );
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = ordinary.object().len();
+        let capped_request = request(target).limits(limits);
+        let capped_base = compile(capped_request.clone()).expect("capped exact base");
+        let declined = compile_with_exact_finite_selected_end_grep_count(capped_request)
+            .expect("optional line-jump object-byte decline");
+        assert_eq!(declined.object(), capped_base.object());
+        assert_eq!(declined.module(), capped_base.module());
+        assert_eq!(declined.receipt(), capped_base.receipt());
+        assert!(
+            declined
+                .module()
+                .exact_finite_selected_end_grep_count_aot_report()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn exact_finite_selected_end_grep_count_declines_closed_and_preserves_existing_apis() {
+    let target = Target::x86_64_linux();
+    for pattern in [
+        r"alpha\nbeta",
+        r"alpha\rbeta",
+        "alpha+",
+        "(?:alpha)?",
+        "^alpha",
+    ] {
+        let request = CompileRequest::new(pattern, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd);
+        let ordinary = compile(request.clone()).expect("ordinary decline fixture");
+        let declined = compile_with_exact_finite_selected_end_grep_count(request)
+            .expect("structural line-jump decline");
+        assert_eq!(declined.object(), ordinary.object(), "{pattern:?}");
+        assert_eq!(declined.module(), ordinary.module(), "{pattern:?}");
+        assert_eq!(declined.receipt(), ordinary.receipt(), "{pattern:?}");
+    }
+
+    let fast_request = CompileRequest::new("alpha|beta", target)
+        .mode(CompileMode::Fast)
+        .output(OutputContract::SelectedEnd);
+    let fast = compile(fast_request.clone()).expect("ordinary Fast fixture");
+    let fast_declined = compile_with_exact_finite_selected_end_grep_count(fast_request)
+        .expect("Fast mode has no source-authenticated finite sidecar");
+    assert_eq!(fast_declined.object(), fast.object());
+    assert_eq!(fast_declined.module(), fast.module());
+
+    let generic = compile_with_prepared_aggregate_exports(
+        CompileRequest::new("alpha|beta", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+        PreparedAggregateExports::GREP_COUNT,
+    )
+    .expect("existing generic GrepCount API");
+    assert!(
+        generic
+            .module()
+            .exact_finite_selected_end_grep_count_aot_report()
+            .is_none()
+    );
+
+    assert!(matches!(
+        compile_with_exact_finite_selected_end_grep_count(
+            CompileRequest::new("alpha", target).output(OutputContract::Exists),
+        ),
+        Err(ExactFiniteGrepCountCompileError::RequiresSelectedEnd {
+            actual: OutputContract::Exists,
+        }),
+    ));
+}
+
+#[test]
+fn exact_finite_grep_count_object_decline_does_not_swallow_failures() {
+    assert_eq!(
+        crate::classify_exact_finite_grep_count_object_attempt(Ok(vec![1, 2, 3]))
+            .expect("successful optional object"),
+        Some(vec![1, 2, 3]),
+    );
+    assert_eq!(
+        crate::classify_exact_finite_grep_count_object_attempt(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 10,
+            required: 11,
+        },))
+        .expect("numeric object-byte decline"),
+        None,
+    );
+    assert!(matches!(
+        crate::classify_exact_finite_grep_count_object_attempt(Err(ObjectError::Allocation(
+            "synthetic exact-finite GrepCount allocation"
+        ),)),
+        Err(CompileError::Object(ObjectError::Allocation(
+            "synthetic exact-finite GrepCount allocation",
+        ))),
+    ));
+    assert!(matches!(
+        crate::classify_exact_finite_grep_count_object_attempt(Err(ObjectError::InvalidModule(
+            "synthetic exact-finite GrepCount backend"
+        ),)),
+        Err(CompileError::Object(ObjectError::InvalidModule(
+            "synthetic exact-finite GrepCount backend",
+        ))),
+    ));
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "links and executes the generated line-jump reducer against the real runtime"]
+fn linked_host_exact_finite_selected_end_grep_count_matches_line_oracle() {
+    use std::{fs, process::Command, time::SystemTime};
+
+    let target = if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        }
+    } else if cfg!(target_os = "linux") {
+        Target::aarch64_linux()
+    } else {
+        Target::aarch64_macos()
+    };
+    let compiled = compile_with_exact_finite_selected_end_grep_count(
+        CompileRequest::new("alpha|beta", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+    )
+    .expect("host line-jump artifact");
+    let foreign = compile_with_exact_finite_selected_end_grep_count(
+        CompileRequest::new("gamma|delta", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd),
+    )
+    .expect("foreign line-jump artifact");
+    let reducer = compiled
+        .module()
+        .prepared_grep_count_symbol()
+        .expect("host line-jump symbol");
+    let (program, program_len) = compiled
+        .module()
+        .required_runtime_program()
+        .expect("host preparation program");
+    let (foreign_program, foreign_program_len) = foreign
+        .module()
+        .required_runtime_program()
+        .expect("foreign preparation program");
+    let source = format!(
+        r#"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+typedef void *handle_t;
+extern const unsigned char {program}[];
+extern const unsigned char {foreign_program}[];
+extern uint32_t {reducer}(handle_t,const unsigned char*,size_t,uint64_t*);
+extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);
+extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);
+static const unsigned char empty_source[1]={{0}};
+static const unsigned char negative[]={{'z','z','z'}};
+static const unsigned char one[]={{'a','l','p','h','a'}};
+static const unsigned char twice_one_line[]={{'a','l','p','h','a',' ','b','e','t','a'}};
+static const unsigned char two_lines[]={{'a','l','p','h','a','\n','b','e','t','a','\n','z'}};
+static const unsigned char crlf[]={{'z','\r','\n','a','l','p','h','a','\r','\n'}};
+static const unsigned char empty_lines[]={{'\n','a','l','p','h','a','\n','\n','b','e','t','a'}};
+static const unsigned char trailing_lf[]={{'b','e','t','a','\n'}};
+static const unsigned char binary[]={{0xff,'a','l','p','h','a',0x80,'\n',0x00,'b','e','t','a',0xfe}};
+#define CHECK(H,L,E,C) do{{uint64_t value=UINT64_C(0x1122334455667788);if({reducer}(right,(H),(L),&value)!=0U||value!=(uint64_t)(E))return (C);}}while(0)
+int main(void){{
+  handle_t right=0,wrong=0;
+  if(fre_aot_regex_runtime_prepare_exclusive_v1({program},{program_len}U,&right)!=0U)return 1;
+  if(fre_aot_regex_runtime_prepare_exclusive_v1({foreign_program},{foreign_program_len}U,&wrong)!=0U)return 2;
+  CHECK(empty_source,0U,0U,3);
+  CHECK(negative,sizeof(negative),0U,4);
+  CHECK(one,sizeof(one),1U,5);
+  CHECK(twice_one_line,sizeof(twice_one_line),1U,6);
+  CHECK(two_lines,sizeof(two_lines),2U,7);
+  CHECK(crlf,sizeof(crlf),1U,8);
+  CHECK(empty_lines,sizeof(empty_lines),2U,9);
+  CHECK(trailing_lf,sizeof(trailing_lf),1U,10);
+  CHECK(binary,sizeof(binary),2U,11);
+  uint64_t out=UINT64_C(0x8877665544332211);
+  if({reducer}(wrong,(const unsigned char*)(uintptr_t)1,8U,&out)!=3U||out!=UINT64_C(0x8877665544332211))return 12;
+  if({reducer}((handle_t)0,(const unsigned char*)(uintptr_t)1,8U,&out)!=5U||out!=UINT64_C(0x8877665544332211))return 13;
+  if({reducer}(right,(const unsigned char*)0,0U,&out)!=2U||out!=UINT64_C(0x8877665544332211))return 14;
+  if({reducer}(right,(const unsigned char*)(uintptr_t)1,(size_t)-1,&out)!=2U||out!=UINT64_C(0x8877665544332211))return 15;
+  unsigned char bytes[17];memset(bytes,0xa5,sizeof(bytes));
+  if({reducer}(right,one,sizeof(one),(uint64_t*)(void*)(bytes+1))!=2U)return 16;
+  for(size_t i=0;i<sizeof(bytes);i++)if(bytes[i]!=0xa5U)return 17;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(right)!=0U)return 18;
+  if(fre_aot_regex_runtime_destroy_exclusive_v1(wrong)!=0U)return 19;
+  return 0;
+}}
+"#,
+    );
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-exact-finite-grep-count-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create line-jump linker directory");
+    let object = directory.join("line-jump.o");
+    let foreign_object = directory.join("foreign.o");
+    let c_path = directory.join("line-jump.c");
+    let executable = directory.join("line-jump");
+    fs::write(&object, compiled.object()).expect("write line-jump object");
+    fs::write(&foreign_object, foreign.object()).expect("write foreign object");
+    fs::write(&c_path, source).expect("write line-jump C harness");
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+    let compiler = if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    };
+    let status = Command::new(compiler)
+        .arg("-O0")
+        .arg(&c_path)
+        .arg(&object)
+        .arg(&foreign_object)
+        .arg(&static_runtime)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .expect("link line-jump harness");
+    assert!(status.success(), "line-jump harness failed to link");
+    let output = Command::new(&executable)
+        .output()
+        .expect("execute line-jump harness");
+    assert!(
+        output.status.success(),
+        "line-jump status={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    fs::remove_dir_all(&directory).expect("remove line-jump linker directory");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
     reason = "one cross-target audit keeps the additive object, receipt, symbol, code, and relocation invariants together"
 )]
 fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
@@ -2906,6 +5987,7 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
             compiled.receipt().prepared_aggregate_strategy,
             Some(PreparedAggregateStrategy::NativeFused),
         );
+        assert!(compiled.module().uses_direct_span_trusted_core_aggregate());
         assert!(!compiled.receipt().runtime_helper_required);
         let expected_runtime_program = compiled
             .program()
@@ -3061,7 +6143,14 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
                             .and_then(|source| source.checked_add(5))
                             .and_then(|source| i64::try_from(source).ok())
                             .and_then(|source| source.checked_add(i64::from(displacement)))
-                            == i64::try_from(ordinary_offset).ok()
+                            .and_then(|target| usize::try_from(target).ok())
+                            .is_some_and(|target| {
+                                if entry_name == grep_entry {
+                                    target == ordinary_offset
+                                } else {
+                                    (start..end).contains(&target)
+                                }
+                            })
                     }));
                 }
                 Architecture::Aarch64 => {
@@ -3095,7 +6184,14 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
                             .and_then(|source| {
                                 source.checked_add(i64::from(immediate).checked_mul(4)?)
                             })
-                            == i64::try_from(ordinary_offset).ok()
+                            .and_then(|target| usize::try_from(target).ok())
+                            .is_some_and(|target| {
+                                if entry_name == grep_entry {
+                                    target == ordinary_offset
+                                } else {
+                                    (start..end).contains(&target)
+                                }
+                            })
                     }));
                 }
             }
@@ -3108,13 +6204,526 @@ fn prepared_aggregate_exports_are_additive_authenticated_and_cross_target() {
     clippy::too_many_lines,
     reason = "the cross-target reducer audit keeps both ISAs, engine shapes, and local-call decoding in one matrix"
 )]
-fn direct_native_reducers_reuse_ordinary_byte_and_context_dfa_entries() {
+fn direct_native_reducers_reenter_authenticated_span_core_cross_target() {
     let exports = PreparedAggregateExports::COUNT
         .union(PreparedAggregateExports::SPAN_SUM);
-    for (pattern, expected_engine) in [
-        ("[ab]+z", EngineKind::OrderedDfa),
-        (r"(?-u:\b(?:foo|bar)\b)", EngineKind::OrderedContextDfa),
-    ] {
+    for pattern in ["[ab]+z", "(?:ab|a)+z"] {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let request = || {
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+            };
+            let ordinary = compile(request()).expect("direct native Span module");
+            assert_eq!(ordinary.receipt().engine, EngineKind::OrderedDfa);
+            assert_eq!(ordinary.module().prepared_entry_symbol(), None);
+            assert!(ordinary.module().required_runtime_symbols().next().is_none());
+
+            let counted = compile_with_prepared_aggregate_exports(request(), exports)
+                .expect("direct native Count and SpanSum module");
+            assert_eq!(counted.receipt().engine, EngineKind::OrderedDfa);
+            assert_eq!(
+                counted.receipt().prepared_aggregate_strategy,
+                Some(PreparedAggregateStrategy::NativeFused),
+            );
+            assert!(!counted.receipt().runtime_helper_required);
+            assert!(counted.module().required_runtime_symbols().next().is_none());
+            assert!(counted.module().required_runtime_program().is_some());
+            assert_eq!(counted.module().entry_symbol(), ordinary.module().entry_symbol());
+            assert!(
+                counted.module().uses_direct_span_trusted_core_aggregate(),
+                "pattern={pattern:?} target={target:?}",
+            );
+            let core_offset = counted
+                .module()
+                .direct_span_trusted_core_offset()
+                .expect("authenticated direct Span core offset");
+
+            let ordinary_entry = counted
+                .module()
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == counted.module().entry_symbol())
+                .expect("ordinary native entry symbol");
+            let ordinary_offset = usize::try_from(ordinary_entry.offset)
+                .expect("ordinary native entry offset");
+            let ordinary_end = ordinary_offset
+                .checked_add(usize::try_from(ordinary_entry.size).expect("ordinary size"))
+                .expect("ordinary end");
+            let counted_text = counted.module().sections()[0].bytes();
+            let ordinary_text = ordinary.module().sections()[0].bytes();
+            assert_eq!(
+                counted_text.get(ordinary_offset..ordinary_end),
+                ordinary_text.get(ordinary_offset..ordinary_end),
+                "aggregate append changed the public ordinary entry",
+            );
+            for entry_name in [
+                counted
+                    .module()
+                    .prepared_count_symbol()
+                    .expect("native Count symbol"),
+                counted
+                    .module()
+                    .prepared_span_sum_symbol()
+                    .expect("native SpanSum symbol"),
+            ] {
+                let entry = counted
+                    .module()
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == entry_name)
+                    .expect("native scalar reducer entry symbol");
+                let section = entry.section.expect("native scalar reducer text section");
+                let start = usize::try_from(entry.offset)
+                    .expect("native scalar reducer entry offset");
+                let size = usize::try_from(entry.size)
+                    .expect("native scalar reducer entry size");
+                let end = start
+                    .checked_add(size)
+                    .expect("native scalar reducer entry end");
+                assert_eq!(section, 0);
+                let calls = generated_local_call_sites(
+                    target.architecture,
+                    counted_text,
+                    start,
+                    end,
+                );
+                assert_eq!(calls.len(), 1, "{pattern:?}/{target:?}/{entry_name}");
+                let trampoline = calls[0].1;
+                assert!((start..end).contains(&trampoline));
+                assert_ne!(trampoline, ordinary_offset);
+                match target.architecture {
+                    Architecture::X86_64 => {
+                        let jump_displacement = end.checked_sub(4)
+                            .expect("x86 jump displacement");
+                        assert_eq!(counted_text[jump_displacement - 1], 0xe9);
+                        assert_eq!(
+                            counted_text.get(jump_displacement - 3..jump_displacement - 1),
+                            Some([0x31, 0xc0].as_slice()),
+                        );
+                        let displacement = i32::from_le_bytes(
+                            counted_text[jump_displacement..end]
+                                .try_into()
+                                .expect("x86 core jump displacement"),
+                        );
+                        let target = (jump_displacement + 4)
+                            .checked_add_signed(
+                                isize::try_from(displacement)
+                                    .expect("x86 core displacement fits isize"),
+                            )
+                            .expect("x86 core jump target");
+                        assert_eq!(target, core_offset);
+                    }
+                    Architecture::Aarch64 => {
+                        assert_eq!(end, trampoline + 8);
+                        assert_eq!(
+                            counted_text.get(trampoline..trampoline + 4),
+                            Some(0xf100_001f_u32.to_le_bytes().as_slice()),
+                        );
+                        let branch = u32::from_le_bytes(
+                            counted_text[trampoline + 4..end]
+                                .try_into()
+                                .expect("AArch64 core branch"),
+                        );
+                        assert_eq!(branch & 0xfc00_0000, 0x1400_0000);
+                        assert_eq!(
+                            crate::module::aarch64_direct_branch_target(trampoline + 4, branch)
+                                .expect("decode AArch64 core branch"),
+                            Some(core_offset),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cross-target one-shot reducer audit binds public-entry identity, local-call topology, and table provenance"
+)]
+fn direct_native_single_reducer_uses_authenticated_complete_span_scan_cross_target() {
+    for pattern in ["[ab]+z", "(?:ab|a)+z", "(?:|a)", "a*"] {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let request = || {
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+            };
+            let ordinary = compile(request()).expect("direct public Span module");
+            assert_eq!(ordinary.receipt().engine, EngineKind::OrderedDfa);
+            let exports = PreparedAggregateExports::COUNT;
+            {
+                let reduced = compile_with_prepared_aggregate_exports(request(), exports)
+                    .expect("single direct native reducer");
+                assert_eq!(reduced.receipt().engine, EngineKind::OrderedDfa);
+                assert_eq!(
+                    reduced.receipt().prepared_aggregate_strategy,
+                    Some(PreparedAggregateStrategy::NativeFused),
+                );
+                assert!(!reduced.receipt().runtime_helper_required);
+                assert!(reduced.module().required_runtime_symbols().next().is_none());
+                assert!(reduced.module().uses_complete_span_reduce_aggregate());
+                assert!(!reduced.module().uses_direct_span_trusted_core_aggregate());
+
+                let ordinary_entry = reduced
+                    .module()
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == reduced.module().entry_symbol())
+                    .expect("ordinary entry");
+                let ordinary_start = usize::try_from(ordinary_entry.offset).unwrap();
+                let ordinary_end = ordinary_start
+                    .checked_add(usize::try_from(ordinary_entry.size).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    reduced.module().sections()[0]
+                        .bytes()
+                        .get(ordinary_start..ordinary_end),
+                    ordinary.module().sections()[0]
+                        .bytes()
+                        .get(ordinary_start..ordinary_end),
+                    "{pattern:?}/{target:?}/{exports:?} changed public Span bytes",
+                );
+                let core_offset = reduced
+                    .module()
+                    .complete_span_reduce_core_offset()
+                    .expect("authenticated complete reducer core");
+                assert!(core_offset >= ordinary_end);
+                let reducer_name = reduced.module().prepared_count_symbol().unwrap();
+                let reducer = reduced
+                    .module()
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == reducer_name)
+                    .expect("single reducer symbol");
+                let reducer_start = usize::try_from(reducer.offset).unwrap();
+                let reducer_end = reducer_start
+                    .checked_add(usize::try_from(reducer.size).unwrap())
+                    .unwrap();
+                let calls = generated_local_call_sites(
+                    target.architecture,
+                    reduced.module().sections()[0].bytes(),
+                    reducer_start,
+                    reducer_end,
+                );
+                assert_eq!(calls.len(), 1, "{pattern:?}/{target:?}/{exports:?}");
+                assert_eq!(calls[0].1, core_offset);
+                let core_text = &reduced.module().sections()[0].bytes()
+                    [core_offset..reducer_start];
+                match target.architecture {
+                    Architecture::X86_64 => {
+                        let validation = [
+                            0x48, 0x8b, 0x4c, 0x24, 40, // full end from private frame
+                            0x49, 0x39, 0xf2, // selected start >= requested start
+                        ];
+                        assert!(
+                            core_text.windows(validation.len()).any(|bytes| {
+                                bytes == validation
+                            }),
+                            "{pattern:?}/{target:?}/{exports:?} did not restore the x86 semantic end before matched-result validation",
+                        );
+                    }
+                    Architecture::Aarch64 => {
+                        const RESTORE_END: u32 = 0xf940_17e3; // ldr x3, [sp, #40]
+                        const VALIDATE_START: u32 = 0xeb09_00df; // cmp x6, x9
+                        let words = core_text
+                            .chunks_exact(4)
+                            .map(|bytes| {
+                                u32::from_le_bytes(bytes.try_into().expect("AArch64 core word"))
+                            })
+                            .collect::<Vec<_>>();
+                        assert!(
+                            words.windows(2).any(|pair| {
+                                pair == [RESTORE_END, VALIDATE_START]
+                            }),
+                            "{pattern:?}/{target:?}/{exports:?} did not restore the AArch64 semantic end before matched-result validation",
+                        );
+                    }
+                }
+                assert!(reduced.module().relocations().iter().any(|relocation| {
+                    relocation.section == 0
+                        && usize::try_from(relocation.offset)
+                            .is_ok_and(|offset| offset >= core_offset && offset < reducer_start)
+                        && relocation.symbol == 1
+                }));
+            }
+
+            // SpanSum is deliberately outside the Count-only transaction.
+            // Reconstruct the ce964 append from the ordinary module and bind
+            // both the selected route and emitted bytes to that incumbent.
+            let expected_span_sum = compile_ce964_style_prepared_aggregate(
+                request(),
+                PreparedAggregateExports::SPAN_SUM,
+            )
+            .expect("compile ce964 SpanSum incumbent");
+            let span_sum = compile_with_prepared_aggregate_exports(
+                request(),
+                PreparedAggregateExports::SPAN_SUM,
+            )
+            .expect("Count-only candidate SpanSum incumbent");
+            assert_eq!(span_sum.module(), expected_span_sum.module());
+            assert_eq!(span_sum.object(), expected_span_sum.object());
+            assert_eq!(span_sum.receipt(), expected_span_sum.receipt());
+            assert!(span_sum.module().uses_direct_span_trusted_core_aggregate());
+            assert!(!span_sum.module().uses_complete_span_reduce_aggregate());
+            assert!(!span_sum.module().has_complete_span_reduce_source_for_test());
+        }
+    }
+}
+
+fn compile_ce964_style_prepared_aggregate(
+    request: CompileRequest,
+    exports: PreparedAggregateExports,
+) -> Result<crate::CompiledRegex, CompileError> {
+    let target = request.target;
+    let mode = request.mode;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let compiled = compile(request)?;
+    crate::append_prepared_aggregate_exports_to_compiled(
+        compiled,
+        exports,
+        target,
+        mode,
+        max_object_bytes,
+        SlowAotLimits::default(),
+    )
+}
+
+#[test]
+fn complete_span_reduce_source_allocation_failure_is_terminal() {
+    let failure = crate::module::complete_span_reduce_source_allocation::<()>(Err((
+        fre_exact_alloc::CopyError::AllocationFailed,
+        (),
+    )));
+    assert!(matches!(
+        failure,
+        Err(ObjectError::Allocation("complete Span reducer source")),
+    ));
+}
+
+#[test]
+fn complete_span_scan_excludes_context_mixed_and_exact_singleton_incumbents() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let context_request = || {
+            CompileRequest::new(r"(?-u:\b(?:foo|bar)\b)", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let context = compile_with_prepared_aggregate_exports(
+            context_request(),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("context Count incumbent");
+        let expected_context = compile_ce964_style_prepared_aggregate(
+            context_request(),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("ce964 context Count reconstruction");
+        assert_eq!(context.receipt().engine, EngineKind::OrderedContextDfa);
+        assert!(!context.module().uses_complete_span_reduce_aggregate());
+        assert_eq!(context.module(), expected_context.module());
+        assert_eq!(context.object(), expected_context.object());
+        assert_eq!(context.receipt(), expected_context.receipt());
+
+        let mixed_request = || {
+            CompileRequest::new("[ab]+z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let mixed_exports =
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::SPAN_SUM);
+        let mixed = compile_with_prepared_aggregate_exports(
+            mixed_request(),
+            mixed_exports,
+        )
+        .expect("mixed ce964 incumbent");
+        let expected_mixed = compile_ce964_style_prepared_aggregate(
+            mixed_request(),
+            mixed_exports,
+        )
+        .expect("ce964 mixed-export reconstruction");
+        assert!(mixed.module().uses_direct_span_trusted_core_aggregate());
+        assert!(!mixed.module().uses_complete_span_reduce_aggregate());
+        assert_eq!(mixed.module(), expected_mixed.module());
+        assert_eq!(mixed.object(), expected_mixed.object());
+        assert_eq!(mixed.receipt(), expected_mixed.receipt());
+
+        for exports in [
+            PreparedAggregateExports::GREP_COUNT,
+            PreparedAggregateExports::COUNT.union(PreparedAggregateExports::GREP_COUNT),
+            PreparedAggregateExports::ALL,
+        ] {
+            let grep_or_mixed = compile_with_prepared_aggregate_exports(
+                CompileRequest::new("[ab]+z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                exports,
+            )
+            .expect("Grep or mixed-export incumbent");
+            let expected = compile_ce964_style_prepared_aggregate(
+                mixed_request(),
+                exports,
+            )
+            .expect("ce964 Grep/mixed reconstruction");
+            assert!(
+                !grep_or_mixed
+                    .module()
+                    .uses_complete_span_reduce_aggregate(),
+                "target={target:?} exports={exports:?}",
+            );
+            assert_eq!(grep_or_mixed.module(), expected.module());
+            assert_eq!(grep_or_mixed.object(), expected.object());
+            assert_eq!(grep_or_mixed.receipt(), expected.receipt());
+        }
+
+        for exports in [
+            PreparedAggregateExports::COUNT,
+            PreparedAggregateExports::SPAN_SUM,
+        ] {
+            let exact_request = || {
+                CompileRequest::new("abc", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+            };
+            let ordinary = compile(exact_request()).expect("exact-singleton ordinary source");
+            let serialized = ordinary.program().serialize().unwrap();
+            let expected = ordinary
+                .module()
+                .clone()
+                .without_complete_span_reduce_for_aggregate()
+                .expect("suppress generic exact-singleton recipe")
+                .append_prepared_aggregate_exports(
+                    exports,
+                    ordinary.program().artifact_identity(),
+                    &serialized,
+                )
+                .expect("append pre-feature exact-singleton incumbent");
+            let expected_object = emit_object(
+                &expected,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit pre-feature exact-singleton incumbent");
+            let exact = compile_with_prepared_aggregate_exports(
+                exact_request(),
+                exports,
+            )
+            .expect("exact-singleton incumbent");
+            let expected_compiled = compile_ce964_style_prepared_aggregate(
+                exact_request(),
+                exports,
+            )
+            .expect("ce964 exact-singleton reconstruction");
+            assert_eq!(exact.module(), &expected, "target={target:?} exports={exports:?}");
+            assert_eq!(exact.object(), expected_object, "target={target:?} exports={exports:?}");
+            assert_eq!(exact.module(), expected_compiled.module());
+            assert_eq!(exact.object(), expected_compiled.object());
+            assert_eq!(exact.receipt(), expected_compiled.receipt());
+            assert!(!exact.module().uses_complete_span_reduce_aggregate());
+            assert!(!exact.module().has_complete_span_reduce_source_for_test());
+        }
+
+        let asimd_target = target
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd));
+        if let Ok(asimd_target) = asimd_target {
+            let exact = compile_with_prepared_aggregate_exports(
+                CompileRequest::new("abc", asimd_target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                PreparedAggregateExports::COUNT,
+            )
+            .expect("eligible exact-singleton Count follow-on");
+            assert!(exact.module().direct_exact_singleton_count_aot_report().is_some());
+            assert!(!exact.module().uses_complete_span_reduce_aggregate());
+            assert!(!exact.module().has_complete_span_reduce_source_for_test());
+        }
+    }
+}
+
+#[test]
+fn complete_span_scan_authentication_rejects_public_entry_relocation_and_program_tamper() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let request = || {
+            CompileRequest::new("[ab]+z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let ordinary = crate::module::with_complete_span_reduce_recipe(|| {
+            compile(request())
+        })
+        .expect("complete Span tamper source");
+        assert!(ordinary.module().has_complete_span_reduce_source_for_test());
+        let serialized = ordinary.program().serialize().expect("tamper source program");
+        let identity = ordinary.program().artifact_identity();
+        let entry = ordinary
+            .module()
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == ordinary.module().entry_symbol())
+            .expect("tamper source entry");
+        let entry_start = usize::try_from(entry.offset).expect("tamper entry start");
+        let entry_end = entry_start
+            .checked_add(usize::try_from(entry.size).expect("tamper entry size"))
+            .expect("tamper entry end");
+
+        let mut text = ordinary.module().clone();
+        assert!(text.test_flip_text_byte(entry_end - 1));
+        assert!(matches!(
+            text.append_prepared_aggregate_exports(
+                PreparedAggregateExports::COUNT,
+                identity,
+                &serialized,
+            ),
+            Err(ObjectError::InvalidModule(_)),
+        ));
+
+        let mut relocation = ordinary.module().clone();
+        assert!(relocation.test_flip_text_relocation_addend_in_range(entry_start, entry_end));
+        assert!(matches!(
+            relocation.append_prepared_aggregate_exports(
+                PreparedAggregateExports::COUNT,
+                identity,
+                &serialized,
+            ),
+            Err(ObjectError::InvalidModule(_)),
+        ));
+
+        let mut program = ordinary.module().clone();
+        assert!(program.test_flip_program_byte(0));
+        assert!(matches!(
+            program.append_prepared_aggregate_exports(
+                PreparedAggregateExports::COUNT,
+                identity,
+                &serialized,
+            ),
+            Err(ObjectError::InvalidModule(_)),
+        ));
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cross-target reducer audit keeps both ISAs, engine shapes, and local-call decoding in one matrix"
+)]
+fn direct_native_context_reducers_retain_ordinary_entry_cross_target() {
+    let exports = PreparedAggregateExports::COUNT
+        .union(PreparedAggregateExports::SPAN_SUM);
+    for (pattern, expected_engine) in
+        [(r"(?-u:\b(?:foo|bar)\b)", EngineKind::OrderedContextDfa)]
+    {
         for target in [
             Target::x86_64_linux(),
             Target::x86_64_macos(),
@@ -3145,6 +6754,7 @@ fn direct_native_reducers_reuse_ordinary_byte_and_context_dfa_entries() {
             assert!(counted.module().required_runtime_symbols().next().is_none());
             assert!(counted.module().required_runtime_program().is_some());
             assert_eq!(counted.module().entry_symbol(), ordinary.module().entry_symbol());
+            assert!(!counted.module().uses_direct_span_trusted_core_aggregate());
 
             let ordinary_entry = counted
                 .module()
@@ -3448,6 +7058,58 @@ fn prepared_v15_grep_count_is_native_fail_closed_and_cross_target() {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the test decoder walks bounded generated reducer text",
+)]
+fn generated_local_call_sites(
+    architecture: Architecture,
+    text: &[u8],
+    start: usize,
+    end: usize,
+) -> Vec<(usize, usize)> {
+    match architecture {
+        Architecture::X86_64 => (start..end.saturating_sub(4))
+            .filter_map(|instruction| {
+                if text[instruction] != 0xe8 {
+                    return None;
+                }
+                let displacement = i32::from_le_bytes(
+                    text[instruction + 1..instruction + 5]
+                        .try_into()
+                        .expect("x86 local-call displacement"),
+                );
+                let after = instruction + 5;
+                let target = after.checked_add_signed(
+                    isize::try_from(displacement).expect("x86 call displacement fits isize"),
+                )?;
+                Some((instruction, target))
+            })
+            .collect(),
+        Architecture::Aarch64 => (start..end)
+            .step_by(4)
+            .filter_map(|instruction| {
+                let word = u32::from_le_bytes(
+                    text.get(instruction..instruction + 4)?
+                        .try_into()
+                        .expect("AArch64 local-call instruction"),
+                );
+                if word & 0xfc00_0000 != 0x9400_0000 {
+                    return None;
+                }
+                let immediate = i32::try_from(word & 0x03ff_ffff)
+                    .expect("AArch64 call immediate");
+                let signed = (immediate << 6) >> 6;
+                let displacement = isize::try_from(signed)
+                    .expect("AArch64 call displacement fits isize")
+                    .checked_mul(4)?;
+                let target = instruction.checked_add_signed(displacement)?;
+                Some((instruction, target))
+            })
+            .collect(),
+    }
+}
+
 #[test]
 fn prepared_v15_scalar_operation_is_one_closed_global_function_cross_isa() {
     for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
@@ -3520,6 +7182,98 @@ fn prepared_v15_scalar_operation_is_one_closed_global_function_cross_isa() {
                 .collect::<Vec<_>>();
             assert_eq!(global_functions.len(), 1);
             assert_eq!(global_functions[0].name, module.entry_symbol());
+            let fragment = module
+                .symbols()
+                .iter()
+                .find(|symbol| {
+                    symbol.name == ".Lfre_aot_regex_ordered_nfa_operation_fragment_v1"
+                })
+                .expect("operation-only Ordered-NFA fragment symbol");
+            let fragment_end = fragment
+                .offset
+                .checked_add(fragment.size)
+                .expect("operation-only fragment extent");
+            for internal_name in [
+                ".Lfre_aot_regex_ordered_nfa_operation_fragment_v1",
+                ".Lfre_aot_regex_ordered_nfa_operation_private_v1",
+                ".Lfre_aot_regex_ordered_nfa_private_v1",
+                ".Lfre_aot_regex_ordered_nfa_bulk_gate_v1",
+            ] {
+                let internal = module
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == internal_name)
+                    .unwrap_or_else(|| panic!("missing operation-only symbol {internal_name}"));
+                assert_eq!(internal.binding, crate::SymbolBinding::Local);
+                assert_eq!(internal.kind, crate::SymbolKind::Function);
+                assert_eq!(internal.section, fragment.section);
+                assert!(internal.offset >= fragment.offset);
+                assert!(
+                    internal
+                        .offset
+                        .checked_add(internal.size)
+                        .is_some_and(|end| end <= fragment_end),
+                    "operation-only internal escaped its local fragment: {internal_name}",
+                );
+            }
+            assert!(
+                module.symbols().iter().all(|symbol| !symbol.name.contains("trusted")),
+                "the trusted post-gate label must never become a symbol",
+            );
+            assert!(
+                global_functions[0].offset >= fragment_end,
+                "the only exported function must be the appended reducer",
+            );
+
+            let private = module
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_private_v1")
+                .expect("operation-only private search symbol");
+            let gate = module
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == ".Lfre_aot_regex_ordered_nfa_bulk_gate_v1")
+                .expect("operation-only bulk gate symbol");
+            let reducer_start = usize::try_from(global_functions[0].offset)
+                .expect("operation-only reducer start");
+            let reducer_end = usize::try_from(
+                global_functions[0]
+                    .offset
+                    .checked_add(global_functions[0].size)
+                    .expect("operation-only reducer extent"),
+            )
+            .expect("operation-only reducer end");
+            let calls = generated_local_call_sites(
+                target.architecture,
+                module.sections()[0].bytes(),
+                reducer_start,
+                reducer_end,
+            );
+            let calls_to = |target_offset: u64| {
+                calls
+                    .iter()
+                    .filter_map(|&(site, target)| {
+                        (u64::try_from(target).ok() == Some(target_offset)).then_some(site)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let gate_calls = calls_to(gate.offset);
+            let private_calls = calls_to(private.offset);
+            assert_eq!(
+                gate_calls.len(),
+                1,
+                "one required gate call: {target:?}/{export:?}",
+            );
+            assert_eq!(
+                private_calls.len(),
+                1,
+                "one private search call site: {target:?}/{export:?}",
+            );
+            assert!(
+                gate_calls[0] < private_calls[0],
+                "the private loop must be reachable only after its required gate",
+            );
             assert!(module.relocations().iter().all(|relocation| {
                 module
                     .symbols()
@@ -3735,16 +7489,42 @@ fn ordered_nfa_aggregate_object_cap_rebuilds_the_whole_incumbent_transaction() {
 fn direct_native_aggregate_object_limit_has_exact_boundary() {
     let exports = PreparedAggregateExports::COUNT
         .union(PreparedAggregateExports::SPAN_SUM);
-    let request = |limits| {
+    let request = |max_object_bytes| {
         CompileRequest::new("[ab]+z", Target::x86_64_linux())
             .mode(CompileMode::Optimizing)
             .output(OutputContract::Span)
-            .limits(limits)
+            .limits(CompileLimitsV1 {
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
     };
-    let baseline = compile_with_prepared_aggregate_exports(
-        request(CompileLimitsV1::default()),
-        exports,
+    let ordinary = compile(request(usize::MAX)).expect("direct native aggregate base");
+    let serialized = ordinary
+        .program()
+        .serialize()
+        .expect("serialize direct base");
+    let incumbent = ordinary
+        .module()
+        .clone()
+        .without_complete_span_reduce_for_aggregate()
+        .expect("remove optional complete Span reducer recipe")
+        .without_direct_span_trusted_core_for_aggregate()
+        .expect("remove optional direct Span core receipt")
+        .append_prepared_aggregate_exports(
+            exports,
+            ordinary.program().artifact_identity(),
+            &serialized,
+        )
+        .expect("append DirectOrdinary incumbent wrappers");
+    let incumbent_object = emit_object(
+        &incumbent,
+        crate::ObjectFormat::for_target(Target::x86_64_linux()),
+        usize::MAX,
     )
+    .expect("emit DirectOrdinary incumbent object");
+    assert!(!incumbent.uses_direct_span_trusted_core_aggregate());
+
+    let baseline = compile_with_prepared_aggregate_exports(request(usize::MAX), exports)
     .expect("direct native aggregate exact resource baseline");
     assert_eq!(baseline.receipt().engine, EngineKind::OrderedDfa);
     assert_eq!(
@@ -3752,33 +7532,160 @@ fn direct_native_aggregate_object_limit_has_exact_boundary() {
         Some(PreparedAggregateStrategy::NativeFused),
     );
     assert_eq!(baseline.module().prepared_entry_symbol(), None);
-    let exact_limits = CompileLimitsV1 {
-        max_object_bytes: baseline.object().len(),
-        ..CompileLimitsV1::default()
-    };
-    let exact = compile_with_prepared_aggregate_exports(request(exact_limits), exports)
+    assert!(baseline.module().uses_direct_span_trusted_core_aggregate());
+    assert!(incumbent_object.len() < baseline.object().len());
+
+    let exact = compile_with_prepared_aggregate_exports(request(baseline.object().len()), exports)
         .expect("exact direct native aggregate object boundary");
     assert_eq!(exact.object(), baseline.object());
     assert_eq!(exact.receipt(), baseline.receipt());
-    let one_below = CompileLimitsV1 {
-        max_object_bytes: baseline
-            .object()
-            .len()
-            .checked_sub(1)
-            .expect("nonempty direct native aggregate object"),
-        ..CompileLimitsV1::default()
+
+    let candidate_one_below = baseline.object().len() - 1;
+    assert!(incumbent_object.len() <= candidate_one_below);
+    let declined = compile_with_prepared_aggregate_exports(request(candidate_one_below), exports)
+        .expect("trusted-core text cap restores DirectOrdinary incumbent");
+    assert_eq!(declined.module(), &incumbent);
+    assert_eq!(declined.object(), incumbent_object);
+    assert!(!declined.module().uses_direct_span_trusted_core_aggregate());
+
+    let exact_incumbent =
+        compile_with_prepared_aggregate_exports(request(incumbent_object.len()), exports)
+            .expect("exact DirectOrdinary incumbent boundary");
+    assert_eq!(exact_incumbent.module(), &incumbent);
+    assert_eq!(exact_incumbent.object(), incumbent_object);
+
+    let incumbent_one_below = incumbent_object.len() - 1;
+    let incumbent_error = emit_object(
+        &incumbent,
+        crate::ObjectFormat::for_target(Target::x86_64_linux()),
+        incumbent_one_below,
+    )
+    .expect_err("core-disabled incumbent must fail at the same boundary");
+    let error = compile_with_prepared_aggregate_exports(request(incumbent_one_below), exports)
+        .expect_err("one below DirectOrdinary incumbent remains terminal");
+    let CompileError::Object(error) = error else {
+        panic!("double ObjectBytes decline changed error class");
     };
-    let error = compile_with_prepared_aggregate_exports(request(one_below), exports)
-        .expect_err("one below direct native aggregate object boundary");
-    assert!(matches!(
-        error,
-        CompileError::Object(ObjectError::Resource {
-            resource: CompileResource::ObjectBytes,
-            limit,
-            required,
-        }) if limit.checked_add(1) == Some(baseline.object().len())
-            && required == baseline.object().len()
-    ));
+    assert_eq!(error, incumbent_error);
+}
+
+#[test]
+fn complete_span_reduce_object_limit_restores_each_exact_incumbent() {
+    for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+        let exports = PreparedAggregateExports::COUNT;
+        {
+            let request = |max_object_bytes| {
+                CompileRequest::new("[ab]+z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+                    .limits(CompileLimitsV1 {
+                        max_object_bytes,
+                        ..CompileLimitsV1::default()
+                    })
+            };
+            let ordinary = compile(request(usize::MAX)).expect("complete reducer base");
+            let serialized = ordinary
+                .program()
+                .serialize()
+                .expect("serialize complete reducer base");
+            let identity = ordinary.program().artifact_identity();
+            let trusted_incumbent = ordinary
+                .module()
+                .clone()
+                .without_complete_span_reduce_for_aggregate()
+                .expect("suppress complete reducer recipe")
+                .append_prepared_aggregate_exports(exports, identity, &serialized)
+                .expect("append trusted-core incumbent");
+            let trusted_object = emit_object(
+                &trusted_incumbent,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit trusted-core incumbent");
+            assert!(trusted_incumbent.uses_direct_span_trusted_core_aggregate());
+            assert!(!trusted_incumbent.uses_complete_span_reduce_aggregate());
+
+            let direct_incumbent = ordinary
+                .module()
+                .clone()
+                .without_complete_span_reduce_for_aggregate()
+                .expect("suppress complete reducer for DirectOrdinary")
+                .without_direct_span_trusted_core_for_aggregate()
+                .expect("suppress trusted core for DirectOrdinary")
+                .append_prepared_aggregate_exports(exports, identity, &serialized)
+                .expect("append DirectOrdinary incumbent");
+            let direct_object = emit_object(
+                &direct_incumbent,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit DirectOrdinary incumbent");
+            assert!(!direct_incumbent.uses_direct_span_trusted_core_aggregate());
+            assert!(!direct_incumbent.uses_complete_span_reduce_aggregate());
+
+            let selected = compile_with_prepared_aggregate_exports(
+                request(usize::MAX),
+                exports,
+            )
+            .expect("selected complete reducer");
+            assert!(selected.module().uses_complete_span_reduce_aggregate());
+            assert!(
+                direct_object.len() <= trusted_object.len(),
+                "DirectOrdinary object ({}) was larger than trusted-core object ({}) for {target:?} {exports:?}",
+                direct_object.len(),
+                trusted_object.len(),
+            );
+            assert!(
+                trusted_object.len() < selected.object().len(),
+                "trusted-core object ({}) was not smaller than complete-reducer object ({}) for {target:?} {exports:?}",
+                trusted_object.len(),
+                selected.object().len(),
+            );
+
+            let exact = compile_with_prepared_aggregate_exports(
+                request(selected.object().len()),
+                exports,
+            )
+            .expect("exact complete reducer object boundary");
+            assert_eq!(exact.object(), selected.object());
+            assert_eq!(exact.module(), selected.module());
+
+            let trusted = compile_with_prepared_aggregate_exports(
+                request(selected.object().len() - 1),
+                exports,
+            )
+            .expect("complete reducer decline restores trusted core");
+            assert_eq!(trusted.object(), trusted_object);
+            assert_eq!(trusted.module(), &trusted_incumbent);
+
+            if direct_object.len() < trusted_object.len() {
+                let direct = compile_with_prepared_aggregate_exports(
+                    request(trusted_object.len() - 1),
+                    exports,
+                )
+                .expect("trusted-core decline restores DirectOrdinary");
+                assert_eq!(direct.object(), direct_object);
+                assert_eq!(direct.module(), &direct_incumbent);
+            }
+
+            let direct_one_below = direct_object.len() - 1;
+            let expected = emit_object(
+                &direct_incumbent,
+                crate::ObjectFormat::for_target(target),
+                direct_one_below,
+            )
+            .expect_err("DirectOrdinary one-below must remain terminal");
+            let actual = compile_with_prepared_aggregate_exports(
+                request(direct_one_below),
+                exports,
+            )
+            .expect_err("complete reducer final incumbent cap remains terminal");
+            let CompileError::Object(actual) = actual else {
+                panic!("complete reducer final decline changed error class");
+            };
+            assert_eq!(actual, expected);
+        }
+    }
 }
 
 #[cfg(all(
@@ -3958,10 +7865,15 @@ int main(void){{
 fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
 
+    const DIRECT_EXACT_START_PATTERN: &str =
+        r"(?-u:[\x00-\x40])(?-u:[\x80-\xff])z";
+    const DIRECT_EXACT_WIDTH_PATTERN: &str = r"(?-u:[\x00-\xff]{3})";
     const ORDERED_EDGE_DISPATCH_PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x80-\xFF])\b";
     const ORDERED_TERMINAL_LOW_PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x00-\x29])\b";
+    const ORDERED_TERMINAL_SPARSE_PATTERN: &str =
+        r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}(?-u:[\x01-\x08])\b";
     const ORDERED_TERMINAL_EXACT_PATTERN: &str =
         r"[0-24-68-9A-CE-GI-KM-OQ-SU-WY-Za-ce-gi-km-oq-su-wy-z]{100,}[0-24-6](?-u:\b)";
     const ORDERED_TERMINAL_EXACT_BOUNDARIES_PATTERN: &str = concat!(
@@ -3988,8 +7900,12 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         }
     } else if cfg!(target_os = "linux") {
         Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
     } else {
         Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
     };
     let terminal_boundary_haystack = |byte| {
         let mut haystack = vec![b'A'; 100];
@@ -4012,6 +7928,32 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             ],
         ),
         (
+            DIRECT_EXACT_START_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedDfa,
+            true,
+            false,
+            vec![
+                Vec::new(),
+                vec![0x41, 0x80, b'z'],
+                vec![0x40, 0x80, b'z', b'!', 0x00, 0xff, b'z'],
+                vec![0x00, 0x80, b'x', 0x20, 0xc0, b'z', 0x41],
+            ],
+        ),
+        (
+            DIRECT_EXACT_WIDTH_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedDfa,
+            true,
+            false,
+            vec![
+                Vec::new(),
+                vec![0x00, 0x01],
+                vec![0x00, 0x01, 0x02],
+                vec![0x00, 0x01, 0x02, 0x03, 0x80, 0xff, 0x7f],
+            ],
+        ),
+        (
             "^a+$",
             CompileMode::Optimizing,
             EngineKind::OrderedContextDfa,
@@ -4023,6 +7965,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 b"\r\n".to_vec(),
                 b"a\r\nno\naa\n\n\ra\na\r".to_vec(),
                 b"a\n".to_vec(),
+                b"aaaaaaa\naaaaaaaa\naaaaaaaaa\r\naaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaa\naaaaaaaaaaaaaaaaa\r\n"
+                    .to_vec(),
             ],
         ),
         (
@@ -4239,6 +8183,48 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             ],
         ),
         (
+            ORDERED_TERMINAL_SPARSE_PATTERN,
+            CompileMode::Optimizing,
+            EngineKind::OrderedNfa,
+            false,
+            true,
+            vec![
+                Vec::new(),
+                vec![b'A'; 96],
+                vec![b'A'; 4_096],
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.extend_from_slice(&[0x01, b'A']);
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.extend_from_slice(&[0x08, b'A']);
+                    haystack
+                },
+                {
+                    let mut haystack = Vec::new();
+                    for (index, padding) in [0_usize, 1, 15, 16, 17, 63, 64, 65]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        haystack.extend(std::iter::repeat_n(b'!', padding));
+                        haystack.extend(std::iter::repeat_n(b'A', 100));
+                        haystack.push(1 + u8::try_from(index).unwrap());
+                        haystack.extend_from_slice(b"A!");
+                    }
+                    haystack
+                },
+                {
+                    let mut haystack = vec![b'A'; 100];
+                    haystack.extend_from_slice(&[0x01, b'A', b'!']);
+                    haystack.extend(std::iter::repeat_n(b'!', 128));
+                    haystack.extend_from_slice(&[0x08, b'!']);
+                    haystack
+                },
+            ],
+        ),
+        (
             ORDERED_TERMINAL_EXACT_PATTERN,
             CompileMode::Optimizing,
             EngineKind::OrderedNfa,
@@ -4372,6 +8358,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     let mut source = String::from(
         "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n\
          typedef void *handle_t;\n\
+         typedef uint32_t (*reducer_t)(handle_t,const unsigned char*,size_t,uint64_t*);\n\
+         extern uint32_t fre_test_poison_reducer_stack(handle_t,const unsigned char*,size_t,uint64_t*,reducer_t);\n\
          typedef struct {size_t next_start;size_t last_match_end;uint32_t flags;uint32_t reserved;} iter_state_t;\n\
          typedef struct {size_t start;size_t end;} span_t;\n\
          typedef struct {uint32_t size;uint32_t version;uint64_t operations;uint64_t start_work;uint64_t grep_bytes;uint64_t reserved[4];} prepare_v2_t;\n\
@@ -4388,7 +8376,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             .mode(*mode)
             .output(OutputContract::Span);
         let terminal_prefilter_fixture = *pattern == ORDERED_EDGE_DISPATCH_PATTERN
-            || *pattern == ORDERED_TERMINAL_LOW_PATTERN;
+            || *pattern == ORDERED_TERMINAL_LOW_PATTERN
+            || *pattern == ORDERED_TERMINAL_SPARSE_PATTERN;
         let terminal_exact_set_trim_fixture = *pattern == ORDERED_TERMINAL_EXACT_PATTERN
             || *pattern == ORDERED_TERMINAL_EXACT_BOUNDARIES_PATTERN;
         let terminal_exact_set_width_fixture = *pattern == ORDERED_TERMINAL_EXACT_WIDTH_PATTERN;
@@ -4444,6 +8433,51 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 None,
                 "fixture {pattern:?} must exercise the direct ordinary loop",
             );
+            if *pattern == DIRECT_EXACT_START_PATTERN {
+                let view = artifact
+                    .program()
+                    .native_dfa_view()
+                    .expect("exact-start fixture retains its direct DFA view");
+                assert_eq!(view.exact_match_width, Some(3));
+                assert!(!view.dfa.initial_pending);
+                assert_ne!(
+                    artifact.module().start_accelerator(),
+                    StartAccelerator::None,
+                    "exact-start fixture lost its selective primary",
+                );
+            } else if *pattern == DIRECT_EXACT_WIDTH_PATTERN {
+                let view = artifact
+                    .program()
+                    .native_dfa_view()
+                    .expect("exact-width fixture retains its direct DFA view");
+                assert_eq!(view.exact_match_width, Some(3));
+                assert!(!view.dfa.initial_pending);
+                assert_eq!(
+                    artifact.module().start_accelerator(),
+                    StartAccelerator::None,
+                    "unselective exact-width fixture unexpectedly gained a start scan",
+                );
+            } else if *pattern == "(?:|a)" {
+                let view = artifact
+                    .program()
+                    .native_dfa_view()
+                    .expect("initial-pending fixture retains its direct DFA view");
+                assert!(view.dfa.initial_pending);
+            } else if *pattern == "[ab]+z" {
+                let view = artifact
+                    .program()
+                    .native_dfa_view()
+                    .expect("variable-reverse fixture retains its direct DFA view");
+                assert_eq!(view.exact_match_width, None);
+                assert!(!view.dfa.initial_pending);
+                assert!(view.dfa.reverse_initial.is_some());
+                assert!(!view.dfa.reverse_cells.is_empty());
+            }
+            assert_eq!(
+                artifact.module().uses_direct_span_trusted_core_aggregate(),
+                *expected_engine == EngineKind::OrderedDfa,
+                "fixture {pattern:?} changed its trusted-core eligibility",
+            );
         } else {
             assert!(
                 artifact.module().prepared_entry_symbol().is_some(),
@@ -4478,11 +8512,15 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     Some(crate::ordered_nfa_native::NativeOrderedNfaTerminalRangeV1 {
                         start: if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
                             0x80
+                        } else if *pattern == ORDERED_TERMINAL_SPARSE_PATTERN {
+                            0x01
                         } else {
                             0x00
                         },
                         end: if *pattern == ORDERED_EDGE_DISPATCH_PATTERN {
                             0xff
+                        } else if *pattern == ORDERED_TERMINAL_SPARSE_PATTERN {
+                            0x08
                         } else {
                             0x29
                         },
@@ -4492,6 +8530,23 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 );
                 assert!(artifact.module().has_ordered_nfa_terminal_range_object());
                 assert!(artifact.module().has_ordered_edge_dispatch_object());
+                if cfg!(target_arch = "aarch64")
+                    && *pattern == ORDERED_TERMINAL_SPARSE_PATTERN
+                {
+                    let text = artifact
+                        .module()
+                        .sections()
+                        .iter()
+                        .find(|section| section.kind == SectionKind::Text)
+                        .expect("sparse terminal fixture text");
+                    assert!(text
+                        .bytes()
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .any(|word| word == 0x4c40_2198),
+                        "linked sparse terminal fixture lost its four-vector LD1"
+                    );
+                }
                 assert!(
                     artifact
                         .module()
@@ -4856,6 +8911,28 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
             } else {
                 String::new()
             };
+            let count_call = if *direct {
+                format!(
+                    "fre_test_poison_reducer_stack(h,h{fixture_index}_{case_index},{}U,&c,{count_symbol})",
+                    haystack.len(),
+                )
+            } else {
+                format!(
+                    "{count_symbol}(h,h{fixture_index}_{case_index},{}U,&c)",
+                    haystack.len(),
+                )
+            };
+            let span_sum_call = if *direct {
+                format!(
+                    "fre_test_poison_reducer_stack(h,h{fixture_index}_{case_index},{}U,&s,{span_sum_symbol})",
+                    haystack.len(),
+                )
+            } else {
+                format!(
+                    "{span_sum_symbol}(h,h{fixture_index}_{case_index},{}U,&s)",
+                    haystack.len(),
+                )
+            };
             writeln!(
                 source,
                 concat!(
@@ -4863,8 +8940,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     "const prepare_v2_t v2={{64U,2U,UINT64_C(15),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}}}};",
                     "handle_t h=0;uint64_t c=UINT64_C(0xaaaaaaaaaaaaaaaa),s=UINT64_C(0xbbbbbbbbbbbbbbbb),g=UINT64_C(0xeeeeeeeeeeeeeeee);uint32_t gq;",
                     "if(fre_aot_regex_runtime_prepare_exclusive_v2({program_symbol},{program_len}U,&v2,&h)!=0U)return 1;",
-                    "if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 2;",
-                    "if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 3;",
+                    "if({count_call}!=0U||c!=UINT64_C({count}))return 2;",
+                    "if({span_sum_call}!=0U||s!=UINT64_C({span_sum}))return 3;",
                     "gq={grep_count_symbol}(h,h{fixture_index}_{case_index},{length}U,&g);",
                     "if(UINT64_C({required})==0U){{if(gq!=0U)return 21;if(g!=UINT64_C({grep_count}))return 24;}}else{{if(gq!=3U||g!=UINT64_C(0xeeeeeeeeeeeeeeee))return 22;}}",
                     "{legacy_fill}",
@@ -4873,8 +8950,8 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                     "const prepare_v3_t v3={{112U,3U,UINT64_C(15),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}},UINT64_C(8388608),UINT64_C(8388608),UINT64_C(2000000),UINT64_C({required}),{{0,0}}}};",
                     "h=0;c=UINT64_C(0xcccccccccccccccc);s=UINT64_C(0xdddddddddddddddd);g=UINT64_C(0xffffffffffffffff);",
                     "if(fre_aot_regex_runtime_prepare_exclusive_v3({program_symbol},{program_len}U,&v3,&h)!=0U)return 5;",
-                    "if({count_symbol}(h,h{fixture_index}_{case_index},{length}U,&c)!=0U||c!=UINT64_C({count}))return 6;",
-                    "if({span_sum_symbol}(h,h{fixture_index}_{case_index},{length}U,&s)!=0U||s!=UINT64_C({span_sum}))return 7;",
+                    "if({count_call}!=0U||c!=UINT64_C({count}))return 6;",
+                    "if({span_sum_call}!=0U||s!=UINT64_C({span_sum}))return 7;",
                     "if({grep_count_symbol}(h,h{fixture_index}_{case_index},{length}U,&g)!=0U||g!=UINT64_C({grep_count}))return 23;",
                     "{native_fill}",
                     "{native_search}",
@@ -4885,9 +8962,9 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 case_index = case_index,
                 program_symbol = program_symbol,
                 program_len = program_len,
-                count_symbol = count_symbol,
+                count_call = count_call,
                 count = count,
-                span_sum_symbol = span_sum_symbol,
+                span_sum_call = span_sum_call,
                 span_sum = span_sum,
                 grep_count_symbol = grep_count_symbol,
                 grep_count = grep_count,
@@ -5072,8 +9149,86 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         static_runtime.display(),
     );
     let c_path = directory.join("native-aggregate.c");
+    let assembly_path = directory.join("poison-reducer-stack.S");
     let executable = directory.join("native-aggregate");
     fs::write(&c_path, source).expect("write native aggregate C harness");
+    let assembly_symbol = if cfg!(target_os = "macos") {
+        "_fre_test_poison_reducer_stack"
+    } else {
+        "fre_test_poison_reducer_stack"
+    };
+    let assembly = if cfg!(target_arch = "x86_64") {
+        format!(
+            r#".text
+.globl {assembly_symbol}
+.p2align 4, 0x90
+{assembly_symbol}:
+    movq %r8, %r11
+    subq $128, %rsp
+    movabsq $0xa5a5a5a5a5a5a5a5, %rax
+    movq %rax,   0(%rsp)
+    movq %rax,   8(%rsp)
+    movq %rax,  16(%rsp)
+    movq %rax,  24(%rsp)
+    movq %rax,  32(%rsp)
+    movq %rax,  40(%rsp)
+    movq %rax,  48(%rsp)
+    movq %rax,  56(%rsp)
+    movq %rax,  64(%rsp)
+    movq %rax,  72(%rsp)
+    movq %rax,  80(%rsp)
+    movq %rax,  88(%rsp)
+    movq %rax,  96(%rsp)
+    movq %rax, 104(%rsp)
+    movq %rax, 112(%rsp)
+    movq %rax, 120(%rsp)
+    addq $128, %rsp
+    movabsq $0x5a5a5a5a5a5a5a5a, %r8
+    movabsq $0xc3c3c3c3c3c3c3c3, %r9
+    movabsq $0x3c3c3c3c3c3c3c3c, %r10
+    jmp *%r11
+"#,
+        )
+    } else {
+        format!(
+            r#".text
+.globl {assembly_symbol}
+.p2align 2
+{assembly_symbol}:
+    mov x16, x4
+    sub sp, sp, #128
+    movz x8, #0xa5a5
+    movk x8, #0xa5a5, lsl #16
+    movk x8, #0xa5a5, lsl #32
+    movk x8, #0xa5a5, lsl #48
+    stp x8, x8, [sp, #0]
+    stp x8, x8, [sp, #16]
+    stp x8, x8, [sp, #32]
+    stp x8, x8, [sp, #48]
+    stp x8, x8, [sp, #64]
+    stp x8, x8, [sp, #80]
+    stp x8, x8, [sp, #96]
+    stp x8, x8, [sp, #112]
+    add sp, sp, #128
+    movz x5, #0x5a5a
+    movk x5, #0x5a5a, lsl #16
+    movk x5, #0x5a5a, lsl #32
+    movk x5, #0x5a5a, lsl #48
+    mov x6, x5
+    mov x7, x5
+    mov x8, x5
+    mov x9, x5
+    mov x10, x5
+    mov x11, x5
+    mov x12, x5
+    mov x13, x5
+    mov x14, x5
+    mov x15, x5
+    br x16
+"#,
+        )
+    };
+    fs::write(&assembly_path, assembly).expect("write deterministic stack-poison thunk");
     let compiler = if cfg!(target_os = "macos") {
         "clang"
     } else {
@@ -5082,6 +9237,7 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
     let status = Command::new(compiler)
         .arg("-O0")
         .arg(&c_path)
+        .arg(&assembly_path)
         .args(&objects)
         .arg(&static_runtime)
         .arg("-o")
@@ -5100,4 +9256,219 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
         String::from_utf8_lossy(&output.stderr),
     );
     fs::remove_dir_all(&directory).expect("remove native aggregate linker directory");
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+#[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links the exact Count-only complete reducer to the real runtime"]
+fn linked_host_complete_span_count_matches_regex_find_iter() {
+    use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+    let target = if cfg!(target_arch = "x86_64") {
+        if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        }
+    } else if cfg!(target_os = "linux") {
+        Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
+    } else {
+        Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("linked host ASIMD target")
+    };
+    let fixtures = [
+        (
+            "[ab]+z",
+            vec![
+                Vec::new(),
+                b"zz".to_vec(),
+                b"zzabzyaaz".to_vec(),
+                b"abzXbbzYa".to_vec(),
+            ],
+        ),
+        (
+            "(?:|a)",
+            vec![Vec::new(), b"a".to_vec(), b"ba".to_vec(), b"aaa".to_vec()],
+        ),
+        (
+            "a*",
+            vec![
+                Vec::new(),
+                b"b".to_vec(),
+                b"aa".to_vec(),
+                b"baab".to_vec(),
+            ],
+        ),
+        (
+            r"(?-u:\xFF+|a)",
+            vec![
+                vec![0xff],
+                vec![b'a', 0xff, 0xff, b'b', 0x80, b'a'],
+                vec![0x80, 0xfe],
+            ],
+        ),
+    ];
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let profile_dir = current_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo profile directory");
+    let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+    assert!(
+        static_runtime.is_file(),
+        "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+        static_runtime.display(),
+    );
+    let compiler = if cfg!(target_os = "macos") {
+        "clang"
+    } else {
+        "cc"
+    };
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "fre-aot-complete-span-reduce-{}-{nonce}",
+        std::process::id(),
+    ));
+    fs::create_dir_all(&directory).expect("create complete-reducer linker directory");
+
+    let export_index = 0;
+    let export = PreparedAggregateExports::COUNT;
+    {
+        let mut source = String::from(
+            "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n\
+             typedef void *handle_t;\n\
+             typedef struct {uint32_t size;uint32_t version;uint64_t operations;uint64_t start_work;uint64_t grep_bytes;uint64_t reserved[4];} prepare_v2_t;\n\
+             extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v2(const unsigned char*,size_t,const prepare_v2_t*,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n",
+        );
+        let mut objects = Vec::new();
+        let mut case_functions = Vec::new();
+        for (fixture_index, (pattern, haystacks)) in fixtures.iter().enumerate() {
+            let artifact = compile_with_prepared_aggregate_exports(
+                CompileRequest::new(*pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+                export,
+            )
+            .expect("compile exact complete Span reducer fixture");
+            assert_eq!(artifact.receipt().engine, EngineKind::OrderedDfa, "{pattern:?}");
+            assert!(
+                artifact.module().uses_complete_span_reduce_aggregate(),
+                "fixture {pattern:?}/{export:?} did not select CompleteSpanReduce",
+            );
+            assert_eq!(artifact.receipt().required_prepare_capabilities, 0);
+            assert!(artifact.module().required_runtime_symbols().next().is_none());
+            let (program_symbol, program_len) = artifact
+                .module()
+                .required_runtime_program()
+                .expect("complete reducer preparation program");
+            let reducer_symbol = artifact
+                .module()
+                .prepared_count_symbol()
+                .expect("complete reducer Count symbol");
+            writeln!(source, "extern const unsigned char {program_symbol}[];")
+                .expect("declare complete reducer program");
+            writeln!(
+                source,
+                "extern uint32_t {reducer_symbol}(handle_t,const unsigned char*,size_t,uint64_t*);"
+            )
+            .expect("declare complete reducer export");
+            let oracle = Regex::new(pattern).expect("complete reducer bytes oracle");
+            for (case_index, haystack) in haystacks.iter().enumerate() {
+                let spans = oracle
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect::<Vec<_>>();
+                let expected =
+                    u64::try_from(spans.len()).expect("complete reducer Count oracle");
+                let initializer = if haystack.is_empty() {
+                    String::from("0")
+                } else {
+                    haystack
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                writeln!(
+                    source,
+                    "static const unsigned char h{fixture_index}_{case_index}[]={{{initializer}}};"
+                )
+                .expect("write complete reducer haystack");
+                let function = format!("run{fixture_index}_{case_index}");
+                writeln!(
+                    source,
+                    concat!(
+                        "static int {function}(void){{",
+                        "const prepare_v2_t v2={{64U,2U,UINT64_C(15),UINT64_C(100000000),UINT64_C(67108864),{{0,0,0,0}}}};",
+                        "handle_t h=0;uint64_t out=UINT64_C(0x1122334455667788);uint32_t q;",
+                        "if(fre_aot_regex_runtime_prepare_exclusive_v2({program_symbol},{program_len}U,&v2,&h)!=0U)return 1;",
+                        "q={reducer_symbol}(h,h{fixture_index}_{case_index},{length}U,&out);",
+                        "if(q!=0U||out!=UINT64_C({expected}))return 2;",
+                        "out=UINT64_C(0x1122334455667788);",
+                        "q={reducer_symbol}(h,h{fixture_index}_{case_index},(size_t)-1,&out);",
+                        "if(q!=2U||out!=UINT64_C(0x1122334455667788))return 3;",
+                        "if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 4;return 0;}}"
+                    ),
+                    function = function,
+                    program_symbol = program_symbol,
+                    program_len = program_len,
+                    reducer_symbol = reducer_symbol,
+                    fixture_index = fixture_index,
+                    case_index = case_index,
+                    length = haystack.len(),
+                    expected = expected,
+                )
+                .expect("write complete reducer differential case");
+                case_functions.push(function);
+            }
+            let object = directory.join(format!(
+                "complete-{export_index}-{fixture_index}.o"
+            ));
+            fs::write(&object, artifact.object()).expect("write complete reducer object");
+            objects.push(object);
+        }
+        source.push_str("int main(void){int status;\n");
+        for function in &case_functions {
+            writeln!(
+                source,
+                "status={function}();if(status){{fprintf(stderr,\"{function}: status=%d\\n\",status);return 1;}}"
+            )
+            .expect("invoke complete reducer case");
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join(format!("complete-{export_index}.c"));
+        let executable = directory.join(format!("complete-{export_index}"));
+        fs::write(&c_path, source).expect("write complete reducer C harness");
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link complete reducer real-runtime harness");
+        assert!(status.success(), "complete reducer harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute complete reducer harness");
+        assert!(
+            output.status.success(),
+            "complete reducer export={export:?} status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    fs::remove_dir_all(&directory).expect("remove complete-reducer linker directory");
 }

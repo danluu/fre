@@ -145,6 +145,43 @@ impl std::error::Error for CompileError {
     }
 }
 
+/// Failure from the opt-in independent Exists-batch compiler API.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum IndependentExistsBatchCompileError {
+    RequiresExists {
+        actual: crate::OutputContract,
+    },
+    Compile(CompileError),
+}
+
+impl fmt::Display for IndependentExistsBatchCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequiresExists { actual } => write!(
+                formatter,
+                "independent Exists-batch export requires Exists output, got {actual:?}"
+            ),
+            Self::Compile(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for IndependentExistsBatchCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RequiresExists { .. } => None,
+            Self::Compile(error) => Some(error),
+        }
+    }
+}
+
+impl From<CompileError> for IndependentExistsBatchCompileError {
+    fn from(value: CompileError) -> Self {
+        Self::Compile(value)
+    }
+}
+
 impl From<fre_syntax::ParseError> for CompileError {
     fn from(value: fre_syntax::ParseError) -> Self {
         Self::Syntax(value)
@@ -172,5 +209,40 @@ impl From<fre_automata::SearchError> for CompileError {
 impl From<ObjectError> for CompileError {
     fn from(value: ObjectError) -> Self {
         Self::Object(value)
+    }
+}
+
+/// Failure from the opt-in exact-finite `SelectedEnd` GrepCount compiler.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ExactFiniteGrepCountCompileError {
+    RequiresSelectedEnd { actual: crate::OutputContract },
+    Compile(CompileError),
+}
+
+impl fmt::Display for ExactFiniteGrepCountCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequiresSelectedEnd { actual } => write!(
+                formatter,
+                "exact-finite GrepCount export requires SelectedEnd output, got {actual:?}"
+            ),
+            Self::Compile(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for ExactFiniteGrepCountCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RequiresSelectedEnd { .. } => None,
+            Self::Compile(error) => Some(error),
+        }
+    }
+}
+
+impl From<CompileError> for ExactFiniteGrepCountCompileError {
+    fn from(value: CompileError) -> Self {
+        Self::Compile(value)
     }
 }

@@ -56,11 +56,151 @@ Search windows retain surrounding haystack context. In particular, callers
 must pass a `SearchWindow` over the original bytes instead of slicing when
 anchors or word boundaries can observe bytes outside the window.
 
+## Opt-in exact64 shared-scan substrate
+
+`compile_regex_set_exact64_reported` is a separate experimental entry; the
+existing compiler and its defaults do not request this optimization. It first
+builds the same complete independent-row incumbent. An Optimizing request with
+2 through 64 rows can then select a target-neutral shared Aho-Corasick graph
+only when current authenticated HIR facts independently prove that every row
+is one nonempty, assertion-free exact byte string. Semantic proof refusal,
+including nullable, assertive, and multi-string rows, returns the incumbent
+with an indexed decline.
+
+Before applying the caller's literal-byte ceiling, an allocation-free
+canonical-HIR exact-literal proof establishes singleton shape and exact width.
+The bounded finite-language facts then independently authenticate the same
+assertion-free bytes; the two proofs' materializations must agree. This keeps
+semantic row declines ahead of literal/state/transition resource declines
+without retaining an over-limit witness.
+
+The shared graph assigns one `u64` bit to every source ordinal. Terminal masks
+retain duplicate rows, and failure-link masks inherit suffix matches, so
+prefix, suffix, and overlapping literals are all reported by one scan. Its
+receipt binds the ordered incumbent artifact, exact literal-to-source mapping,
+current canonical exact-literal and HIR-fact algorithm/accounting identities,
+graph dimensions, transitions, failure links, and output masks. Before
+publication, construction replays every independently digested proof byte
+through direct trie edges to its exact source terminal. The portable oracle
+reauthenticates the retained receipt and graph before reading the haystack,
+scans exactly the requested window, and publishes the caller word only after
+success.
+
+Explicit literal-byte, state, transition, and failure-work ceilings are the
+only resource declines after proof. Allocation, arithmetic, construction
+invariant, and authentication failures are terminal. The aggregate
+literal-byte ceiling is charged while witnesses are captured: its first
+crossing stops later optional fact work, and each finite-language proof is
+bounded by the remaining allowance after the allocation-free exact-width
+proof, so an oversized literal is not first retained as an optional witness. A
+decline does not bypass completion of the authoritative incumbent or any later
+indexed semantic error.
+
+### Opt-in AArch64 dense lowering
+
+`compile_regex_set_exact64_aot_v1` is a second explicit step that consumes an
+already-selected `RegexSetExact64Program` by value. It reauthenticates the
+complete graph, expands it under separate transition-cell and data-byte caps
+to a dense 256-way Aho-Corasick table, and emits one scalar AArch64 entry. The
+table stores a `u32` next-state token for every state/byte pair and the exact
+inherited `u64` output mask for every state. The entry scans the requested
+window once, accumulates all source bits, and stores the caller's word only on
+success. It has no runtime-helper symbol.
+
+The effective data limit is also bounded by the published AArch64 ADRP/ADD
+addressability ceiling, even if a caller raises its own cap. Transition cell
+address formation uses the full address width; only authenticated state tokens
+remain `u32`.
+
+A valid x86-64 target or an explicit dense-cell, dense-data, code, or final
+object byte ceiling returns the exact input program unchanged with a typed
+decline. Target incoherence, graph/data malformation, allocation refusal,
+arithmetic overflow, and object failure are terminal. The receipt binds the
+portable graph and incumbent identities, target tuple, dense-data digest and
+geometry, generated code, relocation-closed object, and every ceiling. This
+entry remains opt-in; `compile_regex_set`, `compile_regex_set_exact64_reported`,
+and all of their defaults are unchanged.
+
+### General finite-language shared scan and AArch64 lowering
+
+`compile_regex_set_finite64_reported` is a separate Optimizing-only Exists
+entry for 2 through 64 source rows. Unlike the exact64 substrate, each row may
+be any independently authenticated nonempty, assertion-free finite byte
+language within the caller's witness limits. It still builds the complete
+independent-row regex-set incumbent first. A selected target-neutral graph
+maps every retained finite string to its source bit; duplicate strings can own
+multiple bits, and failure outputs inherit every matching suffix owner. One
+scan therefore publishes the same `u64` source mask as all independent rows.
+Its normal compiler entry and defaults remain unchanged.
+
+`compile_regex_set_finite64_aot_v1` is an additional explicit AArch64 step. It
+consumes an already-selected `RegexSetFinite64Program`, reauthenticates the
+source graph, and constructs a stable generic graph image with a versioned
+128-byte header, a complete 256-way `u32` transition row per state, and one
+inherited `u64` owner mask per state. Immediately before code generation, the
+lowerer independently rehashes the complete image and verifies that its exact
+target, source identities, geometry, and bytes reproduce the operation
+identity. The helper-free entry ABI is:
+
+```text
+u32 entry(const u8 *haystack, usize len, usize start, usize end, u64 *mask)
+```
+
+Status zero transactionally publishes the complete matching-source mask for
+the requested `SearchWindow`. An invalid pointer, alignment, extent, or window
+returns status two without touching the caller word. The object has one global
+identity-suffixed function, only internal data relocations, and no required
+runtime symbol or runtime program.
+
+Dense transition cells, authenticated construction work, dense data bytes,
+code bytes, and final object bytes have independent numeric caps. Those five
+caps are the only safe declines, and a decline returns the exact portable
+owner supplied by the caller. Source or wire authentication failure, target
+incoherence or unsupported architecture, allocation refusal, arithmetic
+overflow, invariant failure, and object failure are terminal. The effective
+data cap is also bounded by the published AArch64 addressing ceiling.
+
+The generic graph ABI, identity domain, symbols, data schema, and receipt are
+distinct from Exact64 V1. This additive lowering neither reuses nor changes
+the frozen Exact64 V1 object format or its byte identities. No default route
+selects the generic graph object implicitly.
+
+### Additive first-any-position lowering
+
+`compile_regex_set_exact64_first_any_aot_v1` is a separate opt-in consumer of
+the same target-neutral exact64 program. It does not change or wrap the v1
+complete-mask entry. Before allocating dense data, it reauthenticates every
+source-terminal parent chain and declines with the unchanged program if any
+exact singleton contains LF. Nonempty exact-singleton admission is inherited
+from the target-neutral exact64 proof.
+
+The helper-free AArch64 ABI is:
+
+```text
+u32 entry(const u8 *haystack, usize len, usize start, usize end, u64 *position)
+```
+
+Status zero publishes exactly one word. `u64::MAX` means no row matched.
+Otherwise the word is the original-haystack offset of the final byte consumed
+by the first graph state, in forward scan order, whose authenticated owner
+mask is nonzero. It is therefore a byte inside at least one match and, because
+all source literals are nonempty and LF-free, inside its matching LF-delimited
+line. It is not a selected span, a leftmost-start result, or a source-pattern
+priority result. A raw-argument failure leaves the output word unchanged.
+
+The new receipt binds the source graph, LF exclusion, position semantics,
+no-match sentinel, target, dense geometry and data, code, relocation-closed
+object, and all resource ceilings. Unsupported architecture, LF presence, and
+the four numeric ceilings are the only safe declines. Authentication,
+allocation, arithmetic, target incoherence, construction, and object failures
+remain terminal. A future ripgrep adapter may use the returned byte only as a
+`Candidate`; stock matching remains responsible for verification, spans, and
+captures.
+
 ## Next layer
 
-This foundation deliberately adds no combined stable wire format, object
-layout, generated multi-row loop, or C ABI. Those can be added independently
-without changing `OutputContract` or the stable `CompiledProgram` format. A
-native set lowering should preserve the same ordered artifact identity,
-pre-source authentication, strict bitset geometry, zero tail, and
-transactional publication contract.
+The native object is deliberately a separate exact64 artifact rather than a
+new `CompiledProgram` wire-format variant. A future registry/runtime adapter
+can bind its identity-suffixed C symbol without changing `OutputContract`, the
+stable ordinary program format, or the authoritative independent-row
+fallback.

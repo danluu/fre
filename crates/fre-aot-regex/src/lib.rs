@@ -23,6 +23,8 @@ mod context_dfa;
 mod context_native;
 mod dfa;
 mod dfa_loop_skip;
+mod direct_count_v3;
+mod direct_span_sum_v1;
 mod error;
 mod finite_language;
 mod grep_count;
@@ -41,8 +43,15 @@ mod prefix_predicate;
 mod prefix_relation;
 mod program;
 mod regex_set;
+mod regex_set_exact64;
+mod regex_set_exact64_aot;
+mod regex_set_exact64_first_any_aot;
+mod regex_set_finite64;
+mod regex_set_finite64_aot;
 mod regex_redux_aot;
+mod rebar_multi_grep;
 mod rebar_single_capture;
+mod rebar_weighted_capture;
 mod required_literals;
 mod seeded_reverse;
 mod shared_uniform_capture;
@@ -93,7 +102,22 @@ pub use dfa::{
     DfaStats, NativeSlowPartialQuotientDisposition, NativeSlowPartialQuotientReceipt,
     MAX_STABLE_DFA_BUILD_WORK, MAX_STABLE_DFA_STATES, MAX_STABLE_DFA_TRANSITIONS,
 };
-pub use error::{CompileError, CompileResource, ObjectError};
+pub use error::{
+    CompileError, CompileResource, ExactFiniteGrepCountCompileError,
+    IndependentExistsBatchCompileError, ObjectError,
+};
+pub use direct_count_v3::{
+    DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
+    DIRECT_EXACT_SINGLETON_COUNT_SHORT_FALLBACK_MAX_BYTES,
+    DirectExactSingletonCountAotReport, DirectExactSingletonCountCostShape,
+    DirectExactSingletonCountSelectionBasis, DirectExactSingletonCountSuccessorMode,
+};
+pub use direct_span_sum_v1::{
+    DIRECT_EXACT_SINGLETON_SPAN_SUM_AOT_SCHEMA_VERSION,
+    DIRECT_EXACT_SINGLETON_SPAN_SUM_COUNT_CORE_ALIGNMENT_BYTES,
+    DirectExactSingletonSpanSumAotReport, DirectExactSingletonSpanSumCostShape,
+    DirectExactSingletonSpanSumSelectionBasis, DirectExactSingletonSpanSumSuccessorMode,
+};
 pub use grep_count::{
     DEFAULT_GREP_COUNT_MAX_WORKSPACE_BYTES, GREP_COUNT_ACCOUNTING_ID,
     GREP_COUNT_ACCOUNTING_VERSION, GREP_COUNT_ALGORITHM_VERSION, GrepCountConstructionReceipt,
@@ -102,8 +126,10 @@ pub use grep_count::{
 };
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
+    DirectExistsBatchStrategy,
     ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndDfaBaselineReport,
-    ExactFiniteSelectedEndTeddyAotIsa, ExactFiniteSelectedEndTeddyAotReport,
+    ExactFiniteSelectedEndGrepCountAotReport, ExactFiniteSelectedEndTeddyAotIsa,
+    ExactFiniteSelectedEndTeddyAotReport,
     ExactFiniteSelectedEndTeddyAotReportV2, ExactFiniteSelectedEndTeddyAotTargetTier,
     ExactFiniteSelectedEndTeddyIncumbentSourceV2, ExactFiniteSelectedEndTeddySelectionBasisV2,
     ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
@@ -313,6 +339,57 @@ pub use regex_set::{
     RegexSetPrepareError, RegexSetProgram, RegexSetProgramShapeError, RegexSetProgramStats,
     RegexSetRunError, RegexSetSession, RegexSetSessionLimits, compile_regex_set,
 };
+pub use regex_set_exact64::{
+    REGEX_SET_EXACT64_MAX_PATTERNS, REGEX_SET_EXACT64_MIN_PATTERNS,
+    REGEX_SET_EXACT64_SCHEMA_VERSION, RegexSetExact64ArtifactIdentity,
+    RegexSetExact64AuthenticationError, RegexSetExact64CompileDisposition,
+    RegexSetExact64CompileError, RegexSetExact64Decline, RegexSetExact64FillReport,
+    RegexSetExact64Limits, RegexSetExact64Program, RegexSetExact64Receipt, RegexSetExact64Resource,
+    RegexSetExact64RunError, compile_regex_set_exact64_reported,
+};
+pub use regex_set_exact64_aot::{
+    REGEX_SET_EXACT64_AOT_V1_ABI_VERSION, REGEX_SET_EXACT64_AOT_V1_ALPHABET_LEN,
+    REGEX_SET_EXACT64_AOT_V1_IDENTITY_DOMAIN, REGEX_SET_EXACT64_AOT_V1_MAX_ADDRESSABLE_DATA_BYTES,
+    REGEX_SET_EXACT64_AOT_V1_STATUS_INVALID_ARGUMENT, REGEX_SET_EXACT64_AOT_V1_STATUS_SUCCESS,
+    RegexSetExact64AotArtifactV1,
+    RegexSetExact64AotCompileDispositionV1, RegexSetExact64AotDeclineV1,
+    RegexSetExact64AotErrorV1, RegexSetExact64AotLimitsV1, RegexSetExact64AotReceiptV1,
+    RegexSetExact64AotResourceV1, compile_regex_set_exact64_aot_v1,
+};
+pub use regex_set_exact64_first_any_aot::{
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_IDENTITY_DOMAIN,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_INVALID_ARGUMENT,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_STATUS_SUCCESS,
+    RegexSetExact64FirstAnyAotArtifactV1, RegexSetExact64FirstAnyAotCompileDispositionV1,
+    RegexSetExact64FirstAnyAotDeclineV1, RegexSetExact64FirstAnyAotReceiptV1,
+    compile_regex_set_exact64_first_any_aot_v1,
+};
+pub use regex_set_finite64::{
+    REGEX_SET_FINITE64_MAX_PATTERNS, REGEX_SET_FINITE64_MIN_PATTERNS,
+    REGEX_SET_FINITE64_SCHEMA_VERSION, RegexSetFinite64ArtifactIdentity,
+    RegexSetFinite64AuthenticationError, RegexSetFinite64CompileDisposition,
+    RegexSetFinite64CompileError, RegexSetFinite64Decline, RegexSetFinite64FillReport,
+    RegexSetFinite64Limits, RegexSetFinite64Program, RegexSetFinite64Receipt,
+    RegexSetFinite64Resource, RegexSetFinite64RunError, RegexSetFinite64Session,
+    compile_regex_set_finite64_reported,
+};
+pub use regex_set_finite64_aot::{
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_ABI_VERSION,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_ALPHABET_LEN,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_DATA_SCHEMA_VERSION,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_IDENTITY_DOMAIN,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_MAX_ADDRESSABLE_DATA_BYTES,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_STATUS_INVALID_ARGUMENT,
+    REGEX_SET_GRAPH_EXISTS_AOT_V1_STATUS_SUCCESS, RegexSetFinite64AotArtifactV1,
+    RegexSetFinite64AotCompileDispositionV1, RegexSetFinite64AotDeclineV1,
+    RegexSetFinite64AotErrorV1, RegexSetFinite64AotLimitsV1,
+    RegexSetFinite64AotResourceV1, RegexSetGraphExistsAotReceiptV1,
+    compile_regex_set_finite64_aot_v1,
+};
 pub use regex_redux_aot::{
     NATIVE_REGEX_REDUX_AOT_V1_ABI_VERSION, NATIVE_REGEX_REDUX_AOT_V1_COMPONENTS,
     NATIVE_REGEX_REDUX_AOT_V1_IDENTITY_DOMAIN, NATIVE_REGEX_REDUX_AOT_V1_REPORT_BYTES,
@@ -325,6 +402,35 @@ pub use regex_redux_aot::{
     NativeRegexReduxAotArtifactV1, NativeRegexReduxAotErrorV1, NativeRegexReduxAotLimitsV1,
     NativeRegexReduxAotReceiptV1, NativeRegexReduxRequestV1, NativeRegexReduxRunReceiptV1,
     compile_native_regex_redux_aot_v1,
+};
+pub use rebar_multi_grep::{
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION,
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_INVALID_ARGUMENT,
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_RUNTIME_FAILURE,
+    REBAR_MULTI_GREP_REDUCER_AOT_V1_STATUS_SUCCESS,
+    REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_ABI_VERSION,
+    REBAR_MIXED_MULTI_GREP_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_MIXED_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION,
+    REBAR_MIXED_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+    RebarMultiGrepReducerAotArtifactV1, RebarMultiGrepReducerAotCompileDeclineV1,
+    RebarMultiGrepReducerAotCompileDispositionV1, RebarMultiGrepReducerAotErrorV1,
+    RebarMultiGrepReducerAotReceiptV1, RebarMultiGrepReducerRowV1,
+    RebarMixedMultiGrepReducerRowV1, RebarMixedNativeRowScalarReducerRowV1,
+    RebarMixedNativeRowScalarRouteV1,
+    RebarNativeRowScalarOperationV1, RebarNativeRowScalarReducerAotArtifactV1,
+    RebarNativeRowScalarReducerAotCompileDeclineV1,
+    RebarNativeRowScalarReducerAotCompileDispositionV1,
+    RebarNativeRowScalarReducerAotErrorV1, RebarNativeRowScalarReducerAotReceiptV1,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_ABI_VERSION,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_INVALID_ARGUMENT,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_RUNTIME_FAILURE,
+    REBAR_NATIVE_ROW_SCALAR_REDUCER_AOT_V1_STATUS_SUCCESS,
+    compile_rebar_multi_grep_reducer_aot_v1,
+    compile_rebar_mixed_multi_grep_reducer_aot_v1,
+    compile_rebar_mixed_native_row_scalar_reducer_aot_v1,
+    compile_rebar_native_row_scalar_reducer_aot_v1,
 };
 pub use rebar_single_capture::{
     REBAR_SINGLE_CAPTURE_AOT_V1_IDENTITY_DOMAIN, REBAR_SINGLE_CAPTURE_AOT_V1_SOURCE_CARDINALITY,
@@ -341,18 +447,34 @@ pub use rebar_single_capture::{
     compile_rebar_single_capture_participation_aot_v1,
     compile_rebar_single_capture_reducer_aot_v1,
 };
+pub use rebar_weighted_capture::{
+    REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_IDENTITY_DOMAIN,
+    REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_MAX_COMPONENTS,
+    REBAR_WEIGHTED_CAPTURE_REDUCER_AOT_V1_RECEIPT_VERSION,
+    RebarWeightedCaptureReducerAotArtifactV1,
+    RebarWeightedCaptureReducerAotAuthenticationErrorV1,
+    RebarWeightedCaptureReducerAotCompileDeclineV1,
+    RebarWeightedCaptureReducerAotCompileDispositionV1,
+    RebarWeightedCaptureReducerAotErrorV1, RebarWeightedCaptureReducerAotReceiptV1,
+    RebarWeightedCaptureReducerAotRequestV1, RebarWeightedCaptureReducerRelocationV1,
+    compile_rebar_weighted_capture_reducer_aot_v1,
+};
 pub use uniform_capture::{
     CompiledUniformCapturePreparedSpanFillSelector, CompiledUniformCaptureReducer,
-    CompiledUniformCaptureSelector, UniformCaptureAuthenticationError,
+    CompiledUniformCaptureSelector,
+    LINKED_PREPARED_ROW_UNIFORM_CAPTURE_REDUCER_V1_RECEIPT_VERSION,
+    LinkedPreparedRowUniformCaptureReducerReceiptV1, LinkedPreparedRowUniformCaptureReducerV1,
+    LinkedPreparedRowUniformCaptureRelocationV1, UniformCaptureAuthenticationError,
     UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
     UniformCaptureCompileRequest, UniformCapturePreparedSpanFillAuthenticationError,
     UniformCapturePreparedSpanFillCompileDisposition,
     UniformCapturePreparedSpanFillCompileError, UniformCapturePreparedSpanFillCompileReceipt,
     UniformCaptureReducerAuthenticationError, UniformCaptureReducerCompileDisposition,
     UniformCaptureReducerCompileError, UniformCaptureReducerCompileReceipt,
-    UniformCaptureReducerDomain, UniformCaptureReducerOperation,
+    UniformCaptureReducerDomain, UniformCaptureReducerLinkCompileDispositionV1,
+    UniformCaptureReducerOperation,
     compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
-    compile_uniform_capture_selector,
+    compile_uniform_capture_reducer_linked_v1, compile_uniform_capture_selector,
 };
 pub use shared_uniform_capture::{
     SHARED_UNIFORM_CAPTURE_REDUCER_AOT_RECEIPT_VERSION,
@@ -448,6 +570,8 @@ pub enum EntryAbi {
     ExistsSearchV1,
     SelectedEndSearchV1,
     SpanSearchV1,
+    /// One fully authenticated exclusive-handle Span search.
+    PreparedSpanSearchV1,
     /// One exclusive-handle full-haystack Count, SpanSum, or GrepCount transaction.
     PreparedScalarReduceV1,
 }
@@ -939,6 +1063,243 @@ pub fn compile_v2_with_slow_aot_limits(
     })
 }
 
+/// Compile a `SelectedEnd` program and opt in to one native matching-line
+/// Count entry when an independently authenticated exact finite language can
+/// use endpoint-to-LF jumps safely.
+///
+/// Admission requires optimizing source compilation to prove the complete,
+/// non-empty, non-nullable, assertion-free finite byte language and to prove
+/// that no member contains CR or LF. The additive entry locally invokes the
+/// unchanged direct ordinary entry over the remaining haystack, counts the
+/// selected endpoint's line, and resumes after that line's LF. It uses the
+/// existing `FreAotRegexExclusiveGrepCountV1` ABI. Prepare the exact program
+/// returned by [`CompiledRegex::program`] through the module's
+/// [`CompiledModule::required_runtime_program`] symbol before invoking it.
+///
+/// Structural ineligibility and an additive final-object byte excess return
+/// the exact ordinary compilation unchanged; callers must inspect
+/// [`CompiledModule::exact_finite_selected_end_grep_count_aot_report`] and
+/// [`CompiledModule::prepared_grep_count_symbol`]. Allocation, arithmetic,
+/// malformed-module, and object-backend failures remain terminal.
+///
+/// # Errors
+///
+/// Returns [`ExactFiniteGrepCountCompileError::RequiresSelectedEnd`] for
+/// another output contract. All terminal compiler/object failures are wrapped
+/// in [`ExactFiniteGrepCountCompileError::Compile`].
+pub fn compile_with_exact_finite_selected_end_grep_count(
+    request: CompileRequest,
+) -> Result<CompiledRegex, ExactFiniteGrepCountCompileError> {
+    if request.output != OutputContract::SelectedEnd {
+        return Err(ExactFiniteGrepCountCompileError::RequiresSelectedEnd {
+            actual: request.output,
+        });
+    }
+    let target = request.target;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let mut compiled = compile(request)?;
+    let Some(proof) = compiled
+        .program
+        .native_finite_selected_end_grep_count_view()
+    else {
+        return Ok(compiled);
+    };
+    if !compiled
+        .module
+        .can_append_exact_finite_selected_end_grep_count()
+        .map_err(CompileError::from)?
+    {
+        return Ok(compiled);
+    }
+    let serialized_program = compiled.program.serialize()?;
+    let Some(module) = compiled
+        .module
+        .clone()
+        .append_exact_finite_selected_end_grep_count(proof, &serialized_program)
+        .map_err(CompileError::from)?
+    else {
+        return Ok(compiled);
+    };
+    let Some(object) = classify_exact_finite_grep_count_object_attempt(emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ))?
+    else {
+        return Ok(compiled);
+    };
+
+    let mut passes = selected_passes(&compiled.program, &module);
+    passes.try_reserve_exact(1).map_err(|_| {
+        CompileError::from(ObjectError::Allocation(
+            "exact-finite GrepCount pass receipt",
+        ))
+    })?;
+    let aggregate_index = passes
+        .iter()
+        .position(|pass| *pass == OptimizationPass::PositionIndependentDataLayout)
+        .unwrap_or(passes.len());
+    passes.insert(aggregate_index, OptimizationPass::PreparedAggregateLowering);
+    compiled.receipt.passes = passes.into_boxed_slice();
+    compiled.receipt.object_sha256 = Sha256::digest(&object).into();
+    compiled.receipt.slow_aot = module.slow_aot_report().cloned();
+    compiled.receipt.compiler_k0_aot = module.compiler_k0_aot_report().cloned();
+    compiled.receipt.exact_finite_exists_byte_set_aot =
+        module.exact_finite_exists_byte_set_aot_report().copied();
+    compiled.receipt.exact_single_literal_aot =
+        module.exact_single_literal_aot_report().copied();
+    compiled.receipt.exact_finite_selected_end_teddy_aot =
+        module.exact_finite_selected_end_teddy_aot_report().copied();
+    compiled.receipt.ordered_finite_language_aot =
+        module.ordered_finite_language_aot_report().copied();
+    compiled.receipt.slow_context_aot = module.slow_context_aot_report().cloned();
+    compiled.receipt.runtime_helper_required =
+        module.required_runtime_symbols().next().is_some();
+    compiled.receipt.prepared_aggregate_exports = module.prepared_aggregate_exports();
+    compiled.receipt.prepared_aggregate_strategy = module.prepared_aggregate_strategy();
+    compiled.receipt.required_prepare_capabilities = module.required_prepare_capabilities();
+    compiled.receipt.start_accelerator = module.start_accelerator();
+    compiled.receipt.anchored_prefix_filter_bytes = module.anchored_prefix_filter_bytes();
+    compiled.receipt.code_bytes = module.code_bytes();
+    compiled.receipt.data_bytes = module
+        .sections()
+        .iter()
+        .filter(|section| section.kind == SectionKind::ReadOnlyData)
+        .map(|section| section.data.len())
+        .sum();
+    compiled.receipt.object_bytes = object.len();
+    compiled.module = module;
+    compiled.object = object.into_boxed_slice();
+    Ok(compiled)
+}
+
+/// Only the optional additive object's numeric byte ceiling authorizes an
+/// exact-base decline. In particular, allocator and backend failures must not
+/// be converted into absence after the compiler has begun the transaction.
+fn classify_exact_finite_grep_count_object_attempt(
+    result: Result<Vec<u8>, ObjectError>,
+) -> Result<Option<Vec<u8>>, CompileError> {
+    match result {
+        Ok(object) => Ok(Some(object)),
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Preserve allocator and structural provenance at the additive module
+/// transaction. An ineligible `Ok(None)` may retain the ordinary artifact;
+/// every error, including `ObjectBytes` reported before final emission,
+/// remains terminal.
+fn independent_exists_batch_append_outcome(
+    outcome: Result<Option<CompiledModule>, ObjectError>,
+) -> Result<Option<CompiledModule>, IndependentExistsBatchCompileError> {
+    outcome.map_err(|error| CompileError::from(error).into())
+}
+
+/// Classify the one resource decline authorized after the additive module is
+/// complete. Only the final object's byte cap may retain the ordinary
+/// artifact; allocator and all other object failures remain terminal.
+fn independent_exists_batch_object_outcome(
+    outcome: Result<Vec<u8>, ObjectError>,
+) -> Result<Option<Vec<u8>>, IndependentExistsBatchCompileError> {
+    match outcome {
+        Ok(object) => Ok(Some(object)),
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(CompileError::from(error).into()),
+    }
+}
+
+/// Compile an Exists program and request one independent-haystack batch
+/// entry for a self-contained direct object.
+///
+/// Prepared artifacts already carry their exclusive-handle batch entry and
+/// are returned unchanged. Runtime-backed artifacts retain their checked
+/// compatibility route. A direct artifact receives an additive handle-free
+/// symbol whose loop enters an independently authenticated private
+/// full-window Exists core after validating each descriptor. The ordinary
+/// entry and its public ABI remain unchanged. Direct artifacts without that
+/// compiler receipt are returned unchanged. If only the additive wrapper
+/// exceeds the requested final object-byte limit, the exact scalar artifact
+/// is likewise returned without that optional symbol; consumers must inspect
+/// [`CompiledModule::direct_exists_batch_symbol`]. The canonical function type
+/// is `FreAotRegexIndependentExistsBatchV1` in `fre-aot-regex-runtime` and its
+/// C header.
+///
+/// # Errors
+///
+/// Returns [`IndependentExistsBatchCompileError::RequiresExists`] for another
+/// output contract. Allocation, malformed-module, object-backend, and base
+/// compilation failures remain terminal through
+/// [`IndependentExistsBatchCompileError::Compile`].
+pub fn compile_with_independent_exists_batch(
+    request: CompileRequest,
+) -> Result<CompiledRegex, IndependentExistsBatchCompileError> {
+    if request.output != OutputContract::Exists {
+        return Err(IndependentExistsBatchCompileError::RequiresExists {
+            actual: request.output,
+        });
+    }
+    let target = request.target;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let mut compiled = compile(request)?;
+    if compiled.module.prepared_exists_batch_symbol().is_some()
+        || compiled.module.direct_exists_batch_symbol().is_some()
+    {
+        return Ok(compiled);
+    }
+    let Some(module) = independent_exists_batch_append_outcome(
+        compiled
+            .module
+            .clone()
+            .append_direct_exists_batch(OutputContract::Exists),
+    )?
+    else {
+        return Ok(compiled);
+    };
+    let Some(object) = independent_exists_batch_object_outcome(emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ))?
+    else {
+        return Ok(compiled);
+    };
+    compiled.receipt.passes = selected_passes(&compiled.program, &module).into_boxed_slice();
+    compiled.receipt.object_sha256 = Sha256::digest(&object).into();
+    compiled.receipt.slow_aot = module.slow_aot_report().cloned();
+    compiled.receipt.compiler_k0_aot = module.compiler_k0_aot_report().cloned();
+    compiled.receipt.exact_finite_exists_byte_set_aot = module
+        .exact_finite_exists_byte_set_aot_report()
+        .copied();
+    compiled.receipt.exact_single_literal_aot =
+        module.exact_single_literal_aot_report().copied();
+    compiled.receipt.exact_finite_selected_end_teddy_aot = module
+        .exact_finite_selected_end_teddy_aot_report()
+        .copied();
+    compiled.receipt.ordered_finite_language_aot = module
+        .ordered_finite_language_aot_report()
+        .copied();
+    compiled.receipt.slow_context_aot = module.slow_context_aot_report().cloned();
+    compiled.receipt.runtime_helper_required = module.required_runtime_symbols().next().is_some();
+    compiled.receipt.code_bytes = module.code_bytes();
+    compiled.receipt.data_bytes = module
+        .sections()
+        .iter()
+        .filter(|section| section.kind == SectionKind::ReadOnlyData)
+        .map(|section| section.data.len())
+        .sum();
+    compiled.receipt.object_bytes = object.len();
+    compiled.module = module;
+    compiled.object = object.into_boxed_slice();
+    Ok(compiled)
+}
+
 /// Compile a program and append explicitly requested prepared reducer
 /// exports.
 ///
@@ -949,6 +1310,29 @@ pub fn compile_v2_with_slow_aot_limits(
 /// matching LF/CRLF line domains in one ordered source pass. Every entry uses
 /// the same exclusive prepared handle. Requesting no exports is exactly
 /// equivalent to [`compile`].
+///
+/// In optimizing mode, an exact sole `Count` request may reuse an
+/// independently authenticated complete public Span DFA as one closed native
+/// iteration core. The private regeneration recipe is enabled only for that
+/// compile-and-append transaction, and only after the semantic program proves
+/// that the exact-singleton portfolio does not apply. `SpanSum`, mixed/Grep
+/// exports, contextual and partial routes, and exact singletons retain the
+/// ordinary compiler's module, object, allocation, and fallback behavior.
+///
+/// An optimizing `AArch64` target that explicitly enables
+/// [`CpuFeature::Aarch64Asimd`] may implement a sole `Count` or `SpanSum`
+/// export with the audited `Count-v3` core when source-independent
+/// finite-language facts prove one exact non-empty 1..=32-byte literal and
+/// that core beats the complete incumbent portfolio. `SpanSum` composes the
+/// count with a separately proved exact-width product and publishes only
+/// after both operations succeed. Periodic two- and four-byte recipes retain
+/// the established short-input instruction path and enter the focused core
+/// through a cold long-input arm. The public wrappers still validate every
+/// argument and authenticate the prepared handle;
+/// [`CompiledModule::direct_exact_singleton_count_aot_report`] and
+/// [`CompiledModule::direct_exact_singleton_span_sum_aot_report`] record the
+/// selected strategy. Numeric candidate limits preserve the exact incumbent,
+/// while allocation or authentication failures remain terminal.
 ///
 /// # Errors
 ///
@@ -992,6 +1376,9 @@ pub fn compile_with_prepared_aggregate_exports_and_slow_aot_limits(
     let target = request.target;
     let mode = request.mode;
     let max_object_bytes = request.limits.max_object_bytes;
+    let _complete_span_reduce_recipe = module::complete_span_reduce_recipe_scope(
+        exports == PreparedAggregateExports::COUNT,
+    );
     let compiled = compile_with_slow_aot_limits(request, slow_aot_limits)?;
     append_prepared_aggregate_exports_to_compiled(
         compiled,
@@ -1013,6 +1400,23 @@ fn validate_prepared_aggregate_exports(
         return Err(CompileError::PreparedAggregateRequiresSpan { actual: output });
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeFiniteLanguageAttachPolicy {
+    Optional,
+    FailClosed,
+}
+
+fn is_proven_object_byte_limit(error: &ObjectError) -> bool {
+    matches!(
+        error,
+        ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        } if required > limit
+    )
 }
 
 #[allow(
@@ -1046,13 +1450,51 @@ fn append_prepared_aggregate_exports_to_compiled(
     let exact_teddy_incumbent = module
         .exact_finite_selected_end_teddy_aot_report()
         .copied();
-    let module =
-        module.append_prepared_aggregate_exports(exports, artifact_identity, &serialized_program)?;
+    // Exact singletons already own a later, independently authenticated
+    // Count-v3/SpanSum portfolio. Suppress this generic complete-reducer
+    // recipe for every exact singleton so both that portfolio's selections
+    // and all of its target/resource declines retain the pre-feature
+    // incumbent. When the AArch64 follow-on is eligible, also suppress the
+    // ce964 trusted-core wrapper so it can authenticate and rewrite the exact
+    // DirectOrdinary bytes it was designed against.
+    let preserve_direct_singleton_followon = mode == CompileMode::Optimizing
+        && target.architecture == Architecture::Aarch64
+        && target.abi == CallAbi::Aapcs64
+        && target
+            .features
+            .contains(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        && matches!(
+            exports,
+            PreparedAggregateExports::COUNT | PreparedAggregateExports::SPAN_SUM
+        )
+        && program
+            .native_exact_singleton_count_literal()
+            .is_some_and(|literal| {
+                (1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+            });
+    let append_exports = |module: CompiledModule| -> Result<CompiledModule, CompileError> {
+        let module = if program.native_exact_singleton_count_literal().is_some() {
+            let module = module.without_complete_span_reduce_for_aggregate()?;
+            if preserve_direct_singleton_followon {
+                module.without_direct_span_trusted_core_for_aggregate()?
+            } else {
+                module
+            }
+        } else {
+            module
+        };
+        Ok(module.append_prepared_aggregate_exports(
+            exports,
+            artifact_identity,
+            &serialized_program,
+        )?)
+    };
+    let module = append_exports(module)?;
     let ordered_nfa_selected = module.required_prepare_capabilities()
         & PREPARED_CAPABILITY_ORDERED_NFA_V15
         != 0;
     let format = ObjectFormat::for_target(target);
-    let (module, object) = match emit_with_ordered_nfa_accelerator_retries(
+    let (mut module, mut object) = match emit_with_ordered_nfa_accelerator_retries(
         module,
         format,
         max_object_bytes,
@@ -1065,80 +1507,211 @@ fn append_prepared_aggregate_exports_to_compiled(
                 allow_synchronizing_accept_reverse,
                 allow_exact_pair,
             )?;
-            Ok(without_reverse.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_reverse)
         },
         || {
             let without_exact_set = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, true, true, true, true, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(without_exact_set.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_exact_set)
         },
         || {
             let without_width = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, true, true, true, false, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(without_width.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_width)
         },
-        || {
-            let without_prefix = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
-                &program, target, false, true, true, true, true, false, false, false,
-                effective_native_data_limit_bytes,
-            )?;
-            Ok(without_prefix.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+        |retain_scalar_prefix| {
+            let prefix_candidate = if retain_scalar_prefix {
+                CompiledModule::lower_ordered_nfa_scalar_prefix_after_width_retry(
+                    &program,
+                    target,
+                    false,
+                    true,
+                    effective_native_data_limit_bytes,
+                )?
+            } else {
+                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                    &program, target, false, true, true, true, true, false, false, false,
+                    effective_native_data_limit_bytes,
+                )?
+            };
+            append_exports(prefix_candidate)
         },
         || {
             let without_start = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, true, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(without_start.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_start)
         },
         || {
             let without_terminal = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, true, false, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(without_terminal.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(without_terminal)
         },
         || {
             let scalar_base = CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
                 &program, target, false, true, false, false, false, false, false, false,
                 effective_native_data_limit_bytes,
             )?;
-            Ok(scalar_base.append_prepared_aggregate_exports(
-                exports,
-                artifact_identity,
-                &serialized_program,
-            )?)
+            append_exports(scalar_base)
         },
     )? {
         FinalObjectAttempt::Fit { module, object } => (module, object),
+        FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error: _,
+        } if module.uses_complete_span_reduce_aggregate() => {
+            // The one-shot complete reducer is optional additive text. A
+            // proven final ObjectBytes decline first restores the exact ce964
+            // trusted-core incumbent. If that incumbent also exceeds the
+            // ceiling, preserve its established DirectOrdinary retry and its
+            // exact final error. Every non-ObjectBytes failure is terminal.
+            let expected_entry_sha256 = module.direct_span_trusted_core_entry_sha256().ok_or(
+                CompileError::InternalInvariant(
+                    "complete Span reducer aggregate lost its public entry identity",
+                ),
+            )?;
+            let selected_reverse = module.has_synchronizing_accept_reverse();
+            let selected_exact_pair = module.has_exact_pair_suffix();
+            let selected_start = module.start_accelerator();
+            let may_continue = module.optimizing_fallbacks_may_continue();
+            let rebuilt = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                &program,
+                target,
+                effective_native_data_limit_bytes,
+                selected_reverse,
+                selected_exact_pair,
+            )?
+            .with_optimizing_fallbacks_may_continue(may_continue);
+            if rebuilt.direct_span_trusted_core_entry_sha256()
+                != Some(expected_entry_sha256)
+                || rebuilt.has_synchronizing_accept_reverse() != selected_reverse
+                || rebuilt.has_exact_pair_suffix() != selected_exact_pair
+                || rebuilt.start_accelerator() != selected_start
+                || rebuilt.required_runtime_symbols().next().is_some()
+                || rebuilt.required_prepare_capabilities() != 0
+            {
+                return Err(CompileError::InternalInvariant(
+                    "complete Span reducer ObjectBytes retry changed its complete-DFA route",
+                ));
+            }
+            let incumbent = rebuilt
+                .clone()
+                .without_complete_span_reduce_for_aggregate()?
+                .append_prepared_aggregate_exports(
+                    exports,
+                    artifact_identity,
+                    &serialized_program,
+                )?;
+            if incumbent.uses_complete_span_reduce_aggregate()
+                || !incumbent.uses_direct_span_trusted_core_aggregate()
+                || incumbent.prepared_aggregate_strategy()
+                    != Some(PreparedAggregateStrategy::NativeFused)
+            {
+                return Err(CompileError::InternalInvariant(
+                    "complete Span reducer ObjectBytes retry did not restore the trusted-core incumbent",
+                ));
+            }
+            match emit_object(&incumbent, format, max_object_bytes) {
+                Ok(object) => (incumbent, object),
+                Err(error) if is_proven_object_byte_limit(&error) => {
+                    let ordinary = rebuilt
+                        .without_complete_span_reduce_for_aggregate()?
+                        .without_direct_span_trusted_core_for_aggregate()?
+                        .append_prepared_aggregate_exports(
+                            exports,
+                            artifact_identity,
+                            &serialized_program,
+                        )?;
+                    if ordinary.uses_complete_span_reduce_aggregate()
+                        || ordinary.uses_direct_span_trusted_core_aggregate()
+                        || ordinary.prepared_aggregate_strategy()
+                            != Some(PreparedAggregateStrategy::NativeFused)
+                    {
+                        return Err(CompileError::InternalInvariant(
+                            "complete Span reducer second ObjectBytes retry did not restore DirectOrdinary",
+                        ));
+                    }
+                    match emit_object(&ordinary, format, max_object_bytes) {
+                        Ok(object) => (ordinary, object),
+                        Err(error) if is_proven_object_byte_limit(&error) => {
+                            return Err(error.into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error: _,
+        } if module.uses_direct_span_trusted_core_aggregate() => {
+            // The trusted-core trampoline is optional additive text. Only a
+            // proven final ObjectBytes decline may remove it. Rebuild the
+            // exact selected complete-DFA route, authenticate the ordinary
+            // entry identity, then suppress only the compiler-private core
+            // receipt so Count/SpanSum regain their pre-feature local call.
+            // Allocation, lowering, authentication, and object-backend
+            // failures during this retry remain terminal.
+            let expected_entry_sha256 = module.direct_span_trusted_core_entry_sha256().ok_or(
+                CompileError::InternalInvariant(
+                    "direct Span trusted-core aggregate lost its entry identity",
+                ),
+            )?;
+            let selected_reverse = module.has_synchronizing_accept_reverse();
+            let selected_exact_pair = module.has_exact_pair_suffix();
+            let selected_start = module.start_accelerator();
+            let may_continue = module.optimizing_fallbacks_may_continue();
+            let fallback = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                &program,
+                target,
+                effective_native_data_limit_bytes,
+                selected_reverse,
+                selected_exact_pair,
+            )?
+            .with_optimizing_fallbacks_may_continue(may_continue);
+            if fallback.direct_span_trusted_core_entry_sha256() != Some(expected_entry_sha256)
+                || fallback.has_synchronizing_accept_reverse() != selected_reverse
+                || fallback.has_exact_pair_suffix() != selected_exact_pair
+                || fallback.start_accelerator() != selected_start
+                || fallback.required_runtime_symbols().next().is_some()
+                || fallback.required_prepare_capabilities() != 0
+            {
+                return Err(CompileError::InternalInvariant(
+                    "direct Span trusted-core ObjectBytes retry changed its complete-DFA route",
+                ));
+            }
+            let fallback = fallback
+                .without_complete_span_reduce_for_aggregate()?
+                .without_direct_span_trusted_core_for_aggregate()?
+                .append_prepared_aggregate_exports(
+                    exports,
+                    artifact_identity,
+                    &serialized_program,
+                )?;
+            if fallback.uses_direct_span_trusted_core_aggregate()
+                || fallback.prepared_aggregate_strategy()
+                    != Some(PreparedAggregateStrategy::NativeFused)
+            {
+                return Err(CompileError::InternalInvariant(
+                    "direct Span trusted-core ObjectBytes retry did not restore the ordinary aggregate",
+                ));
+            }
+            match emit_object(&fallback, format, max_object_bytes) {
+                Ok(object) => (fallback, object),
+                Err(error) if is_proven_object_byte_limit(&error) => {
+                    return Err(error.into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         FinalObjectAttempt::ObjectBytes {
             first_error: first,
             ..
@@ -1231,6 +1804,55 @@ fn append_prepared_aggregate_exports_to_compiled(
             return Err(first_error.into());
         }
     };
+    if mode == CompileMode::Optimizing
+        && (exports == PreparedAggregateExports::COUNT
+            || exports == PreparedAggregateExports::SPAN_SUM)
+        && let Some(literal) = program.native_exact_singleton_count_literal()
+    {
+        match direct_count_v3::prepare_direct_exact_singleton_count(
+            literal,
+            artifact_identity,
+            target,
+            max_object_bytes,
+        )? {
+            direct_count_v3::DirectExactSingletonCountPreparation::Declined => {}
+            direct_count_v3::DirectExactSingletonCountPreparation::Candidate(candidate) => {
+                if exports == PreparedAggregateExports::COUNT {
+                    if let Some(rollback) = module.install_direct_exact_singleton_count(
+                        literal,
+                        artifact_identity,
+                        &candidate,
+                    )? {
+                        match emit_object(&module, format, max_object_bytes) {
+                            Ok(candidate_object) => object = candidate_object,
+                            Err(error) if is_proven_object_byte_limit(&error) => {
+                                module.rollback_direct_exact_singleton_count(rollback)?;
+                            }
+                            Err(error) => {
+                                module.rollback_direct_exact_singleton_count(rollback)?;
+                                return Err(error.into());
+                            }
+                        }
+                    }
+                } else if let Some(rollback) = module.install_direct_exact_singleton_span_sum(
+                    literal,
+                    artifact_identity,
+                    &candidate,
+                )? {
+                    match emit_object(&module, format, max_object_bytes) {
+                        Ok(candidate_object) => object = candidate_object,
+                        Err(error) if is_proven_object_byte_limit(&error) => {
+                            module.rollback_direct_exact_singleton_span_sum(rollback)?;
+                        }
+                        Err(error) => {
+                            module.rollback_direct_exact_singleton_span_sum(rollback)?;
+                            return Err(error.into());
+                        }
+                    }
+                }
+            }
+        }
+    }
     drop(serialized_program);
     let mut passes = selected_passes(&program, &module);
     passes
@@ -1414,6 +2036,36 @@ pub fn compile_with_prepared_ordered_nfa_v15_scalar_operation_and_native_data_li
     )
 }
 
+/// Compile one strict prepared Ordered-NFA V15 Span-search operation.
+///
+/// The returned object publishes exactly one global function using the
+/// exclusive-handle Span ABI and one global exact serialized-program object
+/// for preparation. It publishes no ordinary compatibility entry, SpanFill,
+/// bulk entry, aggregate reducer, or unresolved runtime helper. Every call
+/// reauthenticates the immutable object, prepared header, and scratch state.
+pub fn compile_with_prepared_ordered_nfa_v15_row_search_reported(
+    request: CompileRequest,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_row_search_and_native_data_limit_reported(
+        request,
+        SlowAotLimits::default().max_native_data_bytes,
+    )
+}
+
+/// As [`compile_with_prepared_ordered_nfa_v15_row_search_reported`], with an
+/// exact immutable native-data ceiling.
+pub fn compile_with_prepared_ordered_nfa_v15_row_search_and_native_data_limit_reported(
+    request: CompileRequest,
+    max_native_data_bytes: usize,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported_with_surface(
+        request,
+        PreparedAggregateExports::NONE,
+        max_native_data_bytes,
+        module::PreparedOrderedNfaV15Surface::RowSearchOnly,
+    )
+}
+
 /// As [`compile_with_prepared_ordered_nfa_v15`], with an exact ceiling for the
 /// additional immutable Ordered-NFA object data. Sizing precedes image
 /// allocation; a miss is returned as a terminal `ProgramBytes` resource error.
@@ -1457,14 +2109,22 @@ fn compile_with_prepared_ordered_nfa_v15_and_native_data_limit_reported_with_sur
             actual: request.output,
         });
     }
-    if surface == module::PreparedOrderedNfaV15Surface::ScalarOperationOnly
-        && exports != PreparedAggregateExports::COUNT
-        && exports != PreparedAggregateExports::SPAN_SUM
-        && exports != PreparedAggregateExports::GREP_COUNT
-    {
-        return Err(CompileError::PreparedScalarOperationRequiresSingleExport {
-            actual: exports,
-        });
+    match surface {
+        module::PreparedOrderedNfaV15Surface::ScalarOperationOnly
+            if exports != PreparedAggregateExports::COUNT
+                && exports != PreparedAggregateExports::SPAN_SUM
+                && exports != PreparedAggregateExports::GREP_COUNT =>
+        {
+            return Err(CompileError::PreparedScalarOperationRequiresSingleExport {
+                actual: exports,
+            });
+        }
+        module::PreparedOrderedNfaV15Surface::RowSearchOnly if !exports.is_empty() => {
+            return Err(CompileError::InternalInvariant(
+                "prepared Ordered-NFA RowSearch requested aggregate exports",
+            ));
+        }
+        _ => {}
     }
     let CompileRequest {
         pattern,
@@ -1639,6 +2299,38 @@ fn compile_raw_prepared_ordered_nfa_v15_scalar_operation_reported(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
+    reason = "the in-crate composite compiler keeps the strict RowSearch transaction explicit"
+)]
+// In-crate raw-plan hook for a helper-free, independently authenticated
+// PreparedSpanSearchV1 row. Unlike the scalar-operation surface, this exports
+// exactly the public RowSearch entry and no aggregate or compatibility helper.
+fn compile_raw_prepared_ordered_nfa_v15_row_search_reported(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    max_native_data_bytes: usize,
+) -> Result<PreparedOrderedNfaV15CompileDisposition, CompileError> {
+    compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        target,
+        mode,
+        limits,
+        PreparedAggregateExports::NONE,
+        max_native_data_bytes,
+        module::PreparedOrderedNfaV15Surface::RowSearchOnly,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the explicit route keeps one plan, its six additive text retries, and its authenticated receipt in one transaction"
 )]
 fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
@@ -1716,6 +2408,19 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
                     max_native_data_bytes,
                 )
             }
+            module::PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                CompiledModule::lower_prepared_ordered_nfa_v15_row_search_reported(
+                    &program,
+                    target,
+                    allow_ordered_edge_dispatch,
+                    allow_ordered_nfa_terminal_range,
+                    allow_ordered_nfa_start_closure_dispatch,
+                    allow_ordered_nfa_start_prefix,
+                    allow_ordered_nfa_whole_window_width_gate,
+                    allow_ordered_nfa_terminal_exact_set,
+                    max_native_data_bytes,
+                )
+            }
         }
     };
     let lower_terminal = |allow_ordered_edge_dispatch,
@@ -1740,6 +2445,19 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
             }
             module::PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
                 CompiledModule::lower_prepared_ordered_nfa_v15_scalar_operation_with_native_data_limit(
+                    &program,
+                    target,
+                    allow_ordered_edge_dispatch,
+                    allow_ordered_nfa_terminal_range,
+                    allow_ordered_nfa_start_closure_dispatch,
+                    allow_ordered_nfa_start_prefix,
+                    allow_ordered_nfa_whole_window_width_gate,
+                    allow_ordered_nfa_terminal_exact_set,
+                    max_native_data_bytes,
+                )
+            }
+            module::PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                CompiledModule::lower_prepared_ordered_nfa_v15_row_search_with_native_data_limit(
                     &program,
                     target,
                     allow_ordered_edge_dispatch,
@@ -1783,7 +2501,20 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         },
         || append_exports(lower_terminal(true, true, true, true, true, false)?),
         || append_exports(lower_terminal(true, true, true, true, false, false)?),
-        || append_exports(lower_terminal(true, true, true, false, false, false)?),
+        |retain_scalar_prefix| {
+            if retain_scalar_prefix {
+                append_exports(
+                    CompiledModule::lower_prepared_ordered_nfa_v15_scalar_prefix_after_width_retry(
+                        &program,
+                        target,
+                        max_native_data_bytes,
+                        surface,
+                    )?,
+                )
+            } else {
+                append_exports(lower_terminal(true, true, true, false, false, false)?)
+            }
+        },
         || append_exports(lower_terminal(true, true, false, false, false, false)?),
         || append_exports(lower_terminal(true, false, false, false, false, false)?),
         || append_exports(lower_terminal(false, false, false, false, false, false)?),
@@ -1839,6 +2570,40 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
                 && global_functions.next().map(|symbol| symbol.name.as_str()) == reducer
                 && global_functions.next().is_none()
         }
+        module::PreparedOrderedNfaV15Surface::RowSearchOnly => {
+            let prepared = module.prepared_entry_symbol();
+            let runtime_program = module.required_runtime_program();
+            let mut global_functions = module.symbols().iter().filter(|symbol| {
+                symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && symbol.section.is_some()
+            });
+            let mut global_objects = module.symbols().iter().filter(|symbol| {
+                symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Object
+                    && symbol.section.is_some()
+            });
+            let function_is_exact = global_functions.next().map(|symbol| symbol.name.as_str())
+                == prepared
+                && global_functions.next().is_none();
+            let object_is_exact = match (global_objects.next(), runtime_program) {
+                (Some(symbol), Some((name, size))) => {
+                    symbol.name == name
+                        && usize::try_from(symbol.size).ok() == Some(size)
+                        && size == program_bytes
+                }
+                _ => false,
+            } && global_objects.next().is_none();
+            module.prepared_bulk_strategy().is_none()
+                && prepared == Some(module.entry_symbol())
+                && module.prepared_span_fill_symbol().is_none()
+                && module.prepared_aggregate_exports().is_empty()
+                && module.prepared_aggregate_strategy().is_none()
+                && module.required_runtime_symbols().next().is_none()
+                && module.symbols().iter().all(|symbol| symbol.section.is_some())
+                && function_is_exact
+                && object_is_exact
+        }
     };
     if !exact_surface
         || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
@@ -1882,10 +2647,14 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         optimizer_version: OPTIMIZER_VERSION,
         mode,
         output,
-        entry_abi: if surface == module::PreparedOrderedNfaV15Surface::ScalarOperationOnly {
-            EntryAbi::PreparedScalarReduceV1
-        } else {
-            EntryAbi::for_output(output)
+        entry_abi: match surface {
+            module::PreparedOrderedNfaV15Surface::Compatibility => EntryAbi::for_output(output),
+            module::PreparedOrderedNfaV15Surface::ScalarOperationOnly => {
+                EntryAbi::PreparedScalarReduceV1
+            }
+            module::PreparedOrderedNfaV15Surface::RowSearchOnly => {
+                EntryAbi::PreparedSpanSearchV1
+            }
         },
         target,
         line_terminator,
@@ -2025,6 +2794,7 @@ fn compile_with_slow_aot_limits_and_teddy_policy_v2(
         line_terminator,
         output,
         native_finite_language_candidate,
+        NativeFiniteLanguageAttachPolicy::Optional,
         finite_lower_state_rescue,
         target,
         mode,
@@ -2057,6 +2827,7 @@ pub fn compile_raw(
         b'\n',
         output,
         None,
+        NativeFiniteLanguageAttachPolicy::Optional,
         None,
         target,
         mode,
@@ -2092,6 +2863,7 @@ pub fn compile_raw_with_line_terminator(
         line_terminator,
         output,
         None,
+        NativeFiniteLanguageAttachPolicy::Optional,
         None,
         target,
         mode,
@@ -2116,6 +2888,7 @@ pub(crate) fn compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
     raw: RawPlan,
     line_terminator: u8,
     output: OutputContract,
+    native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
     target: Target,
     mode: CompileMode,
     limits: CompileLimitsV1,
@@ -2128,7 +2901,8 @@ pub(crate) fn compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
             raw,
             line_terminator,
             output,
-            None,
+            native_finite_language_candidate,
+            NativeFiniteLanguageAttachPolicy::FailClosed,
             None,
             target,
             mode,
@@ -2139,12 +2913,16 @@ pub(crate) fn compile_raw_with_prepared_aggregate_exports_and_slow_aot_limits(
     }
     validate_prepared_aggregate_exports(output, exports)?;
     let max_object_bytes = limits.max_object_bytes;
+    let _complete_span_reduce_recipe = module::complete_span_reduce_recipe_scope(
+        exports == PreparedAggregateExports::COUNT,
+    );
     let compiled = compile_raw_with_line_terminator_and_slow_aot_limits(
         source_bytes,
         raw,
         line_terminator,
         output,
-        None,
+        native_finite_language_candidate,
+        NativeFiniteLanguageAttachPolicy::FailClosed,
         None,
         target,
         mode,
@@ -2179,7 +2957,8 @@ enum FinalObjectAttempt {
 /// Emit one selected module and retry its compositional Ordered-NFA
 /// accelerators in exact additive order. Compiler-only fragmented terminal-set
 /// aggregate text is removed first, followed by the whole-window width gate,
-/// prefix, and independent start-closure text, preserving the exact
+/// AArch64 prefix SIMD text, the scalar prefix, and independent start-closure
+/// text, preserving the exact
 /// pre-feature V1/V2/V3 object. A selected V3 then
 /// omits only the terminal-range prefilter, yielding V2 when dispatch is
 /// present and V1 when it is not; a selected V2 becomes scalar V1 by omitting
@@ -2198,7 +2977,12 @@ fn emit_with_ordered_nfa_accelerator_retries(
         -> Result<CompiledModule, CompileError>,
     rebuild_without_terminal_exact_set: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_whole_window_width_gate: impl FnOnce() -> Result<CompiledModule, CompileError>,
-    rebuild_without_width_gate_or_start_prefix: impl FnOnce() -> Result<CompiledModule, CompileError>,
+    mut rebuild_without_width_gate_with_prefix_policy: impl FnMut(
+        bool,
+    ) -> Result<
+        CompiledModule,
+        CompileError,
+    >,
     rebuild_without_width_gate_start_prefix_or_start_closure_dispatch: impl FnOnce() -> Result<
         CompiledModule,
         CompileError,
@@ -2257,6 +3041,7 @@ fn emit_with_ordered_nfa_accelerator_retries(
     let selected_terminal_exact_set = module.has_ordered_nfa_terminal_exact_set();
     let selected_width_gate = module.has_ordered_nfa_whole_window_width_gate();
     let selected_start_prefix = module.has_ordered_nfa_start_prefix();
+    let selected_start_prefix_vector = module.has_ordered_nfa_start_prefix_vector();
     let selected_start_closure = module.has_ordered_nfa_start_closure_dispatch();
     let selected_terminal_range = module.has_ordered_nfa_terminal_range_object();
     let selected_edge_dispatch = module.has_ordered_edge_dispatch_object();
@@ -2303,6 +3088,8 @@ fn emit_with_ordered_nfa_accelerator_retries(
         if without_exact_set.has_ordered_nfa_terminal_exact_set()
             || without_exact_set.has_ordered_nfa_whole_window_width_gate() != selected_width_gate
             || without_exact_set.has_ordered_nfa_start_prefix() != selected_start_prefix
+            || without_exact_set.has_ordered_nfa_start_prefix_vector()
+                != selected_start_prefix_vector
             || without_exact_set.has_ordered_nfa_start_closure_dispatch() != selected_start_closure
             || without_exact_set.has_ordered_nfa_terminal_range_object() != selected_terminal_range
             || without_exact_set.has_ordered_edge_dispatch_object() != selected_edge_dispatch
@@ -2335,6 +3122,8 @@ fn emit_with_ordered_nfa_accelerator_retries(
         if without_width.has_ordered_nfa_terminal_exact_set()
             || without_width.has_ordered_nfa_whole_window_width_gate()
             || without_width.has_ordered_nfa_start_prefix() != selected_start_prefix
+            || without_width.has_ordered_nfa_start_prefix_vector()
+                != selected_start_prefix_vector
             || without_width.has_ordered_nfa_start_closure_dispatch() != selected_start_closure
             || without_width.has_ordered_nfa_terminal_range_object() != selected_terminal_range
             || without_width.has_ordered_edge_dispatch_object() != selected_edge_dispatch
@@ -2361,11 +3150,50 @@ fn emit_with_ordered_nfa_accelerator_retries(
     }
 
     if selected_start_prefix {
-        let without_prefix = rebuild_without_width_gate_or_start_prefix()?
+        // Only an entry whose AArch64 emitter actually selected ASIMD has a
+        // scalar-prefix ablation. Feature-empty targets and graph/frequency
+        // declines already are the byte-identical scalar incumbent, so a
+        // speculative rebuild here would add a new allocation-failure seam.
+        if module.has_ordered_nfa_start_prefix_vector() {
+            let scalar_prefix = rebuild_without_width_gate_with_prefix_policy(true)?
+                .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+            if scalar_prefix.has_ordered_nfa_terminal_exact_set()
+                || scalar_prefix.has_ordered_nfa_whole_window_width_gate()
+                || !scalar_prefix.has_ordered_nfa_start_prefix()
+                || scalar_prefix.has_ordered_nfa_start_prefix_vector()
+                || scalar_prefix.has_ordered_nfa_start_closure_dispatch() != selected_start_closure
+                || scalar_prefix.has_ordered_nfa_terminal_range_object() != selected_terminal_range
+                || scalar_prefix.has_ordered_edge_dispatch_object() != selected_edge_dispatch
+                || scalar_prefix.required_prepare_capabilities()
+                    & PREPARED_CAPABILITY_ORDERED_NFA_V15
+                    == 0
+                || scalar_prefix.target() != module.target()
+            {
+                return Err(CompileError::InternalInvariant(
+                    "Ordered-NFA prefix-SIMD final-object retry changed its scalar-prefix route",
+                ));
+            }
+            match emit_object(&scalar_prefix, format, max_object_bytes) {
+                Ok(object) => {
+                    return Ok(FinalObjectAttempt::Fit {
+                        module: scalar_prefix,
+                        object,
+                    });
+                }
+                Err(ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    ..
+                }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let without_prefix = rebuild_without_width_gate_with_prefix_policy(false)?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
         if without_prefix.has_ordered_nfa_terminal_exact_set()
             || without_prefix.has_ordered_nfa_whole_window_width_gate()
             || without_prefix.has_ordered_nfa_start_prefix()
+            || without_prefix.has_ordered_nfa_start_prefix_vector()
             || without_prefix.has_ordered_nfa_start_closure_dispatch() != selected_start_closure
             || without_prefix.has_ordered_nfa_terminal_range_object() != selected_terminal_range
             || without_prefix.has_ordered_edge_dispatch_object() != selected_edge_dispatch
@@ -2532,11 +3360,21 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                 max_native_data_bytes,
             )
         },
-        || {
-            CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
-                program, target, false, allow_ordered_nfa, true, true, true, false, false, false,
-                max_native_data_bytes,
-            )
+        |retain_scalar_prefix| {
+            if retain_scalar_prefix {
+                CompiledModule::lower_ordered_nfa_scalar_prefix_after_width_retry(
+                    program,
+                    target,
+                    false,
+                    allow_ordered_nfa,
+                    max_native_data_bytes,
+                )
+            } else {
+                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                    program, target, false, allow_ordered_nfa, true, true, true, false, false, false,
+                    max_native_data_bytes,
+                )
+            }
         },
         || {
             CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
@@ -2604,11 +3442,21 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                         max_native_data_bytes,
                     )
                 },
-                || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
-                        program, target, second_endpoint, second_ordered_route, true, true, true, false, false, false,
-                        max_native_data_bytes,
-                    )
+                |retain_scalar_prefix| {
+                    if retain_scalar_prefix {
+                        CompiledModule::lower_ordered_nfa_scalar_prefix_after_width_retry(
+                            program,
+                            target,
+                            second_endpoint,
+                            second_ordered_route,
+                            max_native_data_bytes,
+                        )
+                    } else {
+                        CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                            program, target, second_endpoint, second_ordered_route, true, true, true, false, false, false,
+                            max_native_data_bytes,
+                        )
+                    }
                 },
                 || {
                     CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
@@ -2671,6 +3519,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
     line_terminator: u8,
     output: OutputContract,
     native_finite_language_candidate: Option<finite_language::NativeFiniteLanguageCandidate>,
+    native_finite_language_attach_policy: NativeFiniteLanguageAttachPolicy,
     mut finite_lower_state_rescue: Option<LowerError>,
     target: Target,
     mode: CompileMode,
@@ -2709,12 +3558,23 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                     .into());
             }
         } else {
-            program.attach_native_finite_language(candidate);
+            match native_finite_language_attach_policy {
+                NativeFiniteLanguageAttachPolicy::Optional => {
+                    program.attach_native_finite_language(candidate);
+                }
+                NativeFiniteLanguageAttachPolicy::FailClosed => {
+                    program.attach_native_finite_language_checked(candidate)?;
+                }
+            }
         }
     }
     let program_bytes = program.serialized_len()?;
     let program_sha256 = program.artifact_identity();
     let format = ObjectFormat::for_target(target);
+    let _complete_span_reduce_singleton_suppression = program
+        .native_exact_singleton_count_literal()
+        .is_some()
+        .then(|| module::complete_span_reduce_recipe_scope(false));
     let (module, object) = match mode {
         CompileMode::Fast => lower_ordinary_with_endpoint_oracle_object_retry(
             &program,
@@ -2773,11 +3633,21 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                         effective_native_data_limit_bytes,
                     )
                 },
-                || {
-                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
-                        &program, target, false, true, true, true, true, false, false, false,
-                        effective_native_data_limit_bytes,
-                    )
+                |retain_scalar_prefix| {
+                    if retain_scalar_prefix {
+                        CompiledModule::lower_ordered_nfa_scalar_prefix_after_width_retry(
+                            &program,
+                            target,
+                            false,
+                            true,
+                            effective_native_data_limit_bytes,
+                        )
+                    } else {
+                        CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                            &program, target, false, true, true, true, true, false, false, false,
+                            effective_native_data_limit_bytes,
+                        )
+                    }
                 },
                 || {
                     CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
@@ -2839,11 +3709,21 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
                                     effective_native_data_limit_bytes,
                                 )
                             },
-                            || {
-                                CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
-                                    &program, target, false, true, true, true, true, false, false, false,
-                                    effective_native_data_limit_bytes,
-                                )
+                            |retain_scalar_prefix| {
+                                if retain_scalar_prefix {
+                                    CompiledModule::lower_ordered_nfa_scalar_prefix_after_width_retry(
+                                        &program,
+                                        target,
+                                        false,
+                                        true,
+                                        effective_native_data_limit_bytes,
+                                    )
+                                } else {
+                                    CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(
+                                        &program, target, false, true, true, true, true, false, false, false,
+                                        effective_native_data_limit_bytes,
+                                    )
+                                }
                             },
                             || {
                                 CompiledModule::lower_with_native_data_limit_and_optional_routes_and_ordered_nfa_accelerators_and_start_closure_and_prefix_and_width_and_terminal_exact_set(

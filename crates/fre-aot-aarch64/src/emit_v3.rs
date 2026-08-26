@@ -17,12 +17,12 @@ use fre_kernel_ir::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, AotCountArtifactIdentityV3, AotCountCpuFeatures,
-    AotCountImageBuildReceiptV3, AotCountImageLayoutV3, AotCountImageStatsV3, AotCountImageV3,
-    AotCountLiteralManifestV3, AotCountRecipeManifestV3, AotCountTargetSpec, CodeLabelV3,
-    ConditionV3, CountAotArithmeticSite, CountAotError, CountAotResource, CountAotUnsupported,
-    CountAuditReportV3, LabelKindV3, RelocationKindV3, RelocationTargetV3, RelocationV3,
-    SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3,
+    AOT_COUNT_CODE_ALIGNMENT_V3, AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, AotCountArtifactIdentityV3,
+    AotCountCpuFeatures, AotCountImageBuildReceiptV3, AotCountImageLayoutV3, AotCountImageStatsV3,
+    AotCountImageV3, AotCountLiteralManifestV3, AotCountRecipeManifestV3, AotCountTargetSpec,
+    CodeLabelV3, ConditionV3, CountAotArithmeticSite, CountAotError, CountAotResource,
+    CountAotUnsupported, CountAuditReportV3, LabelKindV3, RelocationKindV3, RelocationTargetV3,
+    RelocationV3, SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3,
     audit_v3::{
         audit_candidate_wrapper_inline_bytes_v3, audit_count_image_candidate_v3,
         audit_count_image_v3, audit_public_wrapper_inline_bytes_v3, audit_scratch_upper_bound_v3,
@@ -30,7 +30,6 @@ use crate::{
     },
 };
 
-const CODE_ALIGNMENT_V3: usize = 16;
 const MAX_CODE_BYTES_V3: u64 = 16 << 10;
 const MAX_LABELS_V3: u64 = 48;
 const MAX_RELOCATIONS_V3: u64 = 256;
@@ -385,10 +384,10 @@ pub fn emit_count_v3(
         });
     }
     let code_bytes = to_u32(code.len(), CountAotArithmeticSite::ImageLayout)?;
-    let rodata_offset = align_up_v3(code.len(), CODE_ALIGNMENT_V3)?;
+    let rodata_offset = align_up_v3(code.len(), AOT_COUNT_CODE_ALIGNMENT_V3)?;
     let layout = AotCountImageLayoutV3 {
-        code_alignment: u32::try_from(CODE_ALIGNMENT_V3).expect("small alignment"),
-        rodata_alignment: u32::try_from(CODE_ALIGNMENT_V3).expect("small alignment"),
+        code_alignment: u32::try_from(AOT_COUNT_CODE_ALIGNMENT_V3).expect("small alignment"),
+        rodata_alignment: u32::try_from(AOT_COUNT_CODE_ALIGNMENT_V3).expect("small alignment"),
         rodata_from_code_start: to_u32(rodata_offset, CountAotArithmeticSite::ImageLayout)?,
         total_mapped_bytes: to_u32(rodata_offset, CountAotArithmeticSite::ImageLayout)?,
     };
@@ -3678,13 +3677,14 @@ fn emit_multi_specialized_v3(
     assembler.branch(scalar_loop)
 }
 
-/// NEON periodic scan with one complete-filter reduction per 16 starts.
+/// NEON periodic scan with one staged complete-filter reduction per 16 starts.
 ///
 /// Periodic literals deliberately bypass the generic staged sparse graph:
-/// their repeated bytes make a one-column absence classifier unreliable.
-/// Intersecting the complete sealed period filter first both removes false
-/// candidate storms and leaves a compact lane-recovery loop. Confirmed matches
-/// enter the exact non-overlapping successor run.
+/// their repeated bytes make one-column presence a poor candidate classifier.
+/// Absence is nevertheless exact, so the 128-start loop tests its first sealed
+/// period column before loading the second. A surviving batch intersects the
+/// complete period filter before lane recovery. Confirmed matches enter the
+/// exact non-overlapping successor run.
 #[allow(
     clippy::too_many_lines,
     reason = "the closed periodic mask and successor graph is intentionally explicit"
@@ -3704,6 +3704,9 @@ fn emit_periodic_neon_v3(
         });
     }
     let wide = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let wide_primary_first_hit = assembler.new_label(LabelKindV3::Internal)?;
+    let wide_second_columns = assembler.new_label(LabelKindV3::Internal)?;
+    let wide_empty = assembler.new_label(LabelKindV3::Internal)?;
     let wide_hit = assembler.new_label(LabelKindV3::Internal)?;
     let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
@@ -3776,9 +3779,10 @@ fn emit_periodic_neon_v3(
         assembler.move_x_to_vector_double(OVERLAPPING_SUFFIX_VECTOR_V3, X8)?;
     }
 
-    // Scan eight blocks using the two sealed period-boundary columns. This
-    // retains their close structural relationship; semantic endpoints are
-    // paid only by confirmation after a surviving block.
+    // Scan eight blocks using the first sealed period-boundary column. An
+    // empty union proves that the complete two-column mask is empty, avoiding
+    // the second 128-byte load stream. Presence falls through to the exact
+    // second-column intersection; semantic endpoints remain confirmation-only.
     assembler.bind(wide)?;
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
@@ -3788,17 +3792,77 @@ fn emit_periodic_neon_v3(
     assembler.add_reg(X15, X0, X3)?;
     assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
     assembler.add_imm(X9, X15, u16::from(filter.offsets[1]))?;
-    for (group, (first_base, second_base)) in [(X8, X9), (X16, X5)].into_iter().enumerate() {
+    assembler.load_vectors4x128(0, X8)?;
+    for lane in 0_u8..4 {
+        assembler.compare_equal_bytes16(
+            SPARSE_BLOCK_MASK_BASE_V3 + lane,
+            lane,
+            vector_registers[0],
+        )?;
+    }
+    // A nonempty first 16-start mask is a cheap density witness. Preserve
+    // the incumbent two-column work shape for that common dense case instead
+    // of paying the complete eight-mask absence reduction on every batch.
+    assembler.unsigned_max_across_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3)?;
+    assembler.move_vector_byte_to32(X6, 0)?;
+    assembler.cmp_imm64(X6, 0)?;
+    assembler.branch_cond(ConditionV3::NotEqual, wide_primary_first_hit)?;
+
+    assembler.add_imm(X16, X8, 64)?;
+    assembler.load_vectors4x128(0, X16)?;
+    for lane in 0_u8..4 {
+        assembler.compare_equal_bytes16(
+            SPARSE_BLOCK_MASK_BASE_V3 + 4 + lane,
+            lane,
+            vector_registers[0],
+        )?;
+    }
+    assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
+    assembler.or_bytes16(
+        1,
+        SPARSE_BLOCK_MASK_BASE_V3 + 2,
+        SPARSE_BLOCK_MASK_BASE_V3 + 3,
+    )?;
+    assembler.or_bytes16(0, 0, 1)?;
+    assembler.or_bytes16(
+        1,
+        SPARSE_BLOCK_MASK_BASE_V3 + 4,
+        SPARSE_BLOCK_MASK_BASE_V3 + 5,
+    )?;
+    assembler.or_bytes16(
+        2,
+        SPARSE_BLOCK_MASK_BASE_V3 + 6,
+        SPARSE_BLOCK_MASK_BASE_V3 + 7,
+    )?;
+    assembler.or_bytes16(1, 1, 2)?;
+    assembler.or_bytes16(0, 0, 1)?;
+    assembler.unsigned_max_across_bytes16(0, 0)?;
+    assembler.move_vector_byte_to32(X6, 0)?;
+    assembler.cmp_imm64(X6, 0)?;
+    assembler.branch_cond(ConditionV3::Equal, wide_empty)?;
+    assembler.branch(wide_second_columns)?;
+
+    // The first primary mask was already proved nonempty. Materialize the
+    // remaining retained primary masks, then fall through to the unchanged
+    // exact second-column intersection without the full-batch reduction.
+    assembler.bind(wide_primary_first_hit)?;
+    assembler.add_imm(X16, X8, 64)?;
+    assembler.load_vectors4x128(0, X16)?;
+    for lane in 0_u8..4 {
+        assembler.compare_equal_bytes16(
+            SPARSE_BLOCK_MASK_BASE_V3 + 4 + lane,
+            lane,
+            vector_registers[0],
+        )?;
+    }
+
+    assembler.bind(wide_second_columns)?;
+    for (group, second_base) in [X9, X5].into_iter().enumerate() {
         if group != 0 {
-            assembler.add_imm(first_base, X8, 64)?;
             assembler.add_imm(second_base, X9, 64)?;
         }
         let mask_base =
             SPARSE_BLOCK_MASK_BASE_V3 + u8::try_from(group * 4).expect("two four-vector groups");
-        assembler.load_vectors4x128(0, first_base)?;
-        for lane in 0_u8..4 {
-            assembler.compare_equal_bytes16(mask_base + lane, lane, vector_registers[0])?;
-        }
         assembler.load_vectors4x128(0, second_base)?;
         for lane in 0_u8..4 {
             assembler.compare_equal_bytes16(lane, lane, vector_registers[1])?;
@@ -3832,6 +3896,7 @@ fn emit_periodic_neon_v3(
     assembler.move_vector_byte_to32(X8, 1)?;
     assembler.cmp_imm64(X8, 0)?;
     assembler.branch_cond(ConditionV3::NotEqual, wide_hit)?;
+    assembler.bind(wide_empty)?;
     assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;
     assembler.branch(wide)?;
 

@@ -1850,12 +1850,12 @@ fn try_reserve_items<T>(
         .map_err(|_| invalid(allocation_error))
 }
 
-fn zeroed_object_bytes(required: usize, max_bytes: usize) -> Result<Vec<u8>, ObjectError> {
+fn zeroed_object_bytes(required: usize, _max_bytes: usize) -> Result<Vec<u8>, ObjectError> {
     let mut bytes = Vec::new();
     note_object_allocation(required);
     bytes
         .try_reserve_exact(required)
-        .map_err(|_| resource(required, max_bytes))?;
+        .map_err(|_| ObjectError::Allocation("object output bytes"))?;
     // `try_reserve_items` established capacity first, so this initialization
     // cannot trigger another allocation.
     bytes.resize(required, 0);
@@ -2212,6 +2212,14 @@ mod tests {
                 limit: one_less,
                 required: exact_limit,
             })
+        );
+    }
+
+    #[test]
+    fn output_allocation_refusal_is_not_an_object_byte_limit() {
+        assert_eq!(
+            zeroed_object_bytes(usize::MAX, usize::MAX),
+            Err(ObjectError::Allocation("object output bytes")),
         );
     }
 

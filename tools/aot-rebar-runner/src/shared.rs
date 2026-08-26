@@ -1,39 +1,40 @@
 use std::{collections::BTreeMap, fmt, time::Duration};
 
+#[cfg(test)]
+use fre_aot_regex::compile_with_prepared_ordered_nfa_v15_reported;
 use fre_aot_regex::{
-    compile_ordered_many_aot_reported, compile_rebar_single_capture_aot_v1,
-    compile_rebar_single_capture_participation_aot_v1,
-    compile_rebar_single_capture_reducer_aot_v1,
-    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer,
-    compile_uniform_capture_selector,
-    compile_with_prepared_aggregate_exports_and_slow_aot_limits,
-    compile_with_prepared_ordered_nfa_v15_reported,
-    compile_with_prepared_ordered_nfa_v15_scalar_operation_reported, compile_with_slow_aot_limits,
     Architecture, CaptureCompileError, CaptureCompileLimits, CompileError, CompileLimitsV1,
-    CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind, EntryAbi, FeatureSet,
-    NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1,
+    CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind, EntryAbi,
+    FeatureSet, NativeParticipationAotErrorV1, NativeParticipationAotLimitsV1,
     NativeParticipationAotResourceV1, NativeParticipationAotStrategyV1, OperatingSystem,
     OrderedManyAotArtifact, OrderedManyAotCompileDecline, OrderedManyAotCompileDisposition,
-    OrderedManyAotCompileLimits, OrderedManyAotCompileRequest, OrderedManyPatternId, OrderedManyRow,
-    OutputContract, PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy,
-    PreparedOrderedNfaV15CompileDisposition, RebarSingleCaptureAotArtifactV1,
-    RebarSingleCaptureAotRequestV1, RebarSingleCaptureParticipationAotArtifactV1,
-    RebarSingleCaptureParticipationAotErrorV1, RebarSingleCaptureReducerAotArtifactV1,
-    RebarSingleCaptureReducerOperationV1, RebarSingleCaptureReducerSourceArtifactV1,
+    OrderedManyAotCompileLimits, OrderedManyAotCompileRequest, OrderedManyPatternId,
+    OrderedManyRow, OutputContract, PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports,
+    PreparedAggregateStrategy, PreparedBulkStrategy, PreparedOrderedNfaV15CompileDisposition,
+    RebarSingleCaptureAotArtifactV1, RebarSingleCaptureAotRequestV1,
+    RebarSingleCaptureParticipationAotArtifactV1, RebarSingleCaptureParticipationAotErrorV1,
+    RebarSingleCaptureReducerAotArtifactV1, RebarSingleCaptureReducerOperationV1,
+    RebarSingleCaptureReducerSourceArtifactV1, RebarWeightedCaptureReducerAotArtifactV1,
+    RebarWeightedCaptureReducerAotCompileDeclineV1,
+    RebarWeightedCaptureReducerAotCompileDispositionV1, RebarWeightedCaptureReducerAotRequestV1,
     SectionKind, SharedUniformCaptureReducerAotArtifact,
-    SharedUniformCaptureReducerAotCompileDecline,
-    SharedUniformCaptureReducerAotCompileDisposition, SlowAotLimits, SymbolBinding, SymbolKind,
-    Target,
-    UniformCaptureAuthenticationError, UniformCaptureCompileDisposition,
-    UniformCaptureCompileError, UniformCaptureCompileReceipt, UniformCaptureCompileRequest,
-    UniformCapturePreparedSpanFillCompileDisposition, UniformCapturePreparedSpanFillCompileError,
-    UniformCapturePreparedSpanFillCompileReceipt, UniformCaptureReducerCompileDisposition,
-    UniformCaptureReducerCompileError, UniformCaptureReducerOperation,
-    PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    SharedUniformCaptureReducerAotCompileDecline, SharedUniformCaptureReducerAotCompileDisposition,
+    SlowAotLimits, SymbolBinding, SymbolKind, Target, UniformCaptureAuthenticationError,
+    UniformCaptureCompileDisposition, UniformCaptureCompileError, UniformCaptureCompileReceipt,
+    UniformCaptureCompileRequest, UniformCapturePreparedSpanFillCompileDisposition,
+    UniformCapturePreparedSpanFillCompileError, UniformCapturePreparedSpanFillCompileReceipt,
+    UniformCaptureReducerCompileError, UniformCaptureReducerLinkCompileDispositionV1,
+    UniformCaptureReducerOperation, compile_ordered_many_aot_reported,
+    compile_rebar_single_capture_aot_v1, compile_rebar_single_capture_participation_aot_v1,
+    compile_rebar_single_capture_reducer_aot_v1, compile_rebar_weighted_capture_reducer_aot_v1,
     compile_shared_uniform_capture_reducer_aot_reported,
+    compile_uniform_capture_prepared_span_fill_selector, compile_uniform_capture_reducer_linked_v1,
+    compile_uniform_capture_selector, compile_with_prepared_aggregate_exports_and_slow_aot_limits,
+    compile_with_prepared_ordered_nfa_v15_row_search_reported,
+    compile_with_prepared_ordered_nfa_v15_scalar_operation_reported, compile_with_slow_aot_limits,
 };
 use fre_lower::{LowerError, LowerResource, UniformCaptureParticipationLimits};
-use fre_syntax::{parse, CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
+use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile, parse};
 use sha2::{Digest, Sha256};
 
 pub const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
@@ -56,6 +57,9 @@ pub const MAX_NATIVE_ROW_BRIDGE_PATTERNS: usize = 4_096;
 /// Maximum combined bytes of distinct relocatable row objects linked into one
 /// job-specialized bridge binary.
 pub const MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES: usize = 256 * 1_048_576;
+/// Serialized-object cap for the separately linked straight-line weighted
+/// capture reducer. Row objects retain their independent aggregate cap above.
+pub const MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES: usize = 16 * 1_048_576;
 /// Maximum group-zero-inclusive slot count accepted by the strict capture
 /// adapter. This keeps its one caller-owned result allocation inside the same
 /// deliberately small cardinality envelope as the native-row bridge.
@@ -394,10 +398,36 @@ pub fn authenticate_native_whole_scalar_reducer(
     model: Model,
     compiled: &CompiledRegex,
 ) -> Result<bool, String> {
+    authenticate_native_whole_scalar_reducer_with_policy(model, compiled, false)
+}
+
+/// Authenticate a complete scalar reducer selected specifically by the
+/// shared ordered-many route.
+///
+/// Unlike a direct single-pattern Grep artifact, the shared Grep compiler
+/// lowers a Span-output automaton before appending the whole-haystack native
+/// reducer. The route proof is therefore the only place where GrepCount plus
+/// `NativeFused` is an eligible whole-operation scalar topology.
+pub fn authenticate_shared_ordered_many_whole_scalar_reducer(
+    model: Model,
+    compiled: &CompiledRegex,
+) -> Result<bool, String> {
+    authenticate_native_whole_scalar_reducer_with_policy(model, compiled, true)
+}
+
+fn authenticate_native_whole_scalar_reducer_with_policy(
+    model: Model,
+    compiled: &CompiledRegex,
+    shared_ordered_many: bool,
+) -> Result<bool, String> {
     let receipt = compiled.receipt();
     let module = compiled.module();
     let strategy = receipt.prepared_aggregate_strategy;
-    if !is_native_whole_scalar_reducer(model, strategy) {
+    let shared_native_fused_grep = shared_ordered_many
+        && model == Model::GrepCount
+        && strategy == Some(PreparedAggregateStrategy::NativeFused)
+        && receipt.output == OutputContract::Span;
+    if !is_native_whole_scalar_reducer(model, strategy) && !shared_native_fused_grep {
         return Ok(false);
     }
 
@@ -424,8 +454,12 @@ pub fn authenticate_native_whole_scalar_reducer(
         .required_runtime_program()
         .ok_or_else(|| "native scalar reducer has no preparation program".to_owned())?;
     let program_identity =
-        canonical_symbol_identity(program_name, "fre_aot_regex_runtime_program_v1_")
-        .ok_or_else(|| "native scalar preparation program symbol is not canonical".to_owned())?;
+        canonical_symbol_identity(program_name, "fre_aot_regex_runtime_program_v1_").ok_or_else(
+            || "native scalar preparation program symbol is not canonical".to_owned(),
+        )?;
+    let shared_native_fused_identity_is_exact = !shared_ordered_many
+        || strategy != Some(PreparedAggregateStrategy::NativeFused)
+        || reducer_identity == program_identity;
 
     let ordered_nfa = strategy == Some(PreparedAggregateStrategy::NativeOrderedNfaFused);
     let bulk_shape_is_exact = if ordered_nfa {
@@ -453,6 +487,7 @@ pub fn authenticate_native_whole_scalar_reducer(
         || module.required_prepare_capabilities() != receipt.required_prepare_capabilities
         || receipt.runtime_helper_required
         || !bulk_shape_is_exact
+        || !shared_native_fused_identity_is_exact
         || !has_exact_runtime_symbol_closure(compiled, &[])
         || reducer_name == program_name
         || program_len == 0
@@ -489,9 +524,7 @@ pub fn authenticate_native_whole_scalar_reducer(
             })
             .collect::<Vec<_>>();
         if global_functions.len() != 1 || global_functions[0].name != reducer_name {
-            return Err(
-                "Ordered-NFA scalar operation exports another defined function".to_owned(),
-            );
+            return Err("Ordered-NFA scalar operation exports another defined function".to_owned());
         }
     }
     let section_index = reducer
@@ -553,6 +586,19 @@ pub fn authenticate_native_whole_scalar_reducer(
         return Err("native scalar reducer has an unexpected aggregate helper surface".to_owned());
     }
     Ok(true)
+}
+
+fn admit_native_whole_scalar_reducer(
+    model: Model,
+    compiled: CompiledRegex,
+) -> Result<CompiledRegex, String> {
+    if !authenticate_native_whole_scalar_reducer(model, &compiled)? {
+        return Err(format!(
+            "general AOT {} compilation did not publish an authenticated native whole-operation reducer",
+            model.name(),
+        ));
+    }
+    Ok(compiled)
 }
 
 fn canonical_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> {
@@ -972,12 +1018,10 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
         })?;
         let selected =
             select_prepared_ordered_nfa_v15_or_incumbent(benchmark.model, compiled, disposition)?;
-        authenticate_native_whole_scalar_reducer(benchmark.model, &selected)?;
-        return Ok(selected);
+        return admit_native_whole_scalar_reducer(benchmark.model, selected);
     }
     if benchmark.model != Model::GrepCount {
-        authenticate_native_whole_scalar_reducer(benchmark.model, &compiled)?;
-        return Ok(compiled);
+        return admit_native_whole_scalar_reducer(benchmark.model, compiled);
     }
     let grep_needs_operation_only_v15 = if compiled.module().required_prepare_capabilities()
         == PREPARED_CAPABILITY_ORDERED_NFA_V15
@@ -999,23 +1043,35 @@ pub fn compile_benchmark(benchmark: &Benchmark, target: Target) -> Result<Compil
             .limits(selected_limits),
         PreparedAggregateExports::GREP_COUNT,
     );
-    match classify_grep_operation_only_attempt(attempt)? {
-        Some(selected) => {
-            authenticate_prepared_ordered_nfa_scalar(Model::GrepCount, &selected)?;
-            Ok(selected)
-        }
-        None => Ok(compiled),
-    }
+    let selected = select_grep_operation_only_candidate(compiled, attempt)?;
+    authenticate_prepared_ordered_nfa_scalar(Model::GrepCount, &selected)?;
+    Ok(selected)
 }
 
-fn classify_grep_operation_only_attempt(
+/// Select the operation-only replacement after a Grep artifact has exposed
+/// either the exact RuntimeHelper compatibility surface or an authenticated
+/// legacy V15 native reducer.
+///
+/// The current runner has no authenticated non-native Grep execution route:
+/// its linked boundary accepts only direct `NativeFused` or operation-only
+/// V15. A typed V15 resource/representation decline may preserve only the
+/// independently re-authenticated legacy V15 native incumbent. It cannot
+/// authorize emitting a stale RuntimeHelper incumbent that runtime
+/// authentication would reject.
+fn select_grep_operation_only_candidate(
+    incumbent: CompiledRegex,
     attempt: Result<PreparedOrderedNfaV15CompileDisposition, CompileError>,
-) -> Result<Option<CompiledRegex>, String> {
+) -> Result<CompiledRegex, String> {
     match attempt {
-        Ok(PreparedOrderedNfaV15CompileDisposition::Compiled(compiled)) => {
-            Ok(Some(compiled))
+        Ok(PreparedOrderedNfaV15CompileDisposition::Compiled(compiled)) => Ok(compiled),
+        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(decline)) => {
+            authenticate_prepared_v15_grep(&incumbent).map_err(|_| {
+                format!(
+                    "general AOT operation-only prepared V15 grep compilation declined: {decline:?}; refusing the unauthenticated RuntimeHelper incumbent",
+                )
+            })?;
+            Ok(incumbent)
         }
-        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(_)) => Ok(None),
         Err(error) => Err(format!(
             "general AOT operation-only prepared V15 grep compilation failed: {error}"
         )),
@@ -1061,10 +1117,7 @@ fn authenticate_same_scalar_semantic_program(
     Ok(())
 }
 
-fn scalar_incumbent_requires_prepared_ordered_nfa(
-    model: Model,
-    compiled: &CompiledRegex,
-) -> bool {
+fn scalar_incumbent_requires_prepared_ordered_nfa(model: Model, compiled: &CompiledRegex) -> bool {
     let module = compiled.module();
     let route_shape = scalar_incumbent_route_shape(
         model,
@@ -1095,10 +1148,7 @@ const fn scalar_incumbent_route_shape(
     let transitive_prepared_loop = matches!(
         (bulk, aggregate),
         (
-            Some(
-                PreparedBulkStrategy::NativePreparedLoop
-                    | PreparedBulkStrategy::NativeFrozenLoop,
-            ),
+            Some(PreparedBulkStrategy::NativePreparedLoop | PreparedBulkStrategy::NativeFrozenLoop,),
             Some(PreparedAggregateStrategy::NativeFusedWithRuntimeHelper),
         )
     );
@@ -1117,10 +1167,7 @@ const fn scalar_incumbent_route_shape(
                 && required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15))
 }
 
-fn legacy_prepared_v15_scalar_incumbent_is_exact(
-    model: Model,
-    compiled: &CompiledRegex,
-) -> bool {
+fn legacy_prepared_v15_scalar_incumbent_is_exact(model: Model, compiled: &CompiledRegex) -> bool {
     let module = compiled.module();
     let receipt = compiled.receipt();
     let (reducer, other_reducer, runtime_symbols, reducer_prefix) = match model {
@@ -1232,9 +1279,7 @@ fn authenticate_prepared_ordered_nfa_scalar(
         || match model {
             Model::Count => module.prepared_count_symbol() != Some(module.entry_symbol()),
             Model::SpanSum => module.prepared_span_sum_symbol() != Some(module.entry_symbol()),
-            Model::GrepCount => {
-                module.prepared_grep_count_symbol() != Some(module.entry_symbol())
-            }
+            Model::GrepCount => module.prepared_grep_count_symbol() != Some(module.entry_symbol()),
             _ => true,
         }
         || compiled.object().is_empty()
@@ -1327,10 +1372,7 @@ fn has_exact_symbol_name_closure(actual: &[&str], expected: &[&str]) -> bool {
     actual.len() == expected_len && expected.len() == expected_len && actual == expected
 }
 
-fn has_exact_optional_symbol_name_closure(
-    actual: &[&str],
-    expected: &[Option<&str>],
-) -> bool {
+fn has_exact_optional_symbol_name_closure(actual: &[&str], expected: &[Option<&str>]) -> bool {
     let expected = expected.iter().flatten().copied().collect::<Vec<_>>();
     has_exact_symbol_name_closure(actual, &expected)
 }
@@ -1382,10 +1424,7 @@ fn native_dynamic_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> b
 }
 
 fn native_prepared_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> bool {
-    compiled
-        .module()
-        .prepared_bulk_strategy()
-        == Some(PreparedBulkStrategy::NativePreparedLoop)
+    compiled.module().prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativePreparedLoop)
         && native_dynamic_loop_runtime_symbols_are_closed(compiled)
 }
 
@@ -1393,7 +1432,7 @@ fn native_frozen_loop_runtime_symbols_are_closed(compiled: &CompiledRegex) -> bo
     let module = compiled.module();
     module.prepared_bulk_strategy() == Some(PreparedBulkStrategy::NativeFrozenLoop)
         && module.required_prepared_dynamic_rows_loop_scan_runtime_symbol()
-        == Some(FROZEN_LOOP_RUNTIME_SYMBOL)
+            == Some(FROZEN_LOOP_RUNTIME_SYMBOL)
         && native_dynamic_loop_runtime_symbols_are_closed(compiled)
 }
 
@@ -1522,6 +1561,7 @@ fn shared_ordered_many_v15_symbol_identities_are_closed(
     let reducer_prefix = match model {
         Model::Count => "fre_aot_regex_count_exclusive_v1_",
         Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
+        Model::GrepCount => "fre_aot_regex_grep_count_exclusive_v1_",
         _ => return false,
     };
     let Some(reducer_identity) = native_symbol_identity(reducer, reducer_prefix) else {
@@ -1544,11 +1584,24 @@ fn shared_ordered_many_native_fused_symbol_identities_are_closed(
     let reducer_prefix = match model {
         Model::Count => "fre_aot_regex_count_exclusive_v1_",
         Model::SpanSum => "fre_aot_regex_span_sum_exclusive_v1_",
+        Model::GrepCount => "fre_aot_regex_grep_count_exclusive_v1_",
         _ => return false,
     };
-    native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_").is_some()
-        && native_symbol_identity(reducer, reducer_prefix).is_some()
-        && native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_").is_some()
+    let Some(ordinary_identity) =
+        native_symbol_identity(ordinary_entry, "fre_aot_regex_search_v1_")
+    else {
+        return false;
+    };
+    let Some(reducer_identity) = native_symbol_identity(reducer, reducer_prefix) else {
+        return false;
+    };
+    let Some(program_identity) =
+        native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_")
+    else {
+        return false;
+    };
+    reducer_identity == program_identity
+        && reducer_identity != ordinary_identity
         && [ordinary_entry, reducer, program]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
@@ -1744,11 +1797,7 @@ fn authenticate_direct_native_grep(compiled: &CompiledRegex) -> Result<(), Strin
         || !has_defined_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
         || !has_defined_symbol(compiled, reducer, SymbolKind::Function, None)
         || !has_defined_symbol(compiled, program, SymbolKind::Object, Some(program_len))
-        || !direct_native_grep_symbol_identities_are_closed(
-            module.entry_symbol(),
-            reducer,
-            program,
-        )
+        || !direct_native_grep_symbol_identities_are_closed(module.entry_symbol(), reducer, program)
         || [module.entry_symbol(), reducer, program]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
@@ -1774,7 +1823,11 @@ fn authenticate_direct_native_grep(compiled: &CompiledRegex) -> Result<(), Strin
             module.prepared_span_sum_symbol().is_some(),
             program_len,
             module.entry_symbol(),
-            direct_native_grep_symbol_identities_are_closed(module.entry_symbol(), reducer, program),
+            direct_native_grep_symbol_identities_are_closed(
+                module.entry_symbol(),
+                reducer,
+                program
+            ),
             unresolved_runtime_function_names(compiled),
         ));
     }
@@ -1852,12 +1905,23 @@ pub enum NativeRowRoute {
     /// The ordinary artifact was well-formed but runtime-dependent, so this
     /// row uses the explicit capability-authenticated prepared V15 entry.
     PreparedOrderedNfaV15,
+    /// The row uses the helper-free, one-function `PreparedSpanSearchV1`
+    /// surface while retaining the same V15 preparation capability.
+    PreparedOrderedNfaV15RowSearch,
 }
 
 impl NativeRowRoute {
     #[must_use]
     pub const fn is_prepared(self) -> bool {
-        matches!(self, Self::PreparedOrderedNfaV15)
+        matches!(
+            self,
+            Self::PreparedOrderedNfaV15 | Self::PreparedOrderedNfaV15RowSearch
+        )
+    }
+
+    #[must_use]
+    pub const fn is_strict(self) -> bool {
+        matches!(self, Self::PreparedOrderedNfaV15RowSearch)
     }
 }
 
@@ -1874,7 +1938,8 @@ impl NativeRowArtifact {
     pub fn entry_symbol(&self) -> &str {
         match self.route {
             NativeRowRoute::Ordinary => self.compiled.module().entry_symbol(),
-            NativeRowRoute::PreparedOrderedNfaV15 => self
+            NativeRowRoute::PreparedOrderedNfaV15
+            | NativeRowRoute::PreparedOrderedNfaV15RowSearch => self
                 .compiled
                 .module()
                 .prepared_entry_symbol()
@@ -1894,12 +1959,12 @@ pub struct NativeRowBridge {
 /// Compile one genuine shared-scan ordered multi-pattern reducer.
 ///
 /// This route joins independently parsed canonical HIRs into one ordered
-/// automaton and emits one native Count or SpanSum entry. The combined program
-/// compares the full ordinary optimizing portfolio first, so an exact
-/// helper-free `NativeFused` reducer remains incumbent ahead of explicit V15.
-/// It never invokes or retains the independent native-row bridge. The caller
-/// may fall back only after classifying the returned typed error outside this
-/// function.
+/// automaton and emits one native Count, SpanSum, or GrepCount entry. The
+/// combined program compares the full ordinary optimizing portfolio first, so
+/// an exact helper-free `NativeFused` reducer remains incumbent ahead of
+/// explicit V15. It never invokes or retains the independent native-row
+/// bridge. The caller may fall back only after classifying the returned typed
+/// error outside this function.
 pub fn compile_shared_ordered_many_aggregate(
     benchmark: &Benchmark,
     target: Target,
@@ -1940,6 +2005,23 @@ pub enum SharedUniformCaptureReducerDisposition {
 pub fn try_compile_shared_uniform_capture_reducer(
     benchmark: &Benchmark,
     target: Target,
+) -> Result<SharedUniformCaptureReducerDisposition, String> {
+    try_compile_shared_uniform_capture_reducer_with_slow_aot_limits(
+        benchmark,
+        target,
+        SlowAotLimits::default(),
+    )
+}
+
+/// Explicit-limit counterpart used by the recursive build-script regression
+/// to exercise the shared compiler's typed numeric-decline boundary. Normal
+/// adapter builds call [`try_compile_shared_uniform_capture_reducer`] and
+/// therefore retain the compiler's default slow-AOT envelope.
+#[doc(hidden)]
+pub(crate) fn try_compile_shared_uniform_capture_reducer_with_slow_aot_limits(
+    benchmark: &Benchmark,
+    target: Target,
+    slow_aot_limits: SlowAotLimits,
 ) -> Result<SharedUniformCaptureReducerDisposition, String> {
     if benchmark.patterns.len() <= 1
         || benchmark.patterns.len() > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
@@ -1987,7 +2069,7 @@ pub fn try_compile_shared_uniform_capture_reducer(
             .limits(limits),
         operation,
         UniformCaptureParticipationLimits::default(),
-        SlowAotLimits::default(),
+        slow_aot_limits,
     )
     .map_err(|error| format!("shared uniform-capture AOT compilation failed: {error}"))?;
     let artifact = match disposition {
@@ -2047,7 +2129,7 @@ fn authenticate_shared_uniform_capture_reducer(
     Ok(())
 }
 
-fn ordered_many_source_sha256(patterns: &[String]) -> Result<[u8; 32], String> {
+pub fn ordered_many_source_sha256(patterns: &[String]) -> Result<[u8; 32], String> {
     let mut digest = Sha256::new();
     digest.update(b"fre.ordered-many-aot.sources.v1\0");
     digest.update(
@@ -2082,12 +2164,30 @@ pub fn try_compile_shared_ordered_many_aggregate(
     benchmark: &Benchmark,
     target: Target,
 ) -> Result<SharedOrderedManyAggregateDisposition, String> {
+    try_compile_shared_ordered_many_aggregate_with_object_limit(
+        benchmark,
+        target,
+        MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES,
+    )
+}
+
+/// Explicit object-limit counterpart used only by the fallback-equivalence
+/// regression. Production keeps the fixed bridge-wide object envelope.
+#[doc(hidden)]
+pub(crate) fn try_compile_shared_ordered_many_aggregate_with_object_limit(
+    benchmark: &Benchmark,
+    target: Target,
+    max_object_bytes: usize,
+) -> Result<SharedOrderedManyAggregateDisposition, String> {
     if benchmark.patterns.len() <= 1
         || benchmark.patterns.len() > fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS
-        || !matches!(benchmark.model, Model::Count | Model::SpanSum)
+        || !matches!(
+            benchmark.model,
+            Model::Count | Model::SpanSum | Model::GrepCount
+        )
     {
         return Err(format!(
-            "shared ordered-many AOT requires a 2..={} row Count/SpanSum job, got model={} rows={}",
+            "shared ordered-many AOT requires a 2..={} row Count/SpanSum/GrepCount job, got model={} rows={}",
             fre_aot_regex::ORDERED_MANY_AOT_MAX_ROWS,
             benchmark.model.name(),
             benchmark.patterns.len(),
@@ -2115,7 +2215,7 @@ pub fn try_compile_shared_ordered_many_aggregate(
         .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
         .ok_or_else(|| "shared ordered-many source byte sum overflowed".to_owned())?;
     limits.compile = rebar_recovery_compile_limits();
-    limits.compile.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+    limits.compile.max_object_bytes = max_object_bytes;
     let disposition = compile_ordered_many_aot_reported(
         OrderedManyAotCompileRequest::new(rows, target)
             .profile(profile.clone())
@@ -2145,12 +2245,19 @@ fn authenticate_shared_ordered_many_aggregate(
     let module = compiled.module();
     let receipt = compiled.receipt();
     let shared_receipt = artifact.receipt();
+    let expected_pattern_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "shared ordered-many authentication byte sum overflowed".to_owned())?;
+    let expected_sources_sha256 = ordered_many_source_sha256(&benchmark.patterns)?;
     let strategy = module.prepared_aggregate_strategy();
     let whole_scalar_is_authenticated =
-        authenticate_native_whole_scalar_reducer(benchmark.model, compiled)?;
+        authenticate_shared_ordered_many_whole_scalar_reducer(benchmark.model, compiled)?;
     let reducer = match benchmark.model {
         Model::Count => module.prepared_count_symbol(),
         Model::SpanSum => module.prepared_span_sum_symbol(),
+        Model::GrepCount => module.prepared_grep_count_symbol(),
         _ => None,
     };
     let prepared_entry = module.prepared_entry_symbol();
@@ -2163,17 +2270,16 @@ fn authenticate_shared_ordered_many_aggregate(
                 Some(
                     PreparedBulkStrategy::NativePreparedLoop
                     | PreparedBulkStrategy::NativeFrozenLoop,
-                ) => prepared_entry
-                    .zip(span_fill)
-                    .zip(program)
-                    .is_some_and(|((prepared_entry, span_fill), (program, _))| {
+                ) => prepared_entry.zip(span_fill).zip(program).is_some_and(
+                    |((prepared_entry, span_fill), (program, _))| {
                         prepared_row_symbol_identities_are_closed(
                             module.entry_symbol(),
                             prepared_entry,
                             span_fill,
                             program,
                         )
-                    }),
+                    },
+                ),
                 Some(_) => false,
             };
             receipt.required_prepare_capabilities == 0
@@ -2185,13 +2291,7 @@ fn authenticate_shared_ordered_many_aggregate(
                         && defined_function_has_no_unresolved_relocations(compiled, symbol)
                 })
                 && program.is_some_and(|(symbol, len)| {
-                    len != 0
-                        && has_defined_symbol(
-                            compiled,
-                            symbol,
-                            SymbolKind::Object,
-                            Some(len),
-                        )
+                    len != 0 && has_defined_symbol(compiled, symbol, SymbolKind::Object, Some(len))
                 })
                 && reducer.zip(program).is_some_and(|(reducer, (program, _))| {
                     shared_ordered_many_native_fused_symbol_identities_are_closed(
@@ -2201,20 +2301,14 @@ fn authenticate_shared_ordered_many_aggregate(
                         program,
                     )
                 })
-                && has_defined_symbol(
-                    compiled,
-                    module.entry_symbol(),
-                    SymbolKind::Function,
-                    None,
-                )
+                && has_defined_symbol(compiled, module.entry_symbol(), SymbolKind::Function, None)
         }
         Some(PreparedAggregateStrategy::NativeOrderedNfaFused) => {
             receipt.engine == EngineKind::OrderedNfa
                 && receipt.entry_abi == EntryAbi::PreparedScalarReduceV1
                 && module.prepared_bulk_strategy().is_none()
                 && module.required_prepare_capabilities() == PREPARED_CAPABILITY_ORDERED_NFA_V15
-                && receipt.required_prepare_capabilities
-                    == PREPARED_CAPABILITY_ORDERED_NFA_V15
+                && receipt.required_prepare_capabilities == PREPARED_CAPABILITY_ORDERED_NFA_V15
                 && !receipt.runtime_helper_required
                 && has_exact_runtime_symbol_closure(compiled, &[])
                 && prepared_entry.is_none()
@@ -2225,13 +2319,7 @@ fn authenticate_shared_ordered_many_aggregate(
                         && defined_function_has_no_unresolved_relocations(compiled, symbol)
                 })
                 && program.is_some_and(|(symbol, len)| {
-                    len != 0
-                        && has_defined_symbol(
-                            compiled,
-                            symbol,
-                            SymbolKind::Object,
-                            Some(len),
-                        )
+                    len != 0 && has_defined_symbol(compiled, symbol, SymbolKind::Object, Some(len))
                 })
                 && reducer.zip(program).is_some_and(|(reducer, (program, _))| {
                     shared_ordered_many_v15_symbol_identities_are_closed(
@@ -2254,9 +2342,10 @@ fn authenticate_shared_ordered_many_aggregate(
         || reducer.is_none()
         || !whole_scalar_is_authenticated
         || !symbol_surface_closed
+        || shared_receipt.schema_version != fre_aot_regex::ORDERED_MANY_AOT_RECEIPT_VERSION
         || shared_receipt.rows != benchmark.patterns.len()
-        || shared_receipt.pattern_bytes
-            != benchmark.patterns.iter().map(String::len).sum::<usize>()
+        || shared_receipt.pattern_bytes != expected_pattern_bytes
+        || shared_receipt.ordered_sources_sha256 != expected_sources_sha256
         || shared_receipt.program_sha256 != receipt.program_sha256
         || shared_receipt.object_sha256 != receipt.object_sha256
         || shared_receipt.exports != benchmark.model.exports()
@@ -2282,6 +2371,20 @@ fn authenticate_shared_ordered_many_aggregate(
 pub struct UniformCaptureBridge {
     pub rows: NativeRowBridge,
     pub source_receipts: Vec<UniformCaptureCompileReceipt>,
+}
+
+/// One separately linked helper-free native reducer over the already
+/// authenticated ordinary Span rows of a proven uniform-capture bridge.
+#[derive(Clone, Debug)]
+pub struct WeightedCaptureReducerBridge {
+    pub artifact: RebarWeightedCaptureReducerAotArtifactV1,
+}
+
+/// The exact wrapper or its sole nonterminal serialized-object-cap result.
+#[derive(Clone, Debug)]
+pub enum WeightedCaptureReducerBridgeDisposition {
+    Compiled(WeightedCaptureReducerBridge),
+    Declined(RebarWeightedCaptureReducerAotCompileDeclineV1),
 }
 
 /// One positive uniform-participation proof paired with the exact prepared
@@ -2449,14 +2552,12 @@ pub fn try_compile_participation_capture_bridge(
                         | NativeParticipationAotStrategyV1::OrderedNfaAarch64
                 ) && match artifact.native_receipt().dfa_fallback_resource {
                     Some(NativeParticipationAotResourceV1::DfaStates) => {
-                        artifact.native_receipt().dfa_fallback_limit
-                            == native_limits.max_dfa_states
+                        artifact.native_receipt().dfa_fallback_limit == native_limits.max_dfa_states
                             && native_limits.max_dfa_states.checked_add(1)
                                 == Some(artifact.native_receipt().dfa_fallback_required)
                     }
                     Some(NativeParticipationAotResourceV1::BuildWork) => {
-                        artifact.native_receipt().dfa_fallback_limit
-                            == native_limits.max_build_work
+                        artifact.native_receipt().dfa_fallback_limit == native_limits.max_build_work
                             && native_limits.max_build_work.checked_add(1)
                                 == Some(artifact.native_receipt().dfa_fallback_required)
                     }
@@ -2466,9 +2567,7 @@ pub fn try_compile_participation_capture_bridge(
                 let retry_limits = rebar_participation_native_retry_limits(native_limits);
                 compile_with_limits(compile_limits, retry_limits)
             }
-            Err(error)
-                if is_rebar_participation_native_retry_limit(&error, native_limits) =>
-            {
+            Err(error) if is_rebar_participation_native_retry_limit(&error, native_limits) => {
                 let retry_limits = rebar_participation_native_retry_limits(native_limits);
                 compile_with_limits(compile_limits, retry_limits)
             }
@@ -2539,8 +2638,7 @@ pub fn try_compile_participation_capture_bridge(
     };
     let dfa = matches!(
         receipt.strategy,
-        NativeParticipationAotStrategyV1::DfaX86_64
-            | NativeParticipationAotStrategyV1::DfaAarch64
+        NativeParticipationAotStrategyV1::DfaX86_64 | NativeParticipationAotStrategyV1::DfaAarch64
     );
     let ordered_nfa = matches!(
         receipt.strategy,
@@ -2557,8 +2655,7 @@ pub fn try_compile_participation_capture_bridge(
             && receipt.dfa_fallback_resource.is_none()
             && receipt.dfa_fallback_required == 0
             && receipt.dfa_fallback_limit == 0
-            && receipt.scratch_bytes
-                == fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
+            && receipt.scratch_bytes == fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
     } else if ordered_nfa {
         receipt.assertions <= 2
             && receipt.assertion_signatures == 0
@@ -2573,8 +2670,7 @@ pub fn try_compile_participation_capture_bridge(
                         | NativeParticipationAotResourceV1::BuildWork
                 )
             )
-            && receipt.dfa_fallback_limit.checked_add(1)
-                == Some(receipt.dfa_fallback_required)
+            && receipt.dfa_fallback_limit.checked_add(1) == Some(receipt.dfa_fallback_required)
             && receipt.scratch_bytes != 0
             && receipt
                 .scratch_bytes
@@ -2629,8 +2725,7 @@ pub fn try_compile_participation_capture_bridge(
         || entry.size == 0
     {
         return Err(ParticipationCaptureBridgeError::Terminal(
-            "participation artifact is not a helper-free native selector/replay closure"
-                .to_owned(),
+            "participation artifact is not a helper-free native selector/replay closure".to_owned(),
         ));
     }
     Ok(ParticipationCaptureBridgeDisposition::Selected(
@@ -2767,7 +2862,9 @@ pub fn compile_single_capture_reducer_bridge(
         || source_sha256 != expected_source_sha256
         || source_target != target
     {
-        return Err("single-capture reducer source failed retained receipt authentication".to_owned());
+        return Err(
+            "single-capture reducer source failed retained receipt authentication".to_owned(),
+        );
     }
     let operation = match benchmark.model {
         Model::CountCaptures => RebarSingleCaptureReducerOperationV1::CountCaptures,
@@ -2779,7 +2876,9 @@ pub fn compile_single_capture_reducer_bridge(
         operation,
         MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES,
     )
-    .map_err(|error| format!("single-capture whole-operation reducer compilation failed: {error}"))?;
+    .map_err(|error| {
+        format!("single-capture whole-operation reducer compilation failed: {error}")
+    })?;
     let receipt = artifact.receipt();
     let reducer_prefix = match (operation, receipt.caller_scratch_bytes() != 0) {
         (RebarSingleCaptureReducerOperationV1::CountCaptures, false) => {
@@ -2809,9 +2908,9 @@ pub fn compile_single_capture_reducer_bridge(
                     0
                 }
                 && (!ordered
-                    || receipt.caller_scratch_bytes().is_multiple_of(
-                        fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN,
-                    ))
+                    || receipt
+                        .caller_scratch_bytes()
+                        .is_multiple_of(fre_aot_regex::NATIVE_PARTICIPATION_AOT_V1_SCRATCH_ALIGN))
                 && receipt.private_participation_scratch_bytes()
                     == if ordered {
                         0
@@ -2860,7 +2959,11 @@ pub fn compile_single_capture_reducer_bridge(
         || receipt.artifact_identity_sha256() == [0; 32]
         || artifact.reducer_symbol().is_empty()
         || native_symbol_identity(artifact.reducer_symbol(), reducer_prefix).is_none()
-        || artifact.module().required_runtime_symbols().next().is_some()
+        || artifact
+            .module()
+            .required_runtime_symbols()
+            .next()
+            .is_some()
         || artifact.module().required_runtime_program().is_some()
         || artifact.module().prepared_entry_symbol().is_some()
         || !artifact.module().prepared_aggregate_exports().is_empty()
@@ -2883,7 +2986,7 @@ pub fn compile_single_capture_reducer_bridge(
 pub fn try_compile_native_uniform_capture_reducer(
     benchmark: &Benchmark,
     target: Target,
-) -> Result<UniformCaptureReducerCompileDisposition, String> {
+) -> Result<UniformCaptureReducerLinkCompileDispositionV1, String> {
     if benchmark.patterns.len() != 1 || !benchmark.model.is_capture() {
         return Err(
             "native uniform-capture reducer requires one CountCaptures/GrepCaptures source"
@@ -2908,7 +3011,7 @@ pub fn try_compile_native_uniform_capture_reducer(
         _ => unreachable!("capture gate accepted a non-capture model"),
     };
     let compile_with_limits = |limits, slow_aot_limits| {
-        compile_uniform_capture_reducer(
+        compile_uniform_capture_reducer_linked_v1(
             &parsed,
             UniformCaptureCompileRequest::new(pattern.len(), target)
                 .profile(profile.clone())
@@ -2917,21 +3020,24 @@ pub fn try_compile_native_uniform_capture_reducer(
             operation,
         )
     };
-    let disposition =
-        match compile_with_limits(CompileLimitsV1::default(), SlowAotLimits::default()) {
-            Ok(disposition) => disposition,
-            Err(error) if is_uniform_reducer_lower_work_limit(&error) => compile_with_limits(
-                rebar_recovery_compile_limits(),
-                rebar_recovery_slow_aot_limits(),
-            )
-            .map_err(|error| format!("native uniform-capture reducer recovery failed: {error}"))?,
-            Err(error) => {
-                return Err(format!(
-                    "native uniform-capture reducer compilation failed: {error}"
-                ));
-            }
-        };
-    if let Some(selected) = disposition.selected() {
+    let mut default_limits = CompileLimitsV1::default();
+    default_limits.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+    let disposition = match compile_with_limits(default_limits, SlowAotLimits::default()) {
+        Ok(disposition) => disposition,
+        Err(error) if is_uniform_reducer_lower_work_limit(&error) => {
+            let mut limits = rebar_recovery_compile_limits();
+            limits.max_object_bytes = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES;
+            compile_with_limits(limits, rebar_recovery_slow_aot_limits()).map_err(|error| {
+                format!("native uniform-capture reducer recovery failed: {error}")
+            })?
+        }
+        Err(error) => {
+            return Err(format!(
+                "native uniform-capture reducer compilation failed: {error}"
+            ));
+        }
+    };
+    if let Some(selected) = disposition.combined() {
         selected
             .authenticate()
             .map_err(|error| format!("native uniform-capture reducer seal failed: {error}"))?;
@@ -2940,6 +3046,21 @@ pub fn try_compile_native_uniform_capture_reducer(
         {
             return Err(format!(
                 "native uniform-capture reducer object is empty or exceeds {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES} bytes"
+            ));
+        }
+    }
+    if let Some(selected) = disposition.prepared_row_search() {
+        selected.authenticate().map_err(|error| {
+            format!("native linked-row uniform-capture reducer seal failed: {error}")
+        })?;
+        if selected.row().object().is_empty()
+            || selected.row().object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+            || selected.reducer_object().is_empty()
+            || selected.reducer_object().len() > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+            || selected.receipt().max_object_bytes() != MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        {
+            return Err(format!(
+                "native linked-row uniform-capture objects are empty or exceed {MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES} bytes"
             ));
         }
     }
@@ -2991,6 +3112,113 @@ pub fn compile_uniform_capture_bridge(
         } => Err(format!(
             "uniform-capture proof declined at source ordinal {source_ordinal}: {reason}"
         )),
+    }
+}
+
+/// Close a retained multi-source uniform row bridge with one helper-free
+/// native reducer over its independently authenticated ordinary Span
+/// components.
+///
+/// This includes both unequal multipliers and equal-multiplier jobs whose
+/// preferred shared reducer declined its explicit representation or numeric
+/// envelope. Allocation, arithmetic, lowering, object formation and
+/// authentication failures are terminal. Only the reducer object's exact
+/// numeric cap may preserve the existing Rust row bridge.
+pub fn try_compile_weighted_capture_reducer_bridge(
+    benchmark: &Benchmark,
+    target: Target,
+    bridge: &UniformCaptureBridge,
+) -> Result<WeightedCaptureReducerBridgeDisposition, String> {
+    if !benchmark.uses_uniform_capture_bridge()
+        || !benchmark.model.is_capture()
+        || benchmark.patterns.len() <= 1
+        || bridge.source_receipts.len() != benchmark.patterns.len()
+        || bridge.rows.source_to_artifact.len() != benchmark.patterns.len()
+        || bridge.rows.artifacts.is_empty()
+        || bridge
+            .rows
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.route != NativeRowRoute::Ordinary)
+    {
+        return Err(
+            "weighted capture reducer requires a multi-source ordinary uniform-capture bridge"
+                .to_owned(),
+        );
+    }
+    let mut components = Vec::new();
+    components
+        .try_reserve_exact(bridge.rows.artifacts.len())
+        .map_err(|_| "weighted capture component-reference allocation failed".to_owned())?;
+    let mut first_ordinals = Vec::new();
+    first_ordinals
+        .try_reserve_exact(bridge.rows.artifacts.len())
+        .map_err(|_| "weighted capture first-ordinal allocation failed".to_owned())?;
+    for artifact in &bridge.rows.artifacts {
+        components.push(&artifact.compiled);
+        first_ordinals.push(artifact.first_source_ordinal);
+    }
+    let pattern_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| {
+            total
+                .checked_add(pattern.len())
+                .ok_or_else(|| "weighted capture pattern-byte total overflowed".to_owned())
+        })?;
+    let operation = match benchmark.model {
+        Model::CountCaptures => UniformCaptureReducerOperation::CountCaptures,
+        Model::GrepCaptures => UniformCaptureReducerOperation::GrepCaptures,
+        _ => return Err("weighted capture reducer received a non-capture model".to_owned()),
+    };
+    let disposition = compile_rebar_weighted_capture_reducer_aot_v1(
+        RebarWeightedCaptureReducerAotRequestV1::new(
+            operation,
+            target,
+            pattern_bytes,
+            ordered_many_source_sha256(&benchmark.patterns)?,
+            &components,
+            &bridge.rows.source_to_artifact,
+            &first_ordinals,
+            &bridge.source_receipts,
+            MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES,
+        ),
+    )
+    .map_err(|error| format!("weighted capture reducer compilation failed: {error}"))?;
+    match disposition {
+        RebarWeightedCaptureReducerAotCompileDispositionV1::Compiled(artifact) => {
+            artifact.authenticate(&components).map_err(|error| {
+                format!("weighted capture reducer authentication failed: {error}")
+            })?;
+            let receipt = artifact.receipt();
+            if receipt.operation() != operation
+                || receipt.domain() != operation.domain()
+                || receipt.target() != target
+                || receipt.source_count() != benchmark.patterns.len()
+                || receipt.pattern_bytes() != pattern_bytes
+                || receipt.source_to_component() != bridge.rows.source_to_artifact
+                || receipt.component_first_source_ordinals() != first_ordinals
+                || receipt.max_object_bytes() != MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES
+                || receipt.reducer_object_bytes() == 0
+            {
+                return Err(
+                    "weighted capture reducer receipt disagrees with its Rebar bridge".to_owned(),
+                );
+            }
+            Ok(WeightedCaptureReducerBridgeDisposition::Compiled(
+                WeightedCaptureReducerBridge { artifact },
+            ))
+        }
+        RebarWeightedCaptureReducerAotCompileDispositionV1::Declined(decline) => {
+            if decline.limit != MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES
+                || decline.required <= decline.limit
+            {
+                return Err(
+                    "weighted capture reducer returned a malformed object-cap decline".to_owned(),
+                );
+            }
+            Ok(WeightedCaptureReducerBridgeDisposition::Declined(decline))
+        }
     }
 }
 
@@ -3340,56 +3568,65 @@ pub fn compile_native_row_bridge(
                 ));
             }
         };
+        let compile_strict_row = |ordinary: &CompiledRegex,
+                                  ordinary_error: &str|
+         -> Result<CompiledRegex, String> {
+            let disposition = compile_with_prepared_ordered_nfa_v15_row_search_reported(
+                CompileRequest::new(pattern, target)
+                    .profile(profile.clone())
+                    .output(OutputContract::Span)
+                    .mode(CompileMode::Optimizing)
+                    .limits(selected_limits),
+            )
+            .map_err(|error| {
+                format!(
+                    "general AOT strict prepared V15 row compilation failed at source ordinal {source_ordinal} after {ordinary_error}: {error}"
+                )
+            })?;
+            let prepared = match disposition {
+                PreparedOrderedNfaV15CompileDisposition::Compiled(prepared) => prepared,
+                PreparedOrderedNfaV15CompileDisposition::Declined(decline) => {
+                    return Err(format!(
+                        "general AOT strict prepared V15 row declined at source ordinal {source_ordinal} after {ordinary_error}: {decline:?}"
+                    ));
+                }
+            };
+            if prepared.receipt().automaton_sha256 != ordinary.receipt().automaton_sha256
+                || prepared.receipt().program_sha256 != ordinary.receipt().program_sha256
+            {
+                return Err(format!(
+                    "general AOT strict prepared V15 row changed the semantic identity at source ordinal {source_ordinal}"
+                ));
+            }
+            authenticate_strict_prepared_v15_row(&prepared, source_ordinal)?;
+            Ok(prepared)
+        };
         let (compiled, route) = match authenticate_native_row(&compiled, source_ordinal) {
             Ok(()) => (compiled, NativeRowRoute::Ordinary),
-            Err(_ordinary_error)
+            Err(ordinary_error)
                 if compiled.module().required_prepare_capabilities()
                     == PREPARED_CAPABILITY_ORDERED_NFA_V15 =>
             {
+                // Retain the legacy surface authenticator as a closed input
+                // route, then replace it with the independently compiled
+                // strict surface for new runner artifacts.
                 authenticate_prepared_v15_row(&compiled, source_ordinal)?;
-                (compiled, NativeRowRoute::PreparedOrderedNfaV15)
+                let prepared = compile_strict_row(&compiled, &ordinary_error)?;
+                (prepared, NativeRowRoute::PreparedOrderedNfaV15RowSearch)
             }
             Err(ordinary_error)
                 if ordinary_row_is_well_formed_runtime_dependency(&compiled, source_ordinal)? =>
             {
-                let disposition = compile_with_prepared_ordered_nfa_v15_reported(
-                    CompileRequest::new(pattern, target)
-                        .profile(profile.clone())
-                        .output(OutputContract::Span)
-                        .mode(CompileMode::Optimizing)
-                        .limits(selected_limits),
-                    PreparedAggregateExports::NONE,
-                )
-                .map_err(|error| {
-                    format!(
-                        "general AOT prepared V15 row compilation failed at source ordinal {source_ordinal} after {ordinary_error}: {error}"
-                    )
-                })?;
-                let prepared = match disposition {
-                    PreparedOrderedNfaV15CompileDisposition::Compiled(prepared) => prepared,
-                    PreparedOrderedNfaV15CompileDisposition::Declined(decline) => {
-                        return Err(format!(
-                            "general AOT prepared V15 row declined at source ordinal {source_ordinal} after {ordinary_error}: {decline:?}"
-                        ));
-                    }
-                };
-                if prepared.receipt().automaton_sha256
-                    != compiled.receipt().automaton_sha256
-                    || prepared.receipt().program_sha256 != compiled.receipt().program_sha256
-                {
-                    return Err(format!(
-                        "general AOT prepared V15 row changed the semantic identity at source ordinal {source_ordinal}"
-                    ));
-                }
-                authenticate_prepared_v15_row(&prepared, source_ordinal)?;
-                (prepared, NativeRowRoute::PreparedOrderedNfaV15)
+                let prepared = compile_strict_row(&compiled, &ordinary_error)?;
+                (prepared, NativeRowRoute::PreparedOrderedNfaV15RowSearch)
             }
             Err(error) => return Err(error),
         };
 
         let entry = match route {
             NativeRowRoute::Ordinary => compiled.module().entry_symbol(),
-            NativeRowRoute::PreparedOrderedNfaV15 => compiled
+            NativeRowRoute::PreparedOrderedNfaV15
+            | NativeRowRoute::PreparedOrderedNfaV15RowSearch => compiled
                 .module()
                 .prepared_entry_symbol()
                 .expect("authenticated prepared V15 row entry"),
@@ -3458,6 +3695,402 @@ pub fn compile_native_row_bridge(
         source_to_artifact,
         total_object_bytes,
     })
+}
+
+/// Build-time selection for the ordinary or mixed whole-operation
+/// multi-pattern `grep` reducer. Only the final numeric object-cap decline
+/// retains the pre-existing exact Rust line/row adapter.
+#[derive(Clone, Debug)]
+pub enum NativeMultiGrepReducerDisposition {
+    Selected(fre_aot_regex::RebarMultiGrepReducerAotArtifactV1),
+    DeclinedObjectBytes { limit: usize, required: usize },
+}
+
+/// Attempt to replace the Rust line/row adapter with one native operation.
+///
+/// Existing independently authenticated rows remain the semantic leaves.
+/// A mixed closure seals one route and one handle-table slot per row; handle
+/// lifecycle remains outside the reducer ABI. The wrapper is charged against
+/// the same total linked-object ceiling as its rows. Only that final numeric
+/// object cap may decline; every construction or authentication failure is
+/// terminal.
+pub fn try_compile_native_multi_grep_reducer(
+    benchmark: &Benchmark,
+    bridge: &NativeRowBridge,
+) -> Result<NativeMultiGrepReducerDisposition, String> {
+    if benchmark.model != Model::GrepCount
+        || benchmark.patterns.len() < 2
+        || !benchmark.uses_native_row_bridge()
+        || bridge.artifacts.is_empty()
+        || bridge.source_to_artifact.len() != benchmark.patterns.len()
+        || bridge.total_object_bytes == 0
+        || bridge.total_object_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err(
+            "native multi-grep reducer requires an authenticated multi-pattern Grep row bridge"
+                .to_owned(),
+        );
+    }
+    let exact_row_bytes = bridge
+        .artifacts
+        .iter()
+        .try_fold(0_usize, |total, artifact| {
+            total.checked_add(artifact.compiled.object().len())
+        })
+        .ok_or_else(|| "native multi-grep row object-byte sum overflowed".to_owned())?;
+    if exact_row_bytes != bridge.total_object_bytes {
+        return Err("native multi-grep row object-byte receipt mismatch".to_owned());
+    }
+    let has_prepared = bridge
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.route.is_prepared());
+    let source_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "native multi-grep source byte sum overflowed".to_owned())?;
+    let ordered_sources_sha256 = ordered_many_source_sha256(&benchmark.patterns)?;
+    let reducer_limit = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        .checked_sub(bridge.total_object_bytes)
+        .ok_or_else(|| "native multi-grep reducer object-byte remainder underflowed".to_owned())?;
+    let (disposition, authenticated) = if has_prepared {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(bridge.artifacts.len())
+            .map_err(|_| "mixed native multi-grep row descriptor allocation failed".to_owned())?;
+        rows.extend(bridge.artifacts.iter().map(|artifact| {
+            fre_aot_regex::RebarMixedMultiGrepReducerRowV1::new(
+                &artifact.compiled,
+                artifact.first_source_ordinal,
+                match artifact.route {
+                    NativeRowRoute::Ordinary => {
+                        fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary
+                    }
+                    NativeRowRoute::PreparedOrderedNfaV15 => {
+                        fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15
+                    }
+                    NativeRowRoute::PreparedOrderedNfaV15RowSearch => {
+                        fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch
+                    }
+                },
+            )
+        }));
+        let disposition = fre_aot_regex::compile_rebar_mixed_multi_grep_reducer_aot_v1(
+            ordered_sources_sha256,
+            benchmark.patterns.len(),
+            source_bytes,
+            &bridge.source_to_artifact,
+            &rows,
+            reducer_limit,
+        )
+        .map_err(|error| format!("mixed native multi-grep reducer compilation failed: {error}"))?;
+        let authenticated = match &disposition {
+            fre_aot_regex::RebarMultiGrepReducerAotCompileDispositionV1::Selected(selected) => {
+                selected.authenticates_mixed_rows(
+                    ordered_sources_sha256,
+                    benchmark.patterns.len(),
+                    source_bytes,
+                    &bridge.source_to_artifact,
+                    &rows,
+                )
+            }
+            fre_aot_regex::RebarMultiGrepReducerAotCompileDispositionV1::Declined(_) => true,
+        };
+        (disposition, authenticated)
+    } else {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(bridge.artifacts.len())
+            .map_err(|_| "native multi-grep row descriptor allocation failed".to_owned())?;
+        rows.extend(bridge.artifacts.iter().map(|artifact| {
+            fre_aot_regex::RebarMultiGrepReducerRowV1::new(
+                &artifact.compiled,
+                artifact.first_source_ordinal,
+            )
+        }));
+        let disposition = fre_aot_regex::compile_rebar_multi_grep_reducer_aot_v1(
+            ordered_sources_sha256,
+            benchmark.patterns.len(),
+            source_bytes,
+            &bridge.source_to_artifact,
+            &rows,
+            reducer_limit,
+        )
+        .map_err(|error| format!("native multi-grep reducer compilation failed: {error}"))?;
+        let authenticated = match &disposition {
+            fre_aot_regex::RebarMultiGrepReducerAotCompileDispositionV1::Selected(selected) => {
+                selected.authenticates_rows(
+                    ordered_sources_sha256,
+                    benchmark.patterns.len(),
+                    source_bytes,
+                    &bridge.source_to_artifact,
+                    &rows,
+                )
+            }
+            fre_aot_regex::RebarMultiGrepReducerAotCompileDispositionV1::Declined(_) => true,
+        };
+        (disposition, authenticated)
+    };
+    if !authenticated {
+        return Err("native multi-grep reducer row authentication failed".to_owned());
+    }
+    let selected = match disposition {
+        fre_aot_regex::RebarMultiGrepReducerAotCompileDispositionV1::Selected(selected) => selected,
+        fre_aot_regex::RebarMultiGrepReducerAotCompileDispositionV1::Declined(
+            fre_aot_regex::RebarMultiGrepReducerAotCompileDeclineV1::ObjectBytes {
+                limit,
+                required,
+            },
+        ) => {
+            return Ok(NativeMultiGrepReducerDisposition::DeclinedObjectBytes { limit, required });
+        }
+    };
+    let receipt = selected.receipt();
+    let total_link_bytes = bridge
+        .total_object_bytes
+        .checked_add(selected.object().len())
+        .ok_or_else(|| "native multi-grep total linked object bytes overflowed".to_owned())?;
+    let routes_match = receipt
+        .row_routes()
+        .iter()
+        .copied()
+        .eq(bridge
+            .artifacts
+            .iter()
+            .map(|artifact| match artifact.route {
+                NativeRowRoute::Ordinary => {
+                    fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary
+                }
+                NativeRowRoute::PreparedOrderedNfaV15 => {
+                    fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15
+                }
+                NativeRowRoute::PreparedOrderedNfaV15RowSearch => {
+                    fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch
+                }
+            }));
+    if receipt.uses_mixed_handle_table() != has_prepared
+        || receipt.required_handle_count() != usize::from(has_prepared) * bridge.artifacts.len()
+        || !routes_match
+        || receipt.max_object_bytes() != reducer_limit
+        || receipt.object_bytes() != selected.object().len()
+        || receipt.reducer_relocation_count() != bridge.artifacts.len()
+        || receipt.semantic_runtime_calls() != 0
+        || !receipt
+            .row_entry_symbols()
+            .iter()
+            .map(String::as_str)
+            .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        || !selected
+            .module()
+            .required_runtime_symbols()
+            .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        || selected.object().is_empty()
+        || total_link_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err("native multi-grep reducer adapter authentication failed".to_owned());
+    }
+    Ok(NativeMultiGrepReducerDisposition::Selected(selected))
+}
+
+/// Build-time selection for a whole-operation Count or SpanSum reducer over
+/// the independently authenticated ordinary/prepared row closure.
+#[derive(Clone, Debug)]
+pub enum NativeRowScalarReducerDisposition {
+    Selected(fre_aot_regex::RebarNativeRowScalarReducerAotArtifactV1),
+    DeclinedObjectBytes { limit: usize, required: usize },
+}
+
+/// Attempt to replace the Rust ordered-row iterator with one native scalar
+/// transaction. A mixed closure passes the already-prepared opaque handle
+/// table once and seals the ordinary/prepared call route for every row. Only
+/// the final numeric object cap can decline after authenticated rows exist.
+pub fn try_compile_native_row_scalar_reducer(
+    benchmark: &Benchmark,
+    bridge: &NativeRowBridge,
+) -> Result<NativeRowScalarReducerDisposition, String> {
+    let operation = match benchmark.model {
+        Model::Count => fre_aot_regex::RebarNativeRowScalarOperationV1::Count,
+        Model::SpanSum => fre_aot_regex::RebarNativeRowScalarOperationV1::SpanSum,
+        _ => {
+            return Err(
+                "native row-scalar reducer requires a multi-pattern Count or SpanSum bridge"
+                    .to_owned(),
+            );
+        }
+    };
+    if benchmark.patterns.len() < 2
+        || !benchmark.uses_native_row_bridge()
+        || bridge.artifacts.is_empty()
+        || bridge.source_to_artifact.len() != benchmark.patterns.len()
+        || bridge.total_object_bytes == 0
+        || bridge.total_object_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err(
+            "native row-scalar reducer requires an authenticated multi-pattern row bridge"
+                .to_owned(),
+        );
+    }
+    let exact_row_bytes = bridge
+        .artifacts
+        .iter()
+        .try_fold(0_usize, |total, artifact| {
+            total.checked_add(artifact.compiled.object().len())
+        })
+        .ok_or_else(|| "native row-scalar row object-byte sum overflowed".to_owned())?;
+    if exact_row_bytes != bridge.total_object_bytes {
+        return Err("native row-scalar row object-byte receipt mismatch".to_owned());
+    }
+    let has_prepared = bridge
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.route.is_prepared());
+    let source_bytes = benchmark
+        .patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or_else(|| "native row-scalar source byte sum overflowed".to_owned())?;
+    let ordered_sources_sha256 = ordered_many_source_sha256(&benchmark.patterns)?;
+    let reducer_limit = MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+        .checked_sub(bridge.total_object_bytes)
+        .ok_or_else(|| "native row-scalar object-byte remainder underflowed".to_owned())?;
+    let disposition = if has_prepared {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(bridge.artifacts.len())
+            .map_err(|_| "mixed native row-scalar descriptor allocation failed".to_owned())?;
+        rows.extend(bridge.artifacts.iter().map(|artifact| {
+            fre_aot_regex::RebarMixedNativeRowScalarReducerRowV1::new(
+                &artifact.compiled,
+                artifact.first_source_ordinal,
+                match artifact.route {
+                    NativeRowRoute::Ordinary => {
+                        fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary
+                    }
+                    NativeRowRoute::PreparedOrderedNfaV15 => {
+                        fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15
+                    }
+                    NativeRowRoute::PreparedOrderedNfaV15RowSearch => {
+                        fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch
+                    }
+                },
+            )
+        }));
+        let disposition = fre_aot_regex::compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
+            operation,
+            ordered_sources_sha256,
+            benchmark.patterns.len(),
+            source_bytes,
+            &bridge.source_to_artifact,
+            &rows,
+            reducer_limit,
+        )
+        .map_err(|error| format!("mixed native row-scalar reducer compilation failed: {error}"))?;
+        if let fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(selected) =
+            &disposition
+            && !selected.authenticates_mixed_rows(
+                operation,
+                ordered_sources_sha256,
+                benchmark.patterns.len(),
+                source_bytes,
+                &bridge.source_to_artifact,
+                &rows,
+            )
+        {
+            return Err("mixed native row-scalar reducer row authentication failed".to_owned());
+        }
+        disposition
+    } else {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(bridge.artifacts.len())
+            .map_err(|_| "native row-scalar descriptor allocation failed".to_owned())?;
+        rows.extend(bridge.artifacts.iter().map(|artifact| {
+            fre_aot_regex::RebarMultiGrepReducerRowV1::new(
+                &artifact.compiled,
+                artifact.first_source_ordinal,
+            )
+        }));
+        let disposition = fre_aot_regex::compile_rebar_native_row_scalar_reducer_aot_v1(
+            operation,
+            ordered_sources_sha256,
+            benchmark.patterns.len(),
+            source_bytes,
+            &bridge.source_to_artifact,
+            &rows,
+            reducer_limit,
+        )
+        .map_err(|error| format!("native row-scalar reducer compilation failed: {error}"))?;
+        if let fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(selected) =
+            &disposition
+            && !selected.authenticates_rows(
+                operation,
+                ordered_sources_sha256,
+                benchmark.patterns.len(),
+                source_bytes,
+                &bridge.source_to_artifact,
+                &rows,
+            )
+        {
+            return Err("native row-scalar reducer row authentication failed".to_owned());
+        }
+        disposition
+    };
+    let selected = match disposition {
+        fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(selected) => {
+            selected
+        }
+        fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Declined(
+            fre_aot_regex::RebarNativeRowScalarReducerAotCompileDeclineV1::ObjectBytes {
+                limit,
+                required,
+            },
+        ) => {
+            return Ok(NativeRowScalarReducerDisposition::DeclinedObjectBytes { limit, required });
+        }
+    };
+    let receipt = selected.receipt();
+    let total_link_bytes = bridge
+        .total_object_bytes
+        .checked_add(selected.object().len())
+        .ok_or_else(|| "native row-scalar total linked object bytes overflowed".to_owned())?;
+    let routes_match = receipt
+        .row_routes()
+        .iter()
+        .copied()
+        .eq(bridge
+            .artifacts
+            .iter()
+            .map(|artifact| match artifact.route {
+                NativeRowRoute::Ordinary => {
+                    fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary
+                }
+                NativeRowRoute::PreparedOrderedNfaV15 => {
+                    fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15
+                }
+                NativeRowRoute::PreparedOrderedNfaV15RowSearch => {
+                    fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch
+                }
+            }));
+    if receipt.uses_mixed_handle_table() != has_prepared
+        || receipt.required_handle_count() != usize::from(has_prepared) * bridge.artifacts.len()
+        || !routes_match
+        || receipt.max_object_bytes() != reducer_limit
+        || receipt.object_bytes() != selected.object().len()
+        || receipt.reducer_relocations() != selected.module().relocations()
+        || receipt.reducer_relocations().len() != bridge.artifacts.len()
+        || receipt.semantic_runtime_calls() != 0
+        || !receipt
+            .row_entry_symbols()
+            .iter()
+            .map(String::as_str)
+            .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        || !selected
+            .module()
+            .required_runtime_symbols()
+            .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        || selected.object().is_empty()
+        || total_link_bytes > MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+    {
+        return Err("native row-scalar reducer adapter authentication failed".to_owned());
+    }
+    Ok(NativeRowScalarReducerDisposition::Selected(selected))
 }
 
 fn authenticate_native_row(compiled: &CompiledRegex, source_ordinal: usize) -> Result<(), String> {
@@ -3646,6 +4279,95 @@ fn authenticate_prepared_v15_row(
     Ok(())
 }
 
+fn authenticate_strict_prepared_v15_row(
+    compiled: &CompiledRegex,
+    source_ordinal: usize,
+) -> Result<(), String> {
+    let module = compiled.module();
+    let receipt = compiled.receipt();
+    let prepared_entry = module
+        .prepared_entry_symbol()
+        .ok_or_else(|| format!("strict prepared V15 row {source_ordinal} has no entry"))?;
+    let (program, program_len) = module.required_runtime_program().ok_or_else(|| {
+        format!("strict prepared V15 row {source_ordinal} has no serialized program")
+    })?;
+    let global_functions = module
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.binding == SymbolBinding::Global
+                && symbol.kind == SymbolKind::Function
+                && symbol.section.is_some()
+        })
+        .collect::<Vec<_>>();
+    let global_objects = module
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.binding == SymbolBinding::Global
+                && symbol.kind == SymbolKind::Object
+                && symbol.section.is_some()
+        })
+        .collect::<Vec<_>>();
+    let entry_identity = prepared_entry.strip_prefix("fre_aot_regex_search_exclusive_v1_");
+    let program_identity = program.strip_prefix("fre_aot_regex_runtime_program_v1_");
+    let identities_are_exact = entry_identity.is_some()
+        && entry_identity == program_identity
+        && entry_identity.is_some_and(|identity| {
+            identity.len() == 64
+                && identity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    if receipt.entry_abi != EntryAbi::PreparedSpanSearchV1
+        || receipt.mode != CompileMode::Optimizing
+        || receipt.output != OutputContract::Span
+        || receipt.engine != EngineKind::OrderedNfa
+        || receipt.runtime_helper_required
+        || receipt.required_prepare_capabilities != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || module.entry_symbol() != prepared_entry
+        || program_len == 0
+        || program_len != receipt.program_bytes
+        || receipt.program_sha256 != compiled.program().artifact_identity()
+        || module.prepared_span_fill_symbol().is_some()
+        || module.prepared_bulk_strategy().is_some()
+        || !receipt.prepared_aggregate_exports.is_empty()
+        || receipt.prepared_aggregate_strategy.is_some()
+        || !module.prepared_aggregate_exports().is_empty()
+        || module.prepared_aggregate_strategy().is_some()
+        || module.prepared_count_symbol().is_some()
+        || module.prepared_span_sum_symbol().is_some()
+        || module.prepared_grep_count_symbol().is_some()
+        || module.prepared_exists_batch_symbol().is_some()
+        || module.required_runtime_symbols().next().is_some()
+        || global_functions.len() != 1
+        || global_functions[0].name != prepared_entry
+        || global_functions[0].size == 0
+        || global_objects.len() != 1
+        || global_objects[0].name != program
+        || usize::try_from(global_objects[0].size).ok() != Some(program_len)
+        || module
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.section.is_none())
+        || module.relocations().iter().any(|relocation| {
+            module
+                .symbols()
+                .get(relocation.symbol)
+                .is_none_or(|symbol| symbol.section.is_none())
+        })
+        || !identities_are_exact
+        || Sha256::digest(compiled.object()).as_slice() != receipt.object_sha256
+        || compiled.object().is_empty()
+    {
+        return Err(format!(
+            "strict prepared V15 row {source_ordinal} failed exact PreparedSpanSearchV1 topology authentication"
+        ));
+    }
+    Ok(())
+}
+
 fn text<'a>(value: &'a [u8], key: &str) -> Result<&'a str, String> {
     std::str::from_utf8(value).map_err(|error| format!("{key} is not UTF-8: {error}"))
 }
@@ -3680,20 +4402,139 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strict_row_search_authentication_is_distinct_and_mixed_route_is_exact() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = true;
+        let request = |pattern| {
+            CompileRequest::new(pattern, target)
+                .profile(profile.clone())
+                .output(OutputContract::Span)
+                .mode(CompileMode::Optimizing)
+                .limits(rebar_recovery_compile_limits())
+        };
+        let ordinary = compile_with_slow_aot_limits(
+            CompileRequest::new("a+", target)
+                .profile(profile.clone())
+                .output(OutputContract::Span)
+                .mode(CompileMode::Optimizing),
+            SlowAotLimits::default(),
+        )
+        .expect("ordinary mixed-row fixture");
+        authenticate_native_row(&ordinary, 0).expect("ordinary row authentication");
+        let legacy = compile_with_prepared_ordered_nfa_v15_reported(
+            request(r"\b\w+\b"),
+            PreparedAggregateExports::NONE,
+        )
+        .expect("legacy compatibility compilation")
+        .into_compiled()
+        .expect("legacy compatibility fixture is supported");
+        let strict = compile_with_prepared_ordered_nfa_v15_row_search_reported(request(r"\b\w+\b"))
+            .expect("strict RowSearch compilation")
+            .into_compiled()
+            .expect("strict RowSearch fixture is supported");
+
+        authenticate_prepared_v15_row(&legacy, 1)
+            .expect("legacy compatibility surface remains accepted");
+        assert!(authenticate_strict_prepared_v15_row(&legacy, 1).is_err());
+        authenticate_strict_prepared_v15_row(&strict, 1)
+            .expect("strict RowSearch surface is accepted");
+        assert!(authenticate_prepared_v15_row(&strict, 1).is_err());
+
+        let ordered_sources_sha256 = [7_u8; 32];
+        let source_to_row = [0_usize, 1_usize];
+        let strict_rows = [
+            fre_aot_regex::RebarMixedNativeRowScalarReducerRowV1::new(
+                &ordinary,
+                0,
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary,
+            ),
+            fre_aot_regex::RebarMixedNativeRowScalarReducerRowV1::new(
+                &strict,
+                1,
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch,
+            ),
+        ];
+        let disposition = fre_aot_regex::compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
+            fre_aot_regex::RebarNativeRowScalarOperationV1::Count,
+            ordered_sources_sha256,
+            2,
+            8,
+            &source_to_row,
+            &strict_rows,
+            MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES,
+        )
+        .expect("strict mixed reducer compilation");
+        let fre_aot_regex::RebarNativeRowScalarReducerAotCompileDispositionV1::Selected(selected) =
+            disposition
+        else {
+            panic!("strict mixed reducer unexpectedly declined");
+        };
+        assert!(selected.authenticates_mixed_rows(
+            fre_aot_regex::RebarNativeRowScalarOperationV1::Count,
+            ordered_sources_sha256,
+            2,
+            8,
+            &source_to_row,
+            &strict_rows,
+        ));
+
+        let strict_mistagged_legacy = [
+            strict_rows[0],
+            fre_aot_regex::RebarMixedNativeRowScalarReducerRowV1::new(
+                &strict,
+                1,
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15,
+            ),
+        ];
+        assert!(
+            fre_aot_regex::compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
+                fre_aot_regex::RebarNativeRowScalarOperationV1::Count,
+                ordered_sources_sha256,
+                2,
+                8,
+                &source_to_row,
+                &strict_mistagged_legacy,
+                MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES,
+            )
+            .is_err()
+        );
+        let legacy_mistagged_strict = [
+            strict_rows[0],
+            fre_aot_regex::RebarMixedNativeRowScalarReducerRowV1::new(
+                &legacy,
+                1,
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch,
+            ),
+        ];
+        assert!(
+            fre_aot_regex::compile_rebar_mixed_native_row_scalar_reducer_aot_v1(
+                fre_aot_regex::RebarNativeRowScalarOperationV1::Count,
+                ordered_sources_sha256,
+                2,
+                8,
+                &source_to_row,
+                &legacy_mistagged_strict,
+                MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn frozen_schedule_binding_rejects_missing_and_tampered_fields() {
         let klv = [0x11; 32];
         let expected_value = 1;
         let comparator = "re2-2025-11-05";
         let binding = frozen_schedule_binding_sha256(klv, expected_value, comparator)
             .expect("valid frozen schedule binding");
-        authenticate_frozen_schedule_binding(
-            klv,
-            expected_value,
-            comparator,
-            klv,
-            binding,
-        )
-        .expect("exact frozen schedule metadata");
+        authenticate_frozen_schedule_binding(klv, expected_value, comparator, klv, binding)
+            .expect("exact frozen schedule metadata");
         assert!(
             authenticate_frozen_schedule_binding(
                 [0x22; 32],
@@ -3736,7 +4577,10 @@ mod tests {
             validate_expected_comparator(comparator).expect("valid comparator identifier");
         }
         for comparator in ["", "-leading", "has space", "has=equals", "line\nbreak"] {
-            assert!(validate_expected_comparator(comparator).is_err(), "{comparator:?}");
+            assert!(
+                validate_expected_comparator(comparator).is_err(),
+                "{comparator:?}"
+            );
         }
         let oversized = "a".repeat(MAX_EXPECTED_COMPARATOR_BYTES.saturating_add(1));
         assert!(validate_expected_comparator(&oversized).is_err());
@@ -3858,7 +4702,7 @@ mod tests {
 
     #[test]
     fn safe_v15_declines_return_the_incumbent_byte_for_byte() {
-        use fre_aot_regex::{compile, PreparedOrderedNfaV15CompileDecline};
+        use fre_aot_regex::{PreparedOrderedNfaV15CompileDecline, compile};
 
         let target = target_from_parts(
             std::env::consts::ARCH,
@@ -3955,17 +4799,16 @@ mod tests {
             alternate_feature_bits,
         )
         .expect("feature-bearing host target");
-        let target_mismatched =
-            compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
-                CompileRequest::new(r"\b\w+\b", alternate_target)
-                    .profile(profile)
-                    .output(OutputContract::Span)
-                    .mode(CompileMode::Optimizing),
-                PreparedAggregateExports::COUNT,
-            )
-            .expect("feature-bearing scalar V15 compilation")
-            .into_compiled()
-            .expect("feature-bearing fixture selects scalar V15");
+        let target_mismatched = compile_with_prepared_ordered_nfa_v15_scalar_operation_reported(
+            CompileRequest::new(r"\b\w+\b", alternate_target)
+                .profile(profile)
+                .output(OutputContract::Span)
+                .mode(CompileMode::Optimizing),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("feature-bearing scalar V15 compilation")
+        .into_compiled()
+        .expect("feature-bearing fixture selects scalar V15");
         authenticate_prepared_ordered_nfa_scalar(Model::Count, &target_mismatched)
             .expect("target-mismatched candidate is independently valid");
         assert_eq!(
@@ -3976,7 +4819,10 @@ mod tests {
             target_mismatched.receipt().program_sha256,
             incumbent.receipt().program_sha256,
         );
-        assert_ne!(target_mismatched.receipt().target, incumbent.receipt().target);
+        assert_ne!(
+            target_mismatched.receipt().target,
+            incumbent.receipt().target
+        );
         let error = match select_prepared_ordered_nfa_v15_or_incumbent(
             Model::Count,
             incumbent,
@@ -3992,7 +4838,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_only_v15_grep_declines_preserve_incumbent_and_errors_stay_terminal() {
+    fn operation_only_v15_grep_declines_preserve_only_exact_native_v15() {
         use fre_aot_regex::{ObjectError, PreparedOrderedNfaV15CompileDecline};
 
         let target = target_from_parts(
@@ -4001,17 +4847,34 @@ mod tests {
             FeatureSet::EMPTY.bits(),
         )
         .expect("host target");
-        let incumbent = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
-            CompileRequest::new("ab", target)
+        let mut profile = RustProfile::rebar_1_12_4();
+        profile.options.unicode = true;
+        let runtime_helper = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+            CompileRequest::new(r"\b\w{25,}\b", target)
+                .profile(profile.clone())
                 .mode(CompileMode::Optimizing)
-                .output(OutputContract::Exists),
+                .output(OutputContract::Exists)
+                .limits(rebar_recovery_compile_limits()),
             PreparedAggregateExports::GREP_COUNT,
-            SlowAotLimits::default(),
+            rebar_recovery_slow_aot_limits(),
         )
-        .expect("grep incumbent fixture");
-        let expected_program = incumbent.program().serialize().unwrap();
-        let expected_object = incumbent.object().to_vec();
-        let expected_receipt = incumbent.receipt().clone();
+        .expect("ordinary RuntimeHelper grep incumbent");
+        assert!(ordinary_grep_requires_prepared_v15(&runtime_helper));
+        assert!(authenticate_prepared_v15_grep(&runtime_helper).is_err());
+
+        let legacy_v15 = compile_with_prepared_ordered_nfa_v15_reported(
+            CompileRequest::new(r"\b\w+\b", target)
+                .profile(profile)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+            PreparedAggregateExports::GREP_COUNT,
+        )
+        .expect("legacy V15 grep compilation")
+        .into_compiled()
+        .expect("legacy V15 grep fixture is supported");
+        authenticate_prepared_v15_grep(&legacy_v15)
+            .expect("legacy V15 grep incumbent is independently authenticated");
+
         for decline in [
             PreparedOrderedNfaV15CompileDecline::Unsupported,
             PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
@@ -4023,20 +4886,31 @@ mod tests {
                 required: 12,
             },
         ] {
-            let candidate = classify_grep_operation_only_attempt(Ok(
-                PreparedOrderedNfaV15CompileDisposition::Declined(decline),
-            ))
-            .expect("typed operation-only grep decline");
-            assert!(candidate.is_none());
-            let selected = candidate.unwrap_or_else(|| incumbent.clone());
-            assert_eq!(selected.program().serialize().unwrap(), expected_program);
-            assert_eq!(selected.object(), expected_object);
-            assert_eq!(selected.receipt(), &expected_receipt);
+            let error = select_grep_operation_only_candidate(
+                runtime_helper.clone(),
+                Ok(PreparedOrderedNfaV15CompileDisposition::Declined(decline)),
+            )
+            .expect_err("typed operation-only grep decline must be terminal");
+            assert!(error.contains(&format!("{decline:?}")));
+            assert!(error.contains("refusing the unauthenticated RuntimeHelper incumbent"));
+
+            let preserved = select_grep_operation_only_candidate(
+                legacy_v15.clone(),
+                Ok(PreparedOrderedNfaV15CompileDisposition::Declined(decline)),
+            )
+            .expect("typed decline preserves exact legacy V15");
+            assert_eq!(preserved.object(), legacy_v15.object());
+            assert_eq!(preserved.receipt(), legacy_v15.receipt());
+            authenticate_prepared_v15_grep(&preserved)
+                .expect("preserved incumbent remains exact legacy V15");
         }
 
-        let error = classify_grep_operation_only_attempt(Err(CompileError::Object(
-            ObjectError::Allocation("injected operation-only GrepCount allocation"),
-        )))
+        let error = select_grep_operation_only_candidate(
+            legacy_v15,
+            Err(CompileError::Object(ObjectError::Allocation(
+                "injected operation-only GrepCount allocation",
+            ))),
+        )
         .expect_err("allocator failure must remain terminal");
         assert!(error.contains("injected operation-only GrepCount allocation"));
     }
@@ -4124,15 +4998,13 @@ mod tests {
         assert!(direct_native_grep_symbol_identities_are_closed(
             &ordinary, &reducer, &program,
         ));
-        let aliased_reducer =
-            format!("fre_aot_regex_grep_count_exclusive_v1_{}", "a".repeat(64));
+        let aliased_reducer = format!("fre_aot_regex_grep_count_exclusive_v1_{}", "a".repeat(64));
         assert!(!direct_native_grep_symbol_identities_are_closed(
             &ordinary,
             &aliased_reducer,
             &program,
         ));
-        let wrong_program =
-            format!("fre_aot_regex_runtime_program_v1_{}", "c".repeat(64));
+        let wrong_program = format!("fre_aot_regex_runtime_program_v1_{}", "c".repeat(64));
         assert!(!direct_native_grep_symbol_identities_are_closed(
             &ordinary,
             &reducer,
@@ -4141,19 +5013,38 @@ mod tests {
     }
 
     #[test]
+    fn shared_native_fused_identity_binds_reducer_to_its_program() {
+        let ordinary = format!("fre_aot_regex_search_v1_{}", "a".repeat(64));
+        let reducer = format!("fre_aot_regex_grep_count_exclusive_v1_{}", "b".repeat(64));
+        let program = format!("fre_aot_regex_runtime_program_v1_{}", "b".repeat(64));
+        assert!(
+            shared_ordered_many_native_fused_symbol_identities_are_closed(
+                Model::GrepCount,
+                &ordinary,
+                &reducer,
+                &program,
+            )
+        );
+
+        let wrong_program = format!("fre_aot_regex_runtime_program_v1_{}", "c".repeat(64));
+        assert!(
+            !shared_ordered_many_native_fused_symbol_identities_are_closed(
+                Model::GrepCount,
+                &ordinary,
+                &reducer,
+                &wrong_program,
+            )
+        );
+    }
+
+    #[test]
     fn prepared_row_symbol_identity_requires_one_exact_suffix() {
         let ordinary = format!("fre_aot_regex_search_v1_{}", "a".repeat(64));
         let prepared = format!("fre_aot_regex_search_exclusive_v1_{}", "a".repeat(64));
-        let span_fill = format!(
-            "fre_aot_regex_fill_spans_exclusive_v1_{}",
-            "a".repeat(64)
-        );
+        let span_fill = format!("fre_aot_regex_fill_spans_exclusive_v1_{}", "a".repeat(64));
         let program = format!("fre_aot_regex_runtime_program_v1_{}", "a".repeat(64));
         assert!(prepared_row_symbol_identities_are_closed(
-            &ordinary,
-            &prepared,
-            &span_fill,
-            &program,
+            &ordinary, &prepared, &span_fill, &program,
         ));
 
         let wrong_program = format!("fre_aot_regex_runtime_program_v1_{}", "b".repeat(64));
@@ -4215,12 +5106,7 @@ mod tests {
     #[test]
     fn optional_runtime_symbol_closure_is_exact() {
         let actual = ["runtime", "fallback", "preflight"];
-        let expected = [
-            Some("runtime"),
-            None,
-            Some("fallback"),
-            Some("preflight"),
-        ];
+        let expected = [Some("runtime"), None, Some("fallback"), Some("preflight")];
         assert!(has_exact_optional_symbol_name_closure(&actual, &expected));
         assert!(!has_exact_optional_symbol_name_closure(
             &actual[..2],
@@ -4231,19 +5117,14 @@ mod tests {
         assert!(!has_exact_optional_symbol_name_closure(&extra, &expected));
         let poisoned = ["runtime", "fallback", "poisoned"];
         assert!(!has_exact_optional_symbol_name_closure(
-            &poisoned,
-            &expected,
+            &poisoned, &expected,
         ));
         let duplicated_actual = ["runtime", "runtime", "preflight"];
         assert!(!has_exact_optional_symbol_name_closure(
             &duplicated_actual,
             &expected,
         ));
-        let duplicated_expected = [
-            Some("runtime"),
-            Some("fallback"),
-            Some("fallback"),
-        ];
+        let duplicated_expected = [Some("runtime"), Some("fallback"), Some("fallback")];
         assert!(!has_exact_optional_symbol_name_closure(
             &actual,
             &duplicated_expected,
@@ -4316,9 +5197,8 @@ mod tests {
 
     #[test]
     fn direct_grep_compiles_to_one_authenticated_native_reducer() {
-        let benchmark =
-            Benchmark::parse(&fixture("grep", b"ab", b"none\nab\r\nlast"))
-                .expect("direct grep fixture");
+        let benchmark = Benchmark::parse(&fixture("grep", b"ab", b"none\nab\r\nlast"))
+            .expect("direct grep fixture");
         let target = target_from_parts(
             std::env::consts::ARCH,
             std::env::consts::OS,
@@ -4332,6 +5212,10 @@ mod tests {
             Some(PreparedAggregateStrategy::NativeFused),
         );
         assert_eq!(selected.module().required_prepare_capabilities(), 0);
+        assert!(
+            !authenticate_native_whole_scalar_reducer(Model::GrepCount, &selected)
+                .expect("direct Grep remains outside Span-output scalar admission"),
+        );
     }
 
     #[test]
@@ -4477,11 +5361,20 @@ mod tests {
             authenticate_native_whole_scalar_reducer(benchmark.model, &selected)
                 .expect("whole Ordered-NFA scalar authentication")
         );
-        assert_eq!(selected.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+        assert_eq!(
+            selected.receipt().entry_abi,
+            EntryAbi::PreparedScalarReduceV1
+        );
         assert_eq!(selected.module().prepared_bulk_strategy(), None);
         assert_eq!(selected.module().prepared_entry_symbol(), None);
         assert_eq!(selected.module().prepared_span_fill_symbol(), None);
-        assert!(selected.module().required_runtime_symbols().next().is_none());
+        assert!(
+            selected
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
         assert_eq!(
             selected.module().prepared_count_symbol(),
             Some(selected.module().entry_symbol()),
@@ -4499,9 +5392,8 @@ mod tests {
         )
         .expect("host target");
         for model_name in ["count", "count-spans"] {
-            let mut benchmark =
-                Benchmark::parse(&fixture(model_name, br"\b\w+\b", b"word"))
-                    .expect("Unicode word scalar fixture");
+            let mut benchmark = Benchmark::parse(&fixture(model_name, br"\b\w+\b", b"word"))
+                .expect("Unicode word scalar fixture");
             benchmark.unicode = true;
             let mut profile = RustProfile::rebar_1_12_4();
             profile.options.unicode = benchmark.unicode;
@@ -4560,8 +5452,7 @@ mod tests {
                 assert_eq!(preserved.object(), incumbent.object());
                 assert_eq!(preserved.receipt(), incumbent.receipt());
                 assert!(
-                    authenticate_native_whole_scalar_reducer(benchmark.model, &preserved)
-                        .is_err(),
+                    authenticate_native_whole_scalar_reducer(benchmark.model, &preserved).is_err(),
                     "a typed decline must not authenticate the legacy helper surface",
                 );
             }
@@ -4576,11 +5467,20 @@ mod tests {
                 authenticate_native_whole_scalar_reducer(benchmark.model, &selected)
                     .expect("whole scalar route authentication"),
             );
-            assert_eq!(selected.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+            assert_eq!(
+                selected.receipt().entry_abi,
+                EntryAbi::PreparedScalarReduceV1
+            );
             assert_eq!(selected.module().prepared_bulk_strategy(), None);
             assert_eq!(selected.module().prepared_entry_symbol(), None);
             assert_eq!(selected.module().prepared_span_fill_symbol(), None);
-            assert!(selected.module().required_runtime_symbols().next().is_none());
+            assert!(
+                selected
+                    .module()
+                    .required_runtime_symbols()
+                    .next()
+                    .is_none()
+            );
             let reducer = match benchmark.model {
                 Model::Count => selected.module().prepared_count_symbol(),
                 Model::SpanSum => selected.module().prepared_span_sum_symbol(),
@@ -4748,7 +5648,7 @@ mod tests {
             let disposition = try_compile_native_uniform_capture_reducer(&benchmark, target)
                 .expect("native uniform capture reducer");
             let selected = disposition
-                .selected()
+                .combined()
                 .expect("uniform capture fixture proves one multiplier");
             selected.authenticate().expect("fresh reducer seal");
             assert_eq!(selected.receipt().operation(), expected_operation);
@@ -4773,12 +5673,17 @@ mod tests {
             let disposition = try_compile_native_uniform_capture_reducer(&benchmark, target)
                 .expect("operation-only uniform capture reducer");
             let selected = disposition
-                .selected()
+                .combined()
                 .expect("uniform fixture proves one multiplier");
-            selected.authenticate().expect("operation-only reducer seal");
+            selected
+                .authenticate()
+                .expect("operation-only reducer seal");
             let compiled = selected.compiled();
             let module = compiled.module();
-            assert_eq!(compiled.receipt().entry_abi, EntryAbi::PreparedScalarReduceV1);
+            assert_eq!(
+                compiled.receipt().entry_abi,
+                EntryAbi::PreparedScalarReduceV1
+            );
             assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
             assert_eq!(
                 compiled.receipt().prepared_aggregate_strategy,
@@ -4859,13 +5764,247 @@ mod tests {
         );
         for artifact in bridge.artifacts {
             assert!(!artifact.compiled.receipt().runtime_helper_required);
-            assert!(artifact
-                .compiled
+            assert!(
+                artifact
+                    .compiled
+                    .module()
+                    .required_runtime_symbols()
+                    .next()
+                    .is_none()
+            );
+            assert!(artifact.compiled.module().prepared_entry_symbol().is_none());
+        }
+    }
+
+    #[test]
+    fn native_multi_grep_reducer_seals_the_deduplicated_row_closure() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for insertion in [
+            b"pattern:5:^foo$\npattern:5:^bar$\n".as_slice(),
+            b"pattern:5:^foo$\n".as_slice(),
+        ] {
+            let mut multi = fixture("grep", b"^foo$", b"foo\nbar\r\nno");
+            let offset = multi
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            multi.splice(offset..offset, insertion.iter().copied());
+            let benchmark = Benchmark::parse(&multi).expect("multi-grep fixture");
+            let bridge =
+                compile_native_row_bridge(&benchmark, target).expect("independent multi-grep rows");
+            let disposition = try_compile_native_multi_grep_reducer(&benchmark, &bridge)
+                .expect("native multi-grep adapter");
+            let NativeMultiGrepReducerDisposition::Selected(artifact) = disposition else {
+                panic!("ordinary public rows unexpectedly declined their reducer");
+            };
+            let receipt = artifact.receipt();
+            assert_eq!(receipt.source_cardinality(), benchmark.patterns.len());
+            assert_eq!(receipt.source_to_row(), bridge.source_to_artifact);
+            assert_eq!(receipt.reducer_relocation_count(), bridge.artifacts.len());
+            assert_eq!(receipt.semantic_runtime_calls(), 0);
+            assert_eq!(
+                receipt.object_bytes() + bridge.total_object_bytes,
+                artifact.object().len() + bridge.total_object_bytes,
+            );
+            assert!(
+                receipt.object_bytes() + bridge.total_object_bytes
+                    <= MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn native_multi_grep_reducer_seals_mixed_prepared_row_routes() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut multi = fixture("grep", b"a+", b"foo\nbar");
+        let insertion = b"pattern:7:\\bfoo\\b\n";
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, insertion.iter().copied());
+        let mut benchmark = Benchmark::parse(&multi).expect("prepared multi-grep fixture");
+        benchmark.unicode = true;
+        let bridge = compile_native_row_bridge(&benchmark, target)
+            .expect("runtime-dependent row selects explicit prepared V15");
+        assert_eq!(bridge.artifacts.len(), 2);
+        assert_eq!(bridge.artifacts[0].route, NativeRowRoute::Ordinary);
+        assert_eq!(
+            bridge.artifacts[1].route,
+            NativeRowRoute::PreparedOrderedNfaV15RowSearch,
+        );
+        let disposition = try_compile_native_multi_grep_reducer(&benchmark, &bridge)
+            .expect("prepared rows select the mixed reducer ABI");
+        let NativeMultiGrepReducerDisposition::Selected(selected) = disposition else {
+            panic!("mixed public rows unexpectedly declined their Grep reducer");
+        };
+        let receipt = selected.receipt();
+        assert!(receipt.uses_mixed_handle_table());
+        assert_eq!(receipt.required_handle_count(), 2);
+        assert_eq!(
+            receipt.row_routes(),
+            [
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary,
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch,
+            ]
+        );
+        assert!(
+            receipt
+                .reducer_symbol()
+                .starts_with("fre_aot_regex_rebar_mixed_multi_grep_v1_")
+        );
+        assert!(
+            selected
                 .module()
                 .required_runtime_symbols()
-                .next()
-                .is_none());
-            assert!(artifact.compiled.module().prepared_entry_symbol().is_none());
+                .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+        );
+    }
+
+    #[test]
+    fn native_row_scalar_reducer_seals_count_and_span_sum_row_closure() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for (model, operation) in [
+            (
+                "count",
+                fre_aot_regex::RebarNativeRowScalarOperationV1::Count,
+            ),
+            (
+                "count-spans",
+                fre_aot_regex::RebarNativeRowScalarOperationV1::SpanSum,
+            ),
+        ] {
+            let mut multi = fixture(model, b"a", b"aba");
+            let offset = multi
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            multi.splice(
+                offset..offset,
+                b"pattern:1:a\npattern:2:ab\n".iter().copied(),
+            );
+            let benchmark = Benchmark::parse(&multi).expect("row-scalar fixture");
+            let bridge =
+                compile_native_row_bridge(&benchmark, target).expect("independent ordinary rows");
+            assert_eq!(bridge.source_to_artifact, [0, 0, 1]);
+            let disposition = try_compile_native_row_scalar_reducer(&benchmark, &bridge)
+                .expect("native row-scalar adapter");
+            let NativeRowScalarReducerDisposition::Selected(artifact) = disposition else {
+                panic!("ordinary public rows unexpectedly declined their scalar reducer");
+            };
+            let receipt = artifact.receipt();
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.source_cardinality(), benchmark.patterns.len());
+            assert_eq!(receipt.source_to_row(), bridge.source_to_artifact);
+            assert_eq!(receipt.reducer_relocations().len(), bridge.artifacts.len());
+            assert_eq!(receipt.semantic_runtime_calls(), 0);
+            assert!(
+                artifact
+                    .module()
+                    .required_runtime_symbols()
+                    .eq(bridge.artifacts.iter().map(NativeRowArtifact::entry_symbol))
+            );
+            assert!(
+                receipt.object_bytes() + bridge.total_object_bytes
+                    <= MAX_NATIVE_ROW_BRIDGE_OBJECT_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn native_row_scalar_reducer_seals_mixed_prepared_row_routes() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut multi = fixture("count", b"a+", b"foo bar");
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, b"pattern:7:\\bfoo\\b\n".iter().copied());
+        let mut benchmark = Benchmark::parse(&multi).expect("prepared row-scalar fixture");
+        benchmark.unicode = true;
+        let bridge = compile_native_row_bridge(&benchmark, target)
+            .expect("runtime-dependent row selects explicit prepared V15");
+        assert_eq!(bridge.artifacts[0].route, NativeRowRoute::Ordinary);
+        assert_eq!(
+            bridge.artifacts[1].route,
+            NativeRowRoute::PreparedOrderedNfaV15RowSearch,
+        );
+        let NativeRowScalarReducerDisposition::Selected(selected) =
+            try_compile_native_row_scalar_reducer(&benchmark, &bridge)
+                .expect("compile mixed prepared scalar wrapper")
+        else {
+            panic!("mixed prepared scalar wrapper unexpectedly hit its numeric object cap");
+        };
+        assert!(selected.receipt().uses_mixed_handle_table());
+        assert_eq!(selected.receipt().required_handle_count(), 2);
+        assert_eq!(
+            selected.receipt().row_routes(),
+            [
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::Ordinary,
+                fre_aot_regex::RebarMixedNativeRowScalarRouteV1::PreparedOrderedNfaV15RowSearch,
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_object_decline_selects_the_same_authenticated_row_scalar_incumbent() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for model in ["count", "count-spans"] {
+            let mut multi = fixture(model, b"a", b"abab");
+            let offset = multi
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            multi.splice(offset..offset, b"pattern:2:ab\n".iter().copied());
+            let benchmark = Benchmark::parse(&multi).expect("fallback fixture");
+            let shared = try_compile_shared_ordered_many_aggregate_with_object_limit(
+                &benchmark, target, 256,
+            )
+            .expect("shared numeric-cap transaction");
+            assert!(
+                matches!(
+                    shared,
+                    SharedOrderedManyAggregateDisposition::Declined(
+                        OrderedManyAotCompileDecline::ObjectBytes { limit: 256, required }
+                    ) if required > 256
+                ),
+                "unexpected shared numeric-cap disposition: {shared:?}"
+            );
+            let bridge = compile_native_row_bridge(&benchmark, target)
+                .expect("prior independent-row incumbent");
+            let NativeRowScalarReducerDisposition::Selected(reducer) =
+                try_compile_native_row_scalar_reducer(&benchmark, &bridge)
+                    .expect("whole-operation row-scalar fallback")
+            else {
+                panic!("ordinary fallback rows unexpectedly declined");
+            };
+            assert_eq!(reducer.receipt().source_to_row(), bridge.source_to_artifact);
+            assert_eq!(reducer.receipt().semantic_runtime_calls(), 0);
         }
     }
 
@@ -4898,7 +6037,10 @@ mod tests {
             artifact.receipt().aggregate_strategy,
             PreparedAggregateStrategy::NativeFused,
         );
-        assert_eq!(artifact.compiled().module().required_prepare_capabilities(), 0);
+        assert_eq!(
+            artifact.compiled().module().required_prepare_capabilities(),
+            0
+        );
         assert!(
             artifact
                 .compiled()
@@ -4907,8 +6049,121 @@ mod tests {
                 .next()
                 .is_none(),
         );
-        assert!(artifact.compiled().module().prepared_count_symbol().is_some());
+        assert!(
+            artifact
+                .compiled()
+                .module()
+                .prepared_count_symbol()
+                .is_some()
+        );
         assert_ne!(artifact.receipt().ordered_sources_sha256, [0; 32]);
+    }
+
+    #[test]
+    fn shared_ordered_many_grep_count_is_one_native_line_operation() {
+        let mut multi = fixture("grep", b"foo", b"none\nbar\nfoo\n");
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, b"pattern:3:bar\n".iter().copied());
+        let benchmark = Benchmark::parse(&multi).expect("shared GrepCount fixture");
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let artifact = compile_shared_ordered_many_aggregate(&benchmark, target)
+            .expect("shared GrepCount aggregate");
+        let compiled = artifact.compiled();
+        assert_eq!(artifact.receipt().rows, 2);
+        assert_eq!(
+            artifact.receipt().aggregate_strategy,
+            PreparedAggregateStrategy::NativeFused,
+        );
+        assert_eq!(
+            compiled.module().prepared_aggregate_exports(),
+            PreparedAggregateExports::GREP_COUNT,
+        );
+        assert!(compiled.module().prepared_grep_count_symbol().is_some());
+        assert_eq!(compiled.module().prepared_count_symbol(), None);
+        assert_eq!(compiled.module().prepared_span_sum_symbol(), None);
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            authenticate_shared_ordered_many_whole_scalar_reducer(Model::GrepCount, compiled)
+                .expect("authenticate shared GrepCount reducer"),
+        );
+    }
+
+    #[test]
+    fn shared_ordered_many_grep_count_v15_is_one_closed_count_prepared_operation() {
+        let mut multi = fixture(
+            "grep",
+            br"\b\w{25,}\b",
+            b"short\none_very_long_identifier_name\n",
+        );
+        let second = br"\p{L}{20,}";
+        let mut second_field = format!("pattern:{}:", second.len()).into_bytes();
+        second_field.extend_from_slice(second);
+        second_field.push(b'\n');
+        let offset = multi
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        multi.splice(offset..offset, second_field);
+        let mut benchmark = Benchmark::parse(&multi).expect("shared V15 GrepCount fixture");
+        benchmark.unicode = true;
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let artifact = compile_shared_ordered_many_aggregate(&benchmark, target)
+            .expect("shared V15 GrepCount aggregate");
+        let compiled = artifact.compiled();
+        assert_eq!(
+            artifact.receipt().aggregate_strategy,
+            PreparedAggregateStrategy::NativeOrderedNfaFused,
+        );
+        assert_eq!(
+            compiled.module().required_prepare_capabilities(),
+            PREPARED_CAPABILITY_ORDERED_NFA_V15,
+        );
+        assert_eq!(
+            compiled.receipt().entry_abi,
+            EntryAbi::PreparedScalarReduceV1
+        );
+        assert_eq!(
+            benchmark
+                .model
+                .prepare_operation_flags_for_required_capabilities(
+                    compiled.module().required_prepare_capabilities(),
+                ),
+            Model::Count.prepare_operation_flags(),
+        );
+        assert_eq!(
+            compiled.module().prepared_grep_count_symbol(),
+            Some(compiled.module().entry_symbol()),
+        );
+        assert!(
+            compiled
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            authenticate_shared_ordered_many_whole_scalar_reducer(Model::GrepCount, compiled)
+                .expect("authenticate shared V15 GrepCount reducer"),
+        );
     }
 
     #[test]
@@ -4934,8 +6189,17 @@ mod tests {
             artifact.receipt().aggregate_strategy,
             PreparedAggregateStrategy::NativeFused,
         );
-        assert_eq!(artifact.compiled().module().required_prepare_capabilities(), 0);
-        assert!(artifact.compiled().module().prepared_count_symbol().is_some());
+        assert_eq!(
+            artifact.compiled().module().required_prepare_capabilities(),
+            0
+        );
+        assert!(
+            artifact
+                .compiled()
+                .module()
+                .prepared_count_symbol()
+                .is_some()
+        );
     }
 
     #[test]
@@ -5074,21 +6338,28 @@ mod tests {
             assert_eq!(bridge.artifacts[0].route, NativeRowRoute::Ordinary);
             assert_eq!(
                 bridge.artifacts[1].route,
-                NativeRowRoute::PreparedOrderedNfaV15
+                NativeRowRoute::PreparedOrderedNfaV15RowSearch
             );
             let selected = &bridge.artifacts[1].compiled;
             assert_eq!(
                 selected.module().required_prepare_capabilities(),
                 PREPARED_CAPABILITY_ORDERED_NFA_V15
             );
+            assert_eq!(selected.receipt().entry_abi, EntryAbi::PreparedSpanSearchV1);
+            assert!(!selected.receipt().runtime_helper_required);
+            assert_eq!(selected.module().prepared_bulk_strategy(), None);
             assert_eq!(
-                selected.module().prepared_bulk_strategy(),
-                Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+                selected.module().prepared_entry_symbol(),
+                Some(selected.module().entry_symbol())
             );
-            assert!(has_exact_runtime_symbol_closure(
-                selected,
-                &PREPARED_V15_ROW_RUNTIME_SYMBOLS,
-            ));
+            assert!(selected.module().prepared_span_fill_symbol().is_none());
+            assert!(
+                selected
+                    .module()
+                    .required_runtime_symbols()
+                    .next()
+                    .is_none()
+            );
             assert_eq!(
                 selected.receipt().automaton_sha256,
                 ordinary.receipt().automaton_sha256,
@@ -5122,7 +6393,7 @@ mod tests {
             assert_eq!(bridge.artifacts[0].route, NativeRowRoute::Ordinary);
             assert_eq!(
                 bridge.artifacts[1].route,
-                NativeRowRoute::PreparedOrderedNfaV15
+                NativeRowRoute::PreparedOrderedNfaV15RowSearch
             );
             assert_eq!(
                 bridge.artifacts[1]
@@ -5132,17 +6403,37 @@ mod tests {
                 PREPARED_CAPABILITY_ORDERED_NFA_V15
             );
             assert_eq!(
+                bridge.artifacts[1].compiled.receipt().entry_abi,
+                EntryAbi::PreparedSpanSearchV1
+            );
+            assert!(
+                !bridge.artifacts[1]
+                    .compiled
+                    .receipt()
+                    .runtime_helper_required
+            );
+            assert_eq!(
                 bridge.artifacts[1]
                     .compiled
                     .module()
                     .prepared_bulk_strategy(),
-                Some(PreparedBulkStrategy::NativeOrderedNfaLoop)
+                None
             );
-            assert!(bridge.artifacts[1]
-                .compiled
-                .module()
-                .prepared_span_fill_symbol()
-                .is_some());
+            assert!(
+                bridge.artifacts[1]
+                    .compiled
+                    .module()
+                    .prepared_span_fill_symbol()
+                    .is_none()
+            );
+            assert!(
+                bridge.artifacts[1]
+                    .compiled
+                    .module()
+                    .required_runtime_symbols()
+                    .next()
+                    .is_none()
+            );
         }
     }
 
@@ -5192,6 +6483,102 @@ mod tests {
                     .authenticate(&bridge.rows.artifacts[0].compiled)
                     .expect("each source proof binds the retained selector");
             }
+        }
+    }
+
+    #[test]
+    fn weighted_capture_reducer_closes_the_unequal_uniform_row_bridge() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let mut klv = fixture("count-captures", b"(a+)", b"aa bbb aa");
+        let insertion = b"pattern:2:a+\npattern:6:((b+))\n";
+        let offset = klv
+            .windows(b"haystack".len())
+            .position(|window| window == b"haystack")
+            .expect("haystack field");
+        klv.splice(offset..offset, insertion.iter().copied());
+        let benchmark = Benchmark::parse(&klv).expect("weighted capture fixture");
+        let bridge =
+            compile_uniform_capture_bridge(&benchmark, target).expect("uniform capture bridge");
+        assert_eq!(bridge.rows.source_to_artifact, [0, 0, 1]);
+        assert_eq!(bridge.rows.artifacts.len(), 2);
+        let WeightedCaptureReducerBridgeDisposition::Compiled(weighted) =
+            try_compile_weighted_capture_reducer_bridge(&benchmark, target, &bridge)
+                .expect("compile weighted capture reducer")
+        else {
+            panic!("small weighted wrapper must fit its explicit cap")
+        };
+        let receipt = weighted.artifact.receipt();
+        assert_eq!(
+            receipt.operation(),
+            UniformCaptureReducerOperation::CountCaptures
+        );
+        assert_eq!(receipt.source_to_component(), [0, 0, 1]);
+        assert_eq!(receipt.component_first_source_ordinals(), [0, 2]);
+        assert_eq!(receipt.component_weights(), [2, 3]);
+        assert_eq!(
+            receipt.max_object_bytes(),
+            MAX_WEIGHTED_CAPTURE_REDUCER_OBJECT_BYTES
+        );
+        assert_eq!(receipt.relocations().len(), 2);
+        assert!(receipt.reducer_object_bytes() > 0);
+    }
+
+    #[test]
+    fn weighted_capture_reducer_accepts_equal_uniform_row_bridge() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for (model, operation) in [
+            (
+                "count-captures",
+                UniformCaptureReducerOperation::CountCaptures,
+            ),
+            (
+                "grep-captures",
+                UniformCaptureReducerOperation::GrepCaptures,
+            ),
+        ] {
+            let mut klv = fixture(model, b"(a+)", b"aa\nbbb\nab");
+            let insertion = b"pattern:4:(a+)\npattern:4:(b+)\n";
+            let offset = klv
+                .windows(b"haystack".len())
+                .position(|window| window == b"haystack")
+                .expect("haystack field");
+            klv.splice(offset..offset, insertion.iter().copied());
+            let benchmark = Benchmark::parse(&klv).expect("equal capture fixture");
+            let bridge = compile_uniform_capture_bridge(&benchmark, target)
+                .expect("equal uniform capture bridge");
+            assert_eq!(bridge.rows.source_to_artifact, [0, 0, 1]);
+            assert_eq!(bridge.rows.artifacts.len(), 2);
+            assert!(bridge.source_receipts.iter().all(|receipt| {
+                receipt
+                    .participation()
+                    .participating_groups_per_match()
+                    .get()
+                    == 2
+            }));
+
+            let WeightedCaptureReducerBridgeDisposition::Compiled(weighted) =
+                try_compile_weighted_capture_reducer_bridge(&benchmark, target, &bridge)
+                    .expect("compile equal-weight capture reducer")
+            else {
+                panic!("small equal-weight wrapper must fit its explicit cap")
+            };
+            let receipt = weighted.artifact.receipt();
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.source_to_component(), [0, 0, 1]);
+            assert_eq!(receipt.component_first_source_ordinals(), [0, 2]);
+            assert_eq!(receipt.component_weights(), [2, 2]);
+            assert_eq!(receipt.relocations().len(), 2);
+            assert!(receipt.reducer_object_bytes() > 0);
         }
     }
 
@@ -5276,12 +6663,14 @@ mod tests {
         ));
         let strict = compile_strict_capture_bridge(&benchmark, target).expect("strict capture");
         assert!(strict.artifact.authenticates_receipt());
-        assert!(strict
-            .artifact
-            .module()
-            .required_runtime_symbols()
-            .next()
-            .is_none());
+        assert!(
+            strict
+                .artifact
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
         assert_eq!(strict.artifact.receipt().source_cardinality(), 1);
         assert!(strict.artifact.receipt().includes_group_zero());
         assert!(strict.artifact.receipt().group_count() <= MAX_STRICT_CAPTURE_GROUPS);
@@ -5325,17 +6714,21 @@ mod tests {
         assert_eq!(receipt.strategy, expected);
         assert!(receipt.decline.is_none());
         assert_eq!(receipt.semantic_runtime_calls, 0);
-        assert!(bridge
-            .artifact
-            .module()
-            .required_runtime_symbols()
-            .next()
-            .is_none());
-        assert!(bridge
-            .artifact
-            .module()
-            .required_runtime_program()
-            .is_none());
+        assert!(
+            bridge
+                .artifact
+                .module()
+                .required_runtime_symbols()
+                .next()
+                .is_none()
+        );
+        assert!(
+            bridge
+                .artifact
+                .module()
+                .required_runtime_program()
+                .is_none()
+        );
     }
 
     #[test]
@@ -5395,12 +6788,9 @@ mod tests {
             // CaptureNext receipt without manufacturing an impossible branch.
             let strict = compile_strict_capture_bridge(&benchmark, target)
                 .expect("capture-next source compilation");
-            let strict = compile_single_capture_reducer_bridge(
-                &benchmark,
-                target,
-                strict.artifact.into(),
-            )
-            .expect("capture-next whole-operation reducer");
+            let strict =
+                compile_single_capture_reducer_bridge(&benchmark, target, strict.artifact.into())
+                    .expect("capture-next whole-operation reducer");
             let receipt = strict.artifact.receipt();
             assert!(strict.artifact.authenticates_receipt());
             assert_eq!(receipt.operation(), operation);
@@ -5417,7 +6807,8 @@ mod tests {
             assert_eq!(receipt.private_result_slot_count(), receipt.group_count());
             assert_eq!(
                 receipt.private_result_slot_bytes(),
-                receipt.group_count()
+                receipt
+                    .group_count()
                     .checked_mul(
                         usize::try_from(fre_aot_regex::NATIVE_CAPTURE_AOT_V1_RESULT_SLOT_BYTES)
                             .expect("slot width fits usize"),
@@ -5425,12 +6816,14 @@ mod tests {
                     .expect("slot schema fits usize")
             );
             assert_eq!(receipt.semantic_runtime_calls(), 0);
-            assert!(strict
-                .artifact
-                .module()
-                .required_runtime_symbols()
-                .next()
-                .is_none());
+            assert!(
+                strict
+                    .artifact
+                    .module()
+                    .required_runtime_symbols()
+                    .next()
+                    .is_none()
+            );
         }
     }
 
@@ -5442,8 +6835,8 @@ mod tests {
             FeatureSet::EMPTY.bits(),
         )
         .expect("host target");
-        let benchmark = Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab"))
-            .expect("source fixture");
+        let benchmark =
+            Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab")).expect("source fixture");
         let wrong = Benchmark::parse(&fixture("count-captures", b"(c)?b", b"ab"))
             .expect("equal-length wrong-source fixture");
         let ParticipationCaptureBridgeDisposition::Selected(source) =
@@ -5610,21 +7003,25 @@ mod tests {
             required: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES,
             limit: REBAR_PARTICIPATION_RETRY_MAX_DFA_STATES - 1,
         };
-        assert!(compile_selector_capture_fallback_bridge(
-            &benchmark,
-            bridge.rows.artifacts[0].clone(),
-            wrong_limit,
-        )
-        .is_err());
+        assert!(
+            compile_selector_capture_fallback_bridge(
+                &benchmark,
+                bridge.rows.artifacts[0].clone(),
+                wrong_limit,
+            )
+            .is_err()
+        );
 
         let count_benchmark = Benchmark::parse(&fixture("count-captures", b"(a)?b", b"ab"))
             .expect("count capture fixture");
-        assert!(compile_selector_capture_fallback_bridge(
-            &count_benchmark,
-            bridge.rows.artifacts.into_iter().next().expect("one row"),
-            exhaustion,
-        )
-        .is_err());
+        assert!(
+            compile_selector_capture_fallback_bridge(
+                &count_benchmark,
+                bridge.rows.artifacts.into_iter().next().expect("one row"),
+                exhaustion,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5775,8 +7172,7 @@ mod tests {
             "general-aot-linked-complete-spans-prepared-v3-required-ordered-nfa-v15",
         );
         assert_eq!(
-            Model::GrepCount
-                .adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
+            Model::GrepCount.adapter_for_required_capabilities(PREPARE_CAPABILITY_ORDERED_NFA_V15,),
             "general-aot-linked-native-grep-count-reducer-prepared-v3-required-ordered-nfa-v15",
         );
         assert_eq!(
@@ -5807,10 +7203,17 @@ mod tests {
                 assert!(!is_native_whole_scalar_reducer(model, strategy));
             }
         }
+        assert!(!is_native_whole_scalar_reducer(
+            Model::GrepCount,
+            Some(PreparedAggregateStrategy::NativeFused),
+        ));
+        assert!(is_native_whole_scalar_reducer(
+            Model::GrepCount,
+            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
+        ));
         for model in [
             Model::Compile,
             Model::CountCaptures,
-            Model::GrepCount,
             Model::GrepCaptures,
             Model::RegexRedux,
         ] {
@@ -5819,10 +7222,69 @@ mod tests {
                 Some(PreparedAggregateStrategy::NativeFused),
             ));
         }
-        assert!(is_native_whole_scalar_reducer(
-            Model::GrepCount,
-            Some(PreparedAggregateStrategy::NativeOrderedNfaFused),
-        ));
+    }
+
+    #[test]
+    fn static_scalar_admission_rejects_a_runtime_helper_artifact() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        let helper_backed = fre_aot_regex::compile_with_prepared_aggregate_exports(
+            CompileRequest::new(r"\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}", target)
+                .output(OutputContract::Span)
+                .mode(CompileMode::Fast),
+            PreparedAggregateExports::COUNT,
+        )
+        .expect("helper-backed Count artifact");
+        assert_eq!(
+            helper_backed.receipt().prepared_aggregate_strategy,
+            Some(PreparedAggregateStrategy::RuntimeHelper),
+        );
+        let error = match admit_native_whole_scalar_reducer(Model::Count, helper_backed) {
+            Ok(_) => panic!("static scalar admission accepted RuntimeHelper"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "general AOT count compilation did not publish an authenticated native whole-operation reducer",
+        );
+    }
+
+    #[test]
+    fn static_scalar_admission_preserves_authenticated_native_artifacts() {
+        let target = target_from_parts(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            FeatureSet::EMPTY.bits(),
+        )
+        .expect("host target");
+        for model_name in ["count", "count-spans"] {
+            let benchmark = Benchmark::parse(&fixture(model_name, b"a+", b"baa"))
+                .expect("native scalar fixture");
+            let compiled = compile_with_prepared_aggregate_exports_and_slow_aot_limits(
+                CompileRequest::new(benchmark.pattern(), target)
+                    .profile(RustProfile::rebar_1_12_4())
+                    .output(benchmark.model.output())
+                    .mode(CompileMode::Optimizing)
+                    .limits(CompileLimitsV1::default()),
+                benchmark.model.exports(),
+                SlowAotLimits::default(),
+            )
+            .expect("native scalar artifact");
+            assert!(
+                authenticate_native_whole_scalar_reducer(benchmark.model, &compiled)
+                    .expect("authenticate native scalar artifact"),
+            );
+            let expected_object = compiled.object().to_vec();
+            let expected_receipt = compiled.receipt().clone();
+            let admitted = admit_native_whole_scalar_reducer(benchmark.model, compiled)
+                .expect("admit authenticated native scalar artifact");
+            assert_eq!(admitted.object(), expected_object);
+            assert_eq!(admitted.receipt(), &expected_receipt);
+        }
     }
 
     #[test]

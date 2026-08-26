@@ -11169,6 +11169,25 @@ impl CompiledProgram {
         .map(Box::new);
     }
 
+    pub(crate) fn attach_native_finite_language_checked(
+        &mut self,
+        candidate: NativeFiniteLanguageCandidate,
+    ) -> Result<(), LowerError> {
+        self.native_finite_language = None;
+        if self.engine_selection_reason == Some(EngineSelectionReason::FastMode) {
+            return Err(LowerError::InternalInvariant {
+                detail: "checked finite-language sidecar reached a Fast-mode program",
+            });
+        }
+        self.native_finite_language = NativeFiniteLanguageProgram::bind_checked(
+            candidate,
+            self.identity.artifact,
+            self.output,
+        )?
+        .map(Box::new);
+        Ok(())
+    }
+
     pub(crate) fn attach_native_finite_language_for_lower_state_rescue(
         &mut self,
         candidate: NativeFiniteLanguageCandidate,
@@ -11237,6 +11256,23 @@ impl CompiledProgram {
     ) -> Option<NativeFiniteSelectedEndTeddyView<'_>> {
         self.native_finite_language_program()?
             .native_selected_end_teddy_view(self.identity.artifact, self.output)
+    }
+
+    /// Return an independently re-authenticated proof that an exact finite
+    /// `SelectedEnd` language is non-empty, non-nullable, assertion-free, and
+    /// contains neither CR nor LF.
+    pub(crate) fn native_finite_selected_end_grep_count_view(
+        &self,
+    ) -> Option<crate::finite_language::NativeFiniteSelectedEndGrepCountView> {
+        self.native_finite_language_program()?
+            .native_selected_end_grep_count_view(self.identity.artifact, self.output)
+    }
+
+    /// Return the source-fact-authenticated exact singleton witness retained
+    /// only for the explicit whole-haystack Count portfolio.
+    pub(crate) fn native_exact_singleton_count_literal(&self) -> Option<&[u8]> {
+        self.native_finite_language_program()?
+            .exact_singleton_literal(self.identity.artifact, self.output)
     }
 
     /// Return the bounded graph-derived fixed-prefix facts.
@@ -30477,16 +30513,20 @@ mod tests {
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 PROGRAM_FORMAT_VERSION_V7
             );
-            assert!(compiled.automaton.has_epsilon_closure_dispatch());
+            // The small graph retains the selective suffix without paying for
+            // a separate epsilon-dispatch owner.
+            assert!(!compiled.automaton.has_epsilon_closure_dispatch());
             assert_eq!(
                 bytes[15],
-                PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
-                    | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
-                    | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
+                PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
             );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
             assert!(restored.nfa_mandatory_suffix.is_some());
+            assert_eq!(
+                restored.automaton.has_epsilon_closure_dispatch(),
+                compiled.automaton.has_epsilon_closure_dispatch()
+            );
             assert_eq!(
                 restored.bit_parallel_exists_stats(),
                 compiled.bit_parallel_exists_stats()
@@ -47991,11 +48031,10 @@ mod tests {
             },
         );
         let bytes = fallback.serialize().unwrap();
+        assert!(!fallback.automaton.has_epsilon_closure_dispatch());
         assert_eq!(
             bytes[15],
-            PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
-                | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
-                | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
+            PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
         );
 
         let mut missing_optimizing_marker = bytes.clone();

@@ -703,8 +703,8 @@ pub struct FreAotRegexIterStateV1 {
     pub reserved: u32,
 }
 
-/// One independent byte haystack accepted by a compiler-produced prepared
-/// Exists-batch entry.
+/// One independent byte haystack accepted by a compiler-produced Exists-batch
+/// entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct FreAotRegexHaystackV1 {
@@ -751,6 +751,28 @@ pub type FreAotRegexExclusiveSpanFillV1 = unsafe extern "C" fn(
 /// null input/output arrays, and publishes a processed count of zero.
 pub type FreAotRegexExclusiveExistsBatchV1 = unsafe extern "C" fn(
     FreAotRegexExclusiveHandleV1,
+    *const FreAotRegexHaystackV1,
+    usize,
+    *mut u8,
+    *mut usize,
+) -> u32;
+
+/// Compiler-produced handle-free Exists-batch entry for a self-contained
+/// direct program.
+///
+/// Status zero means all independent haystacks were processed. After top-level
+/// argument validation, `processed_out` is initialized to zero. When the call
+/// returns, it counts the completely initialized `matched_out` prefix; every
+/// initialized byte is exactly zero or one. A later invalid descriptor or
+/// ordinary-entry failure returns the exact completed prefix. A zero input
+/// count is valid, permits null input/output arrays, and publishes a processed
+/// count of zero.
+///
+/// For a nonzero count, the descriptor and output arrays are live for the
+/// complete call, every descriptor pointer is nonnull even for an empty
+/// haystack, and its length is in the signed address domain. Input and output
+/// extents do not overlap.
+pub type FreAotRegexIndependentExistsBatchV1 = unsafe extern "C" fn(
     *const FreAotRegexHaystackV1,
     usize,
     *mut u8,
@@ -10602,6 +10624,7 @@ mod tests {
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ITER_FINISHED 4u"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanFillV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveExistsBatchV1"));
+        assert!(C_API_V1_HEADER.contains("FreAotRegexIndependentExistsBatchV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveCountV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanSumV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveGrepCountV1"));
@@ -10648,6 +10671,10 @@ mod tests {
         );
         assert_eq!(
             size_of::<FreAotRegexExclusiveExistsBatchV1>(),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            size_of::<FreAotRegexIndependentExistsBatchV1>(),
             size_of::<usize>()
         );
         assert_eq!(size_of::<FreAotRegexExclusiveCountV1>(), size_of::<usize>());

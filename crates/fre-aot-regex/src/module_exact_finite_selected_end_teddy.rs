@@ -22,6 +22,7 @@ const EXACT_FINITE_TEDDY_MATERIAL_GAIN_DENOMINATOR: u128 = 8;
 const EXACT_FINITE_LITERAL_BYTE_VERIFICATION_UNITS: u128 = 11;
 const EXACT_FINITE_LITERAL_DISPATCH_UNITS: u128 = 8;
 const EXACT_FINITE_TEDDY_RUNTIME_VERIFICATION_BUDGET: u16 = 64;
+const EXACT_FINITE_TEDDY_ASIMD_VERIFIER_BYTES: u16 = 16;
 /// Frozen before timing: the scalable Teddy miss path scans four complete
 /// runtime vectors while retaining each block's bucket vector. Candidate
 /// predicates are materialized only after the batch is known to contain a hit.
@@ -1322,6 +1323,22 @@ fn aarch64_exact_mov_w(destination: u8, source: u8) -> Result<u32, ObjectError> 
     Ok(0x2a00_03e0 | aarch64_reg(source, 16)? | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_exact_load_q_post_imm(
+    destination: u8,
+    base: u8,
+    byte_offset: i16,
+) -> Result<u32, ObjectError> {
+    if !(-256..=255).contains(&byte_offset) {
+        return Err(ObjectError::InvalidModule("AArch64 LDR Q post-index"));
+    }
+    Ok(0x3cc0_0400
+        | (u32::try_from(i32::from(byte_offset) & 0x01ff)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 LDR Q post-index"))?
+            << 12)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_emit_exact_teddy_sve_first_candidate(
     assembler: &mut Aarch64Assembler,
     candidates: u8,
@@ -1404,6 +1421,7 @@ fn lower_aarch64_wrapper(
     layout: ExactFiniteSelectedEndTeddyDataLayout,
     lane_index_offset: Option<u32>,
     selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    use_asimd_exact_verifier: bool,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>, usize), ObjectError> {
     let teddy = layout.teddy;
     if incumbent_code.is_empty()
@@ -1476,7 +1494,12 @@ fn lower_aarch64_wrapper(
             ))?;
             assembler.instruction(aarch64_cmp_x_imm(12, required)?)?;
             assembler.branch_cond(AARCH64_LO, scalar)?;
-            aarch64_emit_mandatory_teddy_asimd_candidates(&mut assembler, teddy)?;
+            aarch64_emit_mandatory_teddy_asimd_candidates(
+                &mut assembler,
+                teddy,
+                vector,
+                None,
+            )?;
             assembler.branch_cond(AARCH64_NE, vector_candidate)?;
             assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
             assembler.branch(vector)?;
@@ -1513,7 +1536,7 @@ fn lower_aarch64_wrapper(
             let partial = assembler.label()?;
             let single_candidate = assembler.label()?;
             let batch_candidate = assembler.label()?;
-            let batch_plan = aarch64_mandatory_teddy_sve_batch_plan(&teddy.plan)?;
+            let batch_plan = aarch64_mandatory_teddy_column_plan(&teddy.plan)?;
             let single_prefix_vector = if selection_basis
                 == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility
                 && batch_plan.single_prefix_max_vector_bytes.is_some()
@@ -1708,6 +1731,33 @@ fn lower_aarch64_wrapper(
     assembler.instruction(aarch64_mov_x(1, 15)?)?; // preserve selected width
     assembler.instruction(aarch64_exact_mov_w(10, 15)?)?;
     assembler.instruction(aarch64_add_x_reg(13, 0, 2)?)?;
+    if use_asimd_exact_verifier {
+        let wide_exact_loop = assembler.label()?;
+        let vector_byte_offset = i16::try_from(EXACT_FINITE_TEDDY_ASIMD_VERIFIER_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 exact verifier vector width"))?;
+        // Every selected literal is at least one complete ASIMD vector. Keep
+        // the public width/result registers and Teddy's retained state live;
+        // V0/V1 and W16 are leaf-local scratch. A residue of one through
+        // fifteen falls into the unchanged byte verifier below.
+        assembler.bind(wide_exact_loop)?;
+        assembler.instruction(aarch64_exact_load_q_post_imm(0, 13, vector_byte_offset)?)?;
+        assembler.instruction(aarch64_exact_load_q_post_imm(1, 14, vector_byte_offset)?)?;
+        assembler.instruction(aarch64_eor_16b(0, 0, 1)?)?;
+        assembler.instruction(aarch64_umaxv_16b(0, 0)?)?;
+        assembler.instruction(aarch64_umov_b0(16, 0)?)?;
+        assembler.branch_nonzero_w(16, ordinal_failed)?;
+        assembler.instruction(aarch64_sub_w_imm(
+            10,
+            10,
+            EXACT_FINITE_TEDDY_ASIMD_VERIFIER_BYTES,
+        )?)?;
+        assembler.branch_zero_w(10, matched)?;
+        assembler.instruction(aarch64_cmp_w_imm(
+            10,
+            EXACT_FINITE_TEDDY_ASIMD_VERIFIER_BYTES,
+        )?)?;
+        assembler.branch_cond(AARCH64_HS, wide_exact_loop)?;
+    }
     assembler.bind(exact_loop)?;
     assembler.instruction(aarch64_load_byte_post_imm(16, 13, 1)?)?;
     assembler.instruction(aarch64_load_byte_post_imm(17, 14, 1)?)?;
@@ -2190,13 +2240,16 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
             (code, wrapper_relocations, core_offset)
         }
         Architecture::Aarch64 => {
-            let (code, mut wrapper_relocations, core_offset) =
-                lower_aarch64_wrapper(
-                    &incumbent_code,
-                    verifier_layout,
-                    lane_index_offset,
-                    selection_basis,
-                )?;
+            let use_asimd_exact_verifier = target.features.has(CpuFeature::Aarch64Asimd)
+                && selection.view.minimum_width()
+                    >= u32::from(EXACT_FINITE_TEDDY_ASIMD_VERIFIER_BYTES);
+            let (code, mut wrapper_relocations, core_offset) = lower_aarch64_wrapper(
+                &incumbent_code,
+                verifier_layout,
+                lane_index_offset,
+                selection_basis,
+                use_asimd_exact_verifier,
+            )?;
             let rebased = checked_rebase_relocations(
                 incumbent_relocations,
                 incumbent_code.len(),
@@ -3005,6 +3058,101 @@ mod tests {
         pattern
     }
 
+    fn fourth_column_disambiguation_pattern() -> String {
+        // The first three bytes deliberately have a common modeled
+        // fingerprint while the fourth separates the sources. Long exact
+        // verifiers make that fourth column win the unchanged forced V2 cost
+        // ordering, so this fixture truly emits all eight constant tables.
+        const LITERAL_BYTES: usize = 192;
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, fourth) in SCANNER_FREE_BYTES.into_iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for byte in [
+                0xc0 + u8::try_from(ordinal % 2).unwrap(),
+                b'\n',
+                0x01,
+                fourth,
+                u8::try_from(ordinal).unwrap(),
+                0xee,
+            ] {
+                pattern.push_str(&format!("\\x{byte:02x}"));
+            }
+            for _ in 6..LITERAL_BYTES {
+                pattern.push_str("\\xee");
+            }
+            if ordinal + 1 == SCANNER_FREE_BYTES.len() {
+                pattern.push_str("\\xc8");
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    fn exact_verifier_boundary_literals(minimum_width: usize) -> Vec<Vec<u8>> {
+        assert!(matches!(minimum_width, 15 | 16));
+        [minimum_width, 17, 31, 32, 33, 47, 48, 63]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, width)| {
+                (0..width)
+                    .map(|index| {
+                        if index == 0 {
+                            SCANNER_FREE_BYTES[ordinal]
+                        } else {
+                            let value = ordinal
+                                .checked_mul(53)
+                                .and_then(|value| value.checked_add(index * 29))
+                                .unwrap()
+                                % 251;
+                            u8::try_from(value).unwrap()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn exact_verifier_boundary_pattern(minimum_width: usize) -> String {
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, literal) in exact_verifier_boundary_literals(minimum_width)
+            .iter()
+            .enumerate()
+        {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for byte in literal {
+                pattern.push_str(&format!("\\x{byte:02x}"));
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    fn exact_verifier_late_ordinal_pattern() -> (String, Vec<u8>) {
+        let mut literals = exact_verifier_boundary_literals(16);
+        literals[0] = (0_u8..32)
+            .map(|index| if index < 20 { 0x42 } else { 0x11 })
+            .collect();
+        literals[1] = (0_u8..32)
+            .map(|index| if index < 20 { 0x42 } else { 0x22 })
+            .collect();
+        let expected = literals[1].clone();
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, literal) in literals.iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for byte in literal {
+                pattern.push_str(&format!("\\x{byte:02x}"));
+            }
+        }
+        pattern.push(')');
+        (pattern, expected)
+    }
+
     fn sve_batch_column_schedule(column: u8, initialize: bool) -> Vec<u32> {
         let mut schedule = Vec::new();
         schedule.push(aarch64_add_x_reg(12, 0, 2).unwrap());
@@ -3212,7 +3360,7 @@ mod tests {
             program.native_dynamic_rows_view(),
             program
                 .native_ordered_nfa_view()
-                .map(|view| (view, usize::MAX)),
+                .map(|view| (view, usize::MAX, true)),
             target,
         )
         .unwrap()
@@ -4620,6 +4768,91 @@ mod tests {
     }
 
     #[test]
+    fn sve_teddy_tables_use_exact_fixed_ld1rqb_offsets_for_three_and_four_columns() {
+        let three_columns = sparse_single_prefix_three_column_pattern();
+        let four_columns = fourth_column_disambiguation_pattern();
+        for features in [
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+        ] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            for (pattern, expected_columns) in
+                [(three_columns.as_str(), 3_u8), (four_columns.as_str(), 4)]
+            {
+                let forced = force_v2(pattern, target);
+                let report = forced
+                    .receipt_v2()
+                    .exact_finite_selected_end_teddy_aot
+                    .expect("forced SVE exact Teddy report")
+                    .lowering;
+                let selection = select_exact_finite_selected_end_teddy_forced_v2(
+                    forced
+                        .program()
+                        .native_finite_selected_end_teddy_view()
+                        .unwrap(),
+                    target,
+                    report.incumbent_complete_dfa,
+                )
+                .expect("structurally eligible exact Teddy selection");
+                assert_eq!(selection.plan.columns(), expected_columns);
+
+                assert_eq!(report.columns, expected_columns);
+                let table_base = usize::try_from(report.table_base).unwrap();
+                let table_end = usize::try_from(report.table_end).unwrap();
+                assert!(table_base.is_multiple_of(16));
+                assert_eq!(
+                    table_end - table_base,
+                    usize::from(expected_columns) * AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN,
+                );
+                let data = forced.module().sections()[1].bytes();
+                let bank = selection.plan.bank(0).unwrap();
+                for column in 0..usize::from(expected_columns) {
+                    let low = table_base + column * AARCH64_MANDATORY_TEDDY_TABLE_BYTES_PER_COLUMN;
+                    let high = low + 16;
+                    assert_eq!(&data[low..high], bank.low(column).unwrap());
+                    assert_eq!(&data[high..high + 16], bank.high(column).unwrap());
+                }
+
+                let table_count = expected_columns * 2;
+                let loads = (0..table_count)
+                    .map(|table| {
+                        aarch64_sve_ld1rqb_imm(16 + table, 12, i16::from(table) * 16).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    table_base + usize::from(table_count - 1) * 16 + 16,
+                    table_end,
+                );
+                let words = forced.module().sections()[TEXT_SECTION].bytes()
+                    [..report.incumbent_code_offset]
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    words
+                        .windows(loads.len())
+                        .filter(|window| *window == loads)
+                        .count(),
+                    1,
+                    "one contiguous fixed-offset constant schedule: {target:?}/{expected_columns}",
+                );
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word & 0xfff0_fc00 == 0xa400_2000)
+                        .count(),
+                    usize::from(table_count),
+                    "only the authenticated table loads use LD1RQB: {target:?}/{expected_columns}",
+                );
+                assert!(
+                    !words.contains(&aarch64_add_x_imm(12, 12, 16).unwrap()),
+                    "fixed-offset loads must retire the serial table-base update: {target:?}/{expected_columns}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sve_inclusive_prefix_extracts_the_exact_first_and_retried_bucket() {
         for vector_length in (16_usize..=256).step_by(16) {
             let buckets = (0..vector_length)
@@ -5078,6 +5311,197 @@ mod tests {
             assert!(words.contains(&aarch64_mov_x(21, 2).unwrap()));
             assert!(words.contains(&aarch64_sve_addvl(2, 21, 1).unwrap()));
         }
+    }
+
+    #[test]
+    fn aarch64_exact_q_post_index_encoder_matches_oracle_and_rejects_invalid_inputs() {
+        assert_eq!(
+            aarch64_exact_load_q_post_imm(0, 13, 16).unwrap(),
+            0x3cc1_05a0,
+        );
+        assert_eq!(
+            aarch64_exact_load_q_post_imm(1, 14, 16).unwrap(),
+            0x3cc1_05c1,
+        );
+        assert!(aarch64_exact_load_q_post_imm(0, 0, -256).is_ok());
+        assert!(aarch64_exact_load_q_post_imm(31, 31, 255).is_ok());
+        assert!(aarch64_exact_load_q_post_imm(0, 0, -257).is_err());
+        assert!(aarch64_exact_load_q_post_imm(0, 0, 256).is_err());
+        assert!(aarch64_exact_load_q_post_imm(32, 0, 16).is_err());
+        assert!(aarch64_exact_load_q_post_imm(0, 32, 16).is_err());
+    }
+
+    #[test]
+    fn aarch64_exact_verifier_uses_asimd_only_with_feature_and_full_vector_minimum() {
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let mixed = asimd
+            .with(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let pattern16 = exact_verifier_boundary_pattern(16);
+        let pattern15 = exact_verifier_boundary_pattern(15);
+
+        let wide_head = [
+            aarch64_exact_load_q_post_imm(0, 13, 16).unwrap(),
+            aarch64_exact_load_q_post_imm(1, 14, 16).unwrap(),
+            aarch64_eor_16b(0, 0, 1).unwrap(),
+            aarch64_umaxv_16b(0, 0).unwrap(),
+            aarch64_umov_b0(16, 0).unwrap(),
+        ];
+        for features in [asimd, mixed] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            let compiled = force_v2(&pattern16, target);
+            let report = compiled
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .expect("wide exact verifier fixture");
+            assert_eq!(report.lowering.minimum_width, 16);
+            let words = compiled.module().sections()[TEXT_SECTION].bytes()
+                [..report.lowering.incumbent_code_offset]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let matches = words
+                .windows(wide_head.len())
+                .enumerate()
+                .filter(|(_, window)| *window == wide_head)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "target={target:?}");
+            let wide = matches[0];
+            let vector_destinations = [
+                u8::try_from(words[wide] & 0x1f).unwrap(),
+                u8::try_from(words[wide + 1] & 0x1f).unwrap(),
+                u8::try_from(words[wide + 2] & 0x1f).unwrap(),
+                u8::try_from(words[wide + 3] & 0x1f).unwrap(),
+            ];
+            assert_eq!(vector_destinations, [0, 1, 0, 0]);
+            for retained in [24, 25, 27, 28] {
+                assert!(
+                    !vector_destinations.contains(&retained),
+                    "the exact leaf must not write retained Z/V{retained}: {target:?}",
+                );
+            }
+            assert_eq!(
+                words[wide + 5] & 0xff00_001f,
+                0x3500_0010,
+                "CBNZ W16 must reject a nonzero vector reduction: {target:?}",
+            );
+            assert_eq!(words[wide + 6], aarch64_sub_w_imm(10, 10, 16).unwrap(),);
+            assert_eq!(words[wide + 7] & 0xff00_001f, 0x3400_000a);
+            assert_eq!(words[wide + 8], aarch64_cmp_w_imm(10, 16).unwrap());
+            assert_eq!(words[wide + 9] & 0xff00_001f, 0x5400_0002);
+            // The first five exact words above are two Q loads and three
+            // ASIMD operations. The remaining five exact words asserted here
+            // are scalar CBNZ/SUB/CBZ/CMP/B.cond instructions. Thus this
+            // complete inserted block contains no predicate-register write;
+            // in particular, retained P0..P4/P10 remain untouched.
+            let loop_delta =
+                (i32::try_from((words[wide + 9] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            assert_eq!(
+                isize::try_from(wide + 9).unwrap() + loop_delta as isize,
+                isize::try_from(wide).unwrap(),
+                "B.HS must close the vector loop: {target:?}",
+            );
+            assert_eq!(
+                words[wide + 10],
+                aarch64_load_byte_post_imm(16, 13, 1).unwrap(),
+                "a one-through-fifteen-byte residue must enter the scalar verifier",
+            );
+        }
+
+        for (features, pattern) in [
+            (sve, pattern16.as_str()),
+            (sve2, pattern16.as_str()),
+            (asimd, pattern15.as_str()),
+            (mixed, pattern15.as_str()),
+        ] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            let compiled = force_v2(pattern, target);
+            let report = compiled
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .expect("scalar exact verifier fixture");
+            let words = compiled.module().sections()[TEXT_SECTION].bytes()
+                [..report.lowering.incumbent_code_offset]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert!(
+                !words
+                    .windows(wide_head.len())
+                    .any(|window| window == wide_head),
+                "pure SVE/SVE2 and sub-vector minima remain scalar: {target:?}",
+            );
+            assert!(
+                words.windows(3).any(|window| {
+                    window
+                        == [
+                            aarch64_load_byte_post_imm(16, 13, 1).unwrap(),
+                            aarch64_load_byte_post_imm(17, 14, 1).unwrap(),
+                            aarch64_cmp_w(16, 17).unwrap(),
+                        ]
+                }),
+                "scalar verifier must remain present: {target:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn aarch64_asimd_selected_end_teddy_uses_authoritative_pair_miss() {
+        let compiled = compile_selected(
+            &scanner_free_exact_finite_pattern(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        );
+        let report = compiled
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("exact finite SelectedEnd Teddy receipt");
+        let words = compiled.module().sections()[TEXT_SECTION].bytes()
+            [..report.incumbent_code_offset]
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert!(
+            words.windows(5).any(|window| {
+                window[0] == aarch64_umaxv_16b(7, 24).unwrap()
+                    && window[1] == aarch64_umov_b0(12, 7).unwrap()
+                    && window[2] & 0xff00_001f == 0x3500_000c
+                    && window[3] == aarch64_add_x_imm(2, 2, 16).unwrap()
+                    && window[4] & 0xfc00_0000 == 0x1400_0000
+            }),
+            "selected-end wrapper has no authoritative two-column miss edge",
+        );
+        assert!(
+            words.windows(4).any(|window| {
+                window
+                    == [
+                        aarch64_cmtst_16b(24, 24, 24).unwrap(),
+                        aarch64_umaxv_16b(7, 24).unwrap(),
+                        aarch64_umov_b0(12, 7).unwrap(),
+                        aarch64_cmp_w_zero(12).unwrap(),
+                    ]
+            }),
+            "selected-end wrapper does not publish its final exact lane mask",
+        );
+        assert!(
+            words.windows(6).any(|window| {
+                window
+                    == [
+                        aarch64_mov_x(21, 2).unwrap(),
+                        aarch64_orr_16b(28, 24, 24).unwrap(),
+                        aarch64_bsl_16b(28, 29, 31).unwrap(),
+                        aarch64_uminv_16b(28, 28).unwrap(),
+                        aarch64_umov_b0(12, 28).unwrap(),
+                        aarch64_add_x_reg(2, 21, 12).unwrap(),
+                    ]
+            }),
+            "selected-end wrapper no longer reaches exact first-lane selection",
+        );
     }
 
     #[test]
@@ -5596,12 +6020,14 @@ mod tests {
         let Some(target) = linked_host_target() else {
             return;
         };
-        let mut cases = Vec::<(String, Vec<(Vec<u8>, usize, usize)>, bool)>::new();
+        type LinkedCase = (Target, String, Vec<(Vec<u8>, usize, usize)>, bool);
+        let mut cases = Vec::<LinkedCase>::new();
         for long_first in [false, true] {
             let mut order_long = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
             order_long[83..90].fill(0xaa);
             let order_len = order_long.len();
             cases.push((
+                target,
                 scanner_free_overlapping_pattern(long_first),
                 vec![
                     (order_long.clone(), 17, order_len),
@@ -5673,6 +6099,7 @@ mod tests {
         collision_budget_positive[budget_match..].fill(0);
         let collision_budget_len = collision_budget_negative.len();
         cases.push((
+            target,
             collision_pattern,
             vec![
                 (
@@ -5694,7 +6121,7 @@ mod tests {
         cases
             .last_mut()
             .expect("collision case")
-            .1
+            .2
             .push((binary_eof, 23, binary_len));
 
         let sparse_pattern = sparse_single_prefix_pattern();
@@ -5720,6 +6147,7 @@ mod tests {
         tail_hit[tail_base..].copy_from_slice(&sparse_literals[3]);
         let tail_hit_len = tail_hit.len();
         cases.push((
+            target,
             sparse_pattern,
             vec![
                 (singleton_miss, 17, singleton_miss_len),
@@ -5731,6 +6159,55 @@ mod tests {
             true,
         ));
 
+        let mut guard_artifact = None;
+        if target.architecture == Architecture::Aarch64 {
+            let wide_target = target
+                .with_features(target.features.with(CpuFeature::Aarch64Asimd))
+                .expect("the host AArch64 target accepts its mandatory ASIMD feature");
+            let literals = exact_verifier_boundary_literals(16);
+            let mut windows = Vec::new();
+            for literal in &literals {
+                for residue in 0..16 {
+                    let base = 64 + residue;
+                    let mut haystack = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+                    haystack[base..base + literal.len()].copy_from_slice(literal);
+                    let end = haystack.len();
+                    windows.push((haystack, 7, end));
+                }
+                for mismatch in 0..literal.len() {
+                    let base = 96 + mismatch % 16;
+                    let mut haystack = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+                    let mut changed = literal.clone();
+                    changed[mismatch] ^= 0x80;
+                    haystack[base..base + changed.len()].copy_from_slice(&changed);
+                    let end = haystack.len();
+                    windows.push((haystack, 7, end));
+                }
+                let mut eof = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + literal.len() + 17];
+                let base = eof.len() - literal.len();
+                eof[base..].copy_from_slice(literal);
+                let end = eof.len();
+                windows.push((eof, 7, end));
+            }
+            guard_artifact = Some(cases.len());
+            cases.push((
+                wide_target,
+                exact_verifier_boundary_pattern(16),
+                windows,
+                true,
+            ));
+
+            // The first source matches the first vector and fails in the
+            // second; the next source then succeeds. This exercises ordered
+            // retry after vector-local pointer/count mutation.
+            let (pattern, later_source) = exact_verifier_late_ordinal_pattern();
+            let mut haystack = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+            let base = 97;
+            haystack[base..base + later_source.len()].copy_from_slice(&later_source);
+            let end = haystack.len();
+            cases.push((wide_target, pattern, vec![(haystack, 7, end)], true));
+        }
+
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -5740,10 +6217,13 @@ mod tests {
             std::process::id(),
         ));
         fs::create_dir_all(&directory).unwrap();
-        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n#include <sys/mman.h>\n#include <unistd.h>\n#ifndef MAP_ANONYMOUS\n#define MAP_ANONYMOUS MAP_ANON\n#endif\n",
+        );
         let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
         let mut objects = Vec::new();
-        for (artifact, (pattern, windows, forced_v2)) in cases.iter().enumerate() {
+        let mut guard_symbol = None;
+        for (artifact, (case_target, pattern, windows, forced_v2)) in cases.iter().enumerate() {
             if *forced_v2
                 && let Ok(expected) = std::env::var("FRE_EXPECT_SVE_VECTOR_LENGTH_BYTES")
             {
@@ -5755,7 +6235,7 @@ mod tests {
                 assert_eq!(actual, expected.parse::<u16>().unwrap());
             }
             let (symbol, object_bytes) = if *forced_v2 {
-                let compiled = force_v2(pattern, target);
+                let compiled = force_v2(pattern, *case_target);
                 let report = compiled
                     .receipt_v2()
                     .exact_finite_selected_end_teddy_aot
@@ -5769,14 +6249,17 @@ mod tests {
                     compiled.object().to_vec(),
                 )
             } else {
-                let compiled = compile_selected(pattern, target);
+                let compiled = compile_selected(pattern, *case_target);
                 (
                     compiled.module().entry_symbol().to_owned(),
                     compiled.object().to_vec(),
                 )
             };
+            if guard_artifact == Some(artifact) {
+                guard_symbol = Some(symbol.clone());
+            }
             let reference = compile(
-                CompileRequest::new(pattern, target)
+                CompileRequest::new(pattern, *case_target)
                     .mode(CompileMode::Fast)
                     .output(OutputContract::SelectedEnd),
             )
@@ -5797,7 +6280,12 @@ mod tests {
                     .join(",");
                 writeln!(
                     source,
-                    "static const unsigned char h{artifact}_{window_index}[]={{{bytes}}};",
+                    "{}static const unsigned char h{artifact}_{window_index}[]={{{bytes}}};",
+                    if guard_artifact == Some(artifact) {
+                        "_Alignas(16) "
+                    } else {
+                        ""
+                    },
                 )
                 .unwrap();
                 let expected = reference
@@ -5809,7 +6297,7 @@ mod tests {
                     haystack.len(),
                 )
                 .unwrap();
-                let failure = 10 + artifact * 10 + window_index;
+                let failure = 1 + (10 + artifact * 10 + window_index) % 254;
                 match expected {
                     MatchResult::SelectedEnd(Some(selected_end)) => writeln!(
                         calls,
@@ -5829,6 +6317,38 @@ mod tests {
                 80 + artifact,
             )
             .unwrap();
+        }
+        if let Some(symbol) = guard_symbol {
+            let literals = exact_verifier_boundary_literals(16);
+            for (ordinal, literal) in literals.iter().enumerate() {
+                let bytes = literal
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                writeln!(
+                    source,
+                    "static const unsigned char guard_literal_{ordinal}[]={{{bytes}}};",
+                )
+                .unwrap();
+            }
+            let guard_len = EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256;
+            writeln!(
+                calls,
+                "long guard_page=sysconf(_SC_PAGESIZE);if(guard_page<=0)return 220;size_t guard_pages=({guard_len}+(size_t)guard_page-1)/(size_t)guard_page;size_t guard_map_bytes=(guard_pages+1)*(size_t)guard_page;unsigned char*guard_map=(unsigned char*)mmap(0,guard_map_bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);if(guard_map==MAP_FAILED)return 221;if(mprotect(guard_map+guard_pages*(size_t)guard_page,(size_t)guard_page,PROT_NONE)!=0)return 222;unsigned char*guard_hay=guard_map+guard_pages*(size_t)guard_page-{guard_len};",
+            )
+            .unwrap();
+            for (ordinal, literal) in literals.iter().enumerate() {
+                writeln!(
+                    calls,
+                    "memset(guard_hay,255,{guard_len});memcpy(guard_hay+{guard_len}-{},guard_literal_{ordinal},{});r[0]=91;r[1]=92;s={symbol}(guard_hay,{guard_len},0,{guard_len},r);if(s!=1||r[0]!={guard_len}||r[1]!={guard_len})return {};",
+                    literal.len(),
+                    literal.len(),
+                    223 + ordinal,
+                )
+                .unwrap();
+            }
+            calls.push_str("if(munmap(guard_map,guard_map_bytes)!=0)return 239;\n");
         }
         calls.push_str("return 0;}\n");
         source.push_str(&calls);

@@ -41,7 +41,7 @@ typedef struct FreAotRegexIterStateV1 {
     uint32_t reserved;
 } FreAotRegexIterStateV1;
 
-/* One independent byte haystack in a prepared Exists batch. */
+/* One independent byte haystack in a compiler-produced Exists batch. */
 typedef struct FreAotRegexHaystackV1 {
     const uint8_t *ptr;
     size_t len;
@@ -116,6 +116,26 @@ typedef uint32_t (*FreAotRegexExclusiveSpanFillV1)(
  */
 typedef uint32_t (*FreAotRegexExclusiveExistsBatchV1)(
     FreAotRegexExclusiveHandleV1 handle,
+    const FreAotRegexHaystackV1 *haystacks,
+    size_t count,
+    uint8_t *matched_out,
+    size_t *processed_out);
+
+/*
+ * Handle-free counterpart for a self-contained direct Exists program. Status
+ * 0 means every input was processed. After top-level argument validation,
+ * processed_out starts at zero. When the call returns, it counts the
+ * completely initialized matched_out prefix; each initialized byte is exactly
+ * 0 or 1. A later invalid descriptor or ordinary-entry failure returns the
+ * exact completed prefix. A zero count permits null haystacks and matched_out
+ * pointers and publishes a processed count of zero.
+ *
+ * For a nonzero count, both arrays are live for the complete call, the
+ * descriptor array is naturally aligned, every descriptor has a nonnull ptr
+ * even when len is zero, and every len is in the signed address domain. Read
+ * and write extents must not overlap.
+ */
+typedef uint32_t (*FreAotRegexIndependentExistsBatchV1)(
     const FreAotRegexHaystackV1 *haystacks,
     size_t count,
     uint8_t *matched_out,

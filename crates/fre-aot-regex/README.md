@@ -64,6 +64,25 @@ each source row as an independent Exists program and transactionally fills an
 exact caller-owned bitset. It keeps all-matching-ID semantics separate from
 ordered-many priority and does not change the stable single-program wire.
 
+## Ordered-many finite-language AOT
+
+Optimizing ordered-many `Count` and `SpanSum` compilation analyzes the one
+canonical HIR composed from all source rows. An independently authenticated,
+nonempty, assertion-free exact finite language may compete as one helper-free
+native scan against the complete ordinary optimizer portfolio. Source order,
+nested alternation order, prefix priority, and duplicates remain part of the
+Span semantics; caller pattern IDs bind the source receipt but do not alter
+matching.
+
+Optional fact or representation limits retain the ordinary incumbent. An
+allocator, arithmetic, authentication, or invariant failure remains terminal
+instead of authorizing a fresh allocating fallback. The selected route is
+reported by `ordered_finite_language_aot`; a cost decline omits that report and
+keeps the incumbent object unchanged. Public generated integration coverage
+checks selected flat, nested, and ordered-prefix languages at multiple sizes,
+plus an eligible exact-finite cost-decline control, under the default compiler
+limits.
+
 ## Uniform capture participation
 
 `compile_uniform_capture_selector` accepts an already canonical
@@ -76,3 +95,16 @@ stable program, final object, target, and line terminator; a semantic proof
 decline remains explicit. Proof/lowering/compiler failures are terminal, and
 the API rejects selectors with runtime or prepared-handle dependencies so a
 consumer cannot mistake a fallback for a helper-free native entry.
+
+`compile_rebar_weighted_capture_reducer_aot_v1` closes a proven ordered
+multi-source capture job whose retained ordinary Span components have unequal
+participation multipliers. It emits a separate three-argument native reducer
+object whose only external relocations are direct calls to those authenticated
+components. The reducer selects the earliest component match in first-source
+order, advances by its positive-width end, checked-adds its proved multiplier,
+and owns either the whole haystack or the exact LF/CRLF byte-line traversal.
+Its receipt binds the source/component map, first ordinals and weights, every
+component program/object identity, target, reducer identities, and exact call
+relocations. Only the explicit serialized-object byte cap is a typed decline;
+allocation, arithmetic, lowering, object-structure, and authentication errors
+remain terminal.

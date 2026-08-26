@@ -1,0 +1,14 @@
+name:26:test/weighted-capture-grep
+model:13:grep-captures
+case-insensitive:5:false
+unicode:5:false
+max-iters:1:2
+max-warmup-iters:1:1
+max-time:4:1000
+max-warmup-time:3:100
+pattern:4:(a+)
+pattern:2:b+
+haystack:10:aa
+bbb
+
+ab

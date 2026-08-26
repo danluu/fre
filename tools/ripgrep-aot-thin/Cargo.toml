@@ -11,9 +11,16 @@ build = "build.rs"
 [dependencies]
 fre-aot-regex = { path = "../../crates/fre-aot-regex" }
 fre-aot-regex-runtime = { path = "../../crates/fre-aot-regex-runtime" }
+sha2 = "0.10.9"
 
 [build-dependencies]
 fre-aot-regex = { path = "../../crates/fre-aot-regex" }
+fre-lower = { path = "../../crates/fre-lower" }
+fre-syntax = { path = "../../crates/fre-syntax" }
+sha2 = "0.10.9"
+
+[dev-dependencies]
+fre-lower = { path = "../../crates/fre-lower" }
 fre-syntax = { path = "../../crates/fre-syntax" }
 
 [lints.clippy]

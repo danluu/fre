@@ -10,7 +10,7 @@ use std::iter::FusedIterator;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fre_automata::Automaton;
-use fre_lower::{LowerLimits, OperationSemantics};
+use fre_lower::{FactResource, LowerLimits, OperationSemantics};
 use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustConstructor, RustMatchKind,
     RustProfile,
@@ -19,7 +19,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileError, CompileMode, DeterminizeLimits, MatchResult, OutputContract, ProgramWorkspace,
-    SearchWindow, program::CompiledProgram,
+    SearchWindow,
+    finite_language::{
+        NativeExactSingletonAnalysis, NativeFiniteLanguageAnalysis, NativeFiniteLanguageCandidate,
+    },
+    program::CompiledProgram,
 };
 
 const REGEX_SET_IDENTITY_DOMAIN: &[u8] = b"FRE-AOT-REGEX-SET\0";
@@ -990,13 +994,106 @@ impl std::error::Error for RegexSetProgramShapeError {}
 ///
 /// Syntax is parsed once per source row and the aggregate size limit is
 /// applied directly to FRE's stable compiled programs.
-#[allow(
-    clippy::too_many_lines,
-    reason = "aggregate admission, exact row allocation, indexed compilation, and identity publication form one transaction"
-)]
 pub fn compile_regex_set(
     request: RegexSetCompileRequest,
 ) -> Result<RegexSetProgram, RegexSetCompileError> {
+    Ok(compile_regex_set_internal(request, None, None)?.program)
+}
+
+pub(crate) struct RegexSetExact64CompileParts {
+    pub(crate) program: RegexSetProgram,
+    pub(crate) witnesses: Vec<Option<Vec<u8>>>,
+    pub(crate) witness_decline: Option<RegexSetExact64WitnessDecline>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegexSetExact64WitnessDecline {
+    RowNotExactSingleton { pattern: usize },
+    LiteralBytes { needed: u64, limit: u64 },
+}
+
+pub(crate) fn compile_regex_set_with_exact64_witnesses(
+    request: RegexSetCompileRequest,
+    max_literal_bytes: usize,
+) -> Result<RegexSetExact64CompileParts, RegexSetCompileError> {
+    let RegexSetCompileParts {
+        program,
+        witnesses,
+        witness_decline,
+        ..
+    } = compile_regex_set_internal(request, Some(max_literal_bytes), None)?;
+    let witnesses = witnesses.ok_or(RegexSetCompileError::InternalInvariant(
+        "exact64 regex-set compilation omitted its witness table",
+    ))?;
+    Ok(RegexSetExact64CompileParts {
+        program,
+        witnesses,
+        witness_decline,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegexSetFinite64WitnessLimits {
+    pub(crate) max_finite_strings: usize,
+    pub(crate) max_literal_bytes: usize,
+}
+
+pub(crate) struct RegexSetFinite64CompileParts {
+    pub(crate) program: RegexSetProgram,
+    pub(crate) witnesses: Vec<Option<NativeFiniteLanguageCandidate>>,
+    pub(crate) witness_decline: Option<RegexSetFinite64WitnessDecline>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegexSetFinite64WitnessDecline {
+    RowNotFiniteLanguage {
+        pattern: usize,
+    },
+    Resource {
+        pattern: usize,
+        resource: FactResource,
+        needed: u64,
+        limit: u64,
+    },
+}
+
+pub(crate) fn compile_regex_set_with_finite64_witnesses(
+    request: RegexSetCompileRequest,
+    limits: RegexSetFinite64WitnessLimits,
+) -> Result<RegexSetFinite64CompileParts, RegexSetCompileError> {
+    let RegexSetCompileParts {
+        program,
+        finite64_witnesses,
+        finite64_witness_decline,
+        ..
+    } = compile_regex_set_internal(request, None, Some(limits))?;
+    let witnesses = finite64_witnesses.ok_or(RegexSetCompileError::InternalInvariant(
+        "finite64 regex-set compilation omitted its witness table",
+    ))?;
+    Ok(RegexSetFinite64CompileParts {
+        program,
+        witnesses,
+        witness_decline: finite64_witness_decline,
+    })
+}
+
+struct RegexSetCompileParts {
+    program: RegexSetProgram,
+    witnesses: Option<Vec<Option<Vec<u8>>>>,
+    witness_decline: Option<RegexSetExact64WitnessDecline>,
+    finite64_witnesses: Option<Vec<Option<NativeFiniteLanguageCandidate>>>,
+    finite64_witness_decline: Option<RegexSetFinite64WitnessDecline>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "aggregate admission, exact row allocation, optional authenticated witness capture, indexed compilation, and identity publication form one transaction"
+)]
+fn compile_regex_set_internal(
+    request: RegexSetCompileRequest,
+    exact64_max_literal_bytes: Option<usize>,
+    finite64_limits: Option<RegexSetFinite64WitnessLimits>,
+) -> Result<RegexSetCompileParts, RegexSetCompileError> {
     let RegexSetCompileRequest {
         patterns,
         profile,
@@ -1037,6 +1134,17 @@ pub fn compile_regex_set(
     let compatibility = CompatibilityProfile::RustBytes(profile.clone());
 
     let mut rows = reserve_exact_compile(pattern_count, "compiled rows")?;
+    let mut witnesses = exact64_max_literal_bytes
+        .map(|_| reserve_exact_compile(pattern_count, "exact64 literal witnesses"))
+        .transpose()?;
+    let mut finite64_witnesses = finite64_limits
+        .map(|_| reserve_exact_compile(pattern_count, "finite64 language witnesses"))
+        .transpose()?;
+    let mut witness_decline = None;
+    let mut finite64_witness_decline = None;
+    let mut exact64_literal_bytes = 0usize;
+    let mut finite64_literal_bytes = 0usize;
+    let mut finite64_string_count = 0usize;
     let line_terminator = profile.options.line_terminator;
     let mut total_program_bytes = 0usize;
     for (pattern, source) in patterns.into_iter().enumerate() {
@@ -1084,6 +1192,280 @@ pub fn compile_regex_set(
                 limit: limits.max_total_program_bytes,
             });
         }
+        if let Some(witnesses) = &mut witnesses {
+            let witness = if matches!(
+                witness_decline,
+                Some(RegexSetExact64WitnessDecline::RowNotExactSingleton { .. })
+            ) {
+                None
+            } else if matches!(
+                witness_decline,
+                Some(RegexSetExact64WitnessDecline::LiteralBytes { .. })
+            ) {
+                let exact = NativeFiniteLanguageCandidate::preflight_exact_singleton_checked(
+                    &parsed,
+                    OutputContract::Exists,
+                )
+                .map_err(CompileError::from)
+                .map_err(|source| RegexSetCompileError::Pattern { pattern, source })?;
+                if !exact {
+                    witness_decline =
+                        Some(RegexSetExact64WitnessDecline::RowNotExactSingleton { pattern });
+                }
+                None
+            } else {
+                let limit =
+                    exact64_max_literal_bytes.ok_or(RegexSetCompileError::InternalInvariant(
+                        "exact64 witness table lacked its literal-byte ceiling",
+                    ))?;
+                let remaining = limit.checked_sub(exact64_literal_bytes).ok_or(
+                    RegexSetCompileError::InternalInvariant(
+                        "exact64 literal-byte census exceeded its ceiling",
+                    ),
+                )?;
+                let witness = match NativeFiniteLanguageCandidate::analyze_exact_singleton_checked(
+                    &parsed,
+                    OutputContract::Exists,
+                    remaining,
+                ) {
+                    Ok(result) => result,
+                    Err(source) => {
+                        return Err(RegexSetCompileError::Pattern {
+                            pattern,
+                            source: CompileError::from(source),
+                        });
+                    }
+                };
+                match witness {
+                    NativeExactSingletonAnalysis::Proven(literal) => {
+                        let needed = exact64_literal_bytes.checked_add(literal.len()).ok_or(
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 literal byte sum",
+                            },
+                        )?;
+                        if needed > limit {
+                            let needed = u64::try_from(needed).map_err(|_| {
+                                RegexSetCompileError::ArithmeticOverflow {
+                                    computation: "exact64 literal byte requirement",
+                                }
+                            })?;
+                            let limit = u64::try_from(limit).map_err(|_| {
+                                RegexSetCompileError::ArithmeticOverflow {
+                                    computation: "exact64 literal byte limit",
+                                }
+                            })?;
+                            witness_decline =
+                                Some(RegexSetExact64WitnessDecline::LiteralBytes { needed, limit });
+                            None
+                        } else {
+                            exact64_literal_bytes = needed;
+                            Some(literal)
+                        }
+                    }
+                    NativeExactSingletonAnalysis::Declined => {
+                        witness_decline =
+                            Some(RegexSetExact64WitnessDecline::RowNotExactSingleton { pattern });
+                        None
+                    }
+                    NativeExactSingletonAnalysis::LiteralBytesLimit {
+                        needed,
+                        limit: proof_limit,
+                    } => {
+                        let expected_limit = u64::try_from(remaining).map_err(|_| {
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 remaining literal byte limit",
+                            }
+                        })?;
+                        if proof_limit != expected_limit || needed <= proof_limit {
+                            return Err(RegexSetCompileError::InternalInvariant(
+                                "exact64 fact refusal did not authenticate its byte ceiling",
+                            ));
+                        }
+                        let retained = u64::try_from(exact64_literal_bytes).map_err(|_| {
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 retained literal bytes",
+                            }
+                        })?;
+                        let aggregate_needed = retained.checked_add(needed).ok_or(
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 refused literal byte sum",
+                            },
+                        )?;
+                        let aggregate_limit = u64::try_from(limit).map_err(|_| {
+                            RegexSetCompileError::ArithmeticOverflow {
+                                computation: "exact64 aggregate literal byte limit",
+                            }
+                        })?;
+                        witness_decline = Some(RegexSetExact64WitnessDecline::LiteralBytes {
+                            needed: aggregate_needed,
+                            limit: aggregate_limit,
+                        });
+                        None
+                    }
+                }
+            };
+            witnesses.push(witness);
+        }
+        if let Some(witnesses) = &mut finite64_witnesses {
+            let witness = if finite64_witness_decline.is_some() {
+                None
+            } else {
+                let proof_limits =
+                    finite64_limits.ok_or(RegexSetCompileError::InternalInvariant(
+                        "finite64 witness table lacked its proof limits",
+                    ))?;
+                let remaining_strings = proof_limits
+                    .max_finite_strings
+                    .checked_sub(finite64_string_count)
+                    .ok_or(RegexSetCompileError::InternalInvariant(
+                        "finite64 string census exceeded its ceiling",
+                    ))?;
+                let remaining_bytes = proof_limits
+                    .max_literal_bytes
+                    .checked_sub(finite64_literal_bytes)
+                    .ok_or(RegexSetCompileError::InternalInvariant(
+                        "finite64 byte census exceeded its ceiling",
+                    ))?;
+                // Every selected row must contribute at least one nonempty
+                // string. Once either aggregate allowance is exhausted, that
+                // representation is numerically impossible regardless of the
+                // row's semantic shape. Decline on this authenticated lower
+                // bound instead of asking the HIR-fact allocator to construct
+                // a proof under a zero-sized optional-proof budget.
+                let analysis = if remaining_strings == 0 {
+                    NativeFiniteLanguageAnalysis::ResourceLimit {
+                        resource: FactResource::FiniteStrings,
+                        needed: 1,
+                        limit: 0,
+                    }
+                } else if remaining_bytes == 0 {
+                    NativeFiniteLanguageAnalysis::ResourceLimit {
+                        resource: FactResource::FiniteStringBytes,
+                        needed: 1,
+                        limit: 0,
+                    }
+                } else {
+                    NativeFiniteLanguageCandidate::analyze_regex_set_checked(
+                        &parsed,
+                        OutputContract::Exists,
+                        remaining_strings,
+                        remaining_bytes,
+                    )
+                    .map_err(CompileError::from)
+                    .map_err(|source| RegexSetCompileError::Pattern { pattern, source })?
+                };
+                match analysis {
+                    NativeFiniteLanguageAnalysis::Proven(candidate) => {
+                        candidate
+                            .authenticate_regex_set_checked()
+                            .map_err(CompileError::from)
+                            .map_err(|source| RegexSetCompileError::Pattern { pattern, source })?;
+                        let needed_strings = finite64_string_count
+                            .checked_add(candidate.regex_set_language_len())
+                            .ok_or(RegexSetCompileError::ArithmeticOverflow {
+                                computation: "finite64 language count",
+                            })?;
+                        let needed_bytes = finite64_literal_bytes
+                            .checked_add(candidate.regex_set_language_bytes())
+                            .ok_or(RegexSetCompileError::ArithmeticOverflow {
+                                computation: "finite64 literal byte sum",
+                            })?;
+                        if needed_strings > proof_limits.max_finite_strings
+                            || needed_bytes > proof_limits.max_literal_bytes
+                        {
+                            return Err(RegexSetCompileError::InternalInvariant(
+                                "finite64 proof crossed its aggregate allowance",
+                            ));
+                        }
+                        finite64_string_count = needed_strings;
+                        finite64_literal_bytes = needed_bytes;
+                        Some(candidate)
+                    }
+                    NativeFiniteLanguageAnalysis::Declined => {
+                        finite64_witness_decline =
+                            Some(RegexSetFinite64WitnessDecline::RowNotFiniteLanguage { pattern });
+                        None
+                    }
+                    NativeFiniteLanguageAnalysis::ResourceLimit {
+                        resource,
+                        needed,
+                        limit,
+                    } => {
+                        let (needed, limit) = match resource {
+                            FactResource::FiniteStrings => {
+                                let expected_limit =
+                                    u64::try_from(remaining_strings).map_err(|_| {
+                                        RegexSetCompileError::ArithmeticOverflow {
+                                            computation: "finite64 remaining string limit",
+                                        }
+                                    })?;
+                                if limit != expected_limit || needed <= limit {
+                                    return Err(RegexSetCompileError::InternalInvariant(
+                                        "finite64 string refusal did not authenticate its ceiling",
+                                    ));
+                                }
+                                let retained =
+                                    u64::try_from(finite64_string_count).map_err(|_| {
+                                        RegexSetCompileError::ArithmeticOverflow {
+                                            computation: "finite64 retained string count",
+                                        }
+                                    })?;
+                                let aggregate_needed = retained.checked_add(needed).ok_or(
+                                    RegexSetCompileError::ArithmeticOverflow {
+                                        computation: "finite64 refused string count",
+                                    },
+                                )?;
+                                let aggregate_limit = u64::try_from(
+                                    proof_limits.max_finite_strings,
+                                )
+                                .map_err(|_| RegexSetCompileError::ArithmeticOverflow {
+                                    computation: "finite64 aggregate string limit",
+                                })?;
+                                (aggregate_needed, aggregate_limit)
+                            }
+                            FactResource::FiniteStringBytes => {
+                                let expected_limit =
+                                    u64::try_from(remaining_bytes).map_err(|_| {
+                                        RegexSetCompileError::ArithmeticOverflow {
+                                            computation: "finite64 remaining byte limit",
+                                        }
+                                    })?;
+                                if limit != expected_limit || needed <= limit {
+                                    return Err(RegexSetCompileError::InternalInvariant(
+                                        "finite64 byte refusal did not authenticate its ceiling",
+                                    ));
+                                }
+                                let retained =
+                                    u64::try_from(finite64_literal_bytes).map_err(|_| {
+                                        RegexSetCompileError::ArithmeticOverflow {
+                                            computation: "finite64 retained literal bytes",
+                                        }
+                                    })?;
+                                let aggregate_needed = retained.checked_add(needed).ok_or(
+                                    RegexSetCompileError::ArithmeticOverflow {
+                                        computation: "finite64 refused literal byte sum",
+                                    },
+                                )?;
+                                let aggregate_limit = u64::try_from(proof_limits.max_literal_bytes)
+                                    .map_err(|_| RegexSetCompileError::ArithmeticOverflow {
+                                        computation: "finite64 aggregate literal byte limit",
+                                    })?;
+                                (aggregate_needed, aggregate_limit)
+                            }
+                            _ => (needed, limit),
+                        };
+                        finite64_witness_decline = Some(RegexSetFinite64WitnessDecline::Resource {
+                            pattern,
+                            resource,
+                            needed,
+                            limit,
+                        });
+                        None
+                    }
+                }
+            };
+            witnesses.push(witness);
+        }
         rows.push(program);
     }
     if rows.len() != pattern_count {
@@ -1092,19 +1474,49 @@ pub fn compile_regex_set(
         ));
     }
     validate_exact_capacity_compile(rows.capacity(), pattern_count, "compiled rows")?;
+    if let Some(witnesses) = &witnesses {
+        if witnesses.len() != pattern_count {
+            return Err(RegexSetCompileError::InternalInvariant(
+                "exact64 witness table lost source order",
+            ));
+        }
+        validate_exact_capacity_compile(
+            witnesses.capacity(),
+            pattern_count,
+            "exact64 literal witnesses",
+        )?;
+    }
+    if let Some(witnesses) = &finite64_witnesses {
+        if witnesses.len() != pattern_count {
+            return Err(RegexSetCompileError::InternalInvariant(
+                "finite64 witness table lost source order",
+            ));
+        }
+        validate_exact_capacity_compile(
+            witnesses.capacity(),
+            pattern_count,
+            "finite64 language witnesses",
+        )?;
+    }
     let artifact = semantic_identity(&rows)?;
     let instance = next_instance()?;
-    Ok(RegexSetProgram {
-        rows,
-        identity: RegexSetIdentity { artifact, instance },
-        profile,
-        mode,
-        stats: RegexSetProgramStats {
-            patterns: pattern_count,
-            pattern_bytes,
-            serialized_program_bytes: total_program_bytes,
-            required_words,
+    Ok(RegexSetCompileParts {
+        program: RegexSetProgram {
+            rows,
+            identity: RegexSetIdentity { artifact, instance },
+            profile,
+            mode,
+            stats: RegexSetProgramStats {
+                patterns: pattern_count,
+                pattern_bytes,
+                serialized_program_bytes: total_program_bytes,
+                required_words,
+            },
         },
+        witnesses,
+        witness_decline,
+        finite64_witnesses,
+        finite64_witness_decline,
     })
 }
 

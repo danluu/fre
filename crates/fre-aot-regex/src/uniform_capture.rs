@@ -19,12 +19,13 @@ use fre_syntax::{RustParsed, RustProfile};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CompileError, CompileLimitsV1, CompileMode, CompileReceipt, CompiledModule, CompiledProgram,
-    CompiledRegex, EngineKind, EntryAbi, ObjectFormat, OutputContract,
+    Architecture, CallAbi, CompileError, CompileLimitsV1, CompileMode, CompileReceipt,
+    CompileResource, CompiledModule, CompiledProgram, CompiledRegex, EngineKind, EntryAbi,
+    ObjectError, ObjectFormat, OperatingSystem, OutputContract,
     PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
     PreparedBulkStrategy, PreparedOrderedNfaV15CompileDecline,
-    PreparedOrderedNfaV15CompileDisposition, SectionKind, SlowAotLimits, SymbolBinding, SymbolKind,
-    Target, emit_object, rust_profile_compiled_size_limit,
+    PreparedOrderedNfaV15CompileDisposition, RelocationKind, SectionKind, SlowAotLimits,
+    SymbolBinding, SymbolKind, Target, emit_object, rust_profile_compiled_size_limit,
     set_rust_profile_compiled_size_limit,
 };
 
@@ -363,6 +364,7 @@ pub fn compile_uniform_capture_selector(
         line_terminator,
         OutputContract::Span,
         native_finite_language_candidate,
+        super::NativeFiniteLanguageAttachPolicy::Optional,
         None,
         request.target,
         request.mode,
@@ -989,6 +991,10 @@ pub enum UniformCaptureReducerAuthenticationError {
     CountSymbol,
     ReducerSymbol,
     NativeClosure,
+    LinkedRowClosure,
+    LinkedReducerClosure,
+    LinkedReducerObject,
+    LinkedReceipt,
 }
 
 impl fmt::Display for UniformCaptureReducerAuthenticationError {
@@ -1285,6 +1291,238 @@ impl CompiledUniformCaptureReducer {
     }
 }
 
+/// Receipt schema for a separately linked strict-RowSearch capture reducer.
+pub const LINKED_PREPARED_ROW_UNIFORM_CAPTURE_REDUCER_V1_RECEIPT_VERSION: u32 = 1;
+
+/// One exact external call from the capture reducer object to its strict row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkedPreparedRowUniformCaptureRelocationV1 {
+    offset: u64,
+    kind: RelocationKind,
+    addend: i64,
+}
+
+impl LinkedPreparedRowUniformCaptureRelocationV1 {
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> RelocationKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn addend(self) -> i64 {
+        self.addend
+    }
+}
+
+/// Closed two-object receipt for one strict prepared row and one native
+/// CountCaptures/GrepCaptures wrapper.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkedPreparedRowUniformCaptureReducerReceiptV1 {
+    schema_version: u32,
+    participation: UniformCaptureParticipationReceipt,
+    operation: UniformCaptureReducerOperation,
+    domain: UniformCaptureReducerDomain,
+    multiplier: NonZeroU64,
+    proof_identity_sha256: [u8; 32],
+    target: Target,
+    line_terminator: u8,
+    row_automaton_sha256: [u8; 32],
+    row_program_sha256: [u8; 32],
+    row_object_sha256: [u8; 32],
+    row_object_bytes: usize,
+    row_entry_symbol: String,
+    count_symbol: String,
+    reducer_symbol: String,
+    reducer_code_sha256: [u8; 32],
+    reducer_object_sha256: [u8; 32],
+    reducer_object_bytes: usize,
+    max_object_bytes: usize,
+    row_relocation: LinkedPreparedRowUniformCaptureRelocationV1,
+    semantic_runtime_calls: usize,
+    artifact_identity_sha256: [u8; 32],
+}
+
+impl LinkedPreparedRowUniformCaptureReducerReceiptV1 {
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+    #[must_use]
+    pub const fn participation(&self) -> UniformCaptureParticipationReceipt {
+        self.participation
+    }
+    #[must_use]
+    pub const fn operation(&self) -> UniformCaptureReducerOperation {
+        self.operation
+    }
+    #[must_use]
+    pub const fn domain(&self) -> UniformCaptureReducerDomain {
+        self.domain
+    }
+    #[must_use]
+    pub const fn multiplier(&self) -> NonZeroU64 {
+        self.multiplier
+    }
+    #[must_use]
+    pub const fn proof_identity_sha256(&self) -> [u8; 32] {
+        self.proof_identity_sha256
+    }
+    #[must_use]
+    pub const fn target(&self) -> Target {
+        self.target
+    }
+    #[must_use]
+    pub const fn line_terminator(&self) -> u8 {
+        self.line_terminator
+    }
+    #[must_use]
+    pub const fn row_automaton_sha256(&self) -> [u8; 32] {
+        self.row_automaton_sha256
+    }
+    #[must_use]
+    pub const fn row_program_sha256(&self) -> [u8; 32] {
+        self.row_program_sha256
+    }
+    #[must_use]
+    pub const fn row_object_sha256(&self) -> [u8; 32] {
+        self.row_object_sha256
+    }
+    #[must_use]
+    pub const fn row_object_bytes(&self) -> usize {
+        self.row_object_bytes
+    }
+    #[must_use]
+    pub fn row_entry_symbol(&self) -> &str {
+        &self.row_entry_symbol
+    }
+    #[must_use]
+    pub fn count_symbol(&self) -> &str {
+        &self.count_symbol
+    }
+    #[must_use]
+    pub fn reducer_symbol(&self) -> &str {
+        &self.reducer_symbol
+    }
+    #[must_use]
+    pub const fn reducer_code_sha256(&self) -> [u8; 32] {
+        self.reducer_code_sha256
+    }
+    #[must_use]
+    pub const fn reducer_object_sha256(&self) -> [u8; 32] {
+        self.reducer_object_sha256
+    }
+    #[must_use]
+    pub const fn reducer_object_bytes(&self) -> usize {
+        self.reducer_object_bytes
+    }
+    #[must_use]
+    pub const fn max_object_bytes(&self) -> usize {
+        self.max_object_bytes
+    }
+    #[must_use]
+    pub const fn row_relocation(&self) -> LinkedPreparedRowUniformCaptureRelocationV1 {
+        self.row_relocation
+    }
+    #[must_use]
+    pub const fn semantic_runtime_calls(&self) -> usize {
+        self.semantic_runtime_calls
+    }
+    #[must_use]
+    pub const fn artifact_identity_sha256(&self) -> [u8; 32] {
+        self.artifact_identity_sha256
+    }
+}
+
+/// Strict prepared row plus its separately linkable whole-operation reducer.
+#[derive(Clone, Debug)]
+pub struct LinkedPreparedRowUniformCaptureReducerV1 {
+    row: CompiledRegex,
+    reducer_module: CompiledModule,
+    reducer_object: Box<[u8]>,
+    receipt: LinkedPreparedRowUniformCaptureReducerReceiptV1,
+}
+
+impl LinkedPreparedRowUniformCaptureReducerV1 {
+    #[must_use]
+    pub const fn row(&self) -> &CompiledRegex {
+        &self.row
+    }
+
+    #[must_use]
+    pub const fn reducer_module(&self) -> &CompiledModule {
+        &self.reducer_module
+    }
+
+    #[must_use]
+    pub fn reducer_object(&self) -> &[u8] {
+        &self.reducer_object
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &LinkedPreparedRowUniformCaptureReducerReceiptV1 {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn reducer_symbol(&self) -> &str {
+        self.receipt.reducer_symbol()
+    }
+
+    #[cfg(test)]
+    fn test_flip_row_text_byte(&mut self, offset: usize) -> bool {
+        self.row.module.test_flip_text_byte(offset)
+    }
+
+    pub fn authenticate(&self) -> Result<(), UniformCaptureReducerAuthenticationError> {
+        authenticate_linked_prepared_row_uniform_capture_reducer(self)
+    }
+}
+
+/// Additive compiler result used by linkers that can retain two objects.
+/// Existing users of [`compile_uniform_capture_reducer`] keep the original
+/// one-object API and behavior unchanged.
+#[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would allocate after a selected compiler transaction"
+)]
+pub enum UniformCaptureReducerLinkCompileDispositionV1 {
+    Combined(CompiledUniformCaptureReducer),
+    PreparedRowSearch(LinkedPreparedRowUniformCaptureReducerV1),
+    Declined(UniformCaptureParticipationDecline),
+}
+
+impl UniformCaptureReducerLinkCompileDispositionV1 {
+    #[must_use]
+    pub const fn combined(&self) -> Option<&CompiledUniformCaptureReducer> {
+        match self {
+            Self::Combined(value) => Some(value),
+            Self::PreparedRowSearch(_) | Self::Declined(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn prepared_row_search(&self) -> Option<&LinkedPreparedRowUniformCaptureReducerV1> {
+        match self {
+            Self::PreparedRowSearch(value) => Some(value),
+            Self::Combined(_) | Self::Declined(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn decline(&self) -> Option<UniformCaptureParticipationDecline> {
+        match self {
+            Self::Declined(value) => Some(*value),
+            Self::Combined(_) | Self::PreparedRowSearch(_) => None,
+        }
+    }
+}
+
 /// Positive native selection or the uniform theorem's sole fallback permit.
 #[derive(Clone, Debug)]
 #[allow(
@@ -1329,6 +1567,7 @@ pub enum UniformCaptureReducerCompileError {
     Participation(UniformCaptureParticipationError),
     Ordinary(UniformCaptureCompileError),
     OperationOnly(CompileError),
+    RowSearch(CompileError),
     Prepared(UniformCapturePreparedSpanFillCompileError),
     Finalization(CompileError),
     Authentication(UniformCaptureReducerAuthenticationError),
@@ -1341,6 +1580,12 @@ impl fmt::Display for UniformCaptureReducerCompileError {
             Self::Ordinary(source) => source.fmt(formatter),
             Self::OperationOnly(source) => {
                 write!(formatter, "uniform capture operation-only V15 failed: {source}")
+            }
+            Self::RowSearch(source) => {
+                write!(
+                    formatter,
+                    "uniform capture strict RowSearch V15 failed: {source}"
+                )
             }
             Self::Prepared(source) => source.fmt(formatter),
             Self::Finalization(source) => {
@@ -1357,11 +1602,510 @@ impl std::error::Error for UniformCaptureReducerCompileError {
             Self::Participation(source) => Some(source),
             Self::Ordinary(source) => Some(source),
             Self::OperationOnly(source) => Some(source),
+            Self::RowSearch(source) => Some(source),
             Self::Prepared(source) => Some(source),
             Self::Finalization(source) => Some(source),
             Self::Authentication(source) => Some(source),
         }
     }
+}
+
+fn native_symbol_identity<'a>(symbol: &'a str, prefix: &str) -> Option<&'a str> {
+    let suffix = symbol.strip_prefix(prefix)?;
+    (suffix.len() == 64
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(suffix)
+}
+
+fn authenticate_strict_prepared_row(
+    row: &CompiledRegex,
+) -> Result<(), UniformCaptureReducerAuthenticationError> {
+    let receipt = row.receipt();
+    let module = row.module();
+    let Some(entry) = module.prepared_entry_symbol() else {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedRowClosure);
+    };
+    let Some((program, program_bytes)) = module.required_runtime_program() else {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedRowClosure);
+    };
+    let entry_identity = native_symbol_identity(entry, "fre_aot_regex_search_exclusive_v1_");
+    let program_identity = native_symbol_identity(program, "fre_aot_regex_runtime_program_v1_");
+    let global_functions = module
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.binding == SymbolBinding::Global
+                && symbol.kind == SymbolKind::Function
+                && symbol.section.is_some()
+        })
+        .collect::<Vec<_>>();
+    let global_objects = module
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.binding == SymbolBinding::Global
+                && symbol.kind == SymbolKind::Object
+                && symbol.section.is_some()
+        })
+        .collect::<Vec<_>>();
+    if receipt.output != OutputContract::Span
+        || receipt.entry_abi != EntryAbi::PreparedSpanSearchV1
+        || receipt.engine != EngineKind::OrderedNfa
+        || receipt.runtime_helper_required
+        || receipt.target != module.target()
+        || receipt.line_terminator != row.program().line_terminator()
+        || receipt.program_sha256 != row.program().artifact_identity()
+        || row.object().is_empty()
+        || receipt.object_bytes != row.object().len()
+        || receipt.object_sha256 != sha256(row.object())
+        || receipt.prepared_aggregate_exports != PreparedAggregateExports::NONE
+        || receipt.prepared_aggregate_strategy.is_some()
+        || receipt.required_prepare_capabilities != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || module.required_prepare_capabilities() != PREPARED_CAPABILITY_ORDERED_NFA_V15
+        || module.entry_symbol() != entry
+        || module.prepared_bulk_strategy().is_some()
+        || module.prepared_span_fill_symbol().is_some()
+        || module.prepared_exists_batch_symbol().is_some()
+        || module.direct_exists_batch_symbol().is_some()
+        || module.prepared_count_symbol().is_some()
+        || module.prepared_span_sum_symbol().is_some()
+        || module.prepared_grep_count_symbol().is_some()
+        || module.prepared_aggregate_exports() != PreparedAggregateExports::NONE
+        || module.prepared_aggregate_strategy().is_some()
+        || module.required_runtime_symbols().next().is_some()
+        || program_bytes == 0
+        || program_bytes != receipt.program_bytes
+        || entry_identity.is_none()
+        || entry_identity != program_identity
+        || entry == program
+        || global_functions.len() != 1
+        || global_functions[0].name != entry
+        || global_objects.len() != 1
+        || global_objects[0].name != program
+        || module
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.section.is_none())
+        || module.relocations().iter().any(|relocation| {
+            module
+                .symbols()
+                .get(relocation.symbol)
+                .is_none_or(|symbol| symbol.section.is_none())
+        })
+    {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedRowClosure);
+    }
+
+    let reemitted = emit_object(
+        module,
+        ObjectFormat::for_target(receipt.target),
+        receipt.object_bytes,
+    )
+    .map_err(|_| UniformCaptureReducerAuthenticationError::LinkedRowClosure)?;
+    if reemitted.as_slice() != row.object() {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedRowClosure);
+    }
+
+    let serialized = row
+        .program()
+        .serialize()
+        .map_err(|_| UniformCaptureReducerAuthenticationError::LinkedRowClosure)?;
+    let program_symbol = global_objects[0];
+    let section = program_symbol
+        .section
+        .and_then(|index| module.sections().get(index))
+        .ok_or(UniformCaptureReducerAuthenticationError::LinkedRowClosure)?;
+    let start = usize::try_from(program_symbol.offset)
+        .map_err(|_| UniformCaptureReducerAuthenticationError::LinkedRowClosure)?;
+    let end = start
+        .checked_add(program_bytes)
+        .ok_or(UniformCaptureReducerAuthenticationError::LinkedRowClosure)?;
+    if serialized.len() != program_bytes
+        || section.bytes().get(start..end) != Some(serialized.as_slice())
+    {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedRowClosure);
+    }
+    Ok(())
+}
+
+fn linked_reducer_external_row_relocation(
+    module: &CompiledModule,
+    row_entry: &str,
+) -> Result<LinkedPreparedRowUniformCaptureRelocationV1, UniformCaptureReducerAuthenticationError> {
+    let mut row_symbols = module.symbols().iter().enumerate().filter(|(_, symbol)| {
+        symbol.name == row_entry
+            && symbol.binding == SymbolBinding::Global
+            && symbol.kind == SymbolKind::Function
+            && symbol.section.is_none()
+            && symbol.offset == 0
+            && symbol.size == 0
+    });
+    let Some((row_symbol, _)) = row_symbols.next() else {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedReducerClosure);
+    };
+    if row_symbols.next().is_some() {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedReducerClosure);
+    }
+    let mut row_relocations = module
+        .relocations()
+        .iter()
+        .filter(|relocation| relocation.symbol == row_symbol);
+    let Some(relocation) = row_relocations.next().copied() else {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedReducerClosure);
+    };
+    if row_relocations.next().is_some()
+        || module
+            .sections()
+            .get(relocation.section)
+            .is_none_or(|section| section.kind != SectionKind::Text)
+        || match module.target().architecture {
+            Architecture::X86_64 => {
+                relocation.kind != RelocationKind::X86PltRelative32 || relocation.addend != -4
+            }
+            Architecture::Aarch64 => {
+                relocation.kind != RelocationKind::Aarch64Branch26 || relocation.addend != 0
+            }
+        }
+    {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedReducerClosure);
+    }
+    Ok(LinkedPreparedRowUniformCaptureRelocationV1 {
+        offset: relocation.offset,
+        kind: relocation.kind,
+        addend: relocation.addend,
+    })
+}
+
+fn linked_target_bytes(target: Target) -> [u8; 4] {
+    [
+        match target.architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        },
+        match target.operating_system {
+            OperatingSystem::Linux => 1,
+            OperatingSystem::Macos => 2,
+        },
+        match target.abi {
+            CallAbi::SystemV => 1,
+            CallAbi::Aapcs64 => 2,
+        },
+        0,
+    ]
+}
+
+fn linked_update_usize(
+    digest: &mut Sha256,
+    value: usize,
+) -> Result<(), UniformCaptureReducerAuthenticationError> {
+    digest.update(
+        u64::try_from(value)
+            .map_err(|_| UniformCaptureReducerAuthenticationError::LinkedReceipt)?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+
+fn linked_update_bytes(
+    digest: &mut Sha256,
+    bytes: &[u8],
+) -> Result<(), UniformCaptureReducerAuthenticationError> {
+    linked_update_usize(digest, bytes.len())?;
+    digest.update(bytes);
+    Ok(())
+}
+
+fn linked_uniform_capture_artifact_identity(
+    receipt: &LinkedPreparedRowUniformCaptureReducerReceiptV1,
+) -> Result<[u8; 32], UniformCaptureReducerAuthenticationError> {
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/linked-prepared-row-uniform-capture-artifact/v1\0");
+    digest.update(receipt.schema_version.to_le_bytes());
+    digest.update([match receipt.operation {
+        UniformCaptureReducerOperation::CountCaptures => 1,
+        UniformCaptureReducerOperation::GrepCaptures => 2,
+    }]);
+    digest.update([match receipt.domain {
+        UniformCaptureReducerDomain::WholeHaystack => 1,
+        UniformCaptureReducerDomain::ByteSliceLinesLfCrLf => 2,
+    }]);
+    digest.update(receipt.multiplier.get().to_le_bytes());
+    digest.update(receipt.proof_identity_sha256);
+    digest.update(linked_target_bytes(receipt.target));
+    digest.update(receipt.target.features.bits().to_le_bytes());
+    digest.update([receipt.line_terminator]);
+    digest.update(receipt.row_automaton_sha256);
+    digest.update(receipt.row_program_sha256);
+    digest.update(receipt.row_object_sha256);
+    linked_update_usize(&mut digest, receipt.row_object_bytes)?;
+    linked_update_bytes(&mut digest, receipt.row_entry_symbol.as_bytes())?;
+    linked_update_bytes(&mut digest, receipt.count_symbol.as_bytes())?;
+    linked_update_bytes(&mut digest, receipt.reducer_symbol.as_bytes())?;
+    digest.update(receipt.reducer_code_sha256);
+    digest.update(receipt.reducer_object_sha256);
+    linked_update_usize(&mut digest, receipt.reducer_object_bytes)?;
+    linked_update_usize(&mut digest, receipt.max_object_bytes)?;
+    digest.update(receipt.row_relocation.offset.to_le_bytes());
+    digest.update([match receipt.row_relocation.kind {
+        RelocationKind::X86PcRelative32 => 1,
+        RelocationKind::X86PltRelative32 => 2,
+        RelocationKind::Aarch64Page21 => 3,
+        RelocationKind::Aarch64PageOff12 => 4,
+        RelocationKind::Aarch64Branch26 => 5,
+    }]);
+    digest.update(receipt.row_relocation.addend.to_le_bytes());
+    linked_update_usize(&mut digest, receipt.semantic_runtime_calls)?;
+    Ok(digest.finalize().into())
+}
+
+fn authenticate_linked_prepared_row_uniform_capture_reducer(
+    artifact: &LinkedPreparedRowUniformCaptureReducerV1,
+) -> Result<(), UniformCaptureReducerAuthenticationError> {
+    let receipt = artifact.receipt();
+    authenticate_strict_prepared_row(artifact.row())?;
+    let row_receipt = artifact.row().receipt();
+    let multiplier = u64::try_from(receipt.participation.participating_groups_per_match().get())
+        .ok()
+        .and_then(NonZeroU64::new);
+    let proof_identity =
+        uniform_capture_proof_identity(receipt.participation, receipt.row_program_sha256)?;
+    if receipt.schema_version != LINKED_PREPARED_ROW_UNIFORM_CAPTURE_REDUCER_V1_RECEIPT_VERSION
+        || !receipt.participation.identity().authenticates_current()
+        || multiplier != Some(receipt.multiplier)
+        || proof_identity != receipt.proof_identity_sha256
+        || receipt.operation.domain() != receipt.domain
+        || receipt.target != row_receipt.target
+        || receipt.line_terminator != row_receipt.line_terminator
+        || receipt.row_automaton_sha256 != row_receipt.automaton_sha256
+        || receipt.row_program_sha256 != row_receipt.program_sha256
+        || receipt.row_object_sha256 != row_receipt.object_sha256
+        || receipt.row_object_bytes != artifact.row().object().len()
+        || receipt.row_object_bytes > receipt.max_object_bytes
+        || receipt.row_entry_symbol != artifact.row().module().entry_symbol()
+        || receipt.semantic_runtime_calls != 0
+    {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedReceipt);
+    }
+
+    let (rebuilt, count_symbol, reducer_symbol) =
+        crate::module::lower_linked_prepared_row_uniform_capture_reducer(
+            receipt.target,
+            receipt.operation.native_domain(),
+            receipt.multiplier.get(),
+            receipt.row_program_sha256,
+            receipt.proof_identity_sha256,
+            &receipt.row_entry_symbol,
+        )
+        .map_err(|_| UniformCaptureReducerAuthenticationError::LinkedReducerClosure)?;
+    if artifact.reducer_module != rebuilt
+        || receipt.count_symbol != count_symbol
+        || receipt.reducer_symbol != reducer_symbol
+        || artifact.reducer_module.entry_symbol() != receipt.reducer_symbol
+        || artifact.reducer_module.target() != receipt.target
+        || artifact.reducer_module.prepared_entry_symbol().is_some()
+        || artifact
+            .reducer_module
+            .prepared_span_fill_symbol()
+            .is_some()
+        || artifact
+            .reducer_module
+            .prepared_exists_batch_symbol()
+            .is_some()
+        || artifact
+            .reducer_module
+            .direct_exists_batch_symbol()
+            .is_some()
+        || artifact.reducer_module.prepared_count_symbol().is_some()
+        || artifact.reducer_module.prepared_span_sum_symbol().is_some()
+        || artifact
+            .reducer_module
+            .prepared_grep_count_symbol()
+            .is_some()
+        || !artifact
+            .reducer_module
+            .prepared_aggregate_exports()
+            .is_empty()
+        || artifact
+            .reducer_module
+            .prepared_aggregate_strategy()
+            .is_some()
+        || artifact.reducer_module.required_prepare_capabilities() != 0
+    {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedReducerClosure);
+    }
+
+    let undefined = artifact
+        .reducer_module
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.section.is_none())
+        .collect::<Vec<_>>();
+    let global_defined_functions = artifact
+        .reducer_module
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.binding == SymbolBinding::Global
+                && symbol.kind == SymbolKind::Function
+                && symbol.section.is_some()
+        })
+        .collect::<Vec<_>>();
+    let local_defined_functions = artifact
+        .reducer_module
+        .symbols()
+        .iter()
+        .filter(|symbol| {
+            symbol.binding == SymbolBinding::Local
+                && symbol.kind == SymbolKind::Function
+                && symbol.section.is_some()
+        })
+        .collect::<Vec<_>>();
+    let semantic_runtime_calls = artifact
+        .reducer_module
+        .required_runtime_symbols()
+        .filter(|symbol| symbol.starts_with("fre_aot_regex_runtime_"))
+        .count();
+    if undefined.len() != 1
+        || undefined[0].name != receipt.row_entry_symbol
+        || global_defined_functions.len() != 1
+        || global_defined_functions[0].name != receipt.reducer_symbol
+        || local_defined_functions.len() != 1
+        || local_defined_functions[0].name != receipt.count_symbol
+        || artifact.reducer_module.required_runtime_symbols().count() != 1
+        || artifact.reducer_module.required_runtime_symbols().next()
+            != Some(receipt.row_entry_symbol.as_str())
+        || semantic_runtime_calls != receipt.semantic_runtime_calls
+        || linked_reducer_external_row_relocation(
+            &artifact.reducer_module,
+            &receipt.row_entry_symbol,
+        )? != receipt.row_relocation
+    {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedReducerClosure);
+    }
+
+    let text = artifact
+        .reducer_module
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .ok_or(UniformCaptureReducerAuthenticationError::LinkedReducerClosure)?;
+    let object = emit_object(
+        &rebuilt,
+        ObjectFormat::for_target(receipt.target),
+        receipt.max_object_bytes,
+    )
+    .map_err(|_| UniformCaptureReducerAuthenticationError::LinkedReducerObject)?;
+    if receipt.reducer_code_sha256 != sha256(text.bytes())
+        || receipt.reducer_object_bytes != artifact.reducer_object.len()
+        || receipt.reducer_object_bytes > receipt.max_object_bytes
+        || receipt.reducer_object_sha256 != sha256(&artifact.reducer_object)
+        || object.as_slice() != artifact.reducer_object.as_ref()
+        || receipt.artifact_identity_sha256 != linked_uniform_capture_artifact_identity(receipt)?
+    {
+        return Err(UniformCaptureReducerAuthenticationError::LinkedReducerObject);
+    }
+    Ok(())
+}
+
+enum LinkedPreparedRowUniformCaptureFinalization {
+    Selected(LinkedPreparedRowUniformCaptureReducerV1),
+    ObjectBytes,
+}
+
+fn finalize_linked_prepared_row_uniform_capture_reducer(
+    row: CompiledRegex,
+    participation: UniformCaptureParticipationReceipt,
+    operation: UniformCaptureReducerOperation,
+    max_object_bytes: usize,
+) -> Result<LinkedPreparedRowUniformCaptureFinalization, UniformCaptureReducerCompileError> {
+    authenticate_strict_prepared_row(&row)
+        .map_err(UniformCaptureReducerCompileError::Authentication)?;
+    let multiplier = u64::try_from(participation.participating_groups_per_match().get())
+        .ok()
+        .and_then(NonZeroU64::new)
+        .ok_or(UniformCaptureReducerCompileError::Authentication(
+            UniformCaptureReducerAuthenticationError::ProofMultiplier,
+        ))?;
+    let proof_identity =
+        uniform_capture_proof_identity(participation, row.program().artifact_identity())
+            .map_err(UniformCaptureReducerCompileError::Authentication)?;
+    let row_entry = row.module().entry_symbol().to_owned();
+    let (reducer_module, count_symbol, reducer_symbol) =
+        crate::module::lower_linked_prepared_row_uniform_capture_reducer(
+            row.receipt().target,
+            operation.native_domain(),
+            multiplier.get(),
+            row.receipt().program_sha256,
+            proof_identity,
+            &row_entry,
+        )
+        .map_err(CompileError::from)
+        .map_err(UniformCaptureReducerCompileError::Finalization)?;
+    let reducer_object = match emit_object(
+        &reducer_module,
+        ObjectFormat::for_target(row.receipt().target),
+        max_object_bytes,
+    ) {
+        Ok(object) => object,
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => return Ok(LinkedPreparedRowUniformCaptureFinalization::ObjectBytes),
+        Err(error) => {
+            return Err(UniformCaptureReducerCompileError::Finalization(
+                CompileError::Object(error),
+            ));
+        }
+    };
+    let text = reducer_module
+        .sections()
+        .iter()
+        .find(|section| section.kind == SectionKind::Text)
+        .ok_or(UniformCaptureReducerCompileError::Authentication(
+            UniformCaptureReducerAuthenticationError::LinkedReducerClosure,
+        ))?;
+    let row_relocation = linked_reducer_external_row_relocation(&reducer_module, &row_entry)
+        .map_err(UniformCaptureReducerCompileError::Authentication)?;
+    let mut receipt = LinkedPreparedRowUniformCaptureReducerReceiptV1 {
+        schema_version: LINKED_PREPARED_ROW_UNIFORM_CAPTURE_REDUCER_V1_RECEIPT_VERSION,
+        participation,
+        operation,
+        domain: operation.domain(),
+        multiplier,
+        proof_identity_sha256: proof_identity,
+        target: row.receipt().target,
+        line_terminator: row.receipt().line_terminator,
+        row_automaton_sha256: row.receipt().automaton_sha256,
+        row_program_sha256: row.receipt().program_sha256,
+        row_object_sha256: row.receipt().object_sha256,
+        row_object_bytes: row.object().len(),
+        row_entry_symbol: row_entry,
+        count_symbol,
+        reducer_symbol,
+        reducer_code_sha256: sha256(text.bytes()),
+        reducer_object_sha256: sha256(&reducer_object),
+        reducer_object_bytes: reducer_object.len(),
+        max_object_bytes,
+        row_relocation,
+        semantic_runtime_calls: 0,
+        artifact_identity_sha256: [0; 32],
+    };
+    receipt.artifact_identity_sha256 = linked_uniform_capture_artifact_identity(&receipt)
+        .map_err(UniformCaptureReducerCompileError::Authentication)?;
+    let artifact = LinkedPreparedRowUniformCaptureReducerV1 {
+        row,
+        reducer_module,
+        reducer_object: reducer_object.into_boxed_slice(),
+        receipt,
+    };
+    artifact
+        .authenticate()
+        .map_err(UniformCaptureReducerCompileError::Authentication)?;
+    Ok(LinkedPreparedRowUniformCaptureFinalization::Selected(
+        artifact,
+    ))
 }
 
 /// Prove one nonzero uniform multiplier and compile the complete capture
@@ -1376,11 +2120,65 @@ pub fn compile_uniform_capture_reducer(
     request: UniformCaptureCompileRequest,
     operation: UniformCaptureReducerOperation,
 ) -> Result<UniformCaptureReducerCompileDisposition, UniformCaptureReducerCompileError> {
+    match compile_uniform_capture_reducer_internal(parsed, request, operation, false)? {
+        InternalUniformCaptureReducerCompileDisposition::Combined(selected) => {
+            Ok(UniformCaptureReducerCompileDisposition::Selected(selected))
+        }
+        InternalUniformCaptureReducerCompileDisposition::PreparedRowSearch(_) => {
+            Err(UniformCaptureReducerCompileError::Authentication(
+                UniformCaptureReducerAuthenticationError::LinkedReceipt,
+            ))
+        }
+        InternalUniformCaptureReducerCompileDisposition::Declined(decline) => {
+            Ok(UniformCaptureReducerCompileDisposition::Declined(decline))
+        }
+    }
+}
+
+/// Compile a uniform capture reducer for a linker that can retain two objects.
+///
+/// This is additive to [`compile_uniform_capture_reducer`]. It first runs that
+/// API's exact portfolio. Only a typed operation-only V15 `ObjectBytes`
+/// decline may try the strict helper-free RowSearch plus separate reducer
+/// topology; every safe decline then resumes the unchanged compatibility
+/// compiler.
+pub fn compile_uniform_capture_reducer_linked_v1(
+    parsed: &RustParsed,
+    request: UniformCaptureCompileRequest,
+    operation: UniformCaptureReducerOperation,
+) -> Result<UniformCaptureReducerLinkCompileDispositionV1, UniformCaptureReducerCompileError> {
+    match compile_uniform_capture_reducer_internal(parsed, request, operation, true)? {
+        InternalUniformCaptureReducerCompileDisposition::Combined(selected) => Ok(
+            UniformCaptureReducerLinkCompileDispositionV1::Combined(selected),
+        ),
+        InternalUniformCaptureReducerCompileDisposition::PreparedRowSearch(selected) => {
+            Ok(UniformCaptureReducerLinkCompileDispositionV1::PreparedRowSearch(selected))
+        }
+        InternalUniformCaptureReducerCompileDisposition::Declined(decline) => Ok(
+            UniformCaptureReducerLinkCompileDispositionV1::Declined(decline),
+        ),
+    }
+}
+
+enum InternalUniformCaptureReducerCompileDisposition {
+    Combined(CompiledUniformCaptureReducer),
+    PreparedRowSearch(LinkedPreparedRowUniformCaptureReducerV1),
+    Declined(UniformCaptureParticipationDecline),
+}
+
+fn compile_uniform_capture_reducer_internal(
+    parsed: &RustParsed,
+    request: UniformCaptureCompileRequest,
+    operation: UniformCaptureReducerOperation,
+    allow_linked_row_search: bool,
+) -> Result<InternalUniformCaptureReducerCompileDisposition, UniformCaptureReducerCompileError> {
     let prospective = analyze_uniform_capture_participation(parsed, request.participation_limits)
         .map_err(UniformCaptureReducerCompileError::Participation)?;
     let prospective = match prospective {
         UniformCaptureParticipationDisposition::Declined(decline) => {
-            return Ok(UniformCaptureReducerCompileDisposition::Declined(decline));
+            return Ok(InternalUniformCaptureReducerCompileDisposition::Declined(
+                decline,
+            ));
         }
         UniformCaptureParticipationDisposition::Proven(receipt) => receipt,
     };
@@ -1446,7 +2244,26 @@ pub fn compile_uniform_capture_reducer(
                         .map_err(UniformCaptureReducerCompileError::Authentication)?;
                     (count, prospective, true)
                 }
-                UniformCaptureOperationOnlyAttempt::ResumePreparedSpanFill(_decline) => {
+                UniformCaptureOperationOnlyAttempt::ResumePreparedSpanFill(decline) => {
+                    if allow_linked_row_search
+                        && matches!(
+                            decline,
+                            PreparedOrderedNfaV15CompileDecline::ObjectBytes { .. }
+                        )
+                    {
+                        if let Some(selected) = try_compile_linked_prepared_row_uniform_capture(
+                            parsed,
+                            &request,
+                            prospective,
+                            operation,
+                        )? {
+                            return Ok(
+                                InternalUniformCaptureReducerCompileDisposition::PreparedRowSearch(
+                                    selected,
+                                ),
+                            );
+                        }
+                    }
                     let prepared =
                         compile_uniform_capture_prepared_span_fill_selector(parsed, request)
                             .map_err(UniformCaptureReducerCompileError::Prepared)?;
@@ -1492,7 +2309,80 @@ pub fn compile_uniform_capture_reducer(
             max_object_bytes,
         )
     }
-    .map(UniformCaptureReducerCompileDisposition::Selected)
+    .map(InternalUniformCaptureReducerCompileDisposition::Combined)
+}
+
+fn try_compile_linked_prepared_row_uniform_capture(
+    parsed: &RustParsed,
+    request: &UniformCaptureCompileRequest,
+    prospective: UniformCaptureParticipationReceipt,
+    operation: UniformCaptureReducerOperation,
+) -> Result<Option<LinkedPreparedRowUniformCaptureReducerV1>, UniformCaptureReducerCompileError> {
+    let lowered = lower_raw_general(
+        parsed,
+        OperationSemantics::CaptureFree,
+        request.selector_limits.lower,
+    )
+    .map_err(UniformCaptureCompileError::Lower)
+    .map_err(UniformCaptureReducerCompileError::Ordinary)?;
+    if prospective.canonical_capture_annotations() != lowered.stats().erased_captures() {
+        return Err(UniformCaptureReducerCompileError::Authentication(
+            UniformCaptureReducerAuthenticationError::ProofIdentity,
+        ));
+    }
+    let attempt = super::compile_raw_prepared_ordered_nfa_v15_row_search_reported(
+        request.source_bytes,
+        lowered.into_plan(),
+        request.profile.options.line_terminator,
+        OutputContract::Span,
+        request.target,
+        request.mode,
+        request.selector_limits,
+        request.selector_slow_aot_limits.max_native_data_bytes,
+    );
+    let row = match classify_uniform_capture_row_search_attempt(attempt)? {
+        UniformCaptureRowSearchAttempt::Compiled(compiled) => compiled,
+        UniformCaptureRowSearchAttempt::ResumeCompatibility(_) => return Ok(None),
+    };
+    match finalize_linked_prepared_row_uniform_capture_reducer(
+        row,
+        prospective,
+        operation,
+        request.selector_limits.max_object_bytes,
+    )? {
+        LinkedPreparedRowUniformCaptureFinalization::Selected(selected) => Ok(Some(selected)),
+        LinkedPreparedRowUniformCaptureFinalization::ObjectBytes => Ok(None),
+    }
+}
+
+#[derive(Debug)]
+enum UniformCaptureRowSearchAttempt {
+    Compiled(CompiledRegex),
+    ResumeCompatibility(PreparedOrderedNfaV15CompileDecline),
+}
+
+fn classify_uniform_capture_row_search_attempt(
+    attempt: Result<PreparedOrderedNfaV15CompileDisposition, CompileError>,
+) -> Result<UniformCaptureRowSearchAttempt, UniformCaptureReducerCompileError> {
+    match attempt {
+        Ok(PreparedOrderedNfaV15CompileDisposition::Compiled(compiled)) => {
+            Ok(UniformCaptureRowSearchAttempt::Compiled(compiled))
+        }
+        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(
+            decline @ (PreparedOrderedNfaV15CompileDecline::ObjectBytes { .. }
+            | PreparedOrderedNfaV15CompileDecline::NativeDataBytes { .. }),
+        )) => Ok(UniformCaptureRowSearchAttempt::ResumeCompatibility(
+            decline,
+        )),
+        Ok(PreparedOrderedNfaV15CompileDisposition::Declined(
+            PreparedOrderedNfaV15CompileDecline::Unsupported,
+        )) => Err(UniformCaptureReducerCompileError::RowSearch(
+            CompileError::InternalInvariant(
+                "strict RowSearch became unsupported after operation-only ObjectBytes decline",
+            ),
+        )),
+        Err(error) => Err(UniformCaptureReducerCompileError::RowSearch(error)),
+    }
 }
 
 #[derive(Debug)]
@@ -1561,6 +2451,186 @@ mod operation_only_fallback_policy_tests {
                 ))
             ))
         ));
+    }
+
+    #[test]
+    fn linked_row_resumes_only_numeric_declines_and_keeps_allocation_terminal() {
+        for decline in [
+            PreparedOrderedNfaV15CompileDecline::NativeDataBytes {
+                limit: 7,
+                required: 8,
+            },
+            PreparedOrderedNfaV15CompileDecline::ObjectBytes {
+                limit: 11,
+                required: 12,
+            },
+        ] {
+            let classified = classify_uniform_capture_row_search_attempt(Ok(
+                PreparedOrderedNfaV15CompileDisposition::Declined(decline),
+            ))
+            .expect("numeric strict-row decline");
+            assert!(matches!(
+                classified,
+                UniformCaptureRowSearchAttempt::ResumeCompatibility(actual)
+                    if actual == decline
+            ));
+        }
+        assert!(matches!(
+            classify_uniform_capture_row_search_attempt(Ok(
+                PreparedOrderedNfaV15CompileDisposition::Declined(
+                    PreparedOrderedNfaV15CompileDecline::Unsupported,
+                ),
+            )),
+            Err(UniformCaptureReducerCompileError::RowSearch(
+                CompileError::InternalInvariant(_)
+            ))
+        ));
+        assert!(matches!(
+            classify_uniform_capture_row_search_attempt(Err(CompileError::Object(
+                ObjectError::Allocation("injected strict-row allocation"),
+            ))),
+            Err(UniformCaptureReducerCompileError::RowSearch(
+                CompileError::Object(ObjectError::Allocation("injected strict-row allocation"))
+            ))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod linked_row_compiler_tests {
+    use super::*;
+    use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, parse};
+
+    const FIXTURE: &str = r"\b(?:([\w&&\p{Cyrillic}]{6})|([\w&&\p{Cyrillic}]{5}))\b";
+
+    fn parsed_fixture() -> RustParsed {
+        let parsed = parse(ParseRequest::rust(
+            FIXTURE,
+            CompatibilityProfile::RustBytes(RustProfile::rebar_1_12_4()),
+        ))
+        .expect("parse linked-row fixture");
+        match parsed.pattern {
+            CanonicalPattern::Rust(parsed) => parsed,
+            CanonicalPattern::Re2(_) | CanonicalPattern::Re2Literal(_) => {
+                panic!("Rust fixture produced a non-Rust pattern")
+            }
+        }
+    }
+
+    fn operation_only_object_decline_cap(parsed: &RustParsed, target: Target) -> usize {
+        let request = UniformCaptureCompileRequest::new(FIXTURE.len(), target)
+            .profile(RustProfile::rebar_1_12_4());
+        let lowered = lower_raw_general(
+            parsed,
+            OperationSemantics::CaptureFree,
+            request.selector_limits.lower,
+        )
+        .expect("lower linked-row fixture");
+        let raw = lowered.into_plan();
+        let mut cap = request.selector_limits.max_object_bytes;
+        for _ in 0..16 {
+            let mut limits = request.selector_limits;
+            limits.max_object_bytes = cap;
+            let attempt =
+                super::super::compile_raw_prepared_ordered_nfa_v15_scalar_operation_reported(
+                    request.source_bytes,
+                    raw.clone(),
+                    request.profile.options.line_terminator,
+                    OutputContract::Span,
+                    target,
+                    request.mode,
+                    limits,
+                    PreparedAggregateExports::COUNT,
+                    request.selector_slow_aot_limits.max_native_data_bytes,
+                )
+                .expect("operation-only sizing compile");
+            match attempt {
+                PreparedOrderedNfaV15CompileDisposition::Compiled(compiled) => {
+                    cap = compiled
+                        .object()
+                        .len()
+                        .checked_sub(1)
+                        .expect("operation-only object is nonempty");
+                }
+                PreparedOrderedNfaV15CompileDisposition::Declined(
+                    PreparedOrderedNfaV15CompileDecline::ObjectBytes { limit, required },
+                ) => {
+                    assert_eq!(limit, cap);
+                    assert!(required > limit);
+                    return cap;
+                }
+                PreparedOrderedNfaV15CompileDisposition::Declined(other) => {
+                    panic!("operation-only sizing reached a non-object decline: {other:?}")
+                }
+            }
+        }
+        panic!("operation-only object retries did not converge")
+    }
+
+    #[test]
+    fn object_decline_selects_two_object_row_reducer_cross_target_and_authenticates() {
+        let parsed = parsed_fixture();
+        for target in [Target::x86_64_linux(), Target::aarch64_linux()] {
+            let cap = operation_only_object_decline_cap(&parsed, target);
+            for operation in [
+                UniformCaptureReducerOperation::CountCaptures,
+                UniformCaptureReducerOperation::GrepCaptures,
+            ] {
+                let mut limits = CompileLimitsV1::default();
+                limits.max_object_bytes = cap;
+                let disposition = compile_uniform_capture_reducer_linked_v1(
+                    &parsed,
+                    UniformCaptureCompileRequest::new(FIXTURE.len(), target)
+                        .profile(RustProfile::rebar_1_12_4())
+                        .selector_limits(limits),
+                    operation,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("linked-row compile failed for {target:?}/{operation:?}: {error}")
+                });
+                let selected = disposition.prepared_row_search().unwrap_or_else(|| {
+                    panic!("linked-row route was not selected for {target:?}/{operation:?}")
+                });
+                selected.authenticate().expect("fresh linked-row receipt");
+                let receipt = selected.receipt();
+                assert_eq!(receipt.operation(), operation);
+                assert_eq!(receipt.target(), target);
+                assert_eq!(receipt.multiplier().get(), 2);
+                assert_eq!(receipt.semantic_runtime_calls(), 0);
+                assert!(receipt.row_object_bytes() <= cap);
+                assert!(receipt.reducer_object_bytes() <= cap);
+                assert_eq!(receipt.max_object_bytes(), cap);
+                assert_eq!(
+                    selected
+                        .reducer_module()
+                        .required_runtime_symbols()
+                        .collect::<Vec<_>>(),
+                    [selected.row().module().entry_symbol()],
+                );
+                assert_eq!(
+                    selected.row().receipt().entry_abi,
+                    EntryAbi::PreparedSpanSearchV1
+                );
+                assert_eq!(
+                    selected.row().module().required_prepare_capabilities(),
+                    PREPARED_CAPABILITY_ORDERED_NFA_V15,
+                );
+
+                let mut tampered = selected.clone();
+                assert!(tampered.reducer_module.test_flip_text_byte(0));
+                assert!(matches!(
+                    tampered.authenticate(),
+                    Err(UniformCaptureReducerAuthenticationError::LinkedReducerClosure)
+                ));
+
+                let mut row_tampered = selected.clone();
+                assert!(row_tampered.test_flip_row_text_byte(0));
+                assert!(matches!(
+                    row_tampered.authenticate(),
+                    Err(UniformCaptureReducerAuthenticationError::LinkedRowClosure)
+                ));
+            }
+        }
     }
 }
 

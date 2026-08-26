@@ -1709,11 +1709,7 @@ fn artifact_authenticates(artifact: &NativeParticipationAotArtifactV1) -> bool {
         && artifact.bundle.get(35).copied() == Some(0)
         && read_wire_u32(&artifact.bundle, 36) == Some(target_features)
         && read_wire_usize_u32(&artifact.bundle, 44)
-            == Some(if selected {
-                NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES
-            } else {
-                0
-            })
+            == Some(if selected { receipt.scratch_bytes } else { 0 })
         && read_wire_usize_u32(&artifact.bundle, 48) == Some(receipt.groups)
         && read_wire_usize_u32(&artifact.bundle, 52) == Some(receipt.assertions)
         && read_wire_usize_u32(&artifact.bundle, 56) == Some(receipt.assertion_signatures)
@@ -3211,6 +3207,38 @@ mod tests {
                 crate::RelocationKind::Aarch64PageOff12,
             ]
         );
+    }
+
+    #[test]
+    fn selected_aarch64_ordered_nfa_artifact_authenticates_local_features_and_scratch() {
+        let target = Target::aarch64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Asimd)
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2),
+            )
+            .expect("ASIMD/SVE/SVE2 target");
+        let compiled = compile_captures(CaptureCompileRequest::new(r"^((?:ab|ac)+)(d)?$", target))
+            .expect("capture compile");
+        let artifact = compiled
+            .emit_native_participation_aot_v1(NativeParticipationAotLimitsV1 {
+                max_dfa_states: 1,
+                ..NativeParticipationAotLimitsV1::default()
+            })
+            .expect("ordered-NFA participation artifact");
+
+        assert_eq!(
+            artifact.receipt().strategy,
+            NativeParticipationAotStrategyV1::OrderedNfaAarch64
+        );
+        assert_eq!(artifact.receipt().target.features.bits(), 7_u64 << 32);
+        assert_eq!(read_wire_u32(artifact.bundle(), 36), Some(7));
+        assert_eq!(
+            read_wire_usize_u32(artifact.bundle(), 44),
+            Some(artifact.receipt().scratch_bytes)
+        );
+        assert!(artifact.receipt().scratch_bytes > NATIVE_PARTICIPATION_AOT_V1_SCRATCH_BYTES);
+        assert!(artifact.authenticates_receipt());
     }
 
     #[test]

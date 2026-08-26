@@ -18,6 +18,13 @@ native objects. Each row is either an ordinary helper-free native entry or,
 only when that exact ordinary incumbent reports the typed Ordered-NFA need, an
 independently authenticated V15 prepared native search entry. A build with
 no KLV remains a harmless unconfigured workspace binary.
+For multi-pattern `grep`, the row table additionally selects a native wrapper
+that owns the complete LF/CRLF line traversal, calls and validates every
+distinct row on every line, and publishes the checked line count
+transactionally. An all-ordinary table retains the legacy helper-free ABI; a
+mixed table uses a distinct one-slot-per-row handle ABI. Only the wrapper's
+typed object-byte cap decline retains the exact pre-existing Rust line/row
+adapter.
 
 A configured build has two validation modes. With both
 `FRE_AOT_REBAR_EXPECTED_VALUE` and `FRE_AOT_REBAR_EXPECTED_COMPARATOR` absent,
@@ -122,7 +129,7 @@ timing belongs to a separately named compiler-stage benchmark.
   windows. Those adapter routes validate every span and implement Rebar's
   byte-wise empty-match progress and adjacent-empty suppression; they are
   reported as adapter loops rather than whole-operation-native execution.
-- Single-pattern `grep` calls its identity-suffixed native `GrepCount` reducer
+- `grep` calls its identity-suffixed native `GrepCount` reducer
   exactly once per sample. That generated reducer owns Rebar's LF/CRLF line
   domain, including empty input, lone CR, trailing LF, and checked
   transactional `u64` publication, and calls only its authenticated
@@ -132,10 +139,22 @@ timing belongs to a separately named compiler-stage benchmark.
   gate are object-local, and it has no unresolved runtime functions. Only a
   typed unsupported, native-data-byte, or object-byte decline preserves the
   exact incumbent; allocation, lowering, emission, and authentication errors
-  remain terminal. For multiple patterns the runner
-  still invokes every retained row's corresponding direct or prepared search
-  entry per line and counts lines for which any row reports a match. Prepared
-  handles are constructed before warmup and timed loops.
+  remain terminal. Multiple patterns first use one shared ordered automaton
+  and one whole-operation reducer under the same closed authentication. On its
+  typed decline, an all-ordinary table instead links one identity-suffixed
+  helper-free reducer. It implements the same LF/CRLF
+  line domain, invokes and validates every retained row even after a prior row
+  matches, and stores its `u64` result only after all lines succeed. Its exact
+  source map, row identities, relocations, code/object identities, and total
+  object envelope are sealed at build time; runtime reauthenticates the source
+  and artifact identities, and formal qualification rehashes every object. A
+  A mixed ordinary/prepared table instead links a distinct five-argument
+  reducer. Its authenticated one-slot-per-row handle table is passed once per
+  operation, and the native wrapper invokes ordinary rows with the ordinary
+  ABI and prepared rows with the exclusive-handle ABI. Prepared handles are
+  constructed before warmup and timed loops. Only the final numeric reducer
+  object-cap decline retains the older per-line/per-row adapter; allocator,
+  lowering, emission, and authentication failures remain terminal.
 - An exact one-pattern `count-captures` or `grep-captures` job first attempts
   one identity-suffixed uniform-capture reducer. The reducer owns the complete
   operation and returns a checked `u64` through the same exclusive-session
@@ -147,7 +166,20 @@ timing belongs to a separately named compiler-stage benchmark.
   V15 operation-only reducer likewise enters that numerator only with
   `PreparedScalarReduceV1`, one COUNT child equal to the module entry, no bulk,
   SpanFill, prepared-search, or runtime-symbol surface, the exact V15 caps,
-  and a distinct multiplier wrapper. The compatibility prepared-SpanFill
+  and a distinct multiplier wrapper. If that operation-only object is rejected
+  solely by its typed object-byte envelope, a linker-capable build may instead
+  retain two separately authenticated objects: one Ordered-NFA V15
+  `PreparedSpanSearchV1` / `RowSearchOnly` row and one native multiplier
+  reducer. The reducer has exactly one unresolved PLT32/Branch26 call to the
+  public row entry and no semantic runtime helper; the row therefore performs
+  its normal handle/object authentication on the call. Its receipt binds the
+  complete uniform proof, row automaton/program/object identities, reducer
+  code/object identity, both object extents against the same independent cap,
+  and the exact external relocation. Formal qualification selects
+  `linked-native-uniform-capture-row-search-reducer-v1`, traps the reducer as
+  the operation entry, inventories the public row and serialized program, and
+  reauthenticates the object-local Count identity from the closed receipt. The
+  compatibility prepared-SpanFill
   reducer remains available only after a typed V15 unsupported, native-data,
   or object-byte decline and keeps its declared semantic helpers. Typed
   semantic or exact lower-work
@@ -162,11 +194,20 @@ timing belongs to a separately named compiler-stage benchmark.
   pre-wrapper object into one composite proof identity. It then appends one
   Count/GrepCaptures wrapper to the full shared ordered-many Count portfolio.
   Only helper-free `NativeFused` or scalar-operation-only V15 closure is
-  published: no SpanFill, runtime helper, or Rust row loop remains. Typed
-  semantic, unequal-multiplier, unsupported, native-data, and object-cap
-  declines retain the pre-existing row adapter; all other failures are
-  terminal.
-- The fallback `count-captures` route repeatedly invokes the helper-free Span row table and adds
+  published: no SpanFill, runtime helper, or Rust row loop remains. When all
+  sources still prove uniform participation, a typed shared-reducer decline
+  next retains the independently authenticated ordinary Span rows and emits a
+  separate helper-free weighted reducer. This covers unequal multipliers as
+  well as an equal-multiplier shared representation, native-data, or object
+  envelope decline. The reducer resolves leftmost/first-source priority,
+  checked-adds each winning component's proved multiplier, and owns the whole
+  CountCaptures or exact LF/CRLF GrepCaptures traversal in one call. Its
+  receipt closes the source map, first ordinals, equal or unequal weights,
+  component program/object hashes, reducer identities, and exact
+  PLT32/Branch26 component relocations. Only its fixed numeric object-cap
+  decline preserves the pre-existing Rust row adapter; allocation, arithmetic,
+  lowering, object, and authentication failures are terminal.
+- The final fallback `count-captures` route repeatedly invokes the helper-free Span row table and adds
   the selected row's proved group-zero-inclusive participation count with
   checked arithmetic. `grep-captures` restarts that complete Span iteration on
   every Rebar line domain. Every source must prove a positive minimum width and
@@ -225,11 +266,26 @@ empty progress and adjacent-empty suppression as pinned
 `regex-automata::meta::Regex::build_many`. Count and SpanSum stay in local
 checked state and are published only after the complete traversal.
 
-Count and SpanSum first attempt an additive shared ordered-many route for
-2..=4,096 rows. That route independently parses every source, preserves source
-order in one ordered-NFA program, and invokes one generated Count or SpanSum
-reducer per benchmark operation. The exact combined raw plan first runs through
-the full ordinary optimizing portfolio. An authenticated `NativeFused`
+Multi-pattern Grep uses the same ordered, deduplicated row table but does not
+apply the ordered-many match-selection reduction: only whether any row matches
+each byte line is relevant. When every row is ordinary, its native reducer
+owns that complete line/row loop in one call while still invoking every row so
+a losing row's malformed status or span remains terminal. Its child relocation
+closure is exactly the distinct row entries. Prepared V15 rows retain the old
+semantics through a distinct five-argument reducer ABI: one authenticated table
+slot per row is passed once, ordinary slots are null, and prepared slots hold
+already-prepared exclusive handles. Handle lifecycle remains outside warmup
+and samples. The only safe decline is the exact remaining `ObjectBytes`
+ceiling after charging all row objects. Allocation, arithmetic, lowering,
+emission, and authentication failures are terminal.
+
+Count, SpanSum, and GrepCount first attempt an additive shared ordered-many
+route for 2..=4,096 rows. That route independently parses every source,
+preserves source order in one ordered-NFA program, and invokes one generated
+whole-operation reducer per benchmark operation. GrepCount applies the shared
+union once per LF/CRLF byte line instead of rescanning every independent row.
+The exact combined raw plan first runs through the full ordinary optimizing
+portfolio. An authenticated `NativeFused`
 incumbent has zero required prepare capabilities and no unresolved relocation
 from the selected reducer or unresolved runtime symbol anywhere in the object;
 provenance names it
@@ -390,12 +446,34 @@ all-matching RegexSet and does not claim a shared-scan automaton. Regex-redux is
 admitted only by its typed zero-pattern model and exact fixed public stage
 table; it is not recognized by benchmark name.
 
+Multi-pattern `count` and `count-spans` first attempt the genuine shared
+ordered-many compiler. If that compiler returns one of its typed declines, an
+independent Span-row table may be sealed into one native row-scalar wrapper.
+An all-ordinary table keeps the original three-argument ABI. A table containing
+authenticated Ordered-NFA V15 rows uses the additive mixed ABI: it receives an
+exact handle slot for every row once, requires ordinary slots to be null and
+prepared slots to be non-null, and statically seals which child call ABI owns
+each slot. Handle preparation and destruction remain outside warmup and timed
+samples. The wrapper owns the complete ordered match loop, keeps the lowest
+source row on equal starts, performs Rebar's byte-wise empty-match progress,
+and transactionally publishes either a checked match count or checked
+matched-byte sum. Only the wrapper's final numeric object cap retains the prior
+checked Rust row adapter; allocation, lowering, emission, and authentication
+failures remain terminal. The retained Rust adapter is also the differential
+semantic oracle for the native wrapper.
+
 Multi-pattern `grep` uses the same authenticated direct/prepared native rows,
-restarts their ordered selector for each Rebar byte-line, and reduces only
-whether any row matched that line. Its provenance distinguishes the ordinary
-`per-line-native-independent-span-row-exists-v1` loop from the mixed prepared
-V15 loop. It never scans across a line boundary and never substitutes one
-whole-haystack match stream for Rebar's per-line model.
+restarts every selector for each Rebar byte-line, and reduces only whether any
+row matched that line. An all-ordinary table selects
+`native-independent-span-row-whole-grep-reducer-v1`, with one native wrapper
+owning both loops. A table containing a prepared V15 row selects the distinct
+`native-independent-mixed-prepared-span-row-whole-grep-reducer-v1` wrapper and
+passes its authenticated handle table once. Every row is still called and
+validated after a match, each matching line is counted once, and publication
+remains transactional. Only the final numeric wrapper object-cap decline is
+reported as the corresponding `per-line-native-independent-*` Rust adapter.
+Neither route scans across a line boundary or substitutes one whole-haystack
+match stream for Rebar's per-line model.
 
 The build fails closed unless every linked regex-redux component has no
 prepared program/entry and no semantic runtime-helper relocation, and unless
@@ -411,11 +489,37 @@ and component-link surfaces, empty semantic-helper surface, request/receipt/
 report extents, scratch formula, and report/receipt schemas. The census counts
 this route as whole-operation native only when the one reducer entry and all
 of those closures authenticate.
-Uniform-capture routes additionally publish `capture_resolution` as
+For `native-row-scalar-reducer-v1`, v3 additionally seals the Count/SpanSum
+operation, ordered-source digest and source-to-row map, every row receipt and
+entry, the final wrapper symbol/code/object identities, its exact
+architecture-specific call relocations, zero semantic runtime calls, and the
+row-plus-wrapper object envelope. Mixed receipts additionally seal the exact
+handle count and ordinary/prepared route vector under distinct operation,
+artifact, and symbol domains. New prepared rows use the strict
+`PreparedSpanSearchV1` / `RowSearchOnly` surface: exactly one exclusive-handle
+function and one exact serialized-program object, with no SpanFill, bulk,
+aggregate, or unresolved runtime-helper symbol. The census admits the final
+mixed wrapper to the whole-operation numerator only when every prepared child
+has that strict surface. Legacy `SpanSearchV1` / `Compatibility` receipts
+remain accepted byte-for-byte, but a wrapper containing one remains
+semantic-helper-backed. Child row entries remain identity-defined link targets
+in both cases.
+`native-multi-grep-reducer-v1` uses the same mixed route vector and handle-table
+closure under its own Grep-specific operation, artifact, symbol, and ABI
+domains. Its final reducer is one native operation call; strict mixed children
+qualify as whole-operation native, while a legacy Compatibility child keeps
+the semantic-helper-backed classification.
+Uniform-capture v3 row-adapter routes additionally publish `capture_resolution` as
 `static-uniform-multiplier`, both proof-identity versions, every source's
 multiplier/minimum/census/accounting, and the selector digests that bind it to
 the retained row. They are reported separately from capture-materializing
 engines and remain outside the strict wholly-native-operation numerator.
+The v6 weighted-capture record carries those same per-source proofs but closes
+them into one helper-free operation entry. It additionally seals source and
+component priority, equal or unequal component weights, the LF terminator,
+final reducer and artifact identities, fixed object cap, and every
+architecture-specific child call relocation; the census therefore admits that
+exact route to the strict whole-operation numerator.
 The additive v4 strict-capture record instead binds the native `capture_next`,
 materializer, and selector symbols plus the source, selector, capture program,
 plan, bundle, object, and complete artifact identities. It reports

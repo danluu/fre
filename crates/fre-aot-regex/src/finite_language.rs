@@ -9,10 +9,13 @@ use fre_automata::{
     EdgeKind, RawPlan, StateRole, raw_plan_resource_requirements,
 };
 use fre_lower::{
-    FactError, FactLimits, FactOperation, FactOptionalProofs, FactOutput, FactProof, HirFacts,
-    LowerError, LowerLimits, analyze_facts,
+    CanonicalExactLiteral, CanonicalExactLiteralError, CanonicalExactLiteralLimits, FactError,
+    FactLimits, FactOperation, FactOptionalProofs, FactOutput, FactProof, FactRefusal, FactResource,
+    HirFacts, LowerError, LowerLimits, analyze_canonical_exact_literal, analyze_facts,
+    analyze_hir_facts,
 };
 use fre_syntax::RustParsed;
+use regex_syntax::hir::Hir;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -91,6 +94,85 @@ const fn fact_operation(output: OutputContract) -> FactOperation {
         .with_optional_proofs(FactOptionalProofs::FiniteLanguage)
 }
 
+fn analyze_regex_set_facts_checked(
+    parsed: &RustParsed,
+    operation: FactOperation,
+    limits: FactLimits,
+) -> Result<Option<HirFacts>, LowerError> {
+    match analyze_facts(parsed, operation, limits) {
+        Ok(facts) => Ok(Some(facts)),
+        Err(FactError::ResourceLimit { .. }) => Ok(None),
+        Err(FactError::AllocationFailed {
+            structure,
+            additional,
+        }) => Err(LowerError::AllocationFailed {
+            structure,
+            additional,
+        }),
+        Err(FactError::ArithmeticOverflow { computation }) => {
+            Err(LowerError::ArithmeticOverflow { computation })
+        }
+        Err(FactError::InternalInvariant { detail }) => {
+            Err(LowerError::InternalInvariant { detail })
+        }
+        Err(FactError::CaptureErasureForCaptureOutput) => Err(LowerError::InternalInvariant {
+            detail: "finite regex-set analysis requested capture erasure for capture output",
+        }),
+        Err(_) => Err(LowerError::InternalInvariant {
+            detail: "finite regex-set analysis observed an unknown fact failure",
+        }),
+    }
+}
+
+fn analyze_exact_singleton_preflight(
+    parsed: &RustParsed,
+) -> Result<Option<CanonicalExactLiteral<'_>>, LowerError> {
+    let limits = CanonicalExactLiteralLimits {
+        max_literal_bytes: usize::MAX,
+        max_work: u64::MAX,
+        ..CanonicalExactLiteralLimits::default()
+    };
+    let proof = match analyze_canonical_exact_literal(&parsed.hir, limits) {
+        Ok(proof) => proof,
+        Err(CanonicalExactLiteralError::ResourceLimit { .. }) => return Ok(None),
+        Err(CanonicalExactLiteralError::ArithmeticOverflow { computation }) => {
+            return Err(LowerError::ArithmeticOverflow { computation });
+        }
+        Err(_) => {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set analysis observed an unknown exact-literal failure",
+            });
+        }
+    };
+    let Some(proof) = proof else {
+        return Ok(None);
+    };
+    if !proof.identity().authenticates_current() {
+        return Err(LowerError::InternalInvariant {
+            detail: "finite regex-set exact-literal identity did not authenticate",
+        });
+    }
+    if proof.literal_len() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(proof))
+}
+
+fn check_exact_singleton_finite_refusal(refusal: FactRefusal) -> Result<(), LowerError> {
+    match refusal {
+        FactRefusal::ArithmeticOverflow { computation } => {
+            Err(LowerError::ArithmeticOverflow { computation })
+        }
+        FactRefusal::Limit {
+            resource: FactResource::FiniteStringBytes,
+            ..
+        } => Err(LowerError::InternalInvariant {
+            detail: "exact regex-set finite proof refused bytes after exact-width admission",
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Owned proof payload passed across the lowering/build boundary. Its fields
 /// remain private so only an authenticated current [`HirFacts`] report can
 /// construct one in production.
@@ -101,6 +183,27 @@ pub(crate) struct NativeFiniteLanguageCandidate {
     total_bytes: usize,
 }
 
+/// Result of the bounded exact-singleton proof requested by the opt-in
+/// aggregate regex-set compiler.
+pub(crate) enum NativeExactSingletonAnalysis {
+    Proven(Vec<u8>),
+    Declined,
+    LiteralBytesLimit { needed: u64, limit: u64 },
+}
+
+/// Checked complete finite-language proof requested by the opt-in aggregate
+/// regex-set compiler. A bounded optional proof refusal is kept distinct from
+/// hard construction failures so the caller can return its exact incumbent.
+pub(crate) enum NativeFiniteLanguageAnalysis {
+    Proven(NativeFiniteLanguageCandidate),
+    Declined,
+    ResourceLimit {
+        resource: FactResource,
+        needed: u64,
+        limit: u64,
+    },
+}
+
 impl NativeFiniteLanguageCandidate {
     /// Analyze one canonical parse for the exact output requested by the AOT
     /// entry. Optional proof failure is an optimization decline, never a
@@ -109,6 +212,351 @@ impl NativeFiniteLanguageCandidate {
         let operation = fact_operation(output);
         let facts = analyze_facts(parsed, operation, FactLimits::default()).ok()?;
         Self::from_facts(&facts, operation)
+    }
+
+    /// Analyze one already-parsed regex-set row for a complete, nonempty,
+    /// assertion-free finite byte language. Optional semantic absence and
+    /// bounded proof refusals are reported as declines. Allocation,
+    /// arithmetic, identity, and invariant failures remain terminal.
+    pub(crate) fn analyze_regex_set_checked(
+        parsed: &RustParsed,
+        output: OutputContract,
+        max_finite_strings: usize,
+        max_finite_string_bytes: usize,
+    ) -> Result<NativeFiniteLanguageAnalysis, LowerError> {
+        if output != OutputContract::Exists {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set witness requested non-Exists semantics",
+            });
+        }
+        let operation = fact_operation(output);
+        let limits = FactLimits {
+            max_finite_strings,
+            max_finite_string_bytes,
+            ..FactLimits::default()
+        };
+        let facts = match analyze_facts(parsed, operation, limits) {
+            Ok(facts) => facts,
+            Err(FactError::ResourceLimit {
+                resource,
+                needed,
+                limit,
+            }) => {
+                return Ok(NativeFiniteLanguageAnalysis::ResourceLimit {
+                    resource,
+                    needed,
+                    limit,
+                });
+            }
+            Err(FactError::AllocationFailed {
+                structure,
+                additional,
+            }) => {
+                return Err(LowerError::AllocationFailed {
+                    structure,
+                    additional,
+                });
+            }
+            Err(FactError::ArithmeticOverflow { computation }) => {
+                return Err(LowerError::ArithmeticOverflow { computation });
+            }
+            Err(FactError::InternalInvariant { detail }) => {
+                return Err(LowerError::InternalInvariant { detail });
+            }
+            Err(FactError::CaptureErasureForCaptureOutput) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite regex-set analysis requested capture erasure for capture output",
+                });
+            }
+            Err(_) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite regex-set analysis observed an unknown fact failure",
+                });
+            }
+        };
+        if !facts.identity().authenticates_current() || facts.operation() != operation {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set fact identity did not authenticate",
+            });
+        }
+        if !facts
+            .assertions()
+            .possible()
+            .as_proven()
+            .is_some_and(Vec::is_empty)
+        {
+            return Ok(NativeFiniteLanguageAnalysis::Declined);
+        }
+        let language = match facts.into_finite_language() {
+            FactProof::Proven(language) => language,
+            FactProof::Refused(FactRefusal::Limit {
+                resource,
+                needed,
+                limit,
+            }) => {
+                return Ok(NativeFiniteLanguageAnalysis::ResourceLimit {
+                    resource,
+                    needed,
+                    limit,
+                });
+            }
+            FactProof::Refused(FactRefusal::ArithmeticOverflow { computation }) => {
+                return Err(LowerError::ArithmeticOverflow { computation });
+            }
+            FactProof::Refused(_) | FactProof::Unknown => {
+                return Ok(NativeFiniteLanguageAnalysis::Declined);
+            }
+        };
+        if language.is_empty() || language.strings().any(<[u8]>::is_empty) {
+            return Ok(NativeFiniteLanguageAnalysis::Declined);
+        }
+        let total_bytes = language.total_bytes();
+        let strings = language.into_strings();
+        if strings.len() > max_finite_strings || total_bytes > max_finite_string_bytes {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set proof exceeded its authenticated allowance",
+            });
+        }
+        Ok(NativeFiniteLanguageAnalysis::Proven(Self {
+            operation,
+            strings,
+            total_bytes,
+        }))
+    }
+
+    pub(crate) fn regex_set_language_len(&self) -> usize {
+        self.strings.len()
+    }
+
+    pub(crate) fn authenticate_regex_set_checked(&self) -> Result<(), LowerError> {
+        if self.operation != fact_operation(OutputContract::Exists)
+            || self.strings.is_empty()
+            || self.strings.iter().any(Vec::is_empty)
+        {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set witness lost its semantic proof",
+            });
+        }
+        let total_bytes = self.strings.iter().try_fold(0_usize, |total, string| {
+            total
+                .checked_add(string.len())
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "finite regex-set witness byte census",
+                })
+        })?;
+        if total_bytes != self.total_bytes {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set witness byte census changed",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn regex_set_language_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub(crate) fn regex_set_strings(&self) -> &[Vec<u8>] {
+        &self.strings
+    }
+
+    /// Allocation-free semantic screen used after an earlier row has crossed
+    /// the aggregate literal-byte ceiling. This preserves later indexed
+    /// ineligibility without materializing any more optional witnesses.
+    pub(crate) fn preflight_exact_singleton_checked(
+        parsed: &RustParsed,
+        output: OutputContract,
+    ) -> Result<bool, LowerError> {
+        if output != OutputContract::Exists {
+            return Err(LowerError::InternalInvariant {
+                detail: "exact regex-set preflight requested non-Exists semantics",
+            });
+        }
+        Ok(analyze_exact_singleton_preflight(parsed)?.is_some())
+    }
+
+    /// Analyze one canonical parse for one exact nonempty string while
+    /// preserving hard fact-construction failures as terminal errors.
+    ///
+    /// An allocation-free canonical proof establishes the semantic shape and
+    /// exact width before the caller's aggregate byte allowance is applied.
+    /// The current HIR-fact proof then independently authenticates assertions,
+    /// the singleton language, and the materialized bytes. Allocator,
+    /// arithmetic, identity, and invariant failures cannot be hidden by a
+    /// later allocating fallback.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "semantic preflight, independent fact authentication, cap ordering, and byte agreement form one transaction"
+    )]
+    pub(crate) fn analyze_exact_singleton_checked(
+        parsed: &RustParsed,
+        output: OutputContract,
+        max_literal_bytes: usize,
+    ) -> Result<NativeExactSingletonAnalysis, LowerError> {
+        if output != OutputContract::Exists {
+            return Err(LowerError::InternalInvariant {
+                detail: "exact regex-set witness requested non-Exists semantics",
+            });
+        }
+        let operation = fact_operation(output);
+        let Some(canonical) = analyze_exact_singleton_preflight(parsed)? else {
+            return Ok(NativeExactSingletonAnalysis::Declined);
+        };
+        let exact_width = canonical.literal_len();
+        if exact_width > max_literal_bytes {
+            let needed = u64::try_from(exact_width).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "exact regex-set preflight width",
+                }
+            })?;
+            let limit = u64::try_from(max_literal_bytes).map_err(|_| {
+                LowerError::ArithmeticOverflow {
+                    computation: "exact regex-set preflight byte limit",
+                }
+            })?;
+            return Ok(NativeExactSingletonAnalysis::LiteralBytesLimit {
+                needed,
+                limit,
+            });
+        }
+        let limits = FactLimits {
+            max_finite_string_bytes: max_literal_bytes,
+            ..FactLimits::default()
+        };
+        let Some(facts) = analyze_regex_set_facts_checked(parsed, operation, limits)? else {
+            return Ok(NativeExactSingletonAnalysis::Declined);
+        };
+        if !facts.identity().authenticates_current() || facts.operation() != operation {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite regex-set fact identity did not authenticate",
+            });
+        }
+        if !facts
+            .assertions()
+            .possible()
+            .as_proven()
+            .is_some_and(Vec::is_empty)
+        {
+            return Ok(NativeExactSingletonAnalysis::Declined);
+        }
+        let language = match facts.into_finite_language() {
+            FactProof::Proven(language) => language,
+            FactProof::Refused(refusal) => {
+                check_exact_singleton_finite_refusal(refusal)?;
+                return Ok(NativeExactSingletonAnalysis::Declined);
+            }
+            FactProof::Unknown => {
+                return Ok(NativeExactSingletonAnalysis::Declined);
+            }
+        };
+        if language.is_empty() || language.strings().any(<[u8]>::is_empty) {
+            return Ok(NativeExactSingletonAnalysis::Declined);
+        }
+        let total_bytes = language.total_bytes();
+        let mut strings = language.into_strings();
+        if operation != fact_operation(OutputContract::Exists) {
+            return Err(LowerError::InternalInvariant {
+                detail: "exact regex-set witness did not authenticate Exists semantics",
+            });
+        }
+        if strings.len() != 1 {
+            return Ok(NativeExactSingletonAnalysis::Declined);
+        }
+        let mut literal = strings.pop().ok_or(LowerError::InternalInvariant {
+            detail: "singleton regex-set witness lost its literal",
+        })?;
+        if literal.is_empty() || literal.len() != total_bytes || literal.len() != exact_width {
+            return Err(LowerError::InternalInvariant {
+                detail: "singleton regex-set witness byte census changed",
+            });
+        }
+        if literal.len() > max_literal_bytes {
+            return Err(LowerError::InternalInvariant {
+                detail: "singleton regex-set proof exceeded its literal-byte allowance",
+            });
+        }
+        let fact_digest = <[u8; 32]>::from(Sha256::digest(&literal));
+        canonical
+            .copy_into(&mut literal)
+            .map_err(|_| LowerError::InternalInvariant {
+                detail: "exact regex-set literal proof rejected its authenticated destination",
+            })?;
+        if <[u8; 32]>::from(Sha256::digest(&literal)) != fact_digest {
+            return Err(LowerError::InternalInvariant {
+                detail: "exact regex-set literal proofs disagreed on bytes",
+            });
+        }
+        Ok(NativeExactSingletonAnalysis::Proven(literal))
+    }
+
+    /// Analyze one already-composed canonical HIR while preserving hard
+    /// construction failures as terminal errors.
+    ///
+    /// Ordered multi-source compilation uses this after every source has
+    /// parsed independently and before the combined HIR is lowered. A bounded
+    /// fact or optional finite-language refusal remains an optimization
+    /// decline. Allocation, arithmetic, and invariant failures cannot be
+    /// converted into a later allocating fallback.
+    pub(crate) fn analyze_hir_checked(
+        hir: &Hir,
+        output: OutputContract,
+    ) -> Result<Option<Self>, LowerError> {
+        let operation = fact_operation(output);
+        let facts = match analyze_hir_facts(hir, operation, FactLimits::default()) {
+            Ok(facts) => facts,
+            Err(FactError::ResourceLimit { .. }) => return Ok(None),
+            Err(FactError::AllocationFailed {
+                structure,
+                additional,
+            }) => {
+                return Err(LowerError::AllocationFailed {
+                    structure,
+                    additional,
+                });
+            }
+            Err(FactError::ArithmeticOverflow { computation }) => {
+                return Err(LowerError::ArithmeticOverflow { computation });
+            }
+            Err(FactError::InternalInvariant { detail }) => {
+                return Err(LowerError::InternalInvariant { detail });
+            }
+            Err(FactError::CaptureErasureForCaptureOutput) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite ordered-many analysis requested capture erasure for capture output",
+                });
+            }
+            Err(_) => {
+                return Err(LowerError::InternalInvariant {
+                    detail: "finite ordered-many analysis observed an unknown fact failure",
+                });
+            }
+        };
+        if !facts.identity().authenticates_current() || facts.operation() != operation {
+            return Err(LowerError::InternalInvariant {
+                detail: "finite ordered-many fact identity did not authenticate",
+            });
+        }
+        if !facts
+            .assertions()
+            .possible()
+            .as_proven()
+            .is_some_and(Vec::is_empty)
+        {
+            return Ok(None);
+        }
+        let FactProof::Proven(language) = facts.into_finite_language() else {
+            return Ok(None);
+        };
+        if language.is_empty() || language.strings().any(<[u8]>::is_empty) {
+            return Ok(None);
+        }
+        let total_bytes = language.total_bytes();
+        let strings = language.into_strings();
+        Ok(Some(Self {
+            operation,
+            strings,
+            total_bytes,
+        }))
     }
 
     /// Prove an exact finite language after ordinary lowering exceeded its
@@ -697,6 +1145,21 @@ impl NativeFiniteLanguageView<'_> {
     }
 }
 
+/// Source-authenticated proof that a complete exact finite `SelectedEnd`
+/// language is safe to search across LF-delimited line domains.
+///
+/// The proof carries no source strings. It is constructed only after the
+/// bound finite-language graph has been revalidated and every exact trie edge
+/// has been shown to exclude both CR and LF. Non-empty language and
+/// non-nullability are inherited from [`NativeFiniteLanguageView`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeFiniteSelectedEndGrepCountView {
+    pub(crate) artifact_identity: [u8; 32],
+    pub(crate) source_count: u32,
+    pub(crate) total_source_bytes: usize,
+    pub(crate) maximum_width: u32,
+}
+
 /// Target-neutral exact-finite `Exists` strategy. This is a planning receipt,
 /// not a selection over the already compiled DFA: target finalization must
 /// still compare its concrete lowering against the incumbent native machine.
@@ -818,6 +1281,24 @@ fn finite_literal_digest(literals: &[Vec<u8>]) -> Option<[u8; 32]> {
         digest.update(literal);
     }
     Some(digest.finalize().into())
+}
+
+fn exact_singleton_identity(
+    artifact_identity: [u8; 32],
+    output: OutputContract,
+    literal: &[u8],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"fre-aot-regex/exact-singleton-count-witness/v1\0");
+    digest.update(artifact_identity);
+    digest.update([match output {
+        OutputContract::Exists => 1,
+        OutputContract::SelectedEnd => 2,
+        OutputContract::Span => 3,
+    }]);
+    digest.update(u64::try_from(literal.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(literal);
+    digest.finalize().into()
 }
 
 impl NativeFiniteSelectedEndTeddyChoice {
@@ -1117,6 +1598,7 @@ struct OrderedFiniteAutomaton {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OrderedFiniteBuildPurpose {
     Optional,
+    OptionalFailClosed,
     LowerStateRescue,
 }
 
@@ -1146,6 +1628,19 @@ impl OrderedFiniteAutomaton {
             total_bytes,
             limits,
             OrderedFiniteBuildPurpose::LowerStateRescue,
+        )
+    }
+
+    fn build_optional_checked(
+        strings: &[Vec<u8>],
+        total_bytes: usize,
+        limits: OrderedFiniteBuildLimits,
+    ) -> Result<Option<Self>, LowerError> {
+        Self::build_checked(
+            strings,
+            total_bytes,
+            limits,
+            OrderedFiniteBuildPurpose::OptionalFailClosed,
         )
     }
 
@@ -1445,10 +1940,21 @@ impl OrderedFiniteAutomaton {
             },
         )?;
         let mut transitions = Vec::new();
-        if transition_cells <= limits.max_dense_transition_cells
-            && purpose == OrderedFiniteBuildPurpose::Optional
-            && transitions.try_reserve_exact(transition_cells).is_ok()
+        let build_dense = if transition_cells > limits.max_dense_transition_cells
+            || purpose == OrderedFiniteBuildPurpose::LowerStateRescue
         {
+            false
+        } else if purpose == OrderedFiniteBuildPurpose::Optional {
+            transitions.try_reserve_exact(transition_cells).is_ok()
+        } else {
+            reserve_exact(
+                &mut transitions,
+                transition_cells,
+                "ordered finite dense transitions",
+            )?;
+            true
+        };
+        if build_dense {
             transitions.resize(transition_cells, 0_u32);
             for &state_token in &breadth_first {
                 let state = usize::try_from(state_token).map_err(|_| {
@@ -1575,6 +2081,10 @@ pub(crate) struct NativeFiniteLanguageProgram {
     /// `SelectedEnd` Teddy candidate.
     selected_end_literals: Vec<Vec<u8>>,
     selected_end_teddy_choice: Option<NativeFiniteSelectedEndTeddyChoice>,
+    /// Exact singleton retained only for the explicit Count-v3 portfolio when
+    /// another finite-language leaf does not already own the same bytes.
+    exact_singleton_literal: Vec<u8>,
+    exact_singleton_identity: [u8; 32],
 }
 
 impl NativeFiniteLanguageProgram {
@@ -1589,6 +2099,37 @@ impl NativeFiniteLanguageProgram {
             output,
             OrderedFiniteBuildLimits::default(),
         )
+    }
+
+    pub(crate) fn bind_checked(
+        candidate: NativeFiniteLanguageCandidate,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Result<Option<Self>, LowerError> {
+        if artifact_identity == [0; 32] || candidate.operation != fact_operation(output) {
+            return Err(LowerError::InternalInvariant {
+                detail: "checked finite-language sidecar authentication failed",
+            });
+        }
+        let source_count = u32::try_from(candidate.strings.len()).map_err(|_| {
+            LowerError::ArithmeticOverflow {
+                computation: "checked finite-language source count",
+            }
+        })?;
+        let Some(automaton) = OrderedFiniteAutomaton::build_optional_checked(
+            &candidate.strings,
+            candidate.total_bytes,
+            OrderedFiniteBuildLimits::default(),
+        )? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::finish_bind(
+            candidate,
+            artifact_identity,
+            output,
+            source_count,
+            automaton,
+        )))
     }
 
     fn bind_with_limits(
@@ -1647,12 +2188,21 @@ impl NativeFiniteLanguageProgram {
     }
 
     fn finish_bind(
-        candidate: NativeFiniteLanguageCandidate,
+        mut candidate: NativeFiniteLanguageCandidate,
         artifact_identity: [u8; 32],
         output: OutputContract,
         source_count: u32,
         automaton: OrderedFiniteAutomaton,
     ) -> Self {
+        let retain_singleton = output == OutputContract::Span
+            && candidate.strings.len() == 1
+            && (1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES)
+                .contains(&candidate.strings[0].len());
+        let exact_singleton_identity = if retain_singleton {
+            exact_singleton_identity(artifact_identity, output, &candidate.strings[0])
+        } else {
+            [0; 32]
+        };
         let exists_choice = if output == OutputContract::Exists {
             NativeFiniteExistsChoice::derive(
                 &candidate.strings,
@@ -1671,13 +2221,20 @@ impl NativeFiniteLanguageProgram {
         } else {
             None
         };
-        let (exists_literals, selected_end_literals) = if exists_choice.is_some() {
-            (candidate.strings, Vec::new())
-        } else if selected_end_teddy_choice.is_some() {
-            (Vec::new(), candidate.strings)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let (exists_literals, selected_end_literals, exact_singleton_literal) =
+            if exists_choice.is_some() {
+                (candidate.strings, Vec::new(), Vec::new())
+            } else if selected_end_teddy_choice.is_some() {
+                (Vec::new(), candidate.strings, Vec::new())
+            } else if retain_singleton {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    candidate.strings.pop().unwrap_or_default(),
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
         Self {
             artifact_identity,
             output,
@@ -1688,6 +2245,8 @@ impl NativeFiniteLanguageProgram {
             exists_choice,
             selected_end_literals,
             selected_end_teddy_choice,
+            exact_singleton_literal,
+            exact_singleton_identity,
         }
     }
 
@@ -1886,6 +2445,65 @@ impl NativeFiniteLanguageProgram {
             .native_view(artifact_identity, &self.selected_end_literals)
     }
 
+    /// Re-authenticate the complete exact finite language and prove that its
+    /// literals cannot consume a line delimiter. The compact sparse graph is
+    /// a trie: every source byte occurs on one of its explicit edges, so the
+    /// absence of CR/LF edges proves that a match cannot cross or consume an
+    /// LF/CRLF boundary.
+    pub(crate) fn native_selected_end_grep_count_view(
+        &self,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Option<NativeFiniteSelectedEndGrepCountView> {
+        let view = self.native_view(artifact_identity, output)?;
+        if output != OutputContract::SelectedEnd
+            || view
+                .sparse_edges
+                .iter()
+                .any(|edge| matches!(edge.byte, b'\r' | b'\n'))
+        {
+            return None;
+        }
+        Some(NativeFiniteSelectedEndGrepCountView {
+            artifact_identity,
+            source_count: view.source_count,
+            total_source_bytes: view.total_source_bytes,
+            maximum_width: view.maximum_width,
+        })
+    }
+
+    /// Return one exact non-empty finite literal only after its current
+    /// artifact/output binding and private witness identity are recomputed.
+    pub(crate) fn exact_singleton_literal(
+        &self,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Option<&[u8]> {
+        if output != OutputContract::Span
+            || !self.authenticates(artifact_identity, output)
+            || self.source_count != 1
+        {
+            return None;
+        }
+        let literal = if !self.exact_singleton_literal.is_empty() {
+            self.exact_singleton_literal.as_slice()
+        } else if self.exists_literals.len() == 1 {
+            self.exists_literals[0].as_slice()
+        } else if self.selected_end_literals.len() == 1 {
+            self.selected_end_literals[0].as_slice()
+        } else {
+            return None;
+        };
+        if self.total_source_bytes != literal.len()
+            || !(1..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+            || self.exact_singleton_identity
+                != exact_singleton_identity(artifact_identity, output, literal)
+        {
+            return None;
+        }
+        Some(literal)
+    }
+
     /// Target-neutral correctness oracle for the future native lowering. The
     /// caller has already validated the search window at the public boundary.
     #[allow(
@@ -1993,6 +2611,20 @@ mod tests {
             panic!("Rust request returned a non-Rust pattern");
         };
         parsed
+    }
+
+    #[test]
+    fn exact_singleton_arithmetic_refusal_is_terminal() {
+        let error = check_exact_singleton_finite_refusal(FactRefusal::ArithmeticOverflow {
+            computation: "synthetic exact64 finite-language count",
+        })
+        .expect_err("arithmetic proof refusal must remain terminal");
+        assert!(matches!(
+            error,
+            LowerError::ArithmeticOverflow {
+                computation: "synthetic exact64 finite-language count"
+            }
+        ));
     }
 
     fn candidate(pattern: &str, output: OutputContract) -> Option<NativeFiniteLanguageCandidate> {

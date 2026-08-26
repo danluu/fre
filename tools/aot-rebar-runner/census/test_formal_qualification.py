@@ -18,10 +18,27 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import formal_qualification as DRIVER  # noqa: E402
 import true_native_census as CENSUS  # noqa: E402
-from test_true_native_census import synthetic_plan  # noqa: E402
+from test_true_native_census import (  # noqa: E402
+    synthetic_plan,
+    weighted_capture_reducer_provenance_fields,
+)
 
 
 class FormalQualificationTests(unittest.TestCase):
+    def test_weighted_capture_objects_preserve_children_then_reducer(self) -> None:
+        fields = weighted_capture_reducer_provenance_fields()
+        parsed = CENSUS.parse_provenance(
+            " ".join(f"{key}={value}" for key, value in fields.items()).encode()
+        )
+        provenance = CENSUS.provenance_receipt(parsed)
+        self.assertEqual(
+            DRIVER.expected_object_hashes(provenance),
+            [
+                *fields["component_object_sha256"].split(","),
+                fields["reducer_object_sha256"],
+            ],
+        )
+
     def test_plan_target_must_match_the_native_host(self) -> None:
         plan = synthetic_plan()
         self.assertEqual(plan["target"]["triple"], "aarch64-linux")
