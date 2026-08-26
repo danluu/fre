@@ -3014,6 +3014,8 @@ impl NativeFiniteLanguageLayout {
 const NATIVE_FINITE_ROOT_BATCH_BYTES: usize = 4;
 const NATIVE_FINITE_ROOT_SCANNER_DENSE_HITS: u16 = 4;
 const NATIVE_FINITE_ROOT_SCANNER_BACKOFF_BYTES: u16 = 1024;
+const NATIVE_FINITE_ROOT_SCANNER_WIDE_BATCH_BYTES: u16 = 4 * AARCH64_BATCH_BYTES;
+const NATIVE_FINITE_ROOT_SCANNER_WIDE_REWIND_BYTES: u16 = 3 * AARCH64_BATCH_BYTES;
 
 /// The scalar root loop necessarily probes the first byte. Batch only when a
 /// uniform byte prior predicts at most one root transition among the three
@@ -67163,9 +67165,11 @@ fn aarch64_emit_candidate_any(
     Ok(())
 }
 
-fn aarch64_emit_candidate_batch_any(
+fn aarch64_emit_candidate_batch_union(
     assembler: &mut Aarch64Assembler,
     first_candidates: u8,
+    destination: u8,
+    scratch: u8,
 ) -> Result<(), ObjectError> {
     let second = first_candidates
         .checked_add(1)
@@ -67176,11 +67180,33 @@ fn aarch64_emit_candidate_batch_any(
     let fourth = first_candidates
         .checked_add(3)
         .ok_or(ObjectError::ArithmeticOverflow("AArch64 batch candidates"))?;
+    if destination == scratch
+        || (first_candidates..=fourth).contains(&destination)
+        || (first_candidates..=fourth).contains(&scratch)
+        || !aarch64_caller_saved_simd(destination)
+        || !aarch64_caller_saved_simd(scratch)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 batch union has overlapping registers",
+        ));
+    }
+    assembler.instruction(aarch64_orr_16b(destination, first_candidates, second)?)?;
+    assembler.instruction(aarch64_orr_16b(scratch, third, fourth)?)?;
+    assembler.instruction(aarch64_orr_16b(
+        destination,
+        destination,
+        scratch,
+    )?)?;
+    Ok(())
+}
+
+fn aarch64_emit_candidate_batch_any(
+    assembler: &mut Aarch64Assembler,
+    first_candidates: u8,
+) -> Result<(), ObjectError> {
     // Pairwise reduction preserves all four exact lane masks for a rare hit
     // while shortening the overwhelmingly hot miss path by one ORR.
-    assembler.instruction(aarch64_orr_16b(28, first_candidates, second)?)?;
-    assembler.instruction(aarch64_orr_16b(7, third, fourth)?)?;
-    assembler.instruction(aarch64_orr_16b(28, 28, 7)?)?;
+    aarch64_emit_candidate_batch_union(assembler, first_candidates, 28, 7)?;
     aarch64_emit_candidate_any(assembler, 28)
 }
 
@@ -72671,6 +72697,8 @@ fn lower_aarch64_native_finite_language_impl(
             assembler.label()?, // sparse vector hit after density sampling
             assembler.label()?, // dense backoff reaches the window end
             assembler.label()?, // bounded direct-root scalar backoff
+            assembler.label()?, // direct-filter ordinary four-vector batch
+            assembler.label()?, // direct-filter wide-batch hit replay
             assembler.label()?, // direct-filter single-vector tail
             assembler.label()?, // direct-filter four-vector hit
             assembler.label()?, // direct-filter dense batch
@@ -72755,6 +72783,8 @@ fn lower_aarch64_native_finite_language_impl(
             _,
             _,
             _,
+            _,
+            _,
             root_direct_short_batch,
         ) = root_scanner_labels.ok_or(
             ObjectError::InvalidModule("finite root-scanner labels are absent"),
@@ -72814,6 +72844,8 @@ fn lower_aarch64_native_finite_language_impl(
                 root_vector_hit_sparse,
                 root_vector_hit_backoff_to_end,
                 root_scalar_backoff,
+                root_direct_batch,
+                root_direct_wide_hit,
                 root_direct_single,
                 root_direct_batch_hit,
                 root_direct_batch_dense,
@@ -72826,6 +72858,73 @@ fn lower_aarch64_native_finite_language_impl(
 
             if let Some(filter) = root_scanner.direct_batch_filter {
                 assembler.bind(root_scan)?;
+                assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
+                assembler.instruction(aarch64_cmp_x_imm(
+                    1,
+                    NATIVE_FINITE_ROOT_SCANNER_WIDE_BATCH_BYTES,
+                )?)?;
+                assembler.branch_cond(AARCH64_LO, root_direct_batch)?;
+                let first_candidates = aarch64_emit_start_filter_batch_candidates(
+                    &mut assembler,
+                    filter,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+                if first_candidates != 0 {
+                    return Err(ObjectError::InvalidModule(
+                        "finite root direct wide batch changed its candidate bank",
+                    ));
+                }
+                aarch64_emit_candidate_batch_union(
+                    &mut assembler,
+                    first_candidates,
+                    4,
+                    7,
+                )?;
+                for _ in 1_u8..4 {
+                    assembler.instruction(aarch64_add_x_imm(
+                        2,
+                        2,
+                        AARCH64_BATCH_BYTES,
+                    )?)?;
+                    let candidates = aarch64_emit_start_filter_batch_candidates(
+                        &mut assembler,
+                        filter,
+                        AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                    )?;
+                    if candidates != first_candidates {
+                        return Err(ObjectError::InvalidModule(
+                            "finite root direct wide batch changed its candidate bank",
+                        ));
+                    }
+                    aarch64_emit_candidate_batch_union(
+                        &mut assembler,
+                        candidates,
+                        28,
+                        7,
+                    )?;
+                    assembler.instruction(aarch64_orr_16b(4, 4, 28)?)?;
+                }
+                aarch64_emit_candidate_any(&mut assembler, 4)?;
+                assembler.branch_cond(AARCH64_NE, root_direct_wide_hit)?;
+                assembler.instruction(aarch64_add_x_imm(
+                    2,
+                    2,
+                    AARCH64_BATCH_BYTES,
+                )?)?;
+                assembler.branch(root_scan)?;
+
+                assembler.bind(root_direct_wide_hit)?;
+                // Candidate masks are lowering temporaries. Replay the cold
+                // four-vector path from the original batch to preserve exact
+                // first-byte order, density feedback and scalar backoff.
+                assembler.instruction(aarch64_sub_x_imm(
+                    2,
+                    2,
+                    NATIVE_FINITE_ROOT_SCANNER_WIDE_REWIND_BYTES,
+                )?)?;
+                assembler.branch(root_direct_batch)?;
+
+                assembler.bind(root_direct_batch)?;
                 assembler.instruction(aarch64_sub_x_reg(1, 3, 2)?)?;
                 assembler.instruction(aarch64_cmp_x_imm(1, AARCH64_BATCH_BYTES)?)?;
                 assembler.branch_cond(AARCH64_LO, root_direct_single)?;
@@ -89383,6 +89482,26 @@ mod tests {
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(words.contains(&aarch64_ld1_four_16b(24, 12).unwrap()));
+        assert!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_ld1_four_16b(24, 12).unwrap())
+                .count()
+                >= 5,
+            "the sparse-miss loop must cover 256 bytes before replaying the ordinary batch",
+        );
+        assert!(words.contains(
+            &aarch64_cmp_x_imm(1, NATIVE_FINITE_ROOT_SCANNER_WIDE_BATCH_BYTES).unwrap(),
+        ));
+        assert!(words.contains(
+            &aarch64_sub_x_imm(
+                2,
+                2,
+                NATIVE_FINITE_ROOT_SCANNER_WIDE_REWIND_BYTES,
+            )
+            .unwrap(),
+        ));
+        assert!(words.contains(&aarch64_orr_16b(4, 4, 28).unwrap()));
         assert!(words.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()));
         assert!(words.contains(&aarch64_movi_16b(16, b'q').unwrap()));
         assert!(!words.contains(&aarch64_ld1_three_16b(16, 6).unwrap()));
