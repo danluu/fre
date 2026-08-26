@@ -66096,6 +66096,22 @@ fn aarch64_sve_addvl(destination: u8, source: u8, vector_count: u8) -> Result<u3
         | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_sve_addvl_signed(
+    destination: u8,
+    source: u8,
+    vector_count: i8,
+) -> Result<u32, ObjectError> {
+    if !(-32..=31).contains(&vector_count) {
+        return Err(ObjectError::InvalidModule("SVE ADDVL signed vector count"));
+    }
+    let immediate = u32::try_from(i16::from(vector_count) & 0x3f)
+        .map_err(|_| ObjectError::InvalidModule("SVE ADDVL signed vector count"))?;
+    Ok(0x0420_5000
+        | aarch64_reg(source, 16)?
+        | (immediate << 5)
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_sve2_match_b(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x4520_8000
@@ -132288,6 +132304,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(aarch64_sve_addvl(2, 2, 1).unwrap(), 0x0422_5022);
         assert_eq!(aarch64_sve_addvl(3, 4, 4).unwrap(), 0x0424_5083);
         assert_eq!(aarch64_sve_addvl(6, 6, 1).unwrap(), 0x0426_5026);
+        assert_eq!(aarch64_sve_addvl_signed(9, 10, -4).unwrap(), 0x042a_5789);
+        assert_eq!(aarch64_sve_addvl_signed(0, 0, -32).unwrap(), 0x0420_5400);
+        assert_eq!(aarch64_sve_addvl_signed(0, 0, 31).unwrap(), 0x0420_53e0);
         assert_eq!(aarch64_sve2_match_b(1, 0, 16).unwrap(), 0x4530_8001);
 
         assert!(aarch64_cmp_x_lsl(0, 0, 64).is_err());
@@ -132303,6 +132322,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert!(aarch64_sve_incp_b(0, 16).is_err());
         assert!(aarch64_sve_whilelo_b(16, 0, 0).is_err());
         assert!(aarch64_sve_addvl(0, 0, 32).is_err());
+        assert!(aarch64_sve_addvl_signed(0, 0, -33).is_err());
+        assert!(aarch64_sve_addvl_signed(0, 0, 32).is_err());
+        assert!(aarch64_sve_addvl_signed(32, 0, 0).is_err());
+        assert!(aarch64_sve_addvl_signed(0, 32, 0).is_err());
     }
 
     #[test]
