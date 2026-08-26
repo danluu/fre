@@ -50,6 +50,27 @@ pub(crate) const ONE_BYTE_PLAN_ID: &str =
 pub(crate) const WIDE_PACKED_PLAN_ID: &str =
     "guarded-ascii-word-literal-set.wide-column-packed-dictionary.v1";
 
+#[cfg(test)]
+pub(crate) mod value_path_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static FIND_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        FIND_CALLS.set(0);
+    }
+
+    pub(crate) fn calls() -> usize {
+        FIND_CALLS.get()
+    }
+
+    pub(super) fn record_find() {
+        FIND_CALLS.set(FIND_CALLS.get().saturating_add(1));
+    }
+}
+
 /// Source-independent ceiling closed before the first haystack read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchUpperBounds {
@@ -2388,6 +2409,8 @@ impl Plan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
+        #[cfg(test)]
+        value_path_probe::record_find();
         self.search_window_value(haystack, window, limits)
     }
 

@@ -15893,6 +15893,10 @@ impl PortableRegex {
             PortablePlan::BoundedByteClassRepeat(plan) => plan
                 .earliest_end_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
+            PortablePlan::GuardedLiteralSet(plan) => plan
+                .find_window_value(haystack, window, limits)
+                .map(|matched| matched.map(Match::end))
+                .map_err(SearchError::from),
             PortablePlan::NullableOptionalChain(plan) => plan
                 .earliest_end_window_value(haystack, window, limits)
                 .map_err(SearchError::NullableOptionalChain),
@@ -29632,7 +29636,8 @@ mod tests {
         PackedLiteralSetError, PlanKind, PlanSelection, PortableBuilder,
         PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortableFindIterStepAccounting, PortableParsedBuildContext,
-        PortablePlan, PortableRegex, PortableRegexSetBuilder, PortableSearchSession,
+        PortableOrdinarySessionPlan, PortablePlan, PortableRegex, PortableRegexSetBuilder,
+        PortableSearchSession,
         PortableSearchSessionPlan, PortableSpanVisitLimits, PortableTextBuilder,
         PortableTextRegexSetBuilder, RipgrepStandardLiteralsBuild, SearchAccounting, SearchError,
         SearchLimits, SearchSessionLimits, SearchWindow, SimdDispatchContext,
@@ -51658,6 +51663,138 @@ mod tests {
                 GuardedLiteralSetSearchError::WorkLimit { .. }
             )),
         ));
+    }
+
+    #[test]
+    fn guarded_shortest_value_uses_find_window_value() {
+        let pattern = r"(?-u:\b(?:a|ab|cat|dog)\b)";
+        let fre = PortableBuilder::new(pattern).unicode(false).build().unwrap();
+        assert!(matches!(&fre.plan, PortablePlan::GuardedLiteralSet(_)));
+        let haystack = b"x ab cat";
+        let window = SearchWindow::full(haystack);
+
+        super::guarded_literal_set::value_path_probe::reset();
+        assert_eq!(
+            fre.shortest_match_window_value(haystack, window, SearchLimits::unlimited()),
+            Ok(Some(4)),
+        );
+        assert_eq!(super::guarded_literal_set::value_path_probe::calls(), 1);
+
+        let mut ordinary = fre.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            PortableOrdinarySessionPlan::Canonical(_)
+        ));
+        assert_eq!(ordinary.first_acceptance_at(haystack, 0), Ok(Some(4)));
+        assert_eq!(super::guarded_literal_set::value_path_probe::calls(), 2);
+
+        let (accounted, accounting) = fre
+            .shortest_match_window(haystack, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(accounted, Some(4));
+        assert!(matches!(
+            accounting,
+            SearchAccounting::GuardedLiteralSet(_)
+        ));
+        assert_eq!(super::guarded_literal_set::value_path_probe::calls(), 2);
+    }
+
+    #[test]
+    fn guarded_shortest_value_matches_accounted_exhaustively() {
+        const ALPHABET: [u8; 5] = [b' ', b'a', b'b', b'x', 0xff];
+
+        let pattern = r"(?-u:\b(?:a|ab|cat|dog)\b)";
+        let fre = PortableBuilder::new(pattern).unicode(false).build().unwrap();
+        assert!(matches!(&fre.plan, PortablePlan::GuardedLiteralSet(_)));
+
+        for len in 0_usize..=4 {
+            let case_count = (0..len).fold(1_usize, |count, _| count * ALPHABET.len());
+            for ordinal in 0..case_count {
+                let mut code = ordinal;
+                let mut haystack = vec![0; len];
+                for byte in &mut haystack {
+                    *byte = ALPHABET[code % ALPHABET.len()];
+                    code /= ALPHABET.len();
+                }
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let (expected, accounting) = fre
+                            .shortest_match_window(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            fre.shortest_match_window_value(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            Ok(expected),
+                            "haystack={haystack:?}, window={start}..{end}, unlimited",
+                        );
+
+                        let SearchAccounting::GuardedLiteralSet(accounting) = accounting else {
+                            panic!("guarded route returned another accounting family");
+                        };
+                        let exact_work =
+                            u64::try_from(accounting.upper_bounds.total_work).unwrap();
+                        let exact_limits = SearchLimits {
+                            max_work: exact_work,
+                            max_scratch_bytes: accounting.upper_bounds.scratch_bytes,
+                        };
+                        let expected_exact = fre
+                            .shortest_match_window(&haystack, window, exact_limits)
+                            .map(|(matched, _)| matched);
+                        assert_eq!(
+                            fre.shortest_match_window_value(&haystack, window, exact_limits),
+                            expected_exact,
+                            "haystack={haystack:?}, window={start}..{end}, exact limit",
+                        );
+
+                        if exact_work > 0 {
+                            let refused_limits = SearchLimits {
+                                max_work: exact_work - 1,
+                                ..exact_limits
+                            };
+                            let expected_refusal = fre
+                                .shortest_match_window(&haystack, window, refused_limits)
+                                .map(|(matched, _)| matched);
+                            assert_eq!(
+                                fre.shortest_match_window_value(
+                                    &haystack,
+                                    window,
+                                    refused_limits,
+                                ),
+                                expected_refusal,
+                                "haystack={haystack:?}, window={start}..{end}, refused limit",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let haystack = b"ab";
+        let zero_limits = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        for window in [
+            SearchWindow::new(1, 0),
+            SearchWindow::new(0, haystack.len() + 1),
+        ] {
+            let expected = fre
+                .shortest_match_window(haystack, window, zero_limits)
+                .map(|(matched, _)| matched);
+            assert_eq!(
+                fre.shortest_match_window_value(haystack, window, zero_limits),
+                expected,
+                "invalid window {window:?}",
+            );
+        }
     }
 
     #[test]
