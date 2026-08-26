@@ -24933,9 +24933,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// their ordered endpoints.
     ///
     /// `Ok(Some(count))` is returned for a positive exact literal, a
-    /// positive-width K0 plan, a reverse-inner plan over an exact tail window,
-    /// a legacy literal/class-run plan over a full or unguarded tail window,
-    /// or a packed, ordinary non-uniform, or
+    /// positive-width K0 plan, a reverse-inner or Unicode scalar-run plan over
+    /// an exact tail window, a legacy literal/class-run plan over a full or
+    /// unguarded tail window, or a packed, ordinary non-uniform, or
     /// uniform-standard literal-set plan. Each construction seals nonempty
     /// selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
@@ -25094,6 +25094,11 @@ impl<'r> PortableOrdinarySession<'r> {
                             plan, haystack, start,
                         )
                     }
+                    PortablePlan::UnicodeScalarRun(plan) => {
+                        count_ordinary_unicode_scalar_selected_ends_at(
+                            plan, haystack, start,
+                        )
+                    }
                     _ => Ok(None),
                 }
             }
@@ -25115,6 +25120,40 @@ fn count_ordinary_reverse_inner_selected_ends_at(
     )
     .map(|result| Some(result.count))
     .map_err(SearchError::from)
+}
+
+#[inline(never)]
+fn count_ordinary_unicode_scalar_selected_ends_at(
+    plan: &UnicodeScalarSearchPlan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<u64>, SearchError> {
+    let tail = haystack.get(start..).ok_or_else(|| {
+        SearchError::from(UnicodeScalarSearchError::InvalidWindow {
+            start,
+            end: haystack.len(),
+            haystack_len: haystack.len(),
+        })
+    })?;
+    plan.count_with_cursor_value(
+        tail,
+        UnicodeScalarAggregateReduceLimits::unlimited(),
+    )
+    .map(Some)
+    .map_err(|error| {
+        // Unlimited reduction cannot refuse any resource envelope. The
+        // cursor Count preflight and its execution can therefore expose only
+        // arithmetic failure after the full tail has been validated above.
+        let computation = match error {
+            UnicodeScalarAggregateReduceError::ArithmeticOverflow { computation } => {
+                computation
+            }
+            _ => "ordinary Unicode scalar cursor Count invariant",
+        };
+        SearchError::from(UnicodeScalarSearchError::ArithmeticOverflow {
+            computation,
+        })
+    })
 }
 
 fn try_visit_ordinary_spans_at<F, E, S>(
@@ -47650,6 +47689,84 @@ mod tests {
                 ..
             } if core::ptr::eq(*bound, &required)
         ));
+    }
+
+    #[test]
+    fn ordinary_unicode_scalar_binding_counts_every_exact_tail_once() {
+        fn selected_count(
+            baseline: &regex::bytes::Regex,
+            haystack: &[u8],
+            start: usize,
+        ) -> u64 {
+            let mut cursor = start;
+            let mut count = 0_u64;
+            while let Some(matched) = baseline.find_at(haystack, cursor) {
+                assert!(matched.end() > cursor);
+                cursor = matched.end();
+                count = count.checked_add(1).unwrap();
+            }
+            count
+        }
+
+        let haystacks = [
+            Vec::new(),
+            b"plain ASCII never matches".to_vec(),
+            "x\u{391}\u{392}\u{393}\u{394}\u{395}\u{396}!\u{3b1}\u{3b2}y\u{3a9}\u{3c9}\u{3b3}"
+                .as_bytes()
+                .to_vec(),
+            "A\u{391}\u{392}!AA!\u{3b1}A\u{3b2}\u{3b3}x".as_bytes().to_vec(),
+            vec![
+                0xCE, b'x', 0x91, 0xCE, 0x92, 0xFF, 0xCF, 0xB1, 0xCF, 0xB2,
+                0x80, 0xF4, 0x90, 0x80, 0x80,
+            ],
+        ];
+
+        for pattern in [
+            r"\p{Greek}+",
+            r"\p{Greek}+?",
+            r"\p{Greek}{2,6}",
+            r"\p{Greek}{2,6}?",
+            r"[A\p{Greek}]{2,}",
+        ] {
+            let baseline = regex::bytes::Regex::new(pattern).unwrap();
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::UnicodeScalarRun);
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(bound_regex)
+                ) if core::ptr::eq(*bound_regex, &regex)
+            ));
+            assert!(
+                core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>()
+                    <= 2 * core::mem::size_of::<usize>()
+            );
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    assert_eq!(
+                        ordinary.count_positive_width_selected_ends_at(haystack, start),
+                        Ok(Some(selected_count(&baseline, haystack, start))),
+                        "pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                    );
+                }
+                for start in [haystack.len() + 1, usize::MAX] {
+                    assert!(matches!(
+                        ordinary.count_positive_width_selected_ends_at(haystack, start),
+                        Err(SearchError::UnicodeScalarRun(
+                            fre_kernels::UnicodeScalarSearchError::InvalidWindow {
+                                start: actual_start,
+                                end,
+                                haystack_len,
+                            }
+                        )) if actual_start == start
+                            && end == haystack.len()
+                            && haystack_len == haystack.len()
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
