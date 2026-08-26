@@ -486,6 +486,10 @@ pub(super) unsafe fn block_all_members_neon(
     unsafe_code,
     reason = "compiler target features prove NEON once around the whole-slice ASCII member loop"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one auditable loop keeps four-vector groups, vector-pair and vector-block tails, and exact scalar recovery under the same preloaded classifier"
+)]
 #[cfg(any(not(feature = "static-dispatch"), target_feature = "neon"))]
 #[target_feature(enable = "neon")]
 #[inline(never)]
@@ -494,6 +498,7 @@ pub(super) unsafe fn find_ascii_members_neon(
     set: AsciiByteSet,
     bytes: &[u8],
 ) -> Option<usize> {
+    const GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
     use core::arch::aarch64::{vmaxvq_u8, vorrq_u8};
 
     // SAFETY: both tables contain exactly sixteen initialized bytes and this
@@ -515,7 +520,6 @@ pub(super) unsafe fn find_ascii_members_neon(
         )
     };
     let scalar_find = |slice: &[u8]| slice.iter().position(|&byte| set.contains(byte));
-    const GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
 
     let mut block_start = 0_usize;
     let mut groups = bytes.chunks_exact(GROUP_BYTES);
@@ -544,10 +548,30 @@ pub(super) unsafe fn find_ascii_members_neon(
                 vld1q_u8(fourth.as_ptr()),
             )
         };
-        let first_pair = vorrq_u8(classify(first_input), classify(second_input));
-        let second_pair = vorrq_u8(classify(third_input), classify(fourth_input));
+        let first_members = classify(first_input);
+        let second_members = classify(second_input);
+        let third_members = classify(third_input);
+        let fourth_members = classify(fourth_input);
+        let first_pair = vorrq_u8(first_members, second_members);
+        let second_pair = vorrq_u8(third_members, fourth_members);
         if vmaxvq_u8(vorrq_u8(first_pair, second_pair)) != 0 {
-            return scalar_find(group).and_then(|relative| block_start.checked_add(relative));
+            // Keep the group miss at one horizontal reduction. Only a positive
+            // group pays two more reductions to bound scalar recovery to the
+            // earliest sixteen-byte block that can contain the first member.
+            let (positive_block_start, positive_block) = if vmaxvq_u8(first_pair) != 0 {
+                if vmaxvq_u8(first_members) != 0 {
+                    (0, first)
+                } else {
+                    (BYTE_SET_BLOCK_BYTES, second)
+                }
+            } else if vmaxvq_u8(third_members) != 0 {
+                (BYTE_SET_WIDE_BLOCK_BYTES, third)
+            } else {
+                (BYTE_SET_WIDE_BLOCK_BYTES + BYTE_SET_BLOCK_BYTES, fourth)
+            };
+            return scalar_find(positive_block)
+                .and_then(|relative| positive_block_start.checked_add(relative))
+                .and_then(|relative| block_start.checked_add(relative));
         }
         block_start = block_start
             .checked_add(GROUP_BYTES)

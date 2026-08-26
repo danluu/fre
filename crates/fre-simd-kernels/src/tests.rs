@@ -1462,6 +1462,58 @@ fn forced_neon_and_direct_leaf_match_scalar() {
 #[test]
 #[allow(
     unsafe_code,
+    reason = "the test gates the private whole-slice NEON leaf on the same OS-usable host feature used by production dispatch"
+)]
+fn forced_neon_ascii_member_finder_exhausts_group_lanes_and_alignments() {
+    const GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
+    const EXHAUSTIVE_BYTES: usize = GROUP_BYTES * 3 + 1;
+    let required = FeatureSet::of(Feature::ArmNeon);
+    if !host().usable().contains_all(required) {
+        return;
+    }
+    let set = AsciiByteSet::from_words([
+        (1_u64 << b'!') | (1_u64 << b'?'),
+        (1_u64 << (b'Z' - 64)) | (1_u64 << (b'~' - 64)),
+    ]);
+    let classifier = AsciiByteSetClassifier::with_policy(set, DispatchPolicy::AllowOnly(required))
+        .expect("NEON is OS-usable on this host");
+    assert_eq!(
+        classifier.selection().narrow().variant_id,
+        "ascii-byte-set.mask16.neon.v1"
+    );
+    let columns = set.nibble_columns();
+
+    for alignment in 0..64 {
+        let mut storage = vec![0xff; alignment + EXHAUSTIVE_BYTES];
+        for len in 0..=EXHAUSTIVE_BYTES {
+            let bytes = &storage[alignment..alignment + len];
+            // SAFETY: this test returned unless the immutable host snapshot
+            // proved NEON OS-usable, and `bytes` is a valid initialized slice.
+            let direct = unsafe { aarch64::find_ascii_members_neon(&columns, set, bytes) };
+            assert_eq!(direct, None, "alignment={alignment} len={len}");
+            assert_eq!(classifier.find_first_member(bytes), None);
+        }
+        for position in 0..EXHAUSTIVE_BYTES {
+            storage[alignment + position] = b'Z';
+            let bytes = &storage[alignment..alignment + EXHAUSTIVE_BYTES];
+            // SAFETY: identical OS-usable NEON proof to the no-member loop.
+            let direct = unsafe { aarch64::find_ascii_members_neon(&columns, set, bytes) };
+            assert_eq!(
+                direct,
+                Some(position),
+                "alignment={alignment} position={position}"
+            );
+            assert_eq!(classifier.find_first_member(bytes), Some(position));
+            storage[alignment + position] = 0xff;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[cfg(not(feature = "static-dispatch"))]
+#[test]
+#[allow(
+    unsafe_code,
     reason = "the test gates both private NEON run leaves on the same immutable OS-usable feature used by production dispatch"
 )]
 fn forced_neon_run_scanner_exhausts_boundaries_and_reports_recovery_work() {
