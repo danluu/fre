@@ -40,6 +40,12 @@ const ORDINARY_ROOT_SET4_MIN_BYTES: usize = BYTE_SET_BLOCK_BYTES * 4;
 // narrow entry behind a conservative source-independent amortization floor.
 const ORDINARY_ROOT_ASCII_MIN_BYTES: usize = ASCII_NARROW_BYTES * 8;
 
+// Keep an arbitrary root sparse enough that a uniformly distributed full-byte
+// classifier block contains at most one expected exact-DFA candidate. Tying
+// the limit to the physical 16-byte classifier width also makes the density
+// boundary explicit instead of embedding an unrelated pattern-count constant.
+const ORDINARY_ROOT_ASCII_MAX_MEMBERS: usize = ASCII_NARROW_BYTES;
+
 // Direct existence keeps its native classifier for a short accepting prefix.
 // Past that prefix, four straight transitions amortize cursor and loop control
 // while the outlined tail preserves the short-hit entry layout.
@@ -334,7 +340,7 @@ impl LiteralSetDfaRootRange {
 /// Biased exact ranges occupy the nonzero low-16-bit domain. A non-contiguous
 /// set of at most four exact roots instead records the nonzero mask of their
 /// high-nibble buckets in the high 16 bits, leaving the range half exactly
-/// zero. The all-buckets high-half value marks a construction-proved 5..=8
+/// zero. The all-buckets high-half value marks a construction-proved 5..=16
 /// member ASCII root whose exact classifier may be prepared by an ordinary
 /// worker. The selected-span scanner can retain the incumbent low-half
 /// `Option<NonZeroU16>` projection without learning about either wider form.
@@ -565,9 +571,10 @@ fn direct_dfa_set4_members_from_buckets(
 /// Derive one exact arbitrary ASCII root set for the ordinary-session engine.
 ///
 /// Set4 and contiguous-range roots retain their smaller existing bindings.
-/// The construction marker limits this wider route to 5..=8 exact roots,
-/// keeping its candidate density useful on ordinary text while covering the
-/// first disjoint family beyond Set4.
+/// The construction marker limits this wider route to 5..=16 exact roots.
+/// Sixteen roots occupy at most one sixteenth of the complete byte domain, so
+/// one 16-byte classifier block has at most one expected candidate under a
+/// uniform byte distribution before the exact DFA verifies it.
 #[cold]
 #[inline(never)]
 fn direct_dfa_ascii_root_set(
@@ -593,7 +600,8 @@ fn direct_dfa_ascii_root_set(
         words[word] |= 1_u64 << bit;
         members = members.checked_add(1)?;
     }
-    (members > 4 && members <= 8).then_some(AsciiByteSet::from_words(words))
+    (members > 4 && members <= ORDINARY_ROOT_ASCII_MAX_MEMBERS)
+        .then_some(AsciiByteSet::from_words(words))
 }
 
 #[cold]
@@ -888,7 +896,7 @@ fn direct_dfa_root(
     if members > exact_members.len() {
         #[cfg(target_arch = "aarch64")]
         {
-            return (all_ascii && members <= 8)
+            return (all_ascii && members <= ORDINARY_ROOT_ASCII_MAX_MEMBERS)
                 .then_some(LiteralSetDfaRoot::from_ascii_sparse());
         }
         #[cfg(not(target_arch = "aarch64"))]
@@ -2436,7 +2444,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     /// Bind one worker-owned ordinary engine and prepare its exact ASCII
     /// Exists root against this executor's immutable direct-DFA identity.
     ///
-    /// AArch64 retains one exact 5..=8-member ASCII classifier only when its
+    /// AArch64 retains one exact 5..=16-member ASCII classifier only when its
     /// direct-DFA identity carries the construction marker. Other targets and
     /// root shapes retain the unchanged executor alone.
     #[doc(hidden)]
@@ -5897,7 +5905,8 @@ mod tests {
         LiteralSetError, LiteralSetMatchSemantics, LiteralSetOrdinaryExecutor, LiteralSetPlan,
         LiteralSetSearchLimits, ORDINARY_DIRECT_DFA_BULK_BYTES,
         ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
-        ORDINARY_ROOT_ASCII_MIN_BYTES, ORDINARY_ROOT_SET4_MIN_BYTES,
+        ORDINARY_ROOT_ASCII_MAX_MEMBERS, ORDINARY_ROOT_ASCII_MIN_BYTES,
+        ORDINARY_ROOT_SET4_MIN_BYTES,
         decode_direct_dfa_start_state, encode_direct_dfa_start_state,
         direct_dfa_set4_contains, direct_dfa_set4_members_from_buckets,
         first_acceptance_end_for_count, first_acceptance_end_for_span_visit,
@@ -7347,16 +7356,34 @@ mod tests {
         root_set4_patterns_for_roots([b'A', b'Q', b'a', b'q'])
     }
 
-    fn root_ascii_patterns() -> Vec<Vec<u8>> {
-        // Eight non-contiguous ASCII roots exceed the compact Set4 encoding.
-        // Seventeen widths per root also exceed Aho 1.1.4's Teddy ceiling and
-        // produce the direct no-prefilter DFA exercised by ripgrep workers.
-        [b'A', b'C', b'E', b'G', b'a', b'c', b'e', b'g']
-            .into_iter()
+    const ROOT_ASCII_16: [u8; 16] = [
+        b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'a', b'c', b'e', b'g',
+        b'i', b'k',
+    ];
+    const ROOT_ASCII_17: [u8; 17] = [
+        b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'a', b'c', b'e', b'g',
+        b'i', b'k', b'm',
+    ];
+
+    fn root_ascii_patterns_for_roots(roots: &[u8]) -> Vec<Vec<u8>> {
+        // Seventeen widths per non-contiguous root exceed the compact Set4
+        // encoding and Aho 1.1.4's Teddy ceiling, producing the direct
+        // no-prefilter DFA exercised by ripgrep workers.
+        roots
+            .iter()
+            .copied()
             .flat_map(|root| {
                 (4_usize..=20).map(move |pattern_bytes| vec![root; pattern_bytes])
             })
             .collect()
+    }
+
+    fn root_ascii_patterns() -> Vec<Vec<u8>> {
+        // Sixteen non-contiguous ASCII roots exercise the inclusive admission
+        // boundary while retaining at most one expected candidate per
+        // classifier block under a uniform full-byte distribution.
+        assert_eq!(ROOT_ASCII_16.len(), ORDINARY_ROOT_ASCII_MAX_MEMBERS);
+        root_ascii_patterns_for_roots(&ROOT_ASCII_16)
     }
 
     fn assert_pinned_direct_dfa_special_boundary(plan: &LiteralSetPlan) {
@@ -7960,6 +7987,36 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn ordinary_direct_dfa_ascii_root_admits_extended_public_proxy_counts() {
+        for root_count in [9_usize, 12, ORDINARY_ROOT_ASCII_MAX_MEMBERS] {
+            let patterns = root_ascii_patterns_for_roots(&ROOT_ASCII_16[..root_count]);
+            let plan = LiteralSetPlan::new_stable(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert!(plan.automaton.prefilter().is_none());
+            let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            assert!(ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root)
+                .is_some_and(LiteralSetDfaRoot::is_ascii_sparse));
+            let prepared = ordinary
+                .bind_engine()
+                .expect("an admitted sparse ASCII root prepares its classifier");
+            let retained_roots = prepared
+                .prepared_exists_root
+                .set()
+                .words()
+                .into_iter()
+                .map(u64::count_ones)
+                .sum::<u32>();
+            assert_eq!(usize::try_from(retained_roots).unwrap(), root_count);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn ordinary_direct_dfa_ascii_root_prepares_once_for_exists_only() {
         let patterns = root_ascii_patterns();
         let plan = LiteralSetPlan::new_stable(
@@ -7974,17 +8031,17 @@ mod tests {
             .expect("the no-prefilter DFA retains its direct identity");
         let root = identity
             .root()
-            .expect("eight exact ASCII roots retain their preparation marker");
+            .expect("sixteen exact ASCII roots retain their preparation marker");
         assert!(root.is_ascii_sparse());
         assert_eq!(root.as_range(), None);
         assert_eq!(root.set4_bucket_mask(), None);
 
         let prepared = ordinary
             .bind_engine()
-            .expect("eight non-contiguous ASCII roots prepare a classifier");
+            .expect("sixteen non-contiguous ASCII roots prepare a classifier");
         let roots = &prepared.prepared_exists_root;
         let mut expected_words = [0_u64; 2];
-        for root in [b'A', b'C', b'E', b'G', b'a', b'c', b'e', b'g'] {
+        for root in ROOT_ASCII_16 {
             expected_words[usize::from(root / 64)] |= 1_u64 << u32::from(root % 64);
         }
         assert_eq!(roots.set().words(), expected_words);
@@ -8066,12 +8123,16 @@ mod tests {
         let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
         let prepared = ordinary
             .bind_engine()
-            .expect("eight non-contiguous ASCII roots prepare a classifier");
+            .expect("sixteen non-contiguous ASCII roots prepare a classifier");
 
         let mut haystack = vec![b'!'; ORDINARY_ROOT_ASCII_MIN_BYTES + 11];
-        haystack.extend_from_slice(b"A!AAA!CCCC!e!eeee!ggg!GGGGG!");
+        for (index, root) in ROOT_ASCII_16.into_iter().enumerate() {
+            haystack.push(root);
+            haystack.push(b'!');
+            haystack.extend(core::iter::repeat_n(root, 4 + index % 3));
+            haystack.push(b'!');
+        }
         haystack.extend(core::iter::repeat_n(b'!', 27));
-        haystack.extend_from_slice(b"cccc!AAAA!!!!!!");
         for start in 0..=haystack.len() {
             for end in start..=haystack.len() {
                 let window = Window::new(start, end);
@@ -8093,18 +8154,15 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn ordinary_direct_dfa_ascii_root_rejects_dense_or_non_ascii_roots() {
+    fn ordinary_direct_dfa_ascii_root_rejects_over_density_or_non_ascii_roots() {
         for roots in [
-            &[b'A', b'C', b'E', b'G', b'a', b'c', b'e', 0x80][..],
-            &[b'A', b'C', b'E', b'G', b'I', b'a', b'c', b'e', b'g'][..],
+            &[
+                b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'a', b'c',
+                b'e', b'g', b'i', 0x80,
+            ][..],
+            &ROOT_ASCII_17[..],
         ] {
-            let patterns = roots
-                .iter()
-                .copied()
-                .flat_map(|root| {
-                    (4_usize..=20).map(move |pattern_bytes| vec![root; pattern_bytes])
-                })
-                .collect::<Vec<_>>();
+            let patterns = root_ascii_patterns_for_roots(roots);
             let plan = LiteralSetPlan::new_stable(
                 &patterns,
                 LiteralSetBuildLimits::default(),
