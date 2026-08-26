@@ -40,11 +40,12 @@ const ORDINARY_ROOT_SET4_MIN_BYTES: usize = BYTE_SET_BLOCK_BYTES * 4;
 // narrow entry behind a conservative source-independent amortization floor.
 const ORDINARY_ROOT_ASCII_MIN_BYTES: usize = ASCII_NARROW_BYTES * 8;
 
-// Keep an arbitrary root sparse enough that a uniformly distributed full-byte
-// classifier block contains at most one expected exact-DFA candidate. Tying
-// the limit to the physical 16-byte classifier width also makes the density
-// boundary explicit instead of embedding an unrelated pattern-count constant.
-const ORDINARY_ROOT_ASCII_MAX_MEMBERS: usize = ASCII_NARROW_BYTES;
+// Keep an arbitrary root sparse enough that two uniformly distributed
+// full-byte classifier blocks contain at most three expected exact-DFA
+// candidates. Tying the limit to three halves of the physical 16-byte
+// classifier width makes the density boundary explicit instead of embedding
+// an unrelated pattern-count constant.
+const ORDINARY_ROOT_ASCII_MAX_MEMBERS: usize = ASCII_NARROW_BYTES * 3 / 2;
 
 // Direct existence keeps its native classifier for a short accepting prefix.
 // Past that prefix, four straight transitions amortize cursor and loop control
@@ -343,7 +344,7 @@ impl LiteralSetDfaRootRange {
 /// Biased exact ranges occupy the nonzero low-16-bit domain. A non-contiguous
 /// set of at most four exact roots instead records the nonzero mask of their
 /// high-nibble buckets in the high 16 bits, leaving the range half exactly
-/// zero. The all-buckets high-half value marks a construction-proved 5..=16
+/// zero. The all-buckets high-half value marks a construction-proved 5..=24
 /// member ASCII root whose exact classifier may be prepared by an ordinary
 /// worker. The selected-span scanner can retain the incumbent low-half
 /// `Option<NonZeroU16>` projection without learning about either wider form.
@@ -574,13 +575,14 @@ fn direct_dfa_set4_members_from_buckets(
 /// Derive one exact arbitrary ASCII root set for the ordinary-session engine.
 ///
 /// Set4 and contiguous-range roots retain their smaller existing bindings.
-/// The construction marker proves that this wider route has 5..=16 exact
+/// The construction marker proves that this wider route has 5..=24 exact
 /// roots and that every one is ASCII. Replaying only the ASCII half of the
 /// DFA alphabet therefore reconstructs the complete set without revisiting
 /// 128 transitions that construction already proved cannot be roots.
-/// Sixteen roots occupy at most one sixteenth of the complete byte domain, so
-/// one 16-byte classifier block has at most one expected candidate under a
-/// uniform byte distribution before the exact DFA verifies it.
+/// Twenty-four roots occupy at most three thirty-seconds of the complete byte
+/// domain, so two 16-byte classifier blocks have at most three expected
+/// candidates under a uniform byte distribution before the exact DFA verifies
+/// them.
 #[cold]
 #[inline(never)]
 fn direct_dfa_ascii_root_set(
@@ -2480,7 +2482,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     /// can be prepared lazily against this executor's immutable direct-DFA
     /// identity.
     ///
-    /// AArch64 retains one exact 5..=16-member ASCII classifier only when its
+    /// AArch64 retains one exact 5..=24-member ASCII classifier only when its
     /// direct-DFA identity carries the construction marker. Other targets and
     /// root shapes retain the unchanged executor alone. Binding performs no
     /// classifier construction, so selected-span and count-only workers do not
@@ -7380,13 +7382,13 @@ mod tests {
         root_set4_patterns_for_roots([b'A', b'Q', b'a', b'q'])
     }
 
-    const ROOT_ASCII_16: [u8; 16] = [
-        b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'a', b'c', b'e', b'g',
-        b'i', b'k',
+    const ROOT_ASCII_24: [u8; 24] = [
+        b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'K', b'M', b'O', b'Q',
+        b'S', b'U', b'W', b'Y', b'a', b'c', b'e', b'g', b'i', b'k',
     ];
-    const ROOT_ASCII_17: [u8; 17] = [
-        b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'a', b'c', b'e', b'g',
-        b'i', b'k', b'm',
+    const ROOT_ASCII_25: [u8; 25] = [
+        b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'K', b'M', b'O', b'Q',
+        b'S', b'U', b'W', b'Y', b'a', b'c', b'e', b'g', b'i', b'k', b'm',
     ];
 
     fn root_ascii_patterns_for_roots(roots: &[u8]) -> Vec<Vec<u8>> {
@@ -7403,11 +7405,11 @@ mod tests {
     }
 
     fn root_ascii_patterns() -> Vec<Vec<u8>> {
-        // Sixteen non-contiguous ASCII roots exercise the inclusive admission
-        // boundary while retaining at most one expected candidate per
-        // classifier block under a uniform full-byte distribution.
-        assert_eq!(ROOT_ASCII_16.len(), ORDINARY_ROOT_ASCII_MAX_MEMBERS);
-        root_ascii_patterns_for_roots(&ROOT_ASCII_16)
+        // Twenty-four non-contiguous ASCII roots exercise the inclusive
+        // admission boundary while retaining at most three expected candidates
+        // per two classifier blocks under a uniform full-byte distribution.
+        assert_eq!(ROOT_ASCII_24.len(), ORDINARY_ROOT_ASCII_MAX_MEMBERS);
+        root_ascii_patterns_for_roots(&ROOT_ASCII_24)
     }
 
     fn assert_pinned_direct_dfa_special_boundary(plan: &LiteralSetPlan) {
@@ -8012,8 +8014,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ordinary_direct_dfa_ascii_root_admits_extended_public_proxy_counts() {
-        for root_count in [9_usize, 12, ORDINARY_ROOT_ASCII_MAX_MEMBERS] {
-            let patterns = root_ascii_patterns_for_roots(&ROOT_ASCII_16[..root_count]);
+        for root_count in [9_usize, 12, 16, ORDINARY_ROOT_ASCII_MAX_MEMBERS] {
+            let patterns = root_ascii_patterns_for_roots(&ROOT_ASCII_24[..root_count]);
             let plan = LiteralSetPlan::new_stable(
                 &patterns,
                 LiteralSetBuildLimits::default(),
@@ -8079,7 +8081,7 @@ mod tests {
             .expect("the no-prefilter DFA retains its direct identity");
         let root = identity
             .root()
-            .expect("sixteen exact ASCII roots retain their preparation marker");
+            .expect("twenty-four exact ASCII roots retain their preparation marker");
         assert!(root.is_ascii_sparse());
         assert_eq!(root.as_range(), None);
         assert_eq!(root.set4_bucket_mask(), None);
@@ -8087,7 +8089,7 @@ mod tests {
         ordinary_direct_probe::reset();
         let mut prepared = ordinary
             .bind_engine()
-            .expect("sixteen non-contiguous ASCII roots bind a lazy engine");
+            .expect("twenty-four non-contiguous ASCII roots bind a lazy engine");
         assert!(prepared.prepared_exists_root.is_none());
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         assert_eq!(
@@ -8095,7 +8097,7 @@ mod tests {
             0,
         );
         let mut expected_words = [0_u64; 2];
-        for root in ROOT_ASCII_16 {
+        for root in ROOT_ASCII_24 {
             expected_words[usize::from(root / 64)] |= 1_u64 << u32::from(root % 64);
         }
         assert!(core::ptr::eq(
@@ -8242,10 +8244,10 @@ mod tests {
         let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
         let mut prepared = ordinary
             .bind_engine()
-            .expect("sixteen non-contiguous ASCII roots bind a lazy engine");
+            .expect("twenty-four non-contiguous ASCII roots bind a lazy engine");
 
         let mut haystack = vec![b'!'; ORDINARY_ROOT_ASCII_MIN_BYTES + 11];
-        for (index, root) in ROOT_ASCII_16.into_iter().enumerate() {
+        for (index, root) in ROOT_ASCII_24.into_iter().enumerate() {
             haystack.push(root);
             haystack.push(b'!');
             haystack.extend(core::iter::repeat_n(root, 4 + index % 3));
@@ -8279,7 +8281,7 @@ mod tests {
                 b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'a', b'c',
                 b'e', b'g', b'i', 0x80,
             ][..],
-            &ROOT_ASCII_17[..],
+            &ROOT_ASCII_25[..],
         ] {
             let patterns = root_ascii_patterns_for_roots(roots);
             let plan = LiteralSetPlan::new_stable(
