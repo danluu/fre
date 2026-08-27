@@ -1030,6 +1030,12 @@ pub struct ReverseInnerOrdinaryExecutor<'a> {
     plan: &'a ReverseInnerPlan,
 }
 
+struct OrdinaryStrictCandidate {
+    literal_start: usize,
+    literal_end: usize,
+    first_acceptance_end: usize,
+}
+
 impl ReverseInnerPlan {
     /// Build from one canonical scalar class and source-ordered literals.
     pub fn build<I>(ranges: I, literals: &[&[u8]], limits: BuildLimits) -> Result<Self, BuildError>
@@ -1934,7 +1940,7 @@ impl ReverseInnerPlan {
         &self,
         haystack: &[u8],
         floor: usize,
-    ) -> Result<Option<(usize, usize)>, SearchError> {
+    ) -> Result<Option<OrdinaryStrictCandidate>, SearchError> {
         let finder = self.finders.first().ok_or(ReduceError::AccountingInvariant {
             resource: "ordinary single-literal finder",
             actual: 0,
@@ -1960,13 +1966,18 @@ impl ReverseInnerPlan {
                     computation: "ordinary single-literal candidate end",
                 },
             )?;
-            if self.strict_candidate_has_member_neighbors(
+            let first_acceptance_end = self.strict_candidate_first_acceptance_end(
                 haystack,
                 floor,
                 literal_start,
                 literal_end,
-            )? {
-                return Ok(Some((literal_start, literal_end)));
+            )?;
+            if let Some(first_acceptance_end) = first_acceptance_end {
+                return Ok(Some(OrdinaryStrictCandidate {
+                    literal_start,
+                    literal_end,
+                    first_acceptance_end,
+                }));
             }
             cursor = literal_start
                 .checked_add(1)
@@ -1977,15 +1988,15 @@ impl ReverseInnerPlan {
     }
 
     #[inline]
-    fn strict_candidate_has_member_neighbors(
+    fn strict_candidate_first_acceptance_end(
         &self,
         haystack: &[u8],
         floor: usize,
         literal_start: usize,
         literal_end: usize,
-    ) -> Result<bool, SearchError> {
+    ) -> Result<Option<usize>, SearchError> {
         if literal_start <= floor || literal_end >= haystack.len() {
-            return Ok(false);
+            return Ok(None);
         }
         let preceding_index = literal_start.checked_sub(1).ok_or(
             ReduceError::ArithmeticOverflow {
@@ -2014,18 +2025,24 @@ impl ReverseInnerPlan {
         let following_member =
             following_ascii && ascii_contains(self.ascii, following_byte);
         if (preceding_ascii && !preceding_member) || (following_ascii && !following_member) {
-            return Ok(false);
+            return Ok(None);
         }
-        if preceding_ascii && following_ascii {
-            return Ok(true);
+        if !preceding_ascii {
+            let preceding = decode_previous_scalar(haystack, floor, literal_start)?;
+            let Some(preceding_scalar) = preceding.scalar else {
+                return Ok(None);
+            };
+            if preceding.width == 0 || !self.contains_value(preceding_scalar) {
+                return Ok(None);
+            }
         }
-
-        let preceding = decode_previous_scalar(haystack, floor, literal_start)?;
-        let Some(preceding_scalar) = preceding.scalar else {
-            return Ok(false);
-        };
-        if preceding.width == 0 || !self.contains_value(preceding_scalar) {
-            return Ok(false);
+        if following_ascii {
+            let acceptance_end = literal_end.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "ordinary single-literal ASCII acceptance end",
+                },
+            )?;
+            return Ok(Some(acceptance_end));
         }
         let following = decode_scalar(haystack.get(literal_end..).ok_or(
             ReduceError::ArithmeticOverflow {
@@ -2033,9 +2050,17 @@ impl ReverseInnerPlan {
             },
         )?);
         let Some(following_scalar) = following.scalar else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(following.width != 0 && self.contains_value(following_scalar))
+        if following.width == 0 || !self.contains_value(following_scalar) {
+            return Ok(None);
+        }
+        let acceptance_end = literal_end.checked_add(following.width).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "ordinary single-literal Unicode acceptance end",
+            },
+        )?;
+        Ok(Some(acceptance_end))
     }
 
     #[inline]
@@ -4285,7 +4310,8 @@ impl ReverseInnerOrdinaryExecutor<'_> {
         core::ptr::eq(self.plan, plan)
     }
 
-    /// Try full-origin existence without recovering either selected endpoint.
+    /// Try full-origin existence without recovering a selected span or
+    /// scanning to its greedy end.
     ///
     /// `None` declines before source access when the input-specific canonical
     /// arithmetic envelope is not representable.
@@ -4295,6 +4321,22 @@ impl ReverseInnerOrdinaryExecutor<'_> {
         &self,
         haystack: &[u8],
     ) -> Result<Option<bool>, SearchError> {
+        self.first_acceptance_full_unmetered(haystack)
+            .map(|attempt| attempt.map(|acceptance| acceptance.is_some()))
+    }
+
+    /// Try the first full-origin accepting boundary without recovering a
+    /// selected span or scanning to its greedy end.
+    ///
+    /// `None` declines before source access when the input-specific canonical
+    /// arithmetic envelope is not representable. `Some(None)` is an
+    /// authoritative completed miss.
+    #[doc(hidden)]
+    #[inline]
+    pub fn first_acceptance_full_unmetered(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<Option<usize>>, SearchError> {
         if !self
             .plan
             .bound_ordinary_single_literal_envelope_fits(haystack.len())
@@ -4303,7 +4345,7 @@ impl ReverseInnerOrdinaryExecutor<'_> {
         }
         self.plan
             .first_strict_single_literal_candidate_from(haystack, 0)
-            .map(|candidate| Some(candidate.is_some()))
+            .map(|candidate| Some(candidate.map(|candidate| candidate.first_acceptance_end)))
     }
 
     /// Try the full-origin selected span, selecting its greedy end before
@@ -4409,13 +4451,15 @@ impl ReverseInnerOrdinaryExecutor<'_> {
         haystack: &[u8],
         floor: usize,
     ) -> Result<Option<(usize, usize)>, SearchError> {
-        let Some((literal_start, literal_end)) = self
+        let Some(candidate) = self
             .plan
             .first_strict_single_literal_candidate_from(haystack, floor)?
         else {
             return Ok(None);
         };
-        let selected_end = self.plan.scan_run_forward_value(haystack, literal_end)?;
+        let selected_end = self
+            .plan
+            .scan_run_forward_value(haystack, candidate.literal_end)?;
         if selected_end <= floor {
             return Err(ReduceError::AccountingInvariant {
                 resource: "ordinary single-literal selected-end progress",
@@ -4423,7 +4467,7 @@ impl ReverseInnerOrdinaryExecutor<'_> {
                 upper: u64::try_from(floor).unwrap_or(u64::MAX),
             });
         }
-        Ok(Some((literal_start, selected_end)))
+        Ok(Some((candidate.literal_start, selected_end)))
     }
 }
 
@@ -5467,6 +5511,13 @@ mod tests {
                 Some(expected_find.is_some()),
                 "ordinary exists haystack={haystack:?}",
             );
+            assert_eq!(
+                ordinary
+                    .first_acceptance_full_unmetered(haystack)
+                    .expect("ordinary first-acceptance attempt"),
+                Some(expected_shortest),
+                "ordinary first acceptance haystack={haystack:?}",
+            );
             let mut ordinary_spans = Vec::new();
             assert_eq!(
                 ordinary
@@ -5749,6 +5800,27 @@ mod tests {
             b"!baa\xce!",
         ] {
             assert_matches_oracle(&plan, &regex, haystack);
+        }
+    }
+
+    #[test]
+    fn ordinary_first_acceptance_ends_after_wide_unicode_neighbor() {
+        let plan = plan(
+            &[('a', 'b'), ('中', '中'), ('𐐀', '𐐀')],
+            &[b"aa"],
+        );
+        let regex = oracle(r"[ab中𐐀]+aa[ab中𐐀]+");
+        let ordinary = plan.ordinary_executor().expect("ordinary binding");
+        for (haystack, expected_end) in [
+            ("!baa中!".as_bytes(), 7),
+            ("!baa𐐀!".as_bytes(), 8),
+            ("!中aa𐐀!".as_bytes(), 10),
+        ] {
+            assert_matches_oracle(&plan, &regex, haystack);
+            assert_eq!(
+                ordinary.first_acceptance_full_unmetered(haystack),
+                Ok(Some(Some(expected_end))),
+            );
         }
     }
 

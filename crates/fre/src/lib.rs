@@ -18899,6 +18899,7 @@ mod ordinary_reverse_inner_session_probe {
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub(super) struct Counts {
         pub(super) exists: usize,
+        pub(super) endpoint: usize,
         pub(super) span: usize,
         pub(super) visit: usize,
         pub(super) count: usize,
@@ -18907,6 +18908,7 @@ mod ordinary_reverse_inner_session_probe {
     std::thread_local! {
         static COUNTS: Cell<Counts> = const { Cell::new(Counts {
             exists: 0,
+            endpoint: 0,
             span: 0,
             visit: 0,
             count: 0,
@@ -18926,6 +18928,16 @@ mod ordinary_reverse_inner_session_probe {
             let counts = slot.get();
             slot.set(Counts {
                 exists: counts.exists.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_endpoint() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                endpoint: counts.endpoint.saturating_add(1),
                 ..counts
             });
         });
@@ -19141,15 +19153,24 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|(end, _)| end)
                 .map_err(SearchError::from),
-            Self::ReverseInner(executor) => executor
-                .plan()
-                .shortest_in(
+            Self::ReverseInner(executor) => {
+                if start == 0
+                    && let Some(acceptance) = executor
+                        .first_acceptance_full_unmetered(haystack)
+                        .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_endpoint();
+                    return Ok(acceptance);
+                }
+                executor.plan().shortest_in(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     reverse_inner_search_limits(SearchLimits::unlimited()),
                 )
                 .map(|(end, _)| end)
-                .map_err(SearchError::from),
+                .map_err(SearchError::from)
+            }
             Self::Native(regex) => regex.shortest_match_window_value(
                 haystack,
                 window,
@@ -49498,6 +49519,15 @@ mod tests {
             Ok(baseline.shortest_match_at(routed, 0)),
         );
         assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot(),
+            super::ordinary_reverse_inner_session_probe::Counts {
+                exists: 2,
+                endpoint: 1,
+                span: 1,
+                ..super::ordinary_reverse_inner_session_probe::Counts::default()
+            },
+        );
+        assert_eq!(
             ordinary.find_at(routed, 1).unwrap().map(|matched| (
                 matched.start(),
                 matched.end(),
@@ -49511,10 +49541,11 @@ mod tests {
             super::ordinary_reverse_inner_session_probe::snapshot(),
             super::ordinary_reverse_inner_session_probe::Counts {
                 exists: 2,
+                endpoint: 1,
                 span: 1,
                 ..super::ordinary_reverse_inner_session_probe::Counts::default()
             },
-            "ranged and shortest operations stay on the canonical window engines",
+            "nonzero ranged operations stay on the canonical window engines",
         );
 
         let mut haystacks = sources(&[b'a', b'b', b'!', 0x80, 0xFF], 5);
