@@ -6056,12 +6056,21 @@ mod tests {
                     match spec.output {
                         AotOutput::Exists => {
                             assert!(fill.is_none());
-                            assert!(exists_batch.is_some());
-                            assert!(spec.description.contains("api=direct-exists-batch-v1"));
-                            assert!(
-                                spec.description
-                                    .contains("bulk=native-direct-trusted-full-window-loop")
-                            );
+                            if exists_batch.is_some() {
+                                assert!(spec.description.contains("api=direct-exists-batch-v1"));
+                                assert!(
+                                    spec.description
+                                        .contains("bulk=native-direct-trusted-full-window-loop")
+                                );
+                            } else {
+                                // A direct ordinary entry does not imply that
+                                // its additive batch lowering is available.
+                                // Context-sensitive and other unsupported
+                                // cores retain the exact scalar entry and
+                                // advertise the closed per-haystack route.
+                                assert!(spec.description.contains("api=per-haystack"));
+                                assert!(spec.description.contains("bulk=none"));
+                            }
                         }
                         AotOutput::Span => {
                             assert!(exists_batch.is_none());
