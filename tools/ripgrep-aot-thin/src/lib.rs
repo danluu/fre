@@ -6370,19 +6370,18 @@ mod tests {
                         }
                         AotOutput::Span => {
                             assert!(exists_batch.is_none());
-                            match fill {
-                                Some(_) => {
-                                    assert!(
-                                        spec.description.contains("api=direct-span-fill-v1")
-                                    );
-                                    assert!(spec
-                                        .description
-                                        .contains("bulk=native-direct-trusted-core-loop"));
-                                }
-                                None => {
-                                    assert!(spec.description.contains("api=rust-span-fill"));
-                                    assert!(spec.description.contains("bulk=none"));
-                                }
+                            assert!(fill.is_some());
+                            let direct_fill =
+                                spec.description.contains("api=direct-span-fill-v1");
+                            let rust_fill =
+                                spec.description.contains("api=rust-span-fill");
+                            assert_ne!(direct_fill, rust_fill);
+                            if direct_fill {
+                                assert!(spec
+                                    .description
+                                    .contains("bulk=native-direct-trusted-core-loop"));
+                            } else {
+                                assert!(spec.description.contains("bulk=none"));
                             }
                         }
                     }
