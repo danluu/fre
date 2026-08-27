@@ -559,7 +559,7 @@ pub struct ExactSingletonFirstCandidateAotReport {
 }
 
 /// Schema version for [`MatchingLfLineWitnessAotReport`].
-pub const MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION: u32 = 1;
+pub const MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION: u32 = 2;
 
 /// Miss value published by the matching-LF-line witness endpoint.
 pub const MATCHING_LF_LINE_WITNESS_MISS: u64 = u64::MAX;
@@ -588,6 +588,17 @@ pub enum MatchingLfLineWitnessCursorRegister {
     Aarch64X2,
 }
 
+/// Canonical exact-language identity independently rechecked by the
+/// exact-finite Teddy compiler before an LF witness may consume its cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MatchingLfLineWitnessExactFiniteLanguageV1 {
+    pub literal_sha256: [u8; 32],
+    pub source_count: u32,
+    pub source_bytes: usize,
+    pub minimum_width: u32,
+    pub maximum_width: u32,
+}
+
 /// Authentication receipt for the additive exact-finite whole-buffer
 /// matching-line witness entry.
 ///
@@ -598,12 +609,18 @@ pub enum MatchingLfLineWitnessCursorRegister {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MatchingLfLineWitnessAotReport {
     pub schema_version: u32,
+    /// Exact authenticated native core family entered by this endpoint.
+    pub strategy: MatchingLfLineWitnessStrategy,
     pub semantics: MatchingLfLineWitnessSemantics,
     pub abi: MatchingLfLineWitnessAbi,
     pub miss_sentinel: u64,
     pub target: Target,
     pub program_bytes: usize,
     pub program_sha256: [u8; 32],
+    /// Present exactly for the Teddy strategy. A source-independent adapter
+    /// must reproduce this canonical enumeration identity and geometry before
+    /// using the negative result as authoritative.
+    pub exact_finite_language: Option<MatchingLfLineWitnessExactFiniteLanguageV1>,
     pub cursor_register: MatchingLfLineWitnessCursorRegister,
     pub success_edge_count: u8,
     pub inside_match_edge_count: u8,
@@ -801,6 +818,10 @@ struct ExactFiniteExistsTeddyAotReport {
     /// the Exists-only installer regenerates the complete incumbent and the
     /// `ExistsReverifyInIncumbent` wrapper from the current program.
     lowering: ExactFiniteSelectedEndTeddyAotReport,
+    /// Present only for the explicit native batch/LF transaction. This is the
+    /// deterministically regenerated, self-framed ordinary Teddy entry, not a
+    /// self-signed public-entry digest.
+    trusted_core: Option<NativeDirectSearchTrustedCore>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1535,12 +1556,13 @@ struct NativeDfaEmission {
     direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
 }
 
-/// Local entry into a complete direct search after its public raw-argument
-/// checks and result initialization. An additive wrapper may enter this body
-/// only after proving the same facts and authenticating the exact output,
-/// program, relocation, and body-family contracts. On x86-64, the wrapper
-/// must also reproduce this entry's precise callee-save prologue before
-/// entering the shared body.
+/// Authenticated callable entry into one direct search implementation.
+/// Complete-DFA and Two-Way entries begin after public argument checks and
+/// result initialization, so their additive wrappers reproduce the recorded
+/// callee-save prologue. A self-framed Teddy entry instead repeats validation
+/// and owns every save/restore edge; its additive wrapper jumps in without
+/// imitating an internal frame. Both contracts bind the exact output,
+/// program, relocation, and body family before publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeDirectSearchTrustedCore {
     code_offset: usize,
@@ -1683,44 +1705,56 @@ const MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE: &str =
     "matching-LF-line final-edge tracking is inconsistent";
 
 std::thread_local! {
-    static DIRECT_EXISTS_ENDPOINT_INCUMBENT_REQUESTED: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    static DIRECT_EXISTS_ENDPOINT_REQUEST: std::cell::Cell<DirectExistsEndpointRequest> =
+        const { std::cell::Cell::new(DirectExistsEndpointRequest::None) };
     static MATCHING_LF_LINE_WITNESS_RECIPE_ENABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
 pub(crate) struct DirectExistsEndpointIncumbentScope {
-    previous: bool,
+    previous: DirectExistsEndpointRequest,
+    /// A TLS restoration token must be dropped on the thread that installed
+    /// it. `Rc` makes that invariant structural without adding runtime state.
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectExistsEndpointRequest {
+    None,
+    Batch,
+    BatchAndMatchingLfWitness,
 }
 
 impl Drop for DirectExistsEndpointIncumbentScope {
     fn drop(&mut self) {
-        DIRECT_EXISTS_ENDPOINT_INCUMBENT_REQUESTED.with(|requested| {
+        DIRECT_EXISTS_ENDPOINT_REQUEST.with(|requested| {
             requested.set(self.previous);
         });
     }
 }
 
-/// Preserve the established complete-DFA owner while one explicit direct
-/// Exists endpoint API compiles its ordinary module. Stage-1 Teddy has no
-/// authenticated private batch/LF core, so selecting its scalar-only wrapper
-/// here would make the downstream native append decline and restore a Rust
-/// adapter outer loop.
+/// Select the exact callable receipt required by one explicit direct Exists
+/// endpoint transaction. The request is compiler-private, nested, unwind-safe
+/// and thread-local; ordinary scalar/aggregate compilation remains `None`.
 pub(crate) fn direct_exists_endpoint_incumbent_scope(
-    requested: bool,
+    requested: DirectExistsEndpointRequest,
 ) -> DirectExistsEndpointIncumbentScope {
-    let previous = DIRECT_EXISTS_ENDPOINT_INCUMBENT_REQUESTED.with(|state| {
-        state.replace(requested)
-    });
-    DirectExistsEndpointIncumbentScope { previous }
+    let previous = DIRECT_EXISTS_ENDPOINT_REQUEST.with(|state| state.replace(requested));
+    DirectExistsEndpointIncumbentScope {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
 }
 
-fn direct_exists_endpoint_incumbent_requested() -> bool {
-    DIRECT_EXISTS_ENDPOINT_INCUMBENT_REQUESTED.with(std::cell::Cell::get)
+fn direct_exists_endpoint_request() -> DirectExistsEndpointRequest {
+    DIRECT_EXISTS_ENDPOINT_REQUEST.with(std::cell::Cell::get)
 }
 
 pub(crate) struct MatchingLfLineWitnessRecipeScope {
     previous: bool,
+    /// See `DirectExistsEndpointIncumbentScope`: restoring another thread's
+    /// TLS would strand the originating compiler transaction.
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Drop for MatchingLfLineWitnessRecipeScope {
@@ -1741,7 +1775,10 @@ pub(crate) fn matching_lf_line_witness_recipe_scope(
     let previous = MATCHING_LF_LINE_WITNESS_RECIPE_ENABLED.with(|enabled| {
         enabled.replace(requested)
     });
-    MatchingLfLineWitnessRecipeScope { previous }
+    MatchingLfLineWitnessRecipeScope {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
 }
 
 fn matching_lf_line_witness_recipe_enabled() -> bool {
@@ -2088,6 +2125,10 @@ enum NativeCompleteSpanReduceResultAbi {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeDirectSearchEntryContract {
     PublicCompleteV1,
+    /// A callable ordinary entry that repeats its own public validation and
+    /// owns every frame/save/restore edge. Additive callers must not emulate
+    /// an internal prologue before entering it.
+    PublicSelfFramedV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2113,16 +2154,33 @@ enum NativeDirectSearchTrustedCorePrologue {
         save_r12_r13: bool,
         save_r14_r15: bool,
     },
+    X86_64SelfFramed,
     Aarch64,
+    Aarch64SelfFramed,
 }
 
-/// Exact post-validation body family admitted behind an additive direct
-/// wrapper. The family is authenticated separately from the public entry
-/// digest: an offset that happens to name another valid instruction sequence
-/// must not change the private entry ABI.
+/// Exact callable body family admitted behind an additive direct wrapper.
+/// Complete-DFA and Two-Way landmarks name an internal post-validation body;
+/// the Teddy landmark instead names a self-framed ordinary entry that repeats
+/// validation and owns every save/restore edge. The family is authenticated
+/// separately from the public-entry digest: an offset that happens to name
+/// another valid instruction sequence must not change the private entry ABI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeDirectSearchTrustedCoreLandmark {
     CompleteDfaV1,
+    /// Self-framed ordinary entry into the exact-finite Exists Teddy wrapper.
+    /// The wrapper repeats public validation and owns its complete
+    /// save/restore sequence; the additive trampoline therefore does not
+    /// emulate an internal prologue.
+    ExactFiniteExistsTeddyV1 {
+        prefix_plan_sha256: [u8; 32],
+        native_data_bytes: usize,
+        native_data_sha256: [u8; 32],
+        relocations_sha256: [u8; 32],
+        tail_branch_offset: usize,
+        incumbent_entry_offset: usize,
+        incumbent_core_offset: usize,
+    },
     ExactSingleLiteralTwoWayV1 {
         program_bytes: usize,
         program_sha256: [u8; 32],
@@ -2141,7 +2199,9 @@ impl NativeDirectSearchTrustedCorePrologue {
                     | (u8::from(save_r12_r13) << 1)
                     | (u8::from(save_r14_r15) << 2)
             }
+            Self::X86_64SelfFramed => 2,
             Self::Aarch64 => 1,
+            Self::Aarch64SelfFramed => 2,
         }
     }
 }
@@ -2550,34 +2610,56 @@ fn authenticate_native_direct_search_trusted_core(
     core: NativeDirectSearchTrustedCore,
     expected_output: OutputContract,
 ) -> Result<(), ObjectError> {
+    let entry_contract_and_prologue_match = matches!(
+        (
+            core.entry_contract,
+            core.landmark,
+            architecture,
+            core.prologue,
+        ),
+        (
+            NativeDirectSearchEntryContract::PublicCompleteV1,
+            NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1
+                | NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 { .. },
+            Architecture::X86_64,
+            NativeDirectSearchTrustedCorePrologue::X86_64 { .. },
+        ) | (
+            NativeDirectSearchEntryContract::PublicCompleteV1,
+            NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1
+                | NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 { .. },
+            Architecture::Aarch64,
+            NativeDirectSearchTrustedCorePrologue::Aarch64,
+        ) | (
+            NativeDirectSearchEntryContract::PublicSelfFramedV1,
+            NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 { .. },
+            Architecture::X86_64,
+            NativeDirectSearchTrustedCorePrologue::X86_64SelfFramed,
+        ) | (
+            NativeDirectSearchEntryContract::PublicSelfFramedV1,
+            NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 { .. },
+            Architecture::Aarch64,
+            NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed,
+        )
+    );
     if core.output != expected_output
-        || core.entry_contract != NativeDirectSearchEntryContract::PublicCompleteV1
+        || !entry_contract_and_prologue_match
         || Some(core.result_abi) != NativeDirectSearchResultAbi::for_output(expected_output)
         || !(entry_start..entry_end).contains(&core.code_offset)
         || !core.code_offset.is_multiple_of(match architecture {
             Architecture::X86_64 => 1,
             Architecture::Aarch64 => 4,
         })
-        || !matches!(
-            (architecture, core.prologue),
-            (
-                Architecture::X86_64,
-                NativeDirectSearchTrustedCorePrologue::X86_64 { .. }
-            ) | (
-                Architecture::Aarch64,
-                NativeDirectSearchTrustedCorePrologue::Aarch64
-            )
-        )
     {
         return Err(ObjectError::InvalidModule(
             "direct search trusted core contract is inconsistent",
         ));
     }
     match core.landmark {
-        NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1 => {
+        NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1
+        | NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 { .. } => {
             if core.success_cursor.is_some() {
                 return Err(ObjectError::InvalidModule(
-                    "complete DFA trusted core unexpectedly publishes a cursor",
+                    "complete Exists trusted core unexpectedly publishes a first-candidate cursor",
                 ));
             }
             match (
@@ -2590,7 +2672,7 @@ fn authenticate_native_direct_search_trusted_core(
                         || cursor.matched_offset >= entry_end
                     {
                         return Err(ObjectError::InvalidModule(
-                            "matching-LF-line terminal is outside its trusted core",
+                            "matching-LF-line terminal is outside its complete Exists core",
                         ));
                     }
                     let actual_digest = matching_lf_line_witness_success_edges_digest(
@@ -2608,7 +2690,7 @@ fn authenticate_native_direct_search_trusted_core(
                             || edge.instruction_offset >= cursor.matched_offset
                         {
                             return Err(ObjectError::InvalidModule(
-                                "matching-LF-line edge is outside its trusted core",
+                                "matching-LF-line edge is outside its complete Exists core",
                             ));
                         }
                     }
@@ -2688,6 +2770,102 @@ fn authenticate_native_direct_search_trusted_core(
             landmark[4..8].copy_from_slice(&0x9000_0005_u32.to_le_bytes());
             landmark[8..].copy_from_slice(&aarch64_add_x_imm(5, 5, 0)?.to_le_bytes());
             text.get(core.code_offset..end) == Some(landmark.as_slice())
+        }
+        (
+            Architecture::X86_64,
+            NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 {
+                prefix_plan_sha256,
+                native_data_bytes,
+                native_data_sha256,
+                relocations_sha256,
+                tail_branch_offset,
+                incumbent_entry_offset,
+                incumbent_core_offset,
+            },
+        ) => {
+            let tail_after = tail_branch_offset.checked_add(5);
+            let tail_target = tail_after.and_then(|after| {
+                let displacement = text
+                    .get(tail_branch_offset.checked_add(1)?..after)?
+                    .try_into()
+                    .ok()
+                    .map(i32::from_le_bytes)?;
+                usize::try_from(
+                    i64::try_from(after)
+                        .ok()?
+                        .checked_add(i64::from(displacement))?,
+                )
+                .ok()
+            });
+            core.output == OutputContract::Exists
+                && core.result_abi == NativeDirectSearchResultAbi::ExistsStatusOnlyV1
+                && core.entry_contract == NativeDirectSearchEntryContract::PublicSelfFramedV1
+                && core.prologue == NativeDirectSearchTrustedCorePrologue::X86_64SelfFramed
+                && core.code_offset == entry_start
+                && prefix_plan_sha256 != [0; 32]
+                && native_data_bytes == program.len()
+                && native_data_bytes != 0
+                && <[u8; 32]>::from(Sha256::digest(program)) == native_data_sha256
+                && exact_finite_selected_end_relocation_digest(relocations)
+                    == Some(relocations_sha256)
+                && (core.code_offset..incumbent_entry_offset).contains(&tail_branch_offset)
+                && (incumbent_entry_offset..entry_end).contains(&incumbent_core_offset)
+                && text.get(core.code_offset..core.code_offset.saturating_add(3))
+                    == Some([0x48, 0x85, 0xf6].as_slice())
+                && text.get(tail_branch_offset) == Some(&0xe9)
+                && tail_target == Some(incumbent_entry_offset)
+                && text.get(incumbent_core_offset..incumbent_core_offset.saturating_add(6))
+                    == Some([0x48, 0x89, 0xd6, 0x4c, 0x8d, 0x0d].as_slice())
+        }
+        (
+            Architecture::Aarch64,
+            NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 {
+                prefix_plan_sha256,
+                native_data_bytes,
+                native_data_sha256,
+                relocations_sha256,
+                tail_branch_offset,
+                incumbent_entry_offset,
+                incumbent_core_offset,
+            },
+        ) => {
+            let tail_instruction = text
+                .get(tail_branch_offset..tail_branch_offset.saturating_add(4))
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes);
+            let tail_target = tail_instruction.and_then(|instruction| {
+                (instruction & 0xfc00_0000 == 0x1400_0000).then_some(())?;
+                let immediate = instruction & 0x03ff_ffff;
+                let signed_words = ((u64::from(immediate) << 38) as i64) >> 38;
+                usize::try_from(
+                    i64::try_from(tail_branch_offset)
+                        .ok()?
+                        .checked_add(signed_words.checked_mul(4)?)?,
+                )
+                .ok()
+            });
+            let mut incumbent_landmark = [0_u8; 12];
+            incumbent_landmark[..4].copy_from_slice(&aarch64_mov_x(9, 2)?.to_le_bytes());
+            incumbent_landmark[4..8].copy_from_slice(&0x9000_0005_u32.to_le_bytes());
+            incumbent_landmark[8..].copy_from_slice(&aarch64_add_x_imm(5, 5, 0)?.to_le_bytes());
+            core.output == OutputContract::Exists
+                && core.result_abi == NativeDirectSearchResultAbi::ExistsStatusOnlyV1
+                && core.entry_contract == NativeDirectSearchEntryContract::PublicSelfFramedV1
+                && core.prologue == NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed
+                && core.code_offset == entry_start
+                && prefix_plan_sha256 != [0; 32]
+                && native_data_bytes == program.len()
+                && native_data_bytes != 0
+                && <[u8; 32]>::from(Sha256::digest(program)) == native_data_sha256
+                && exact_finite_selected_end_relocation_digest(relocations)
+                    == Some(relocations_sha256)
+                && (core.code_offset..incumbent_entry_offset).contains(&tail_branch_offset)
+                && (incumbent_entry_offset..entry_end).contains(&incumbent_core_offset)
+                && text.get(core.code_offset..core.code_offset.saturating_add(4))
+                    == Some(0xf100_003f_u32.to_le_bytes().as_slice())
+                && tail_target == Some(incumbent_entry_offset)
+                && text.get(incumbent_core_offset..incumbent_core_offset.saturating_add(12))
+                    == Some(incumbent_landmark.as_slice())
         }
         (
             Architecture::X86_64,
@@ -2775,6 +2953,22 @@ fn authenticate_native_direct_search_trusted_core(
     if !landmark_matches {
         return Err(ObjectError::InvalidModule(
             "direct search trusted core landmark is malformed",
+        ));
+    }
+    if let (
+        NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 {
+            incumbent_core_offset,
+            ..
+        },
+        Some(cursor),
+    ) = (core.landmark, core.matching_lf_line_cursor)
+        && (cursor.matched_offset < incumbent_core_offset
+            || cursor.edges[..usize::from(cursor.edge_count)]
+                .iter()
+                .any(|edge| edge.instruction_offset < incumbent_core_offset))
+    {
+        return Err(ObjectError::InvalidModule(
+            "matching-LF-line Teddy edge precedes its retained DFA core",
         ));
     }
     Ok(())
@@ -3499,6 +3693,11 @@ pub enum DirectExistsBatchStrategy {
     /// compiler may authenticate a private full-window entry into that same
     /// implementation, without changing the public ordinary entry.
     NativeOrdinaryEntryLoop,
+    /// The native descriptor loop calls an authenticated self-framed
+    /// exact-finite Teddy ordinary entry. Each independent haystack receives
+    /// one correlated SIMD scan and exact positives tail-enter the retained
+    /// DFA.
+    NativeTeddyTrustedCoreV1,
 }
 
 /// Implementation selected behind an exact-singleton first-candidate symbol.
@@ -3515,6 +3714,11 @@ pub enum MatchingLfLineWitnessStrategy {
     /// One validated whole-buffer call enters the authenticated complete-DFA
     /// core and normalizes its success cursor to a byte in the matching line.
     NativeCompleteDfaTrustedCoreV1,
+    /// One validated whole-buffer call enters the authenticated exact-finite
+    /// Teddy core. Negatives are exact; a positive reaches the retained
+    /// complete-DFA terminal whose rebased cursor is normalized to a matching
+    /// line byte.
+    NativeTeddyTrustedCoreV1,
 }
 
 /// Prepared-handle capability bit required by an object whose aggregate/fill
@@ -3670,6 +3874,19 @@ struct NativeDirectSearchModuleSurfaceSeal {
     relocations_sha256: [u8; 32],
 }
 
+/// Immutable compiler-private authentication of the additive direct Exists
+/// batch surface. A later LF witness must rederive the patched wrapper and
+/// symbol identity instead of treating mere symbol presence as authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDirectExistsBatchSurfaceSeal {
+    trusted_core: NativeDirectSearchTrustedCore,
+    ordinary_entry_symbol_sha256: [u8; 32],
+    wrapper_entry_offset: usize,
+    wrapper_bytes: usize,
+    wrapper_sha256: [u8; 32],
+    endpoint_symbol_sha256: [u8; 32],
+}
+
 /// Object-format-neutral native module.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledModule {
@@ -3686,8 +3903,8 @@ pub struct CompiledModule {
     prepared_span_fill_symbol_index: Option<usize>,
     prepared_exists_batch_symbol_index: Option<usize>,
     direct_exists_batch_symbol_index: Option<usize>,
-    direct_exact_singleton_first_candidate:
-        Option<(usize, ExactSingletonFirstCandidateAotReport)>,
+    direct_exists_batch_surface_seal: Option<NativeDirectExistsBatchSurfaceSeal>,
+    direct_exact_singleton_first_candidate: Option<(usize, ExactSingletonFirstCandidateAotReport)>,
     direct_matching_lf_line_witness: Option<(usize, MatchingLfLineWitnessAotReport)>,
     native_direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
     native_direct_search_module_surface_seal: Option<NativeDirectSearchModuleSurfaceSeal>,
@@ -5716,19 +5933,21 @@ impl CompiledModule {
             // 4..=64-literal Choice and target-ISA gate. Unsupported targets
             // and small choices therefore retain the pre-feature error and
             // object surface byte for byte.
-            let exact_finite_exists_teddy_choice =
-                (semantic_native.output == OutputContract::Exists
-                    && !direct_exists_endpoint_incumbent_requested())
-                    .then(|| program.native_finite_exists_choice_view())
-                    .flatten()
-                    .filter(|&choice| {
-                        module_exact_finite_selected_end_teddy::
+            let direct_exists_endpoint_request = direct_exists_endpoint_request();
+            let publish_exists_teddy_trusted_core =
+                direct_exists_endpoint_request != DirectExistsEndpointRequest::None;
+            let exact_finite_exists_teddy_choice = (semantic_native.output
+                == OutputContract::Exists)
+                .then(|| program.native_finite_exists_choice_view())
+                .flatten()
+                .filter(|&choice| {
+                    module_exact_finite_selected_end_teddy::
                             exact_finite_exists_teddy_is_structurally_eligible(
                                 program.artifact_identity(),
                                 choice,
                                 target,
                             )
-                    });
+                });
             let finite_view = program.native_finite_language_view();
             let finite_candidate =
                 if let (Some(complete_cost), Some(finite_view)) = (complete_cost, finite_view) {
@@ -5814,6 +6033,29 @@ impl CompiledModule {
             if semantic_native.output == OutputContract::Exists
                 && let Some(choice) = exact_finite_exists_teddy_choice
                 && let Some(incumbent_ref) = incumbent.as_ref()
+                && match (
+                    direct_exists_endpoint_request,
+                    incumbent_ref.direct_search_trusted_core,
+                ) {
+                    (DirectExistsEndpointRequest::None, _) => true,
+                    (
+                        DirectExistsEndpointRequest::Batch,
+                        Some(NativeDirectSearchTrustedCore {
+                            landmark: NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
+                            ..
+                        }),
+                    ) => true,
+                    (
+                        DirectExistsEndpointRequest::BatchAndMatchingLfWitness,
+                        Some(NativeDirectSearchTrustedCore {
+                            landmark: NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
+                            matching_lf_line_cursor: Some(_),
+                            matching_lf_line_success_edges_sha256: Some(_),
+                            ..
+                        }),
+                    ) => true,
+                    _ => false,
+                }
                 && incumbent_ref.start_accelerator == StartAccelerator::None
                 && !incumbent_ref.synchronizing_accept_reverse_lowered
                 && !incumbent_ref.exact_pair_suffix_lowered
@@ -5832,15 +6074,28 @@ impl CompiledModule {
                 let incumbent_lowering = incumbent.take().ok_or(
                     CompileError::InternalInvariant("Exists Teddy lost its materialized incumbent"),
                 )?;
-                match module_exact_finite_selected_end_teddy::wrap_exact_finite_exists_teddy(
-                    selection,
-                    incumbent_lowering,
-                    baseline_report,
-                    target,
-                    effective_native_data_limit_bytes,
-                )? {
+                let wrapped = if publish_exists_teddy_trusted_core {
+                    module_exact_finite_selected_end_teddy::
+                        wrap_exact_finite_exists_teddy_with_trusted_core(
+                            selection,
+                            incumbent_lowering,
+                            baseline_report,
+                            target,
+                            effective_native_data_limit_bytes,
+                        )?
+                } else {
+                    module_exact_finite_selected_end_teddy::wrap_exact_finite_exists_teddy(
+                        selection,
+                        incumbent_lowering,
+                        baseline_report,
+                        target,
+                        effective_native_data_limit_bytes,
+                    )?
+                };
+                match wrapped {
                     module_exact_finite_selected_end_teddy::
                         ExactFiniteSelectedEndTeddyWrapOutcome::Selected { lowering, report } => {
+                            let trusted_core = lowering.direct_search_trusted_core;
                             let mut module = Self::lower_serialized_with_prelowered(
                                 program_bytes,
                                 Some(lowering),
@@ -5860,7 +6115,10 @@ impl CompiledModule {
                                 target,
                             )?;
                             module.install_exact_finite_exists_teddy_aot_report(
-                                ExactFiniteExistsTeddyAotReport { lowering: report },
+                                ExactFiniteExistsTeddyAotReport {
+                                    lowering: report,
+                                    trusted_core,
+                                },
                                 program.artifact_identity(),
                                 semantic_native,
                                 choice,
@@ -8917,6 +9175,7 @@ impl CompiledModule {
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
             direct_exists_batch_symbol_index: None,
+            direct_exists_batch_surface_seal: None,
             direct_exact_singleton_first_candidate: None,
             direct_matching_lf_line_witness: None,
             native_direct_search_trusted_core: lowering.direct_search_trusted_core,
@@ -9096,8 +9355,9 @@ impl CompiledModule {
                 .is_none_or(|identity| identity.sha256 != artifact_identity)
             || lowering_report.output != OutputContract::Exists
             || semantic_native.output != OutputContract::Exists
-            || self.native_direct_search_trusted_core.is_some()
+            || self.native_direct_search_trusted_core != report.trusted_core
             || self.native_direct_search_module_surface_seal.is_some()
+                != report.trusted_core.is_some()
         {
             return Err(ObjectError::InvalidModule(
                 "exact finite Exists Teddy provenance is not exclusive",
@@ -9152,14 +9412,24 @@ impl CompiledModule {
         .ok_or(ObjectError::InvalidModule(
             "exact finite Exists Teddy selection did not regenerate",
         ))?;
-        let regenerated =
+        let regenerated = if report.trusted_core.is_some() {
+            module_exact_finite_selected_end_teddy::
+                wrap_exact_finite_exists_teddy_with_trusted_core(
+                    selection,
+                    incumbent,
+                    baseline,
+                    self.target,
+                    lowering_report.native_data_bytes,
+                )?
+        } else {
             module_exact_finite_selected_end_teddy::wrap_exact_finite_exists_teddy(
                 selection,
                 incumbent,
                 baseline,
                 self.target,
                 lowering_report.native_data_bytes,
-            )?;
+            )?
+        };
         let module_exact_finite_selected_end_teddy::ExactFiniteSelectedEndTeddyWrapOutcome::Selected {
             lowering: regenerated_lowering,
             report: regenerated_report,
@@ -9184,7 +9454,7 @@ impl CompiledModule {
             || regenerated_lowering.start_accelerator != self.start_accelerator
             || regenerated_lowering.anchored_prefix_filter_bytes
                 != self.anchored_prefix_filter_bytes
-            || regenerated_lowering.direct_search_trusted_core.is_some()
+            || regenerated_lowering.direct_search_trusted_core != report.trusted_core
             || self.runtime_symbol_index.is_some()
             || !module_exact_finite_selected_end_teddy::exists_report_matches_lowering(
                 &lowering_report,
@@ -9196,8 +9466,80 @@ impl CompiledModule {
                 "exact finite Exists Teddy module changed after regeneration",
             ));
         }
-        self.exact_finite_exists_leaf_report =
-            Some(ExactFiniteExistsLeafReport::Teddy(report));
+        match report.trusted_core {
+            Some(trusted_core) => {
+                let serialized_program_identity =
+                    self.serialized_program_identity
+                        .ok_or(ObjectError::InvalidModule(
+                            "exact finite Exists Teddy trusted core has no serialized identity",
+                        ))?;
+                let seal = self.native_direct_search_module_surface_seal.ok_or(
+                    ObjectError::InvalidModule(
+                        "exact finite Exists Teddy trusted core has no module seal",
+                    ),
+                )?;
+                let entry =
+                    self.symbols
+                        .get(self.entry_symbol_index)
+                        .ok_or(ObjectError::InvalidModule(
+                            "exact finite Exists Teddy trusted core has no ordinary entry",
+                        ))?;
+                let entry_start = usize::try_from(entry.offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "exact finite Exists Teddy trusted-core entry offset",
+                    )
+                })?;
+                let entry_bytes = usize::try_from(entry.size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "exact finite Exists Teddy trusted-core entry size",
+                    )
+                })?;
+                let entry_end =
+                    entry_start
+                        .checked_add(entry_bytes)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "exact finite Exists Teddy trusted-core entry extent",
+                        ))?;
+                let relocations_sha256 = exact_finite_selected_end_relocation_digest(
+                    &self.relocations,
+                )
+                .ok_or(ObjectError::InvalidModule(
+                    "exact finite Exists Teddy trusted-core module relocations",
+                ))?;
+                if entry_start != 0
+                    || entry_end != text.data.len()
+                    || seal.target != self.target
+                    || seal.serialized_program_identity != serialized_program_identity
+                    || seal.native_data_bytes != data.data.len()
+                    || seal.native_data_sha256 != <[u8; 32]>::from(Sha256::digest(&data.data))
+                    || seal.relocations_sha256 != relocations_sha256
+                    || entry.name
+                        != identity_symbol(ENTRY_SYMBOL_PREFIX, &seal.native_module_identity)?
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "exact finite Exists Teddy trusted-core module seal changed",
+                    ));
+                }
+                authenticate_native_direct_search_trusted_core(
+                    self.target.architecture,
+                    &text.data,
+                    entry_start,
+                    entry_end,
+                    &data.data,
+                    &self.relocations,
+                    trusted_core,
+                    OutputContract::Exists,
+                )?;
+            }
+            None => {
+                if self.native_direct_search_module_surface_seal.is_some() {
+                    return Err(ObjectError::InvalidModule(
+                        "scalar exact finite Exists Teddy unexpectedly retained a module seal",
+                    ));
+                }
+            }
+        }
+        self.exact_finite_exists_leaf_report = Some(ExactFiniteExistsLeafReport::Teddy(report));
         Ok(())
     }
 
@@ -9206,10 +9548,21 @@ impl CompiledModule {
         artifact_identity: [u8; 32],
         serialized_program_bytes: usize,
     ) -> Result<(), ObjectError> {
-        let Some(ExactFiniteExistsLeafReport::Teddy(report)) =
-            self.exact_finite_exists_leaf_report.as_ref()
-        else {
-            return Ok(());
+        let module_publishes_teddy_core = matches!(
+            self.native_direct_search_trusted_core,
+            Some(NativeDirectSearchTrustedCore {
+                landmark: NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 { .. },
+                ..
+            })
+        );
+        let report = match self.exact_finite_exists_leaf_report.as_ref() {
+            Some(ExactFiniteExistsLeafReport::Teddy(report)) => report,
+            _ if module_publishes_teddy_core => {
+                return Err(ObjectError::InvalidModule(
+                    "direct Exists Teddy core has no deterministic lowering receipt",
+                ));
+            }
+            _ => return Ok(()),
         };
         if report.lowering.artifact_identity != artifact_identity
             || self
@@ -9237,6 +9590,133 @@ impl CompiledModule {
             ));
         }
         Ok(())
+    }
+
+    /// Re-authenticate the immutable ordinary Teddy entry after zero or more
+    /// direct endpoint suffixes have been appended. The Stage-1 lowering
+    /// receipt intentionally continues to bind only this entry slice; final
+    /// endpoint receipts separately hash the complete grown text.
+    fn authenticate_exact_finite_exists_teddy_direct_core(
+        &self,
+        entry_start: usize,
+        entry_end: usize,
+    ) -> Result<(), ObjectError> {
+        let module_publishes_teddy_core = matches!(
+            self.native_direct_search_trusted_core,
+            Some(NativeDirectSearchTrustedCore {
+                landmark: NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 { .. },
+                ..
+            })
+        );
+        let report = match self.exact_finite_exists_leaf_report.as_ref() {
+            Some(ExactFiniteExistsLeafReport::Teddy(report)) => report,
+            _ if module_publishes_teddy_core => {
+                return Err(ObjectError::InvalidModule(
+                    "direct Exists Teddy core has no deterministic lowering receipt",
+                ));
+            }
+            _ => return Ok(()),
+        };
+        let Some(trusted_core) = report.trusted_core else {
+            return Err(ObjectError::InvalidModule(
+                "direct endpoint selected a scalar-only Exists Teddy receipt",
+            ));
+        };
+        let module_core =
+            self.native_direct_search_trusted_core
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Exists Teddy core receipt is absent",
+                ))?;
+        let serialized_identity =
+            self.serialized_program_identity
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Exists Teddy serialized identity is absent",
+                ))?;
+        let seal =
+            self.native_direct_search_module_surface_seal
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Exists Teddy module seal is absent",
+                ))?;
+        let text = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists Teddy module text is absent",
+            ))?;
+        let data = self
+            .sections
+            .get(PROGRAM_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists Teddy module data is absent",
+            ))?;
+        let entry = text
+            .data
+            .get(entry_start..entry_end)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists Teddy ordinary entry is outside text",
+            ))?;
+        let ordinary_entry_bytes = report
+            .lowering
+            .incumbent_code_offset
+            .checked_add(report.lowering.incumbent_code_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists Teddy ordinary entry extent",
+            ))?;
+        let relocations_sha256 = exact_finite_selected_end_relocation_digest(&self.relocations)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists Teddy relocation receipt is absent",
+            ))?;
+        let landmark_matches_report = matches!(
+            trusted_core.landmark,
+            NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 {
+                prefix_plan_sha256,
+                native_data_bytes,
+                native_data_sha256,
+                relocations_sha256: core_relocations_sha256,
+                incumbent_entry_offset,
+                ..
+            } if prefix_plan_sha256 == report.lowering.prefix_plan_sha256
+                && native_data_bytes == report.lowering.native_data_bytes
+                && native_data_sha256 == report.lowering.native_data_sha256
+                && core_relocations_sha256 == report.lowering.relocations_sha256
+                && incumbent_entry_offset == report.lowering.incumbent_code_offset
+        );
+        if entry_start != 0
+            || entry.len() != ordinary_entry_bytes
+            || report.lowering.artifact_identity != serialized_identity.sha256
+            || module_core != trusted_core
+            || !landmark_matches_report
+            || seal.target != self.target
+            || seal.serialized_program_identity != serialized_identity
+            || seal.native_data_bytes != data.data.len()
+            || seal.native_data_sha256 != <[u8; 32]>::from(Sha256::digest(&data.data))
+            || seal.relocations_sha256 != relocations_sha256
+            || !module_exact_finite_selected_end_teddy::exists_report_matches_parts(
+                &report.lowering,
+                entry,
+                &data.data,
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists Teddy ordinary entry changed after authentication",
+            ));
+        }
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &text.data,
+            entry_start,
+            entry_end,
+            &data.data,
+            &self.relocations,
+            trusted_core,
+            OutputContract::Exists,
+        )
     }
 
     fn drop_exact_finite_exists_teddy_after_additive_surface(&mut self) {
@@ -9672,11 +10152,33 @@ impl CompiledModule {
     /// Return how the handle-free direct Exists-batch symbol executes.
     #[must_use]
     pub const fn direct_exists_batch_strategy(&self) -> Option<DirectExistsBatchStrategy> {
-        if self.direct_exists_batch_symbol_index.is_some() {
-            Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop)
-        } else {
-            None
+        if self.direct_exists_batch_symbol_index.is_none() {
+            return None;
         }
+        match self.native_direct_search_trusted_core {
+            Some(NativeDirectSearchTrustedCore {
+                landmark: NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 { .. },
+                ..
+            }) => Some(DirectExistsBatchStrategy::NativeTeddyTrustedCoreV1),
+            Some(_) => Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop),
+            None => None,
+        }
+    }
+
+    pub(crate) fn has_exact_finite_exists_teddy_trusted_core(&self) -> bool {
+        matches!(
+            (
+                self.exact_finite_exists_leaf_report.as_ref(),
+                self.native_direct_search_trusted_core,
+            ),
+            (
+                Some(ExactFiniteExistsLeafReport::Teddy(ExactFiniteExistsTeddyAotReport {
+                    trusted_core: Some(report_core),
+                    ..
+                })),
+                Some(module_core),
+            ) if *report_core == module_core
+        )
     }
 
     /// Return the additive exact-singleton whole-haystack earliest-candidate
@@ -9731,10 +10233,9 @@ impl CompiledModule {
     pub const fn direct_matching_lf_line_witness_strategy(
         &self,
     ) -> Option<MatchingLfLineWitnessStrategy> {
-        if self.direct_matching_lf_line_witness.is_some() {
-            Some(MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1)
-        } else {
-            None
+        match &self.direct_matching_lf_line_witness {
+            Some((_, report)) => Some(report.strategy),
+            None => None,
         }
     }
 
@@ -10675,7 +11176,9 @@ impl CompiledModule {
         {
             return Ok(None);
         }
-        if self.direct_exists_batch_symbol_index.is_some() {
+        if self.direct_exists_batch_symbol_index.is_some()
+            || self.direct_exists_batch_surface_seal.is_some()
+        {
             return Err(ObjectError::InvalidModule(
                 "direct Exists batch was appended more than once",
             ));
@@ -10741,12 +11244,13 @@ impl CompiledModule {
                 "direct Exists batch target is not a complete text function",
             ));
         }
-        let program_section = self
-            .sections
-            .get(PROGRAM_SECTION)
-            .ok_or(ObjectError::InvalidModule(
-                "direct Exists batch module has no program section",
-            ))?;
+        let program_section =
+            self.sections
+                .get(PROGRAM_SECTION)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Exists batch module has no program section",
+                ))?;
+        self.authenticate_exact_finite_exists_teddy_direct_core(entry_start, entry_end)?;
         authenticate_native_direct_search_trusted_program_surface(
             program_section,
             &self.symbols,
@@ -10848,6 +11352,13 @@ impl CompiledModule {
         )?);
         let batch_identity: [u8; 32] = batch_identity.finalize().into();
         let batch_name = identity_symbol(DIRECT_EXISTS_BATCH_SYMBOL_PREFIX, &batch_identity)?;
+        let batch_wrapper =
+            text.get(code_offset..final_text_len)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Exists batch wrapper is outside final text",
+                ))?;
+        let batch_wrapper_sha256: [u8; 32] = Sha256::digest(batch_wrapper).into();
+        let batch_endpoint_symbol_sha256: [u8; 32] = Sha256::digest(batch_name.as_bytes()).into();
         if let Some(ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report)) =
             &mut self.exact_finite_exists_leaf_report
         {
@@ -10875,7 +11386,194 @@ impl CompiledModule {
         });
         self.symbols = symbols.into_boxed_slice();
         self.direct_exists_batch_symbol_index = Some(batch_symbol_index);
+        self.direct_exists_batch_surface_seal = Some(NativeDirectExistsBatchSurfaceSeal {
+            trusted_core,
+            ordinary_entry_symbol_sha256: entry_name_digest,
+            wrapper_entry_offset: code_offset,
+            wrapper_bytes: wrapper.code.len(),
+            wrapper_sha256: batch_wrapper_sha256,
+            endpoint_symbol_sha256: batch_endpoint_symbol_sha256,
+        });
         Ok(Some(self))
+    }
+
+    /// Rebuild and authenticate the complete direct-batch suffix before a
+    /// second additive endpoint incorporates it into a new whole-module
+    /// receipt. Symbol presence alone is not an authentication boundary.
+    fn authenticate_direct_exists_batch_surface(
+        &self,
+        trusted_core: NativeDirectSearchTrustedCore,
+    ) -> Result<(), ObjectError> {
+        let seal = self
+            .direct_exists_batch_surface_seal
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists batch surface seal is absent",
+            ))?;
+        let symbol_index =
+            self.direct_exists_batch_symbol_index
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Exists batch symbol is absent",
+                ))?;
+        let symbol = self
+            .symbols
+            .get(symbol_index)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists batch symbol index is invalid",
+            ))?;
+        let entry = self
+            .symbols
+            .get(self.entry_symbol_index)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists batch ordinary entry is absent",
+            ))?;
+        let entry_start = usize::try_from(entry.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch ordinary entry offset")
+        })?;
+        let entry_bytes = usize::try_from(entry.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Exists batch ordinary entry size")
+        })?;
+        let entry_end =
+            entry_start
+                .checked_add(entry_bytes)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Exists batch ordinary entry extent",
+                ))?;
+        let native_surface =
+            self.native_direct_search_module_surface_seal
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Exists batch native surface seal is absent",
+                ))?;
+        let expected_entry_name =
+            identity_symbol(ENTRY_SYMBOL_PREFIX, &native_surface.native_module_identity)?;
+        let expected_entry_symbol_sha256: [u8; 32] =
+            Sha256::digest(expected_entry_name.as_bytes()).into();
+        let wrapper = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_direct_exists_batch(trusted_core.prologue)?,
+            Architecture::Aarch64 => lower_aarch64_direct_exists_batch(trusted_core.prologue)?,
+        };
+        let alignment_mask = match self.target.architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let expected_code_offset =
+            entry_end
+                .checked_add(alignment_mask)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "direct Exists batch authenticated alignment",
+                ))?
+                & !alignment_mask;
+        let expected_text_len = expected_code_offset.checked_add(wrapper.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("direct Exists batch authenticated extent"),
+        )?;
+        let mut expected_text = Vec::new();
+        expected_text
+            .try_reserve_exact(expected_text_len)
+            .map_err(|_| ObjectError::Allocation("direct Exists batch authentication"))?;
+        expected_text.resize(expected_code_offset, 0);
+        push_bytes(&mut expected_text, &wrapper.code)?;
+        let call_offset = expected_code_offset
+            .checked_add(wrapper.search_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch authenticated call",
+            ))?;
+        let trampoline_offset = expected_code_offset
+            .checked_add(wrapper.trampoline_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch authenticated trampoline",
+            ))?;
+        let core_jump_offset = expected_code_offset
+            .checked_add(wrapper.core_jump_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Exists batch authenticated core jump",
+            ))?;
+        match self.target.architecture {
+            Architecture::X86_64 => {
+                patch_x86_64_local_call(&mut expected_text, call_offset, trampoline_offset)?;
+                patch_x86_64_local_jump(
+                    &mut expected_text,
+                    core_jump_offset,
+                    trusted_core.code_offset,
+                )?;
+            }
+            Architecture::Aarch64 => {
+                patch_aarch64_local_call(&mut expected_text, call_offset, trampoline_offset)?;
+                patch_aarch64_local_branch(
+                    &mut expected_text,
+                    core_jump_offset,
+                    trusted_core.code_offset,
+                )?;
+            }
+        }
+        let expected_wrapper = expected_text
+            .get(expected_code_offset..expected_text_len)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists batch regenerated wrapper is absent",
+            ))?;
+        let expected_wrapper_sha256: [u8; 32] = Sha256::digest(expected_wrapper).into();
+        let mut identity = Sha256::new();
+        identity.update(DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN);
+        identity.update(expected_entry_symbol_sha256);
+        identity.update(
+            u64::try_from(trusted_core.code_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("direct Exists batch authenticated call target")
+                })?
+                .to_le_bytes(),
+        );
+        identity.update([trusted_core.prologue.identity_tag()]);
+        identity.update(
+            u64::try_from(expected_code_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("direct Exists batch authenticated code offset")
+                })?
+                .to_le_bytes(),
+        );
+        identity.update(expected_wrapper);
+        let expected_name = identity_symbol(
+            DIRECT_EXISTS_BATCH_SYMBOL_PREFIX,
+            &<[u8; 32]>::from(identity.finalize()),
+        )?;
+        let expected_symbol_sha256: [u8; 32] = Sha256::digest(expected_name.as_bytes()).into();
+        let text = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists batch text is absent",
+            ))?;
+        let padding =
+            text.data
+                .get(entry_end..expected_code_offset)
+                .ok_or(ObjectError::InvalidModule(
+                    "direct Exists batch padding is outside text",
+                ))?;
+        let padding_is_canonical = match self.target.architecture {
+            Architecture::X86_64 => padding.iter().all(|&byte| byte == 0x90),
+            Architecture::Aarch64 => padding
+                .chunks_exact(4)
+                .all(|chunk| chunk == 0xd503_201f_u32.to_le_bytes()),
+        };
+        if seal.trusted_core != trusted_core
+            || entry.name != expected_entry_name
+            || seal.ordinary_entry_symbol_sha256 != expected_entry_symbol_sha256
+            || seal.wrapper_entry_offset != expected_code_offset
+            || seal.wrapper_bytes != wrapper.code.len()
+            || seal.wrapper_sha256 != expected_wrapper_sha256
+            || seal.endpoint_symbol_sha256 != expected_symbol_sha256
+            || symbol.name != expected_name
+            || symbol.binding != SymbolBinding::Global
+            || symbol.kind != SymbolKind::Function
+            || symbol.section != Some(TEXT_SECTION)
+            || usize::try_from(symbol.offset).ok() != Some(expected_code_offset)
+            || usize::try_from(symbol.size).ok() != Some(wrapper.code.len())
+            || !padding_is_canonical
+            || text.data.len() != expected_text_len
+            || text.data.get(expected_code_offset..expected_text_len) != Some(expected_wrapper)
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Exists batch surface changed after authentication",
+            ));
+        }
+        Ok(())
     }
 
     /// Append the exact-singleton whole-window earliest-candidate endpoint to
@@ -11158,10 +11856,12 @@ impl CompiledModule {
     }
 
     /// Append a whole-buffer matching-LF-line witness endpoint to an already
-    /// completed direct Exists-batch module. Non-complete-DFA cores decline;
-    /// complete-DFA cores without the explicitly requested cursor proof also
-    /// decline. Every partial or inconsistent proof is terminal so callers
-    /// cannot silently publish a less-authenticated route.
+    /// completed direct Exists-batch module. Complete-DFA cores without the
+    /// explicitly requested cursor proof decline; a selected self-framed
+    /// Teddy entry must carry its rebased incumbent cursor proof or fail
+    /// terminally. Other core families decline. Every partial or inconsistent
+    /// proof is terminal so callers cannot silently publish a
+    /// less-authenticated route.
     #[allow(
         clippy::too_many_lines,
         reason = "core-edge authentication, wrapper identity, and publication are one failure-atomic transaction"
@@ -11189,21 +11889,71 @@ impl CompiledModule {
         let Some(trusted_core) = self.native_direct_search_trusted_core else {
             return Ok(None);
         };
-        if trusted_core.landmark != NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1 {
-            return Ok(None);
-        }
+        let (strategy, exact_finite_language) = match trusted_core.landmark {
+            NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1 => {
+                if matches!(
+                    self.exact_finite_exists_leaf_report,
+                    Some(ExactFiniteExistsLeafReport::Teddy(_))
+                ) {
+                    return Err(ObjectError::InvalidModule(
+                        "matching-LF-line complete core retained a Teddy receipt",
+                    ));
+                }
+                (
+                    MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1,
+                    None,
+                )
+            }
+            NativeDirectSearchTrustedCoreLandmark::ExactFiniteExistsTeddyV1 { .. } => {
+                let Some(ExactFiniteExistsLeafReport::Teddy(report)) =
+                    self.exact_finite_exists_leaf_report.as_ref()
+                else {
+                    return Err(ObjectError::InvalidModule(
+                        "matching-LF-line Teddy core has no exact-language receipt",
+                    ));
+                };
+                if report.trusted_core != Some(trusted_core) {
+                    return Err(ObjectError::InvalidModule(
+                        "matching-LF-line Teddy core disagrees with its installed receipt",
+                    ));
+                }
+                (
+                    MatchingLfLineWitnessStrategy::NativeTeddyTrustedCoreV1,
+                    Some(MatchingLfLineWitnessExactFiniteLanguageV1 {
+                        literal_sha256: report.lowering.literal_sha256,
+                        source_count: report.lowering.source_count,
+                        source_bytes: report.lowering.source_bytes,
+                        minimum_width: report.lowering.minimum_width,
+                        maximum_width: report.lowering.maximum_width,
+                    }),
+                )
+            }
+            NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 { .. } => {
+                return Ok(None);
+            }
+        };
         let cursor = match (
             trusted_core.matching_lf_line_cursor,
             trusted_core.matching_lf_line_success_edges_sha256,
         ) {
             (Some(cursor), Some(_)) => cursor,
-            (None, None) => return Ok(None),
+            (None, None)
+                if strategy == MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1 =>
+            {
+                return Ok(None);
+            }
+            (None, None) => {
+                return Err(ObjectError::InvalidModule(
+                    "selected matching-LF-line Teddy core omitted its required cursor",
+                ));
+            }
             _ => {
                 return Err(ObjectError::InvalidModule(
                     "complete Exists DFA has no matching-LF-line cursor proof",
                 ));
             }
         };
+        self.authenticate_direct_exists_batch_surface(trusted_core)?;
         let edge_count = usize::from(cursor.edge_count);
         let mut inside_match_edge_count = 0_u8;
         let mut exclusive_end_edge_count = 0_u8;
@@ -11315,6 +12065,7 @@ impl CompiledModule {
                 "matching-LF-line native module surface is inconsistent",
             ));
         }
+        self.authenticate_exact_finite_exists_teddy_direct_core(entry_start, entry_end)?;
         authenticate_native_direct_search_trusted_program_surface(
             program,
             &self.symbols,
@@ -11421,6 +12172,10 @@ impl CompiledModule {
             OperatingSystem::Macos => 2,
         }]);
         identity.update(self.target.features.bits().to_le_bytes());
+        identity.update([match strategy {
+            MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1 => 1,
+            MatchingLfLineWitnessStrategy::NativeTeddyTrustedCoreV1 => 2,
+        }]);
         identity.update([trusted_core.prologue.identity_tag()]);
         identity.update(program_sha256);
         identity.update(
@@ -11440,6 +12195,21 @@ impl CompiledModule {
         identity.update(ordinary_entry_code_sha256);
         identity.update(trusted_core_sha256);
         identity.update(success_edges_sha256);
+        if let Some(language) = exact_finite_language {
+            identity.update(language.literal_sha256);
+            identity.update(language.source_count.to_le_bytes());
+            identity.update(
+                u64::try_from(language.source_bytes)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "matching-LF-line exact language source bytes",
+                        )
+                    })?
+                    .to_le_bytes(),
+            );
+            identity.update(language.minimum_width.to_le_bytes());
+            identity.update(language.maximum_width.to_le_bytes());
+        }
         identity.update(wrapper_sha256);
         identity.update(relocations_sha256);
         let identity: [u8; 32] = identity.finalize().into();
@@ -11474,12 +12244,14 @@ impl CompiledModule {
             symbol_index,
             MatchingLfLineWitnessAotReport {
                 schema_version: MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION,
+                strategy,
                 semantics: MatchingLfLineWitnessSemantics::MatchingLfLineByteV1,
                 abi: MatchingLfLineWitnessAbi::HaystackLenU64OutStatusV1,
                 miss_sentinel: MATCHING_LF_LINE_WITNESS_MISS,
                 target: self.target,
                 program_bytes,
                 program_sha256,
+                exact_finite_language,
                 cursor_register: cursor.register,
                 success_edge_count: cursor.edge_count,
                 inside_match_edge_count,
@@ -35476,6 +36248,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
         direct_matching_lf_line_witness: None,
         native_direct_search_trusted_core: None,
@@ -35819,6 +36592,7 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
         direct_matching_lf_line_witness: None,
         native_direct_search_trusted_core: None,
@@ -36344,6 +37118,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
         direct_matching_lf_line_witness: None,
         native_direct_search_trusted_core: None,
@@ -36509,6 +37284,7 @@ fn native_regex_redux_module(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
         direct_matching_lf_line_witness: None,
         native_direct_search_trusted_core: None,
@@ -36867,6 +37643,7 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
         direct_matching_lf_line_witness: None,
         native_direct_search_trusted_core: None,
@@ -36986,6 +37763,7 @@ fn native_weighted_capture_module(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
         direct_matching_lf_line_witness: None,
         native_direct_search_trusted_core: None,
@@ -37448,6 +38226,7 @@ fn native_rebar_multi_grep_module_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
         direct_matching_lf_line_witness: None,
         native_direct_search_trusted_core: None,
@@ -37700,6 +38479,7 @@ fn native_rebar_row_scalar_module_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_exists_batch_symbol_index: None,
+        direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
         direct_matching_lf_line_witness: None,
         native_direct_search_trusted_core: None,
@@ -52470,10 +53250,12 @@ fn lower_x86_64_prepared_span_reduce_with_terminal_exact_set(
             prologue @ NativeDirectSearchTrustedCorePrologue::X86_64 { .. },
         ) => Some(prologue),
         NativeSpanReducerCallKind::DirectTrustedCore(
-            NativeDirectSearchTrustedCorePrologue::Aarch64,
+            NativeDirectSearchTrustedCorePrologue::Aarch64
+            | NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed
+            | NativeDirectSearchTrustedCorePrologue::X86_64SelfFramed,
         ) => {
             return Err(ObjectError::InvalidModule(
-                "x86 Span reducer received an AArch64 trusted core",
+                "x86 Span reducer received an incompatible trusted core",
             ));
         }
         NativeSpanReducerCallKind::PreparedPrivate | NativeSpanReducerCallKind::DirectOrdinary => {
@@ -54813,15 +55595,19 @@ fn lower_x86_64_direct_exists_batch(
     prologue: NativeDirectSearchTrustedCorePrologue,
 ) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 32;
-    let NativeDirectSearchTrustedCorePrologue::X86_64 {
-        save_rbx,
-        save_r12_r13,
-        save_r14_r15,
-    } = prologue
-    else {
-        return Err(ObjectError::InvalidModule(
-            "x86 direct Exists batch has a non-x86 trusted core",
-        ));
+    let (save_rbx, save_r12_r13, save_r14_r15) = match prologue {
+        NativeDirectSearchTrustedCorePrologue::X86_64 {
+            save_rbx,
+            save_r12_r13,
+            save_r14_r15,
+        } => (save_rbx, save_r12_r13, save_r14_r15),
+        NativeDirectSearchTrustedCorePrologue::X86_64SelfFramed => (false, false, false),
+        NativeDirectSearchTrustedCorePrologue::Aarch64
+        | NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed => {
+            return Err(ObjectError::InvalidModule(
+                "x86 direct Exists batch has a non-x86 trusted core",
+            ));
+        }
     };
     let mut assembler = X86Assembler::new();
     let validated = assembler.label()?;
@@ -55717,10 +56503,12 @@ fn lower_aarch64_prepared_span_reduce_with_terminal_exact_set(
             NativeDirectSearchTrustedCorePrologue::Aarch64,
         ) => true,
         NativeSpanReducerCallKind::DirectTrustedCore(
-            NativeDirectSearchTrustedCorePrologue::X86_64 { .. },
+            NativeDirectSearchTrustedCorePrologue::X86_64 { .. }
+            | NativeDirectSearchTrustedCorePrologue::X86_64SelfFramed
+            | NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed,
         ) => {
             return Err(ObjectError::InvalidModule(
-                "AArch64 Span reducer received an x86 trusted core",
+                "AArch64 Span reducer received an incompatible trusted core",
             ));
         }
         NativeSpanReducerCallKind::PreparedPrivate | NativeSpanReducerCallKind::DirectOrdinary => {
@@ -57808,7 +58596,11 @@ fn lower_aarch64_direct_exists_batch(
     prologue: NativeDirectSearchTrustedCorePrologue,
 ) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 96;
-    if prologue != NativeDirectSearchTrustedCorePrologue::Aarch64 {
+    if !matches!(
+        prologue,
+        NativeDirectSearchTrustedCorePrologue::Aarch64
+            | NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed
+    ) {
         return Err(ObjectError::InvalidModule(
             "AArch64 direct Exists batch has a non-AArch64 trusted core",
         ));
@@ -58141,15 +58933,19 @@ fn lower_x86_64_matching_lf_line_witness(
     prologue: NativeDirectSearchTrustedCorePrologue,
 ) -> Result<NativeMatchingLfLineWitnessWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 40;
-    let NativeDirectSearchTrustedCorePrologue::X86_64 {
-        save_rbx,
-        save_r12_r13,
-        save_r14_r15,
-    } = prologue
-    else {
-        return Err(ObjectError::InvalidModule(
-            "x86 matching-LF-line wrapper has a non-x86 trusted core",
-        ));
+    let (save_rbx, save_r12_r13, save_r14_r15) = match prologue {
+        NativeDirectSearchTrustedCorePrologue::X86_64 {
+            save_rbx,
+            save_r12_r13,
+            save_r14_r15,
+        } => (save_rbx, save_r12_r13, save_r14_r15),
+        NativeDirectSearchTrustedCorePrologue::X86_64SelfFramed => (false, false, false),
+        NativeDirectSearchTrustedCorePrologue::Aarch64
+        | NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed => {
+            return Err(ObjectError::InvalidModule(
+                "x86 matching-LF-line wrapper has a non-x86 trusted core",
+            ));
+        }
     };
     let mut assembler = X86Assembler::new();
     let miss = assembler.label()?;
@@ -58252,7 +59048,11 @@ fn lower_aarch64_matching_lf_line_witness(
     prologue: NativeDirectSearchTrustedCorePrologue,
 ) -> Result<NativeMatchingLfLineWitnessWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 64;
-    if prologue != NativeDirectSearchTrustedCorePrologue::Aarch64 {
+    if !matches!(
+        prologue,
+        NativeDirectSearchTrustedCorePrologue::Aarch64
+            | NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed
+    ) {
         return Err(ObjectError::InvalidModule(
             "AArch64 matching-LF-line wrapper has a non-AArch64 trusted core",
         ));
@@ -86172,6 +86972,21 @@ mod tests {
                     "direct search trusted core contract is inconsistent"
                 ))
             ));
+
+            let mut cross_family = ordinary.module().clone();
+            let mut cross_family_core = trusted_core;
+            cross_family_core.entry_contract = NativeDirectSearchEntryContract::PublicSelfFramedV1;
+            cross_family_core.prologue = match target.architecture {
+                Architecture::X86_64 => NativeDirectSearchTrustedCorePrologue::X86_64SelfFramed,
+                Architecture::Aarch64 => NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed,
+            };
+            cross_family.native_direct_search_trusted_core = Some(cross_family_core);
+            assert!(matches!(
+                cross_family.append_direct_exists_batch(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct search trusted core contract is inconsistent"
+                ))
+            ));
         }
     }
 
@@ -86411,6 +87226,63 @@ mod tests {
                 )),
             );
 
+            let batch_seal = batch
+                .direct_exists_batch_surface_seal
+                .expect("compiler-private direct batch surface seal");
+            let batch_symbol_index = batch
+                .direct_exists_batch_symbol_index
+                .expect("direct batch symbol index");
+            let mut forged_batch_byte = batch.clone();
+            forged_batch_byte.sections[TEXT_SECTION].data[batch_seal.wrapper_entry_offset] ^= 1;
+            assert!(matches!(
+                forged_batch_byte.append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct Exists batch surface changed after authentication"
+                ))
+            ));
+
+            let mut forged_batch_name = batch.clone();
+            forged_batch_name.symbols[batch_symbol_index]
+                .name
+                .push_str("_forged");
+            assert!(matches!(
+                forged_batch_name.append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct Exists batch surface changed after authentication"
+                ))
+            ));
+
+            let mut forged_batch_bounds = batch.clone();
+            forged_batch_bounds.symbols[batch_symbol_index].size = forged_batch_bounds.symbols
+                [batch_symbol_index]
+                .size
+                .checked_add(1)
+                .expect("batch symbol size forgery");
+            assert!(matches!(
+                forged_batch_bounds.append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct Exists batch surface changed after authentication"
+                ))
+            ));
+
+            let mut forged_batch_target = batch.clone();
+            let batch_wrapper = match target.architecture {
+                Architecture::X86_64 => lower_x86_64_direct_exists_batch(ordinary_core.prologue),
+                Architecture::Aarch64 => lower_aarch64_direct_exists_batch(ordinary_core.prologue),
+            }
+            .expect("regenerate direct batch target fixture");
+            let target_byte = batch_seal
+                .wrapper_entry_offset
+                .checked_add(batch_wrapper.core_jump_offset)
+                .expect("batch target byte");
+            forged_batch_target.sections[TEXT_SECTION].data[target_byte] ^= 1;
+            assert!(matches!(
+                forged_batch_target.append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "direct Exists batch surface changed after authentication"
+                ))
+            ));
+
             let mut forged = batch.clone();
             let mut forged_core = forged.native_direct_search_trusted_core.unwrap();
             let mut forged_cursor = forged_core.matching_lf_line_cursor.unwrap();
@@ -86427,7 +87299,7 @@ mod tests {
             assert!(matches!(
                 forged.append_direct_matching_lf_line_witness(OutputContract::Exists),
                 Err(ObjectError::InvalidModule(
-                    "matching-LF-line cursor receipt is inconsistent"
+                    "direct Exists batch surface changed after authentication"
                 ))
             ));
 
@@ -86530,6 +87402,33 @@ mod tests {
             .module()
             .direct_matching_lf_line_witness_symbol()
             .is_none());
+
+        let two_way_pattern = "q".repeat(module_single_literal_two_way::MIN_TWO_WAY_LITERAL_BYTES);
+        let two_way_request = || {
+            CompileRequest::new(&two_way_pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+        };
+        let two_way_batch = crate::compile_with_independent_exists_batch(two_way_request())
+            .expect("compile exact-singleton direct batch control");
+        assert!(
+            two_way_batch
+                .module()
+                .direct_exact_singleton_first_candidate_symbol()
+                .is_some()
+        );
+        let two_way_lf =
+            crate::compile_with_independent_matching_lf_line_witness(two_way_request())
+                .expect("Two-Way LF request structurally declines after its singleton endpoint");
+        assert_eq!(two_way_lf.module(), two_way_batch.module());
+        assert_eq!(two_way_lf.object(), two_way_batch.object());
+        assert_eq!(two_way_lf.receipt(), two_way_batch.receipt());
+        assert!(
+            two_way_lf
+                .module()
+                .direct_matching_lf_line_witness_symbol()
+                .is_none()
+        );
 
         let width_one = crate::compile_with_independent_matching_lf_line_witness(
             CompileRequest::new("x", Target::x86_64_linux())
@@ -115233,31 +116132,55 @@ int main(void){{
 
     #[test]
     fn direct_exists_endpoint_scope_is_nested_unwind_safe_and_thread_local() {
-        assert!(!direct_exists_endpoint_incumbent_requested());
+        assert_eq!(
+            direct_exists_endpoint_request(),
+            DirectExistsEndpointRequest::None
+        );
         {
-            let outer = direct_exists_endpoint_incumbent_scope(true);
-            assert!(direct_exists_endpoint_incumbent_requested());
+            let outer = direct_exists_endpoint_incumbent_scope(
+                DirectExistsEndpointRequest::BatchAndMatchingLfWitness,
+            );
+            assert_eq!(
+                direct_exists_endpoint_request(),
+                DirectExistsEndpointRequest::BatchAndMatchingLfWitness
+            );
             {
-                let inner = direct_exists_endpoint_incumbent_scope(false);
-                assert!(!direct_exists_endpoint_incumbent_requested());
+                let inner =
+                    direct_exists_endpoint_incumbent_scope(DirectExistsEndpointRequest::Batch);
+                assert_eq!(
+                    direct_exists_endpoint_request(),
+                    DirectExistsEndpointRequest::Batch
+                );
                 drop(inner);
             }
-            assert!(direct_exists_endpoint_incumbent_requested());
-            let other = std::thread::spawn(direct_exists_endpoint_incumbent_requested)
+            assert_eq!(
+                direct_exists_endpoint_request(),
+                DirectExistsEndpointRequest::BatchAndMatchingLfWitness
+            );
+            let other = std::thread::spawn(direct_exists_endpoint_request)
                 .join()
                 .expect("direct Exists endpoint policy isolation thread");
-            assert!(!other);
+            assert_eq!(other, DirectExistsEndpointRequest::None);
             drop(outer);
         }
-        assert!(!direct_exists_endpoint_incumbent_requested());
+        assert_eq!(
+            direct_exists_endpoint_request(),
+            DirectExistsEndpointRequest::None
+        );
 
         let unwind = std::panic::catch_unwind(|| {
-            let _scope = direct_exists_endpoint_incumbent_scope(true);
-            assert!(direct_exists_endpoint_incumbent_requested());
+            let _scope = direct_exists_endpoint_incumbent_scope(DirectExistsEndpointRequest::Batch);
+            assert_eq!(
+                direct_exists_endpoint_request(),
+                DirectExistsEndpointRequest::Batch
+            );
             panic!("synthetic direct Exists endpoint scope unwind");
         });
         assert!(unwind.is_err());
-        assert!(!direct_exists_endpoint_incumbent_requested());
+        assert_eq!(
+            direct_exists_endpoint_request(),
+            DirectExistsEndpointRequest::None
+        );
     }
 
     #[test]
@@ -132451,6 +133374,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
                 direct_exists_batch_symbol_index: None,
+                direct_exists_batch_surface_seal: None,
                 direct_exact_singleton_first_candidate: None,
                 direct_matching_lf_line_witness: None,
                 native_direct_search_trusted_core: None,
@@ -132794,6 +133718,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_span_fill_symbol_index: None,
             prepared_exists_batch_symbol_index: None,
             direct_exists_batch_symbol_index: None,
+            direct_exists_batch_surface_seal: None,
             direct_exact_singleton_first_candidate: None,
             direct_matching_lf_line_witness: None,
             native_direct_search_trusted_core: None,

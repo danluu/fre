@@ -126,26 +126,25 @@ pub use grep_count::{
 };
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
-    DirectExistsBatchStrategy,
-    EXACT_SINGLETON_FIRST_CANDIDATE_AOT_SCHEMA_VERSION,
-    EXACT_SINGLETON_FIRST_CANDIDATE_MISS, ExactSingletonFirstCandidateAbi,
-    ExactSingletonFirstCandidateAotReport, ExactSingletonFirstCandidateCursorRegister,
-    ExactSingletonFirstCandidateSemantics, ExactSingletonFirstCandidateStrategy,
-    MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION, MATCHING_LF_LINE_WITNESS_MISS,
-    MatchingLfLineWitnessAbi, MatchingLfLineWitnessAotReport,
-    MatchingLfLineWitnessCursorRegister, MatchingLfLineWitnessSemantics,
-    MatchingLfLineWitnessStrategy,
-    ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndDfaBaselineReport,
+    DirectExistsBatchStrategy, EXACT_SINGLETON_FIRST_CANDIDATE_AOT_SCHEMA_VERSION,
+    EXACT_SINGLETON_FIRST_CANDIDATE_MISS, ExactFiniteExistsByteSetAotReport,
+    ExactFiniteSelectedEndDfaBaselineReport,
     ExactFiniteSelectedEndGrepCountAotReport, ExactFiniteSelectedEndTeddyAotIsa,
-    ExactFiniteSelectedEndTeddyAotReport,
-    ExactFiniteSelectedEndTeddyAotReportV2, ExactFiniteSelectedEndTeddyAotTargetTier,
+    ExactFiniteSelectedEndTeddyAotReport, ExactFiniteSelectedEndTeddyAotReportV2,
+    ExactFiniteSelectedEndTeddyAotTargetTier,
     ExactFiniteSelectedEndTeddyIncumbentSourceV2, ExactFiniteSelectedEndTeddySelectionBasisV2,
     ExactSingleLiteralAotIsa, ExactSingleLiteralAotReport, ExactSingleLiteralPairPrefilterReport,
-    ExactSingleLiteralTwoWayShift, FeatureSet, ModuleRelocation, ModuleSection, ModuleSymbol,
-    OperatingSystem, OrderedFiniteLanguageAotReport, OrderedFiniteRootScannerReport,
-    PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind,
-    SectionKind, SlowAotLimits, SlowAotReport, SlowContextAotReport, StartAccelerator,
-    SymbolBinding, SymbolKind, Target, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    ExactSingleLiteralTwoWayShift, ExactSingletonFirstCandidateAbi,
+    ExactSingletonFirstCandidateAotReport, ExactSingletonFirstCandidateCursorRegister,
+    ExactSingletonFirstCandidateSemantics, ExactSingletonFirstCandidateStrategy, FeatureSet,
+    MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION, MATCHING_LF_LINE_WITNESS_MISS,
+    MatchingLfLineWitnessAbi, MatchingLfLineWitnessAotReport, MatchingLfLineWitnessCursorRegister,
+    MatchingLfLineWitnessExactFiniteLanguageV1, MatchingLfLineWitnessSemantics,
+    MatchingLfLineWitnessStrategy, ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem,
+    OrderedFiniteLanguageAotReport, OrderedFiniteRootScannerReport,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
+    PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits, SlowAotReport,
+    SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use operation_set::{
@@ -781,7 +780,9 @@ pub struct CompileReceipt {
     /// Additive authenticated exact-singleton earliest-candidate endpoint,
     /// when explicitly requested with the independent Exists batch.
     pub exact_singleton_first_candidate_aot: Option<ExactSingletonFirstCandidateAotReport>,
-    /// Additive authenticated complete-DFA matching-line witness endpoint.
+    /// Additive authenticated native matching-line witness endpoint. The
+    /// strategy identifies whether it entered a complete-DFA core or a
+    /// self-framed exact-finite Teddy entry.
     pub matching_lf_line_witness_aot: Option<MatchingLfLineWitnessAotReport>,
     /// Direct exact finite-language Teddy `SelectedEnd` leaf, when selected.
     pub exact_finite_selected_end_teddy_aot: Option<ExactFiniteSelectedEndTeddyAotReport>,
@@ -1258,8 +1259,9 @@ fn independent_exact_singleton_first_candidate_object_outcome(
     }
 }
 
-/// Preserve complete-DFA witness append failure provenance. Only a structural
-/// `Ok(None)` may retain the completed incumbent.
+/// Preserve native witness append failure provenance. Only a structural
+/// `Ok(None)` may retain the completed incumbent; a selected Teddy endpoint
+/// turns that outcome into a terminal invariant failure at its caller.
 fn independent_matching_lf_line_witness_append_outcome(
     outcome: Result<Option<CompiledModule>, ObjectError>,
 ) -> Result<Option<CompiledModule>, IndependentExistsBatchCompileError> {
@@ -1353,17 +1355,18 @@ pub fn compile_with_independent_exists_batch(
 }
 
 /// Compile an Exists program with the established independent batch entries
-/// and explicitly request a complete-DFA matching-LF-line witness.
+/// and explicitly request a native matching-LF-line witness.
 ///
 /// Callers must invoke this entry only after independently authenticating that
 /// the source denotes an exact finite, nonempty, assertion-free byte language
 /// whose every member is nonempty and LF-free. Unlike
 /// [`compile_with_independent_exists_batch`], this transaction enables private
-/// final-assembler success-edge tracking. The compiler still declines
-/// nullable, non-complete-DFA, and otherwise structurally inapplicable native
-/// layouts. A hit is only an unconfirmed byte on a matching LF-delimited line;
-/// it is neither an exact boundary nor the inclusive-final-byte result of the
-/// exact-singleton endpoint.
+/// final-assembler success-edge tracking. Complete-DFA and authenticated
+/// self-framed exact-finite Teddy entries are eligible; nullable and otherwise
+/// structurally inapplicable native layouts still decline. A hit is only an
+/// unconfirmed byte on a matching LF-delimited line; it is neither an exact
+/// boundary nor the inclusive-final-byte result of the exact-singleton
+/// endpoint.
 ///
 /// # Errors
 ///
@@ -1389,13 +1392,12 @@ fn compile_with_independent_exists_batch_policy(
     }
     let target = request.target;
     let max_object_bytes = request.limits.max_object_bytes;
-    // Stage-1 Exists Teddy intentionally has no authenticated private core.
-    // Preserve the established complete-DFA owner for these explicit native
-    // endpoint APIs until a later composite lowering can publish one; a
-    // scalar-only Teddy selection would make the append decline and restore
-    // the Rust descriptor/line outer loop.
-    let endpoint_incumbent_scope =
-        module::direct_exists_endpoint_incumbent_scope(true);
+    let endpoint_request = if matching_lf_line_witness_requested {
+        module::DirectExistsEndpointRequest::BatchAndMatchingLfWitness
+    } else {
+        module::DirectExistsEndpointRequest::Batch
+    };
+    let endpoint_incumbent_scope = module::direct_exists_endpoint_incumbent_scope(endpoint_request);
     let mut compiled = if matching_lf_line_witness_requested {
         let scope =
             module::matching_lf_line_witness_recipe_scope(true);
@@ -1408,18 +1410,25 @@ fn compile_with_independent_exists_batch_policy(
         compile(request)?
     };
     drop(endpoint_incumbent_scope);
+    let selected_teddy_endpoint_core = compiled.module.has_exact_finite_exists_teddy_trusted_core();
     if compiled.module.prepared_exists_batch_symbol().is_some()
         || compiled.module.direct_exists_batch_symbol().is_some()
     {
         return Ok(compiled);
     }
-    let Some(module) = independent_exists_batch_append_outcome(
+    let batch_module = independent_exists_batch_append_outcome(
         compiled
             .module
             .clone()
             .append_direct_exists_batch(OutputContract::Exists),
-    )?
-    else {
+    )?;
+    let Some(module) = batch_module else {
+        if selected_teddy_endpoint_core {
+            return Err(CompileError::Object(ObjectError::InvalidModule(
+                "selected Teddy core declined its required direct Exists batch",
+            ))
+            .into());
+        }
         return Ok(compiled);
     };
     let Some(object) = independent_exists_batch_object_outcome(emit_object(
@@ -1485,17 +1494,24 @@ fn compile_with_independent_exists_batch_policy(
         return Ok(compiled);
     }
 
-    // A complete-DFA incumbent cannot also be the exact Two-Way singleton
-    // above. Append the independently named matching-line witness on a clone.
-    // Once its complete-DFA landmark is present, only final ObjectBytes may
-    // retain the exact preceding artifact after an endpoint failure.
-    let Some(module) = independent_matching_lf_line_witness_append_outcome(
+    // An eligible complete-DFA or Teddy incumbent cannot also be the exact
+    // Two-Way singleton above. Append the independently named matching-line
+    // witness on a clone. Once its authenticated core landmark is present,
+    // only final ObjectBytes may retain the exact preceding artifact after an
+    // endpoint failure.
+    let witness_module = independent_matching_lf_line_witness_append_outcome(
         compiled
             .module
             .clone()
             .append_direct_matching_lf_line_witness(OutputContract::Exists),
-    )?
-    else {
+    )?;
+    let Some(module) = witness_module else {
+        if selected_teddy_endpoint_core {
+            return Err(CompileError::Object(ObjectError::InvalidModule(
+                "selected Teddy core declined its required matching-LF-line witness",
+            ))
+            .into());
+        }
         return Ok(compiled);
     };
     let Some(object) = independent_matching_lf_line_witness_object_outcome(emit_object(

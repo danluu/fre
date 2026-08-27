@@ -542,6 +542,7 @@ pub struct AotExactSingletonFirstCandidateFactory {
 type NativeMatchingLfLineWitness = FreAotRegexMatchingLfLineWitnessV1;
 
 const LF_LINE_WITNESS_STRATEGY_NATIVE_COMPLETE_DFA_TRUSTED_CORE_V1: u8 = 1;
+const LF_LINE_WITNESS_STRATEGY_NATIVE_TEDDY_TRUSTED_CORE_V1: u8 = 2;
 const LF_LINE_WITNESS_SEMANTICS_MATCHING_LF_LINE_BYTE_V1: u8 = 1;
 const LF_LINE_WITNESS_ABI_HAYSTACK_LEN_U64_OUT_STATUS_V1: u8 = 1;
 const LF_LINE_WITNESS_CURSOR_X86_RDX: u8 = 1;
@@ -582,6 +583,11 @@ pub struct AotMatchingLfLineWitnessReceiptV1 {
     minimum_width: usize,
     maximum_width: usize,
     source_language_sha256: [u8; 32],
+    compiler_literal_sha256: [u8; 32],
+    compiler_source_count: usize,
+    compiler_source_bytes: usize,
+    compiler_minimum_width: usize,
+    compiler_maximum_width: usize,
     schema_version: u32,
     strategy: u8,
     semantics: u8,
@@ -670,6 +676,11 @@ impl AotMatchingLfLineWitnessReceiptV1 {
             minimum_width: self.minimum_width,
             maximum_width: self.maximum_width,
             source_language_sha256: self.source_language_sha256,
+            compiler_literal_sha256: self.compiler_literal_sha256,
+            compiler_source_count: self.compiler_source_count,
+            compiler_source_bytes: self.compiler_source_bytes,
+            compiler_minimum_width: self.compiler_minimum_width,
+            compiler_maximum_width: self.compiler_maximum_width,
             schema_version: self.schema_version,
             strategy: self.strategy,
             semantics: self.semantics,
@@ -721,6 +732,23 @@ impl AotMatchingLfLineWitnessReceiptV1 {
             self.object_sha256,
             self.receipt_identity_sha256,
         ];
+        let compiler_language_binding = match self.strategy {
+            LF_LINE_WITNESS_STRATEGY_NATIVE_COMPLETE_DFA_TRUSTED_CORE_V1 => {
+                self.compiler_literal_sha256 == [0; 32]
+                    && self.compiler_source_count == 0
+                    && self.compiler_source_bytes == 0
+                    && self.compiler_minimum_width == 0
+                    && self.compiler_maximum_width == 0
+            }
+            LF_LINE_WITNESS_STRATEGY_NATIVE_TEDDY_TRUSTED_CORE_V1 => {
+                self.compiler_literal_sha256 != [0; 32]
+                    && self.compiler_source_count == self.source_count
+                    && self.compiler_source_bytes == self.source_bytes
+                    && self.compiler_minimum_width == self.minimum_width
+                    && self.compiler_maximum_width == self.maximum_width
+            }
+            _ => false,
+        };
         let target_shape = matches!(
             (self.target_architecture, self.cursor_register),
             (
@@ -747,7 +775,7 @@ impl AotMatchingLfLineWitnessReceiptV1 {
             && self.case_insensitive == case_insensitive
             && source_geometry
             && self.schema_version == MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION
-            && self.strategy == LF_LINE_WITNESS_STRATEGY_NATIVE_COMPLETE_DFA_TRUSTED_CORE_V1
+            && compiler_language_binding
             && self.semantics == LF_LINE_WITNESS_SEMANTICS_MATCHING_LF_LINE_BYTE_V1
             && self.abi == LF_LINE_WITNESS_ABI_HAYSTACK_LEN_U64_OUT_STATUS_V1
             && self.miss_sentinel == MATCHING_LF_LINE_WITNESS_MISS
@@ -3013,6 +3041,11 @@ mod tests {
             minimum_width: 4,
             maximum_width: 5,
             source_language_sha256: [1; 32],
+            compiler_literal_sha256: [0; 32],
+            compiler_source_count: 0,
+            compiler_source_bytes: 0,
+            compiler_minimum_width: 0,
+            compiler_maximum_width: 0,
             schema_version: MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION,
             strategy: LF_LINE_WITNESS_STRATEGY_NATIVE_COMPLETE_DFA_TRUSTED_CORE_V1,
             semantics: LF_LINE_WITNESS_SEMANTICS_MATCHING_LF_LINE_BYTE_V1,
@@ -4076,6 +4109,49 @@ mod tests {
         .expect("known tuple");
         assert_eq!(selected.manifest_profile_key, spec.manifest_profile_key);
 
+        let mut teddy_spec = spec;
+        teddy_spec.receipt.strategy = LF_LINE_WITNESS_STRATEGY_NATIVE_TEDDY_TRUSTED_CORE_V1;
+        teddy_spec.receipt.compiler_literal_sha256 = [11; 32];
+        teddy_spec.receipt.compiler_source_count = teddy_spec.receipt.source_count;
+        teddy_spec.receipt.compiler_source_bytes = teddy_spec.receipt.source_bytes;
+        teddy_spec.receipt.compiler_minimum_width = teddy_spec.receipt.minimum_width;
+        teddy_spec.receipt.compiler_maximum_width = teddy_spec.receipt.maximum_width;
+        teddy_spec.receipt.receipt_identity_sha256 = teddy_spec
+            .receipt
+            .identity_input()
+            .identity()
+            .expect("Teddy test receipt identity");
+        assert!(
+            select_matching_lf_line_witness_spec(
+                std::slice::from_ref(&teddy_spec),
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                RAW_SENTINEL,
+                false,
+            )
+            .expect("authenticated Teddy selection")
+            .is_some()
+        );
+
+        let mut forged_teddy_binding = teddy_spec;
+        forged_teddy_binding.receipt.compiler_source_bytes += 1;
+        forged_teddy_binding.receipt.receipt_identity_sha256 = forged_teddy_binding
+            .receipt
+            .identity_input()
+            .identity()
+            .expect("self-consistent forged Teddy receipt identity");
+        assert!(
+            select_matching_lf_line_witness_spec(
+                std::slice::from_ref(&forged_teddy_binding),
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                RAW_SENTINEL,
+                false,
+            )
+            .expect_err("Teddy compiler/source geometry mismatch is terminal")
+            .contains("receipt authentication failed")
+        );
+
         for (mode, output) in [
             (AotMode::Fast, AotOutput::Exists),
             (AotMode::Optimizing, AotOutput::Span),
@@ -4113,6 +4189,11 @@ mod tests {
             |value| value.minimum_width += 1,
             |value| value.maximum_width += 1,
             |value| value.source_language_sha256[0] ^= 1,
+            |value| value.compiler_literal_sha256[0] ^= 1,
+            |value| value.compiler_source_count += 1,
+            |value| value.compiler_source_bytes += 1,
+            |value| value.compiler_minimum_width += 1,
+            |value| value.compiler_maximum_width += 1,
             |value| value.schema_version ^= 1,
             |value| value.strategy ^= 1,
             |value| value.semantics ^= 1,

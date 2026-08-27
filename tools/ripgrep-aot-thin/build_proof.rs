@@ -18,6 +18,11 @@ pub(crate) struct MatchingLfLineWitnessSourceProof {
     pub(crate) minimum_width: usize,
     pub(crate) maximum_width: usize,
     pub(crate) language_sha256: [u8; 32],
+    /// Canonical count/length/member identity used independently by the
+    /// exact-finite Teddy compiler. Unlike `language_sha256`, this deliberately
+    /// has no adapter domain so it can be compared byte-for-byte with the
+    /// compiler's authenticated literal census.
+    pub(crate) compiler_literal_sha256: [u8; 32],
 }
 
 /// The ordinary byte-regex profile used by ripgrep's LF-delimited line
@@ -146,6 +151,8 @@ pub(crate) fn exact_nonempty_lf_free_finite_language_proof(
     let mut digest = Sha256::new();
     digest.update(MATCHING_LF_LINE_WITNESS_LANGUAGE_IDENTITY_DOMAIN);
     digest.update(u64::try_from(language.len()).ok()?.to_le_bytes());
+    let mut compiler_literal_digest = Sha256::new();
+    compiler_literal_digest.update(u64::try_from(language.len()).ok()?.to_le_bytes());
     for literal in language.strings() {
         if literal.is_empty() || literal.contains(&b'\n') {
             return None;
@@ -155,6 +162,8 @@ pub(crate) fn exact_nonempty_lf_free_finite_language_proof(
         maximum_width = maximum_width.max(literal.len());
         digest.update(u64::try_from(literal.len()).ok()?.to_le_bytes());
         digest.update(literal);
+        compiler_literal_digest.update(u64::try_from(literal.len()).ok()?.to_le_bytes());
+        compiler_literal_digest.update(literal);
     }
     Some(MatchingLfLineWitnessSourceProof {
         source_count: language.len(),
@@ -162,6 +171,7 @@ pub(crate) fn exact_nonempty_lf_free_finite_language_proof(
         minimum_width,
         maximum_width,
         language_sha256: digest.finalize().into(),
+        compiler_literal_sha256: compiler_literal_digest.finalize().into(),
     })
 }
 
@@ -328,6 +338,8 @@ mod tests {
         assert_eq!(singleton.minimum_width, 1);
         assert_eq!(singleton.maximum_width, 1);
         assert_ne!(singleton.language_sha256, [0; 32]);
+        assert_ne!(singleton.compiler_literal_sha256, [0; 32]);
+        assert_ne!(singleton.compiler_literal_sha256, singleton.language_sha256);
 
         let finite =
             exact_nonempty_lf_free_finite_language_proof(r"(?:alpha|beta\r|(?:xy){2})", &profile)
@@ -337,6 +349,10 @@ mod tests {
         assert_eq!(finite.minimum_width, 4);
         assert_eq!(finite.maximum_width, 5);
         assert_ne!(finite.language_sha256, singleton.language_sha256);
+        assert_ne!(
+            finite.compiler_literal_sha256,
+            singleton.compiler_literal_sha256
+        );
     }
 
     #[test]

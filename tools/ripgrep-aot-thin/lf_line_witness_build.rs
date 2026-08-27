@@ -60,17 +60,56 @@ impl MatchingLfLineWitnessRegistryBuild {
         };
         self.independently_eligible += 1;
 
-        let (symbol, module_report, receipt_report) =
+        let (symbol, strategy, module_report, receipt_report) =
             match (symbol, strategy, module_report, receipt_report) {
                 (None, None, None, None) => return,
                 (
                     Some(symbol),
-                    Some(MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1),
+                    Some(
+                        strategy @ (MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1
+                        | MatchingLfLineWitnessStrategy::NativeTeddyTrustedCoreV1),
+                    ),
                     Some(module_report),
                     Some(receipt_report),
-                ) => (symbol, module_report, receipt_report),
+                ) => (symbol, strategy, module_report, receipt_report),
                 _ => panic!("compiler published an incomplete matching-LF-line witness receipt"),
             };
+
+        let (
+            compiler_literal_sha256,
+            compiler_source_count,
+            compiler_source_bytes,
+            compiler_minimum_width,
+            compiler_maximum_width,
+        ) = match (strategy, module_report.exact_finite_language) {
+            (MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1, None) => {
+                ([0; 32], 0, 0, 0, 0)
+            }
+            (MatchingLfLineWitnessStrategy::NativeTeddyTrustedCoreV1, Some(language)) => {
+                let count = usize::try_from(language.source_count)
+                    .expect("Teddy source count is representable as usize");
+                let minimum_width = usize::try_from(language.minimum_width)
+                    .expect("Teddy minimum width is representable as usize");
+                let maximum_width = usize::try_from(language.maximum_width)
+                    .expect("Teddy maximum width is representable as usize");
+                assert!(
+                    language.literal_sha256 == proof.compiler_literal_sha256
+                        && count == proof.source_count
+                        && language.source_bytes == proof.source_bytes
+                        && minimum_width == proof.minimum_width
+                        && maximum_width == proof.maximum_width,
+                    "matching-LF-line Teddy language receipt disagrees with the independent proof"
+                );
+                (
+                    language.literal_sha256,
+                    count,
+                    language.source_bytes,
+                    minimum_width,
+                    maximum_width,
+                )
+            }
+            _ => panic!("matching-LF-line strategy has an inconsistent exact-language receipt"),
+        };
 
         let serialized_program = compiled
             .program()
@@ -97,6 +136,7 @@ impl MatchingLfLineWitnessRegistryBuild {
         assert!(
             module_report == receipt_report
                 && module_report.schema_version == MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION
+                && module_report.strategy == strategy
                 && module_report.semantics == MatchingLfLineWitnessSemantics::MatchingLfLineByteV1
                 && module_report.abi == MatchingLfLineWitnessAbi::HaystackLenU64OutStatusV1
                 && module_report.miss_sentinel == MATCHING_LF_LINE_WITNESS_MISS
@@ -158,8 +198,13 @@ impl MatchingLfLineWitnessRegistryBuild {
             minimum_width: proof.minimum_width,
             maximum_width: proof.maximum_width,
             source_language_sha256: proof.language_sha256,
+            compiler_literal_sha256,
+            compiler_source_count,
+            compiler_source_bytes,
+            compiler_minimum_width,
+            compiler_maximum_width,
             schema_version: module_report.schema_version,
-            strategy: strategy_code(MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1),
+            strategy: strategy_code(strategy),
             semantics: semantics_code(module_report.semantics),
             abi: abi_code(module_report.abi),
             miss_sentinel: module_report.miss_sentinel,
@@ -194,15 +239,20 @@ impl MatchingLfLineWitnessRegistryBuild {
         );
         writeln!(
             &mut self.rows,
-            "    MatchingLfLineWitnessSpec {{ manifest_profile_key: {registry_key:?}, description: {description:?}, entry_symbol: {symbol:?}, entry: {declaration}, receipt: AotMatchingLfLineWitnessReceiptV1 {{ manifest_profile_key: {registry_key:?}, case_insensitive: {}, source_count: {}, source_bytes: {}, minimum_width: {}, maximum_width: {}, source_language_sha256: {:?}, schema_version: {}, strategy: {}, semantics: {}, abi: {}, miss_sentinel: {}, target_architecture: {}, target_operating_system: {}, target_features: {}, program_bytes: {}, program_sha256: {:?}, cursor_register: {}, success_edge_count: {}, inside_match_edge_count: {}, exclusive_end_edge_count: {}, success_edges_sha256: {:?}, trusted_core_offset: {}, trusted_core_sha256: {:?}, ordinary_entry_symbol_sha256: {:?}, ordinary_entry_code_sha256: {:?}, wrapper_entry_offset: {}, wrapper_bytes: {}, wrapper_sha256: {:?}, endpoint_symbol_sha256: {:?}, native_code_sha256: {:?}, relocations_sha256: {:?}, object_sha256: {:?}, runtime_call_count: {}, receipt_identity_sha256: {receipt_identity_sha256:?} }} }},",
+            "    MatchingLfLineWitnessSpec {{ manifest_profile_key: {registry_key:?}, description: {description:?}, entry_symbol: {symbol:?}, entry: {declaration}, receipt: AotMatchingLfLineWitnessReceiptV1 {{ manifest_profile_key: {registry_key:?}, case_insensitive: {}, source_count: {}, source_bytes: {}, minimum_width: {}, maximum_width: {}, source_language_sha256: {:?}, compiler_literal_sha256: {:?}, compiler_source_count: {}, compiler_source_bytes: {}, compiler_minimum_width: {}, compiler_maximum_width: {}, schema_version: {}, strategy: {}, semantics: {}, abi: {}, miss_sentinel: {}, target_architecture: {}, target_operating_system: {}, target_features: {}, program_bytes: {}, program_sha256: {:?}, cursor_register: {}, success_edge_count: {}, inside_match_edge_count: {}, exclusive_end_edge_count: {}, success_edges_sha256: {:?}, trusted_core_offset: {}, trusted_core_sha256: {:?}, ordinary_entry_symbol_sha256: {:?}, ordinary_entry_code_sha256: {:?}, wrapper_entry_offset: {}, wrapper_bytes: {}, wrapper_sha256: {:?}, endpoint_symbol_sha256: {:?}, native_code_sha256: {:?}, relocations_sha256: {:?}, object_sha256: {:?}, runtime_call_count: {}, receipt_identity_sha256: {receipt_identity_sha256:?} }} }},",
             pattern.case_insensitive,
             proof.source_count,
             proof.source_bytes,
             proof.minimum_width,
             proof.maximum_width,
             proof.language_sha256,
+            compiler_literal_sha256,
+            compiler_source_count,
+            compiler_source_bytes,
+            compiler_minimum_width,
+            compiler_maximum_width,
             module_report.schema_version,
-            strategy_code(MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1),
+            strategy_code(strategy),
             semantics_code(module_report.semantics),
             abi_code(module_report.abi),
             module_report.miss_sentinel,
@@ -260,6 +310,7 @@ impl MatchingLfLineWitnessRegistryBuild {
 const fn strategy_code(value: MatchingLfLineWitnessStrategy) -> u8 {
     match value {
         MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1 => 1,
+        MatchingLfLineWitnessStrategy::NativeTeddyTrustedCoreV1 => 2,
     }
 }
 

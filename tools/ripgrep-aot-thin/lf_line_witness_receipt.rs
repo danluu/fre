@@ -14,6 +14,11 @@ pub(crate) struct MatchingLfLineWitnessReceiptIdentityInputV1 {
     pub(crate) minimum_width: usize,
     pub(crate) maximum_width: usize,
     pub(crate) source_language_sha256: [u8; 32],
+    pub(crate) compiler_literal_sha256: [u8; 32],
+    pub(crate) compiler_source_count: usize,
+    pub(crate) compiler_source_bytes: usize,
+    pub(crate) compiler_minimum_width: usize,
+    pub(crate) compiler_maximum_width: usize,
     pub(crate) schema_version: u32,
     pub(crate) strategy: u8,
     pub(crate) semantics: u8,
@@ -54,6 +59,11 @@ impl MatchingLfLineWitnessReceiptIdentityInputV1 {
         update_usize(&mut digest, self.minimum_width)?;
         update_usize(&mut digest, self.maximum_width)?;
         digest.update(self.source_language_sha256);
+        digest.update(self.compiler_literal_sha256);
+        update_usize(&mut digest, self.compiler_source_count)?;
+        update_usize(&mut digest, self.compiler_source_bytes)?;
+        update_usize(&mut digest, self.compiler_minimum_width)?;
+        update_usize(&mut digest, self.compiler_maximum_width)?;
         digest.update(self.schema_version.to_le_bytes());
         digest.update([self.strategy, self.semantics, self.abi]);
         digest.update(self.miss_sentinel.to_le_bytes());
@@ -102,8 +112,13 @@ mod tests {
             minimum_width: 4,
             maximum_width: 8,
             source_language_sha256: [2; 32],
-            schema_version: 1,
-            strategy: 1,
+            compiler_literal_sha256: [13; 32],
+            compiler_source_count: 3,
+            compiler_source_bytes: 17,
+            compiler_minimum_width: 4,
+            compiler_maximum_width: 8,
+            schema_version: 2,
+            strategy: 2,
             semantics: 1,
             abi: 1,
             miss_sentinel: u64::MAX,
@@ -139,6 +154,12 @@ mod tests {
         let mut changed = original;
         changed.source_language_sha256[0] ^= 1;
         assert_ne!(changed.identity().expect("changed source"), expected);
+        let mut changed = original;
+        changed.compiler_literal_sha256[0] ^= 1;
+        assert_ne!(
+            changed.identity().expect("changed compiler language"),
+            expected
+        );
         let mut changed = original;
         changed.exclusive_end_edge_count += 1;
         assert_ne!(changed.identity().expect("changed route"), expected);
