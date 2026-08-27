@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::alloc::System;
+use std::{alloc::System, sync::Mutex};
 
 use fre::{PortableBuilder, RipgrepStandardLiteralHirBuild, RipgrepStandardLiteralsBuild};
 use regex_syntax::hir::Hir;
@@ -8,9 +8,11 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn borrowed_literals_avoid_the_owned_hir_leaf_graph() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().unwrap();
     for count in [2, 16, 64, 128, 256] {
         let patterns = (0..u16::try_from(count).unwrap())
             .map(|bits| {
@@ -70,6 +72,7 @@ fn borrowed_literals_avoid_the_owned_hir_leaf_graph() {
 
 #[test]
 fn borrowed_fixed_metacharacters_avoid_the_owned_hir_leaf_graph() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().unwrap();
     let metacharacters = [
         '.', '[', ']', '(', ')', '{', '}', '*', '+', '?', '|', '^', '$', '\\', '-', '&', '~',
         '#',
