@@ -707,6 +707,47 @@ pub struct FreAotRegexIterStateV1 {
     pub reserved: u32,
 }
 
+impl FreAotRegexIterStateV1 {
+    /// Construct the canonical initial state for iteration at `start` in a
+    /// complete haystack of `haystack_len` bytes.
+    ///
+    /// Byte offsets and all assertion context remain relative to the original
+    /// haystack. Byte zero uses the ABI's all-zero initial state. A positive
+    /// start uses a synthetic prior match ending at byte zero so the state is
+    /// distinguishable from a malformed partially initialized state. Because
+    /// every subsequently accepted match ends at or after the positive start,
+    /// that synthetic endpoint cannot suppress a real empty match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompileError::InvalidWindow`] when `start` is beyond the
+    /// haystack.
+    pub const fn initial_at(start: usize, haystack_len: usize) -> Result<Self, CompileError> {
+        if start > haystack_len {
+            return Err(CompileError::InvalidWindow {
+                start,
+                end: haystack_len,
+                haystack_len,
+            });
+        }
+        if start == 0 {
+            Ok(Self {
+                next_start: 0,
+                last_match_end: 0,
+                flags: 0,
+                reserved: 0,
+            })
+        } else {
+            Ok(Self {
+                next_start: start,
+                last_match_end: 0,
+                flags: ITER_HAS_LAST,
+                reserved: 0,
+            })
+        }
+    }
+}
+
 /// One independent byte haystack accepted by a compiler-produced Exists-batch
 /// entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3936,14 +3977,38 @@ impl PreparedAotRegex {
         &'p mut self,
         haystack: &'h [u8],
     ) -> Result<PreparedAotMatches<'p, 'h>, AotRegexFindError> {
+        self.find_iter_at(haystack, 0)
+    }
+
+    /// Iterate over non-overlapping byte matches at or after `start` in the
+    /// original haystack.
+    ///
+    /// Empty matches use the same byte-wise progress and repeated-empty
+    /// suppression as [`Self::find_iter`]. The complete haystack remains
+    /// visible to absolute, line, and word-boundary assertions; only the
+    /// initial search window advances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output-contract error unless this artifact was compiled for
+    /// [`OutputContract::Span`]. An out-of-bounds `start` is returned as
+    /// [`AotRegexFindError::Search`]. Execution failures are yielded by the
+    /// iterator, which becomes fused after its first failure.
+    pub fn find_iter_at<'p, 'h>(
+        &'p mut self,
+        haystack: &'h [u8],
+        start: usize,
+    ) -> Result<PreparedAotMatches<'p, 'h>, AotRegexFindError> {
         self.require_span_output()?;
+        let state = FreAotRegexIterStateV1::initial_at(start, haystack.len())
+            .map_err(AotRegexFindError::Search)?;
         Ok(PreparedAotMatches {
             prepared: self,
             haystack,
-            start: 0,
-            last_match_end: None,
-            pending_empty_progress: false,
-            finished: false,
+            start: state.next_start,
+            last_match_end: (state.flags & ITER_HAS_LAST != 0).then_some(state.last_match_end),
+            pending_empty_progress: state.flags & ITER_PENDING_EMPTY != 0,
+            finished: state.flags & ITER_FINISHED != 0,
         })
     }
 
@@ -9410,6 +9475,21 @@ mod tests {
             .collect()
     }
 
+    fn collected_spans_at(
+        prepared: &mut PreparedAotRegex,
+        haystack: &[u8],
+        start: usize,
+    ) -> Vec<(usize, usize)> {
+        prepared
+            .find_iter_at(haystack, start)
+            .expect("offset Span iterator")
+            .map(|matched| {
+                let matched = matched.expect("successful offset iterator search");
+                (matched.start(), matched.end())
+            })
+            .collect()
+    }
+
     fn call(
         program: &[u8],
         haystack: &[u8],
@@ -13976,6 +14056,114 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
     }
 
     #[test]
+    fn iter_state_initial_at_is_canonical_and_rejects_out_of_bounds() {
+        assert_eq!(
+            FreAotRegexIterStateV1::initial_at(0, 4).expect("zero start"),
+            FreAotRegexIterStateV1::default(),
+        );
+        assert_eq!(
+            FreAotRegexIterStateV1::initial_at(2, 4).expect("interior start"),
+            FreAotRegexIterStateV1 {
+                next_start: 2,
+                last_match_end: 0,
+                flags: ITER_HAS_LAST,
+                reserved: 0,
+            },
+        );
+        assert_eq!(
+            FreAotRegexIterStateV1::initial_at(4, 4).expect("end start"),
+            FreAotRegexIterStateV1 {
+                next_start: 4,
+                last_match_end: 0,
+                flags: ITER_HAS_LAST,
+                reserved: 0,
+            },
+        );
+        assert!(matches!(
+            FreAotRegexIterStateV1::initial_at(5, 4),
+            Err(CompileError::InvalidWindow {
+                start: 5,
+                end: 4,
+                haystack_len: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn prepared_find_iter_at_preserves_overlap_assertion_and_nullable_semantics() {
+        for mode in [CompileMode::Fast, CompileMode::Optimizing] {
+            let mut overlap = prepared("aba", OutputContract::Span, mode);
+            assert_eq!(collected_spans_at(&mut overlap, b"ababa", 1), [(2, 5)]);
+
+            let mut absolute = prepared("^a", OutputContract::Span, mode);
+            assert!(collected_spans_at(&mut absolute, b"xa", 1).is_empty());
+
+            let mut boundary = prepared(r"\ba", OutputContract::Span, mode);
+            assert!(collected_spans_at(&mut boundary, b"xa", 1).is_empty());
+            assert_eq!(collected_spans_at(&mut boundary, b"x a", 1), [(2, 3)]);
+
+            let mut nullable = prepared("", OutputContract::Span, mode);
+            assert_eq!(
+                collected_spans_at(&mut nullable, b"abc", 2),
+                [(2, 2), (3, 3)],
+            );
+            let mut nullable_at_end = prepared("", OutputContract::Span, mode);
+            assert_eq!(
+                collected_spans_at(&mut nullable_at_end, b"abc", 3),
+                [(3, 3)],
+            );
+
+            let mut nonnullable_at_end = prepared("a", OutputContract::Span, mode);
+            assert!(collected_spans_at(&mut nonnullable_at_end, b"abc", 3).is_empty());
+        }
+    }
+
+    #[test]
+    fn dropping_offset_iteration_after_callback_stop_or_error_releases_workspace() {
+        let mut prepared = prepared("a", OutputContract::Span, CompileMode::Fast);
+        {
+            let mut matches = prepared
+                .find_iter_at(b"zaaa", 1)
+                .expect("offset Span iterator");
+            let first = matches
+                .next()
+                .expect("first callback")
+                .expect("first match");
+            assert_eq!(first.range(), 1..2);
+            // Dropping here models a callback requesting an early stop.
+        }
+        assert_eq!(
+            prepared
+                .find_at(b"zza", 0)
+                .expect("workspace after callback stop")
+                .expect("later match")
+                .range(),
+            2..3,
+        );
+
+        let callback_result: Result<(), &'static str> = prepared
+            .find_iter_at(b"zaaa", 1)
+            .expect("second offset iterator")
+            .try_for_each(|matched| {
+                let matched = matched.map_err(|_| "search failure")?;
+                if matched.start() == 2 {
+                    Err("callback failure")
+                } else {
+                    Ok(())
+                }
+            });
+        assert_eq!(callback_result, Err("callback failure"));
+        assert_eq!(
+            prepared
+                .find_at(b"azza", 0)
+                .expect("workspace after callback error")
+                .expect("later match")
+                .range(),
+            0..1,
+        );
+    }
+
+    #[test]
     fn prepared_scalar_reducers_match_span_iteration_and_publish_transactionally() {
         let cases: Vec<(&str, &[u8], Vec<(usize, usize)>)> = vec![
             ("", b"", vec![(0, 0)]),
@@ -14585,6 +14773,47 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
     }
 
     #[test]
+    fn exclusive_runtime_span_fill_accepts_canonical_offset_state() {
+        let serialized = program("aba", OutputContract::Span);
+        let handle = prepare_exclusive(&serialized);
+        let haystack = b"ababa";
+        let mut state =
+            FreAotRegexIterStateV1::initial_at(1, haystack.len()).expect("canonical offset state");
+        let sentinel = FreAotRegexResultV1 {
+            start: usize::MAX,
+            end: usize::MAX,
+        };
+        let mut output = [sentinel; 2];
+        let mut written = usize::MAX;
+        // SAFETY: the live handle is exclusively owned and every source,
+        // state, result, and scalar extent is aligned, live, and disjoint.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_fill_spans_exclusive_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut state,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &raw mut written,
+                )
+            },
+            STATUS_NO_MATCH,
+        );
+        assert_eq!(written, 1);
+        assert_eq!(output[0], FreAotRegexResultV1 { start: 2, end: 5 });
+        assert_eq!(output[1], sentinel);
+        assert_eq!(state.flags & ITER_FINISHED, ITER_FINISHED);
+        assert_eq!(state.flags & ITER_PENDING_EMPTY, 0);
+        // SAFETY: this test still uniquely owns the live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS,
+        );
+    }
+
+    #[test]
     fn exclusive_runtime_bulk_entries_validate_transactional_prefixes() {
         let span_serialized = program("a", OutputContract::Span);
         let span_handle = prepare_exclusive(&span_serialized);
@@ -14732,11 +14961,23 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 prepared.find_iter(b"a"),
                 Err(AotRegexFindError::OutputContract { actual }) if actual == output
             ));
+            assert!(matches!(
+                prepared.find_iter_at(b"a", 0),
+                Err(AotRegexFindError::OutputContract { actual }) if actual == output
+            ));
         }
 
         let mut prepared = prepared("a", OutputContract::Span, CompileMode::Fast);
         assert!(matches!(
             prepared.find_at(b"a", 2),
+            Err(AotRegexFindError::Search(CompileError::InvalidWindow {
+                start: 2,
+                end: 1,
+                haystack_len: 1,
+            }))
+        ));
+        assert!(matches!(
+            prepared.find_iter_at(b"a", 2),
             Err(AotRegexFindError::Search(CompileError::InvalidWindow {
                 start: 2,
                 end: 1,

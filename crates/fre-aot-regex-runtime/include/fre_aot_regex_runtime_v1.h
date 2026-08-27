@@ -31,7 +31,11 @@ typedef struct FreAotRegexResultV1 {
 
 /*
  * Caller-owned non-overlapping-match continuation. The all-zero value begins
- * at byte zero. Callers must preserve this exact value between refills.
+ * at byte zero. To begin at positive byte start <= haystack_len, initialize
+ * next_start=start, last_match_end=0, flags=FRE_AOT_REGEX_ITER_HAS_LAST, and
+ * reserved=0.
+ * That synthetic prior endpoint cannot suppress a match at a positive start.
+ * Callers must preserve the returned exact value between refills.
  * reserved must remain zero and flags may contain only the three ITER bits.
  * next_start and an active last_match_end must be in bounds. PENDING_EMPTY
  * requires HAS_LAST and equal next/last offsets; FINISHED excludes PENDING.

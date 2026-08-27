@@ -5091,6 +5091,42 @@ fn fixed_width_window_oracle(
         .map(|matched| (matched.start(), matched.end()))
 }
 
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "macos")
+))]
+fn find_iter_at_oracle(regex: &Regex, haystack: &[u8], start: usize) -> Vec<(usize, usize)> {
+    assert!(start <= haystack.len());
+    let mut spans = Vec::new();
+    let mut next_start = start;
+    let mut last_match_end = None;
+    let mut pending_empty_progress = false;
+    loop {
+        if pending_empty_progress {
+            pending_empty_progress = false;
+            if next_start == haystack.len() {
+                break;
+            }
+            next_start += 1;
+        }
+        let Some(matched) = regex.find_at(haystack, next_start) else {
+            break;
+        };
+        if matched.is_empty() && last_match_end == Some(matched.end()) {
+            if next_start == haystack.len() {
+                break;
+            }
+            next_start += 1;
+            continue;
+        }
+        next_start = matched.end();
+        last_match_end = Some(matched.end());
+        pending_empty_progress = matched.is_empty();
+        spans.push((matched.start(), matched.end()));
+    }
+    spans
+}
+
 #[test]
 fn general_source_pipeline_matches_rust_across_structural_families() {
     let patterns = [
@@ -9543,21 +9579,22 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                 .find_iter(haystack)
                 .map(|matched| (matched.start(), matched.end()))
                 .collect::<Vec<_>>();
+            let offset_start = usize::from(!haystack.is_empty());
+            let offset_spans = find_iter_at_oracle(&oracle, haystack, offset_start);
             let count = u64::try_from(spans.len()).expect("oracle Count");
-            let span_sum = spans.iter().try_fold(0_u64, |sum, &(start, end)| {
-                sum.checked_add(u64::try_from(end - start).expect("oracle span width"))
-            })
-            .expect("oracle SpanSum");
+            let span_sum = spans
+                .iter()
+                .try_fold(0_u64, |sum, &(start, end)| {
+                    sum.checked_add(u64::try_from(end - start).expect("oracle span width"))
+                })
+                .expect("oracle SpanSum");
             let mut grep_count = 0_u64;
             let mut line_start = 0_usize;
             while line_start < haystack.len() {
                 let remainder = &haystack[line_start..];
                 let lf = remainder.iter().position(|&byte| byte == b'\n');
                 let mut line_end = lf.map_or(haystack.len(), |offset| line_start + offset);
-                if lf.is_some()
-                    && line_end > line_start
-                    && haystack[line_end - 1] == b'\r'
-                {
+                if lf.is_some() && line_end > line_start && haystack[line_end - 1] == b'\r' {
                     line_end -= 1;
                 }
                 if oracle.is_match(&haystack[line_start..line_end]) {
@@ -9612,11 +9649,25 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                         .collect::<Vec<_>>()
                         .join(",")
                 };
+                let offset_expected_initializer = if offset_spans.is_empty() {
+                    String::from("{0U,0U}")
+                } else {
+                    offset_spans
+                        .iter()
+                        .map(|&(start, end)| format!("{{{start}U,{end}U}}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
                 writeln!(
                     source,
                     "static const span_t e{fixture_index}_{case_index}[]={{{expected_initializer}}};"
                 )
                 .expect("write aggregate Span-fill oracle");
+                writeln!(
+                    source,
+                    "static const span_t o{fixture_index}_{case_index}[]={{{offset_expected_initializer}}};"
+                )
+                .expect("write aggregate offset Span-fill oracle");
                 format!(
                     concat!(
                         "{{iter_state_t it={{0U,0U,0U,0U}};span_t spans[64];size_t w=(size_t)-1;",
@@ -9625,13 +9676,20 @@ fn linked_host_native_prepared_aggregates_match_regex_find_iter() {
                         "if((it.flags&4U)==0U||it.reserved!=0U)return 10;",
                         "for(size_t i=0;i<w;i++)if(spans[i].start!=e{fixture_index}_{case_index}[i].start||spans[i].end!=e{fixture_index}_{case_index}[i].end)return 11;",
                         "iter_state_t done=it;unsigned char frozen[sizeof(spans)];memcpy(frozen,spans,sizeof(spans));w=(size_t)-1;",
-                        "if({span_fill_symbol}(h,h{fixture_index}_{case_index},{length}U,&it,spans,64U,&w)!=0U||w!=0U||memcmp(&it,&done,sizeof(it))!=0||memcmp(spans,frozen,sizeof(spans))!=0)return 12;}}"
+                        "if({span_fill_symbol}(h,h{fixture_index}_{case_index},{length}U,&it,spans,64U,&w)!=0U||w!=0U||memcmp(&it,&done,sizeof(it))!=0||memcmp(spans,frozen,sizeof(spans))!=0)return 12;",
+                        "iter_state_t offset={{{offset_start}U,0U,{offset_flags}U,0U}};w=(size_t)-1;memset(spans,0xa5,sizeof(spans));",
+                        "if({span_fill_symbol}(h,h{fixture_index}_{case_index},{length}U,&offset,spans,64U,&w)!=0U||w!={offset_span_count}U)return 15;",
+                        "if((offset.flags&4U)==0U||offset.reserved!=0U)return 16;",
+                        "for(size_t i=0;i<w;i++)if(spans[i].start!=o{fixture_index}_{case_index}[i].start||spans[i].end!=o{fixture_index}_{case_index}[i].end)return 17;}}"
                     ),
                     span_fill_symbol = span_fill_symbol,
                     fixture_index = fixture_index,
                     case_index = case_index,
                     length = haystack.len(),
                     span_count = spans.len(),
+                    offset_start = offset_start,
+                    offset_flags = u32::from(offset_start != 0),
+                    offset_span_count = offset_spans.len(),
                 )
             } else {
                 String::new()

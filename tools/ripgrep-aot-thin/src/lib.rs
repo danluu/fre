@@ -2400,24 +2400,46 @@ impl AotMatcher {
         &'m mut self,
         haystack: &'h [u8],
     ) -> Result<AotMatches<'m, 'h>, String> {
+        self.find_iter_at(haystack, 0)
+    }
+
+    /// Iterate over every non-overlapping match at or after `start` in the
+    /// original haystack.
+    ///
+    /// The complete haystack remains visible to absolute, line, and
+    /// word-boundary assertions. Only the initial search cursor advances.
+    /// Empty-match progress remains identical to [`Self::find_iter`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-bounds start, or unless this matcher was
+    /// compiled for spans and has a compatible iterator backend. Execution
+    /// failures remain iterator items.
+    pub fn find_iter_at<'m, 'h>(
+        &'m mut self,
+        haystack: &'h [u8],
+        start: usize,
+    ) -> Result<AotMatches<'m, 'h>, String> {
         if self.output != AotOutput::Span {
             return Err("AOT matcher was not compiled for Span".to_owned());
         }
+        let state = NativeIterState::initial_at(start, haystack.len())
+            .map_err(|error| format!("initialize AOT Span iterator: {error}"))?;
         let backend = match &mut self.backend {
             Backend::Runtime(prepared) => AotMatchesBackend::Runtime(
                 prepared
-                    .find_iter(haystack)
+                    .find_iter_at(haystack, start)
                     .map_err(|error| error.to_string())?,
             ),
             Backend::Prepared(prepared) if prepared.span_fill.is_some() => {
-                AotMatchesBackend::Native(NativeMatches::prepared(prepared, haystack))
+                AotMatchesBackend::Native(NativeMatches::prepared(prepared, haystack, state))
             }
             Backend::Prepared(_) => {
                 return Err("compiled-prepared Span artifact has no iterator entry".to_owned());
             }
             Backend::Native {
                 fill: Some(fill), ..
-            } => AotMatchesBackend::Native(NativeMatches::direct(*fill, haystack)),
+            } => AotMatchesBackend::Native(NativeMatches::direct(*fill, haystack, state)),
             Backend::Native { fill: None, .. } => {
                 return Err("AOT Span artifact has no native iterator entry".to_owned());
             }
@@ -2533,11 +2555,11 @@ struct NativeMatches<'m, 'h> {
 }
 
 impl<'m, 'h> NativeMatches<'m, 'h> {
-    fn direct(fill: NativeFill, haystack: &'h [u8]) -> Self {
+    fn direct(fill: NativeFill, haystack: &'h [u8], state: NativeIterState) -> Self {
         Self {
             fill: NativeMatchesFill::Direct(fill),
             haystack,
-            state: NativeIterState::default(),
+            state,
             spans: [const { MaybeUninit::uninit() }; NATIVE_SPAN_BUFFER_CAPACITY],
             next: 0,
             filled: 0,
@@ -2545,11 +2567,15 @@ impl<'m, 'h> NativeMatches<'m, 'h> {
         }
     }
 
-    fn prepared(prepared: &'m mut PreparedNative, haystack: &'h [u8]) -> Self {
+    fn prepared(
+        prepared: &'m mut PreparedNative,
+        haystack: &'h [u8],
+        state: NativeIterState,
+    ) -> Self {
         NativeMatches {
             fill: NativeMatchesFill::Prepared(prepared),
             haystack,
-            state: NativeIterState::default(),
+            state,
             spans: [const { MaybeUninit::uninit() }; NATIVE_SPAN_BUFFER_CAPACITY],
             next: 0,
             filled: 0,
@@ -3353,6 +3379,26 @@ mod tests {
         }
     }
 
+    fn one_byte_fill(
+        haystack: &[u8],
+        state: &mut NativeIterState,
+        output: &mut [MaybeUninit<AbiResult>],
+    ) -> NativeFillOutcome {
+        // SAFETY: the test entry initializes `result` on every status-1 return
+        // and retains none of the borrowed arguments.
+        unsafe {
+            fill_native_spans(haystack, state, output, |haystack, start, result| {
+                one_byte_search(
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    start,
+                    haystack.len(),
+                    result,
+                )
+            })
+        }
+    }
+
     unsafe fn mock_prepared_span_fill(
         search: NativeSearch,
         haystack: *const u8,
@@ -3396,6 +3442,28 @@ mod tests {
         written: *mut usize,
     ) -> u32 {
         PREPARED_SPAN_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            mock_prepared_span_fill(
+                one_byte_search,
+                haystack,
+                haystack_len,
+                state,
+                results,
+                capacity,
+                written,
+            )
+        }
+    }
+
+    unsafe extern "C" fn one_byte_prepared_span_fill(
+        _handle: FreAotRegexExclusiveHandleV1,
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
         unsafe {
             mock_prepared_span_fill(
                 one_byte_search,
@@ -3829,6 +3897,26 @@ mod tests {
                 exists_batch,
                 handle: FreAotRegexExclusiveHandleV1::INVALID,
             }),
+        }
+    }
+
+    fn runtime_test_matcher(pattern: &str) -> AotMatcher {
+        let compiled = fre_aot_regex::compile(
+            fre_aot_regex::CompileRequest::new(pattern, fre_aot_regex::Target::x86_64_linux())
+                .mode(fre_aot_regex::CompileMode::Fast)
+                .output(fre_aot_regex::OutputContract::Span),
+        )
+        .expect("compile test runtime program");
+        let serialized = compiled
+            .program()
+            .serialize()
+            .expect("serialize test program");
+        AotMatcher {
+            output: AotOutput::Span,
+            description: "test-runtime",
+            backend: Backend::Runtime(Box::new(
+                PreparedAotRegex::deserialize(&serialized).expect("prepare test runtime program"),
+            )),
         }
     }
 
@@ -4954,6 +5042,89 @@ mod tests {
     }
 
     #[test]
+    fn offset_iterator_is_equivalent_across_runtime_direct_and_prepared_backends() {
+        let collect = |matcher: &mut AotMatcher, haystack: &[u8], start| {
+            matcher
+                .find_iter_at(haystack, start)
+                .expect("offset Span iterator")
+                .map(|matched| matched.expect("offset match").range())
+                .collect::<Vec<_>>()
+        };
+
+        let expected = [2..3, 3..4, 4..5];
+        for mut matcher in [
+            runtime_test_matcher(r"(?-u:.)"),
+            native_matcher(one_byte_search, one_byte_fill),
+            prepared_test_matcher(AotOutput::Span, Some(one_byte_prepared_span_fill), None),
+        ] {
+            assert_eq!(collect(&mut matcher, b"abcde", 2), expected);
+            assert!(collect(&mut matcher, b"abcde", 5).is_empty());
+            let error = matcher
+                .find_iter_at(b"abcde", 6)
+                .expect_err("out-of-bounds iterator start");
+            assert!(error.contains("invalid search window 6..5 for haystack length 5"));
+        }
+
+        let nullable_expected = [2..2, 3..3];
+        for mut matcher in [
+            runtime_test_matcher(""),
+            native_matcher(nullable_search, nullable_fill),
+            prepared_test_matcher(AotOutput::Span, Some(nullable_prepared_span_fill), None),
+        ] {
+            assert_eq!(collect(&mut matcher, b"xyz", 2), nullable_expected);
+            assert_eq!(collect(&mut matcher, b"xyz", 3), [3..3]);
+        }
+    }
+
+    #[test]
+    fn offset_iterator_releases_matcher_after_callback_stop_and_error() {
+        let mut matcher = native_matcher(one_byte_search, one_byte_fill);
+        {
+            let mut matches = matcher
+                .find_iter_at(b"abcde", 2)
+                .expect("offset Span iterator");
+            assert_eq!(
+                matches
+                    .next()
+                    .expect("callback item")
+                    .expect("match")
+                    .range(),
+                2..3,
+            );
+            // Dropping here models a callback requesting an early stop.
+        }
+        assert_eq!(
+            matcher
+                .find_at(b"abcde", 1)
+                .expect("find after callback stop")
+                .expect("match after callback stop")
+                .range(),
+            1..2,
+        );
+
+        let callback_result: Result<(), String> = matcher
+            .find_iter_at(b"abcde", 2)
+            .expect("second offset iterator")
+            .try_for_each(|matched| {
+                let matched = matched?;
+                if matched.start() == 3 {
+                    Err("public callback failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            });
+        assert_eq!(callback_result, Err("public callback failure".to_owned()));
+        assert_eq!(
+            matcher
+                .find_at(b"abcde", 0)
+                .expect("find after callback error")
+                .expect("match after callback error")
+                .range(),
+            0..1,
+        );
+    }
+
+    #[test]
     fn native_iterator_batches_indirect_refills() {
         SEARCH_CALLS.store(0, Ordering::Relaxed);
         FILL_CALLS.store(0, Ordering::Relaxed);
@@ -5985,6 +6156,58 @@ mod tests {
                 "default public registry must exercise real V3 preparation"
             );
         }
+    }
+
+    #[test]
+    fn public_generated_ordered_nfa_v15_span_fill_executes_end_to_end() {
+        const PATTERN: &str = r"\b(?:PM_RESUME)\b";
+        if generated::BUILD_VARIANT_POLICY != "all" {
+            return;
+        }
+        let pattern_is_selected = generated::SPECS
+            .iter()
+            .any(|spec| spec.pattern == PATTERN && !spec.case_insensitive);
+        if !pattern_is_selected {
+            // External manifests are permitted and need not contain the
+            // package's public Ordered-NFA fixture.
+            return;
+        }
+        let spec = generated::SPECS
+            .iter()
+            .find(|spec| {
+                spec.pattern == PATTERN
+                    && !spec.case_insensitive
+                    && spec.output == AotOutput::Span
+                    && matches!(
+                        spec.backend,
+                        BackendFactory::Prepared {
+                            required_prepare_capabilities: PREPARE_CAPABILITY_ORDERED_NFA_V15,
+                            span_fill: Some(PreparedSpanFillFactory::Compiled(_)),
+                            exists_batch: None,
+                            ..
+                        }
+                    )
+            })
+            .expect("public Ordered-NFA fixture must retain its authenticated V15 Span-fill");
+        assert!(spec.description.contains("bulk=native-ordered-nfa-loop"));
+        assert!(spec.description.contains("api=span-fill-v1"));
+
+        let haystack = b"xx PM_RESUME yy PM_RESUME";
+        let mut matcher = AotMatcher::new(spec.mode, AotOutput::Span, PATTERN, false)
+            .expect("prepare public generated V15 matcher");
+        let all = matcher
+            .find_iter(haystack)
+            .expect("compiled public Span-fill")
+            .map(|matched| matched.expect("compiled public span").range())
+            .collect::<Vec<_>>();
+        assert_eq!(all, [3..12, 16..25]);
+
+        let offset = matcher
+            .find_iter_at(haystack, 4)
+            .expect("compiled public offset Span-fill")
+            .map(|matched| matched.expect("compiled public offset span").range())
+            .collect::<Vec<_>>();
+        assert_eq!(offset, [16..25]);
     }
 
     #[test]
