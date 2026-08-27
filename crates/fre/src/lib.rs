@@ -18747,7 +18747,9 @@ pub struct PortableSearchSession<'a> {
 /// constructed. Unanchored required-literal matchers bind their value-only
 /// projection once while retaining the native regex owner for spans.
 /// Legacy literal/class-run and pure byte-class-repeat native bindings reuse
-/// their ordinary report-free span searches on each remaining tail. A bounded
+/// their ordinary report-free span searches on each remaining tail. A dense
+/// nullable finite-token traversal does the same after two nearby canonical
+/// spans; sparse and short traversals retain the canonical iterator. A bounded
 /// byte-class repeat binds its selected-value engine once and, with a qualified
 /// bounded front, instead scans each maximal run once. These construction
 /// proofs establish positive width and the absence of discarded prefix
@@ -19157,6 +19159,95 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                                 .expect("a relative tail match end remains in the haystack"),
                         }
                     }))
+                },
+                visitor,
+            );
+        }
+
+        // Nullable finite-token repeats retain a nonempty required tail, so
+        // every selected span makes positive progress and discarded prefix
+        // context cannot affect a continuation. Observe two canonical spans
+        // before selecting the report-free full-tail projection: this keeps a
+        // sparse or one-hit search on the incumbent path while amortizing its
+        // checked window machinery for a genuinely dense traversal.
+        if let Self::Native(regex) = self
+            && let PortablePlan::NullableFiniteTokenRepeat(plan) = &regex.plan
+        {
+            const NEAR_SELECTED_END_BYTES: usize = 64;
+
+            let mut cursor = start;
+            let mut near = true;
+            let mut observed = 0_u8;
+            let mut visitor_stopped = false;
+            let probe_result = try_visit_ordinary_spans_at(
+                haystack.len(),
+                start,
+                |search_start| {
+                    self.find_at_value(haystack, search_start)
+                        .map_err(PortableFindIterError::Search)
+                },
+                |matched| match visitor(matched) {
+                    Ok(true) => {
+                        near &= matched.end().saturating_sub(cursor)
+                            <= NEAR_SELECTED_END_BYTES;
+                        cursor = matched.end();
+                        observed = observed.saturating_add(1);
+                        Ok(observed < 2)
+                    }
+                    Ok(false) => {
+                        visitor_stopped = true;
+                        Ok(false)
+                    }
+                    Err(error) => Err(error),
+                },
+            )?;
+            if let Err(error) = probe_result {
+                return Ok(Err(error));
+            }
+            if visitor_stopped || observed < 2 {
+                return Ok(Ok(()));
+            }
+
+            if near {
+                return try_visit_ordinary_spans_at(
+                    haystack.len(),
+                    cursor,
+                    |search_start| {
+                        let tail = haystack.get(search_start..).ok_or_else(|| {
+                            PortableFindIterError::Search(
+                                SearchError::NullableOptionalChain(
+                                    NullableOptionalChainSearchError::InvalidWindow,
+                                ),
+                            )
+                        })?;
+                        plan.find_full_ordinary_value(tail)
+                            .map(|matched| {
+                                matched.map(|matched| Match {
+                                    start: search_start
+                                        .checked_add(matched.start())
+                                        .expect(
+                                            "a relative tail match start remains in the haystack",
+                                        ),
+                                    end: search_start
+                                        .checked_add(matched.end())
+                                        .expect(
+                                            "a relative tail match end remains in the haystack",
+                                        ),
+                                })
+                            })
+                            .map_err(SearchError::NullableOptionalChain)
+                            .map_err(PortableFindIterError::Search)
+                    },
+                    visitor,
+                );
+            }
+
+            return try_visit_ordinary_spans_at(
+                haystack.len(),
+                cursor,
+                |search_start| {
+                    self.find_at_value(haystack, search_start)
+                        .map_err(PortableFindIterError::Search)
                 },
                 visitor,
             );
@@ -25310,7 +25401,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// selected items directly to the callback without an accounting iterator,
     /// result buffer, or search-call cap. Unguarded literal/class-run and pure
     /// byte-class-repeat plans reuse their report-free ordinary span searches
-    /// on each remaining tail. Bounded byte-class repeats bind their
+    /// on each remaining tail. Dense nullable finite-token traversal promotes
+    /// to that projection after two nearby canonical spans; sparse traversal
+    /// retains the canonical iterator. Bounded byte-class repeats bind their
     /// selected-value engine once, and front-qualified calls scan each maximal
     /// class run once. Guarded literal/class-run plans keep the context-aware
     /// canonical fallback. Reverse-inner tail windows retain absolute offsets
@@ -49845,6 +49938,111 @@ mod tests {
                 .count_positive_width_selected_ends_at(b"aab!", usize::MAX),
             Ok(None),
         );
+    }
+
+    #[test]
+    fn ordinary_nullable_finite_token_repeat_adapts_without_changing_spans() {
+        fn selected_spans(
+            regex: &PortableRegex,
+            haystack: &[u8],
+            start: usize,
+        ) -> Vec<(usize, usize)> {
+            let mut cursor = start;
+            let mut spans = Vec::new();
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                spans.push((matched.start(), matched.end()));
+                cursor = matched.end();
+            }
+            spans
+        }
+
+        let dense = b"aaz!baz!z!baaaz!none";
+        let mut sparse = vec![b'x'; 192];
+        sparse[70] = b'z';
+        sparse[150] = b'z';
+        for pattern in [
+            r"(?-u:(?:a|aa|ba){0,3}z)",
+            r"(?-u:(?:aa|a|ba){0,3}?z)",
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert!(matches!(
+                &regex.plan,
+                PortablePlan::NullableFiniteTokenRepeat(_)
+            ));
+            let mut ordinary = regex.ordinary_session().unwrap();
+
+            for haystack in [dense.as_slice(), sparse.as_slice(), b"none"] {
+                for start in 0..=haystack.len() {
+                    let expected = selected_spans(&regex, haystack, start);
+                    let mut actual = Vec::new();
+                    assert_eq!(
+                        ordinary
+                            .try_visit_spans_at(haystack, start, |matched| {
+                                actual.push((matched.start(), matched.end()));
+                                Ok::<bool, ()>(true)
+                            })
+                            .unwrap(),
+                        Ok(()),
+                        "pattern={pattern:?}, start={start}",
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "pattern={pattern:?}, start={start}"
+                    );
+                }
+            }
+        }
+
+        let regex = PortableBuilder::new(r"(?-u:(?:a|aa|ba){0,3}z)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let first = selected_spans(&regex, dense, 0)[0];
+        let mut ordinary = regex.ordinary_session().unwrap();
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(dense, |matched| {
+                    stopped.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(false)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(stopped, [first]);
+
+        let mut errored = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(dense, |matched| {
+                    errored.push((matched.start(), matched.end()));
+                    Err::<bool, _>("callback")
+                })
+                .unwrap(),
+            Err("callback"),
+        );
+        assert_eq!(errored, [first]);
+
+        let mut invalid_callback = false;
+        assert!(matches!(
+            ordinary.try_visit_spans_at(dense, dense.len() + 1, |_| {
+                invalid_callback = true;
+                Ok::<bool, ()>(true)
+            }),
+            Err(PortableFindIterError::Search(
+                SearchError::NullableOptionalChain(
+                    super::NullableOptionalChainSearchError::InvalidWindow
+                )
+            ))
+        ));
+        assert!(!invalid_callback);
     }
 
     #[test]
