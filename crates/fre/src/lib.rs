@@ -19318,6 +19318,19 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 .map_err(PortableFindIterError::Search);
         }
 
+        // Bounded byte-class sequences have positive selected width and keep
+        // absolute-start context in the original haystack. Bind their ordinary
+        // Visit cursor once so one validated tail and one report-free admission
+        // cover the complete monotone traversal.
+        if let Self::Native(regex) = self
+            && let PortablePlan::BoundedByteClassSequence(plan) = &regex.plan
+        {
+            return plan
+                .ordinary_try_visit_selected_spans_at(haystack, start, visitor)
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search);
+        }
+
         // A bounded byte-class repeat is positive-width and has no assertion
         // that can observe discarded prefix context. Bind its ordinary visitor
         // once so one validation covers the complete monotone span traversal
@@ -25644,13 +25657,15 @@ impl<'r> PortableOrdinarySession<'r> {
     /// to that projection after two nearby canonical spans; sparse traversal
     /// retains the canonical iterator. Bounded byte-class repeats bind their
     /// selected-value engine once, and front-qualified calls scan each maximal
-    /// class run once. Bounded-delimited segment repeats preflight their outer
-    /// envelope once and reuse a bound suffix executor across shrinking tails.
-    /// Guarded literal/class-run plans keep the context-aware canonical
-    /// fallback. Reverse-inner tail windows retain absolute offsets and stop
-    /// their shared traversal immediately on callback stop or error. Other
-    /// canonical fallback plans iterate the compact binding with unlimited
-    /// value searches and the ordinary empty-match progress rule.
+    /// class run once. Bounded byte-class sequences bind one validated,
+    /// report-free absolute-tail cursor for the complete Visit traversal.
+    /// Bounded-delimited segment repeats preflight their outer envelope once
+    /// and reuse a bound suffix executor across shrinking tails. Guarded
+    /// literal/class-run plans keep the context-aware canonical fallback.
+    /// Reverse-inner tail windows retain absolute offsets and stop their shared
+    /// traversal immediately on callback stop or error. Other canonical
+    /// fallback plans iterate the compact binding with unlimited value searches
+    /// and the ordinary empty-match progress rule.
     ///
     /// # Errors
     ///

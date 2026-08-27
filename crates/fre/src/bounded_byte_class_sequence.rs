@@ -259,6 +259,53 @@ struct SearchState {
     run_scans: u64,
 }
 
+/// One source-bound ordinary Visit traversal over monotonically shrinking
+/// absolute windows. This is deliberately stack-local: the retained plan
+/// layout stays source-free and unchanged.
+struct OrdinarySelectedSpanCursor<'p, 'h> {
+    plan: &'p Plan,
+    haystack: &'h [u8],
+    next_start: usize,
+    direct: bool,
+}
+
+impl<'p, 'h> OrdinarySelectedSpanCursor<'p, 'h> {
+    fn new(plan: &'p Plan, haystack: &'h [u8], start: usize) -> Result<Self, SearchError> {
+        let initial = SearchWindow::new(start, haystack.len());
+        validate_window(haystack, initial)?;
+        Ok(Self {
+            plan,
+            haystack,
+            next_start: start,
+            direct: plan.unmetered_work_fits(initial),
+        })
+    }
+
+    fn next_span(&mut self) -> Result<Option<Match>, SearchError> {
+        let window = SearchWindow::new(self.next_start, self.haystack.len());
+        let matched = if self.direct {
+            self.plan
+                .search_value(self.haystack, window, false)
+                .map(|(start, end)| Match { start, end })
+        } else {
+            self.plan.find_window_value(
+                self.haystack,
+                window,
+                SearchLimits::unlimited(),
+            )?
+        };
+        let Some(matched) = matched else {
+            return Ok(None);
+        };
+        debug_assert!(
+            matched.end() > self.next_start,
+            "a bounded byte-class sequence has positive selected width",
+        );
+        self.next_start = matched.end();
+        Ok(Some(matched))
+    }
+}
+
 impl Plan {
     #[cold]
     fn build(
@@ -395,6 +442,34 @@ impl Plan {
                 counter: "ordinary selected-match count",
             })?;
         }
+    }
+
+    /// Visit ordinary non-overlapping selected spans at or after `start`.
+    ///
+    /// One stack-local cursor binds a validated absolute tail and its
+    /// report-free admission for the whole monotone traversal. Targets with an
+    /// exceptional arithmetic envelope retain the established unlimited value
+    /// path. Callback stop and error return immediately without retaining
+    /// source or traversal state in the plan.
+    #[inline(never)]
+    pub(crate) fn ordinary_try_visit_selected_spans_at<F, E>(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, SearchError>
+    where
+        F: FnMut(Match) -> Result<bool, E>,
+    {
+        let mut spans = OrdinarySelectedSpanCursor::new(self, haystack, start)?;
+        while let Some(matched) = spans.next_span()? {
+            match visitor(matched) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+        Ok(Ok(()))
     }
 
     pub(crate) fn is_match_window(
@@ -1760,8 +1835,9 @@ mod tests {
     use super::PLAN_ID;
     use crate::pure_byte_class_repeat::SetSeek;
     use crate::{
-        BuildError, BuildLimits, PlanKind, PortableBuilder, PortableFindIterLimits, PortablePlan,
-        SearchAccounting, SearchError as FacadeSearchError, SearchLimits, SearchWindow,
+        BuildError, BuildLimits, PlanKind, PortableBuilder, PortableFindIterError,
+        PortableFindIterLimits, PortablePlan, SearchAccounting,
+        SearchError as FacadeSearchError, SearchLimits, SearchWindow,
     };
     use crate::{
         BoundedByteClassSequenceAccounting as Accounting,
@@ -2225,6 +2301,161 @@ mod tests {
             Err(FacadeSearchError::BoundedByteClassSequence(
                 Error::InvalidWindow,
             )),
+        );
+    }
+
+    #[test]
+    fn ordinary_visit_cursor_and_count_match_upstream_for_every_start() {
+        fn selected_spans(
+            regex: &regex::bytes::Regex,
+            haystack: &[u8],
+            start: usize,
+        ) -> Vec<(usize, usize)> {
+            let mut cursor = start;
+            let mut spans = Vec::new();
+            while let Some(matched) = regex.find_at(haystack, cursor) {
+                assert!(matched.end() > cursor);
+                spans.push((matched.start(), matched.end()));
+                cursor = matched.end();
+            }
+            spans
+        }
+
+        let cases: [(&str, &[u8]); 5] = [
+            (r"(?-u:[ab]){1,2}(?-u:[CD]){1,2}", b"abCD!"),
+            (
+                r"(?-u:[ab])(?-u:[CD])(?-u:[ab]){0,2}",
+                b"abCD!",
+            ),
+            (
+                r"(?-u:[W])(?-u:[Zc])(?-u:[ab]){0,2}(?-u:[ab])",
+                b"WZcab!",
+            ),
+            (
+                r"(?-u:[WZ]){1,3}(?-u:[ab]){0,2}(?-u:[d])",
+                b"WZabd!",
+            ),
+            (
+                r"\A(?-u:[ab]){1,2}(?-u:[CD]){1,2}",
+                b"abCD!",
+            ),
+        ];
+
+        for (pattern, alphabet) in cases {
+            let fre = build(pattern);
+            let PortablePlan::BoundedByteClassSequence(plan) = &fre.plan else {
+                panic!("expected bounded sequence plan for {pattern:?}");
+            };
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut ordinary = fre.ordinary_session().unwrap();
+            for length in 0_u32..=4 {
+                let haystack_count = alphabet.len().pow(length);
+                for encoded in 0..haystack_count {
+                    let mut value = encoded;
+                    let mut haystack = vec![0_u8; usize::try_from(length).unwrap()];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    for start in 0..=haystack.len() {
+                        let expected = selected_spans(&upstream, &haystack, start);
+
+                        let mut direct = Vec::new();
+                        assert_eq!(
+                            plan.ordinary_try_visit_selected_spans_at(
+                                &haystack,
+                                start,
+                                |matched| {
+                                    direct.push((matched.start(), matched.end()));
+                                    Ok::<bool, ()>(true)
+                                },
+                            ),
+                            Ok(Ok(())),
+                            "direct visit: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                        assert_eq!(
+                            direct, expected,
+                            "direct visit: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+
+                        let mut facade = Vec::new();
+                        assert_eq!(
+                            ordinary.try_visit_spans_at(&haystack, start, |matched| {
+                                facade.push((matched.start(), matched.end()));
+                                Ok::<bool, ()>(true)
+                            }),
+                            Ok(Ok(())),
+                            "facade visit: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                        assert_eq!(
+                            facade, expected,
+                            "facade visit: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                        assert_eq!(
+                            plan.ordinary_count_selected_ends_at(&haystack, start),
+                            Ok(u64::try_from(expected.len()).unwrap()),
+                            "direct count: pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_shared_visit_stops_propagates_errors_and_leaves_session_reusable() {
+        let fre = build(r"(?-u:[ab]){1,2}(?-u:[CD]){1,2}");
+        let haystack = b"aC!bbDD!aCC";
+        let expected = [(0, 2), (3, 7), (8, 11)];
+        let mut ordinary = fre.ordinary_session().unwrap();
+
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans(haystack, |matched| {
+                stopped.push((matched.start(), matched.end()));
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(stopped, [expected[0]]);
+
+        let mut errored = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans(haystack, |matched| {
+                errored.push((matched.start(), matched.end()));
+                Err::<bool, _>("callback")
+            }),
+            Ok(Err("callback")),
+        );
+        assert_eq!(errored, [expected[0]]);
+
+        let mut invalid_callback = false;
+        assert_eq!(
+            ordinary.try_visit_spans_at(haystack, haystack.len() + 1, |_| {
+                invalid_callback = true;
+                Ok::<bool, ()>(true)
+            }),
+            Err(PortableFindIterError::Search(
+                FacadeSearchError::BoundedByteClassSequence(Error::InvalidWindow),
+            )),
+        );
+        assert!(!invalid_callback);
+
+        let mut complete = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans(haystack, |matched| {
+                complete.push((matched.start(), matched.end()));
+                Ok::<bool, ()>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(complete, expected);
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, 0),
+            Ok(Some(u64::try_from(expected.len()).unwrap())),
         );
     }
 
