@@ -794,6 +794,7 @@ mod ordinary_direct_probe {
         static ROOT_ASCII_PREPARATION_TRANSITIONS: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_CALLS: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
+        static SPAN_ASCII_REUSES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
@@ -810,6 +811,7 @@ mod ordinary_direct_probe {
         ROOT_ASCII_PREPARATION_TRANSITIONS.set(0);
         ROOT_ASCII_CALLS.set(0);
         ROOT_ASCII_SKIPPED_BYTES.set(0);
+        SPAN_ASCII_REUSES.set(0);
     }
 
     pub(super) fn record() {
@@ -909,6 +911,14 @@ mod ordinary_direct_probe {
 
     pub(super) fn root_ascii_skipped_bytes() -> usize {
         ROOT_ASCII_SKIPPED_BYTES.get()
+    }
+
+    pub(super) fn record_span_ascii_reuse() {
+        SPAN_ASCII_REUSES.set(SPAN_ASCII_REUSES.get().saturating_add(1));
+    }
+
+    pub(super) fn span_ascii_reuses() -> usize {
+        SPAN_ASCII_REUSES.get()
     }
 }
 
@@ -2543,6 +2553,28 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         Some(self.span_from_selection(restart, matched))
     }
 
+    /// Reuse a prepared classifier after the caller observes a sparse first
+    /// selection, avoiding another scalar native prefix between later spans.
+    #[inline(always)]
+    fn next_span_with_prepared_ascii_root(
+        &mut self,
+        roots: &mut Option<AsciiByteSetClassifier>,
+        minimum_bytes: usize,
+    ) -> Option<(usize, usize)> {
+        debug_assert!(roots.is_some());
+        if self.end - self.restart < minimum_bytes {
+            return self.next_span_with_ascii_root(roots, minimum_bytes);
+        }
+        #[cfg(test)]
+        ordinary_direct_probe::record_span_ascii_reuse();
+        let restart = self.restart;
+        if !self.seek_ascii_root_for_selected_span(roots, minimum_bytes) {
+            return None;
+        }
+        let matched = self.next_pattern()?;
+        Some(self.span_from_selection(restart, matched))
+    }
+
     #[inline(always)]
     fn span_from_selection(
         &self,
@@ -3378,16 +3410,47 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                     }
                 }
             }
-            while let Some(matched) =
-                scanner.next_span_with_ascii_root(
-                    &mut self.prepared_ascii_root,
-                    minimum_bytes,
-                )
-            {
-                match visitor(matched) {
-                    Ok(true) => {}
-                    Ok(false) => return Ok(Ok(())),
-                    Err(error) => return Ok(Err(error)),
+            let first_restart = scanner.restart;
+            let first = scanner.next_span_with_ascii_root(
+                &mut self.prepared_ascii_root,
+                minimum_bytes,
+            );
+            let Some(first) = first else {
+                return Ok(Ok(()));
+            };
+            let reuse_prepared_root = self.prepared_ascii_root.is_some()
+                && first.0
+                    >= first_restart.saturating_add(ORDINARY_DIRECT_DFA_NATIVE_BYTES);
+            match visitor(first) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            }
+            if reuse_prepared_root {
+                while let Some(matched) =
+                    scanner.next_span_with_prepared_ascii_root(
+                        &mut self.prepared_ascii_root,
+                        minimum_bytes,
+                    )
+                {
+                    match visitor(matched) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(Ok(())),
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+            } else {
+                while let Some(matched) =
+                    scanner.next_span_with_ascii_root(
+                        &mut self.prepared_ascii_root,
+                        minimum_bytes,
+                    )
+                {
+                    match visitor(matched) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(Ok(())),
+                        Err(error) => return Ok(Err(error)),
+                    }
                 }
             }
             return Ok(Ok(()));
@@ -9586,20 +9649,63 @@ mod tests {
         );
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
 
-        // Two nearby spans hand the remaining dense tail to the compact
-        // endpoint loop without consulting the arbitrary-root classifier.
+        // Once this source's first selected span begins beyond the native
+        // prefix, later distant spans reuse its prepared classifier without
+        // paying that prefix again. A classifier warmed by an older source
+        // alone is not enough to take this route.
+        let gap = ORDINARY_ROOT_ASCII_MIN_BYTES + 13;
+        let mut repeated = vec![b'!'; root_offset];
+        let mut repeated_spans = Vec::new();
+        for &pattern_index in &[0_usize, 17, 34] {
+            let start = repeated.len();
+            repeated.extend_from_slice(&patterns[pattern_index]);
+            repeated_spans.push((start, repeated.len()));
+            if repeated_spans.len() < 3 {
+                repeated.extend(core::iter::repeat_n(b'!', gap));
+            }
+        }
+        ordinary_direct_probe::reset();
+        let mut actual_repeated = Vec::new();
+        assert_eq!(
+            prepared.try_visit_spans_window_value(
+                &repeated,
+                Window::full(&repeated),
+                |matched| {
+                    actual_repeated.push(matched);
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(actual_repeated, repeated_spans);
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 3);
+        assert_eq!(ordinary_direct_probe::span_ascii_reuses(), 2);
+
+        // Dense spans stay on the established native route even though the
+        // same worker already owns a prepared classifier.
         let mut dense = Vec::new();
         for index in 0..64 {
             dense.extend_from_slice(&patterns[(index % ROOT_ASCII_24.len()) * 17]);
             dense.extend_from_slice(b"!!");
         }
         ordinary_direct_probe::reset();
+        let mut dense_spans = 0;
         assert_eq!(
-            prepared.try_count_spans_window_value(&dense, Window::full(&dense)),
-            Ok(Some(64)),
+            prepared.try_visit_spans_window_value(
+                &dense,
+                Window::full(&dense),
+                |_| {
+                    dense_spans += 1;
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
         );
+        assert_eq!(dense_spans, 64);
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+        assert_eq!(ordinary_direct_probe::span_ascii_reuses(), 0);
     }
 
     #[cfg(target_arch = "aarch64")]
