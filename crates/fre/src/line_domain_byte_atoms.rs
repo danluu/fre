@@ -91,6 +91,27 @@ mod accounted_search_probe {
     }
 }
 
+#[cfg(test)]
+mod first_end_probe {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
 /// Optional final-fallback publication result.
 #[derive(Debug)]
 pub(crate) enum PublicationOutcome {
@@ -238,6 +259,8 @@ impl OwnedPlan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
+        #[cfg(test)]
+        first_end_probe::record();
         self.kernel.is_match_value(
             haystack,
             window.start(),
@@ -289,6 +312,22 @@ impl OwnedPlan {
                     end: span.end(),
                 })
             })
+    }
+
+    pub(crate) fn first_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        #[cfg(test)]
+        first_end_probe::record();
+        self.kernel.first_end_value(
+            haystack,
+            window.start(),
+            window.end(),
+            kernel_search_limits(limits),
+        )
     }
 
     fn complete_search_accounting(&self, mut accounting: SearchAccounting) -> SearchAccounting {
@@ -1083,6 +1122,14 @@ mod tests {
         );
 
         super::accounted_search_probe::reset();
+        super::first_end_probe::reset();
+        assert!(regex.is_match(haystack));
+        assert_eq!(super::accounted_search_probe::calls(), 0);
+        assert_eq!(super::first_end_probe::calls(), 1);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(ordinary.is_match(haystack).unwrap());
+        assert_eq!(super::accounted_search_probe::calls(), 0);
+        assert_eq!(super::first_end_probe::calls(), 2);
         assert_eq!(
             regex
                 .shortest_match_window_value(
@@ -1094,9 +1141,10 @@ mod tests {
             Some(9),
         );
         assert_eq!(super::accounted_search_probe::calls(), 0);
-        let mut ordinary = regex.ordinary_session().unwrap();
+        assert_eq!(super::first_end_probe::calls(), 3);
         assert_eq!(ordinary.shortest_match_at(haystack, 0).unwrap(), Some(9));
         assert_eq!(super::accounted_search_probe::calls(), 0);
+        assert_eq!(super::first_end_probe::calls(), 4);
         assert_eq!(
             regex
                 .shortest_match_window(
@@ -1109,6 +1157,7 @@ mod tests {
             Some(9),
         );
         assert_eq!(super::accounted_search_probe::calls(), 1);
+        assert_eq!(super::first_end_probe::calls(), 4);
     }
 
     #[test]

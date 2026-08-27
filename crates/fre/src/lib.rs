@@ -16309,8 +16309,7 @@ impl PortableRegex {
                 )
                 .map_err(SearchError::from),
             PortablePlan::LineDomainByteAtoms(plan) => plan
-                .find_window_value(haystack, window, limits)
-                .map(|matched| matched.map(Match::end))
+                .first_end_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             _ => {
                 if limits == SearchLimits::unlimited()

@@ -598,6 +598,34 @@ pub struct LineDomainPlan {
     value_prefilter: ValuePrefilter,
 }
 
+trait ValueProjection {
+    type Output;
+
+    fn selected(start: usize, end: usize) -> Self::Output;
+}
+
+struct SpanProjection;
+
+impl ValueProjection for SpanProjection {
+    type Output = MatchSpan;
+
+    #[inline]
+    fn selected(start: usize, end: usize) -> Self::Output {
+        MatchSpan::new(start, end)
+    }
+}
+
+struct EndProjection;
+
+impl ValueProjection for EndProjection {
+    type Output = usize;
+
+    #[inline]
+    fn selected(_start: usize, end: usize) -> Self::Output {
+        end
+    }
+}
+
 impl LineDomainPlan {
     /// Exact source-independent work added by value-prefilter derivation for
     /// an atom sequence already certified by the facade.
@@ -943,10 +971,30 @@ impl LineDomainPlan {
             return Err(SearchError::InvalidWindow);
         }
         if limits.max_work == u64::MAX {
-            return Ok(self.find_from_value(haystack, start, end));
+            return Ok(self.find_from_value::<SpanProjection>(haystack, start, end));
         }
         self.find(haystack, start, end, limits)
             .map(|(matched, _)| matched)
+    }
+
+    /// Value-only first-end search. Unlimited calls select the endpoint
+    /// representation in the shared branch-minimal executor; finite limits
+    /// retain the exact prospective/actual span path before projection.
+    pub fn first_end_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        if start > end || end > haystack.len() {
+            return Err(SearchError::InvalidWindow);
+        }
+        if limits.max_work == u64::MAX {
+            return Ok(self.find_from_value::<EndProjection>(haystack, start, end));
+        }
+        self.find(haystack, start, end, limits)
+            .map(|(matched, _)| matched.map(MatchSpan::end))
     }
 
     /// Value-only existence projection.
@@ -957,7 +1005,7 @@ impl LineDomainPlan {
         end: usize,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
-        self.find_value(haystack, start, end, limits)
+        self.first_end_value(haystack, start, end, limits)
             .map(|matched| matched.is_some())
     }
 
@@ -993,7 +1041,12 @@ impl LineDomainPlan {
         }
     }
 
-    fn find_from_value(&self, haystack: &[u8], start: usize, end: usize) -> Option<MatchSpan> {
+    fn find_from_value<P: ValueProjection>(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Option<P::Output> {
         if start >= end || input_bytes(start, end) < self.minimum_match_bytes {
             return None;
         }
@@ -1003,7 +1056,7 @@ impl LineDomainPlan {
                 return None;
             }
             if let Some(matched_end) = self.match_candidate_value(haystack, candidate, end) {
-                return Some(MatchSpan::new(candidate, matched_end));
+                return Some(P::selected(candidate, matched_end));
             }
             // Preserve the delimiter executor's excellent first-line and
             // dense-iteration behavior. Once that unique line start fails, it
@@ -1011,20 +1064,20 @@ impl LineDomainPlan {
             return match anchor {
                 ValueAnchor::Start { offset } => {
                     let search = candidate.checked_add(offset)?.checked_add(1)?;
-                    self.find_from_value_start_prefiltered(
+                    self.find_from_value_start_prefiltered::<P>(
                         haystack, start, end, offset, search,
                     )
                 }
                 ValueAnchor::End { trailing } => {
                     let search = self.next_line_start_value(haystack, candidate, end)?;
-                    self.find_from_value_end_prefiltered(
+                    self.find_from_value_end_prefiltered::<P>(
                         haystack, start, end, trailing, search,
                     )
                 }
             };
         }
         if self.uses_fixed_width_endpoint() {
-            return self.find_from_value_fixed_width(
+            return self.find_from_value_fixed_width::<P>(
                 haystack,
                 start,
                 end,
@@ -1037,7 +1090,7 @@ impl LineDomainPlan {
                 return None;
             }
             if let Some(matched_end) = self.match_candidate_value(haystack, candidate, end) {
-                return Some(MatchSpan::new(candidate, matched_end));
+                return Some(P::selected(candidate, matched_end));
             }
             candidate = self.next_line_start_value(haystack, candidate, end)?;
         }
@@ -1047,13 +1100,13 @@ impl LineDomainPlan {
         self.fixed_width_endpoint
     }
 
-    fn find_from_value_fixed_width(
+    fn find_from_value_fixed_width<P: ValueProjection>(
         &self,
         haystack: &[u8],
         start: usize,
         end: usize,
         width: usize,
-    ) -> Option<MatchSpan> {
+    ) -> Option<P::Output> {
         // Preserve the generic executor's immediate-hit path. After a miss,
         // a false projected endpoint proves that this fixed-width candidate
         // cannot match without reading its body. A true endpoint is only
@@ -1065,13 +1118,13 @@ impl LineDomainPlan {
             return None;
         }
         if let Some(matched_end) = self.match_candidate_value(haystack, candidate, end) {
-            return Some(MatchSpan::new(candidate, matched_end));
+            return Some(P::selected(candidate, matched_end));
         }
         let expected_end = candidate.checked_add(width)?;
         let exact_width = self.is_line_end_value(haystack, expected_end);
         candidate = self.next_line_start_value(haystack, candidate, end)?;
         if exact_width {
-            return self.find_from_value_none_after_candidate(haystack, candidate, end);
+            return self.find_from_value_none_after_candidate::<P>(haystack, candidate, end);
         }
 
         loop {
@@ -1083,40 +1136,40 @@ impl LineDomainPlan {
                 if let Some(matched_end) =
                     self.match_candidate_value(haystack, candidate, end)
                 {
-                    return Some(MatchSpan::new(candidate, matched_end));
+                    return Some(P::selected(candidate, matched_end));
                 }
                 candidate = self.next_line_start_value(haystack, candidate, end)?;
-                return self.find_from_value_none_after_candidate(haystack, candidate, end);
+                return self.find_from_value_none_after_candidate::<P>(haystack, candidate, end);
             }
             candidate = self.next_line_start_value(haystack, candidate, end)?;
         }
     }
 
-    fn find_from_value_none_after_candidate(
+    fn find_from_value_none_after_candidate<P: ValueProjection>(
         &self,
         haystack: &[u8],
         mut candidate: usize,
         end: usize,
-    ) -> Option<MatchSpan> {
+    ) -> Option<P::Output> {
         loop {
             if candidate >= end || input_bytes(candidate, end) < self.minimum_match_bytes {
                 return None;
             }
             if let Some(matched_end) = self.match_candidate_value(haystack, candidate, end) {
-                return Some(MatchSpan::new(candidate, matched_end));
+                return Some(P::selected(candidate, matched_end));
             }
             candidate = self.next_line_start_value(haystack, candidate, end)?;
         }
     }
 
-    fn find_from_value_start_prefiltered(
+    fn find_from_value_start_prefiltered<P: ValueProjection>(
         &self,
         haystack: &[u8],
         start: usize,
         end: usize,
         offset: usize,
         mut search: usize,
-    ) -> Option<MatchSpan> {
+    ) -> Option<P::Output> {
         while search < end {
             let relative = self.value_prefilter.find(haystack.get(search..end)?)?;
             let anchor = search.checked_add(relative)?;
@@ -1127,7 +1180,7 @@ impl LineDomainPlan {
                 && let Some(matched_end) =
                     self.match_candidate_value(haystack, candidate, end)
             {
-                return Some(MatchSpan::new(candidate, matched_end));
+                return Some(P::selected(candidate, matched_end));
             }
 
             // A line-anchored expression has at most one candidate in this
@@ -1141,14 +1194,14 @@ impl LineDomainPlan {
         None
     }
 
-    fn find_from_value_end_prefiltered(
+    fn find_from_value_end_prefiltered<P: ValueProjection>(
         &self,
         haystack: &[u8],
         start: usize,
         end: usize,
         trailing: usize,
         mut search: usize,
-    ) -> Option<MatchSpan> {
+    ) -> Option<P::Output> {
         let needle_width = self.value_prefilter.needle_width()?;
         let suffix_width = trailing.checked_add(needle_width)?;
         while search < end {
@@ -1168,7 +1221,7 @@ impl LineDomainPlan {
                     && self.match_candidate_value(haystack, candidate, line_end)
                         == Some(line_end)
                 {
-                    return Some(MatchSpan::new(candidate, line_end));
+                    return Some(P::selected(candidate, line_end));
                 }
             }
 
@@ -2256,6 +2309,10 @@ mod tests {
                         let actual = plan
                             .find_value(haystack, start, end, SearchLimits::unlimited())
                             .unwrap();
+                        let actual_end = plan
+                            .first_end_value(haystack, start, end, SearchLimits::unlimited())
+                            .unwrap();
+                        assert_eq!(actual_end, actual.map(MatchSpan::end));
                         assert_eq!(
                             tuple(actual),
                             tuple(expected),
@@ -2306,6 +2363,10 @@ mod tests {
                     let actual = plan
                         .find_value(haystack, start, end, SearchLimits::unlimited())
                         .unwrap();
+                    let actual_end = plan
+                        .first_end_value(haystack, start, end, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(actual_end, actual.map(MatchSpan::end));
                     assert_eq!(
                         tuple(actual),
                         tuple(expected),
