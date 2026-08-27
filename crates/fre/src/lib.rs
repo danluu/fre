@@ -18646,13 +18646,15 @@ pub struct PortableSearchSession<'a> {
 /// constructed. Unanchored required-literal matchers bind their value-only
 /// projection once while retaining the native regex owner for spans.
 /// Legacy literal/class-run and pure byte-class-repeat native bindings reuse
-/// their ordinary report-free span searches on each remaining tail. Their
-/// construction proofs establish positive width and the absence of discarded
-/// prefix context. Literal/class-run also retains its direct reducer for
-/// exhaustive positive-width counts. A bounded byte-class sequence retains
-/// its report-free selected-end engine across one monotone exhaustive count
-/// while preserving absolute-start context. A positive complete-boundary ASCII
-/// word-run binding reuses its aggregate reducer from any validated start,
+/// their ordinary report-free span searches on each remaining tail. A bounded
+/// byte-class repeat binds its selected-value engine once and, with a qualified
+/// bounded front, instead scans each maximal run once. These construction
+/// proofs establish positive width and the absence of discarded prefix
+/// context. Literal/class-run also retains its direct reducer for exhaustive
+/// positive-width counts. A bounded byte-class sequence retains its report-free
+/// selected-end engine across one monotone exhaustive count while preserving
+/// absolute-start context. A positive complete-boundary ASCII word-run binding
+/// reuses its aggregate reducer from any validated start,
 /// skipping a word run containing that start to preserve its leading boundary.
 /// A Unicode word-run binding reuses its aggregate reducer only for an exact
 /// full-source count; a nonzero start retains the canonical context-aware
@@ -18992,6 +18994,22 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                         })
                     },
                 )
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search);
+        }
+
+        // A bounded byte-class repeat is positive-width and has no assertion
+        // that can observe discarded prefix context. Bind its ordinary visitor
+        // once so one validation covers the complete monotone span traversal
+        // instead of redispatching through PortableRegex after every selected
+        // end. A qualified bounded front selects the one-pass maximal-run
+        // visitor; other ordinary inputs retain the plan's selected-value
+        // engine.
+        if let Self::Native(regex) = self
+            && let PortablePlan::BoundedByteClassRepeat(plan) = &regex.plan
+        {
+            return plan
+                .try_visit_spans_ordinary(haystack, start, visitor)
                 .map_err(SearchError::from)
                 .map_err(PortableFindIterError::Search);
         }
@@ -25122,12 +25140,13 @@ impl<'r> PortableOrdinarySession<'r> {
     /// selected items directly to the callback without an accounting iterator,
     /// result buffer, or search-call cap. Unguarded literal/class-run and pure
     /// byte-class-repeat plans reuse their report-free ordinary span searches
-    /// on each remaining tail;
-    /// guarded literal/class-run plans keep the context-aware canonical
-    /// fallback. Reverse-inner tail windows retain absolute offsets and stop
-    /// their shared traversal immediately on callback stop or error. Other
-    /// canonical fallback plans iterate the compact binding with unlimited
-    /// value searches and the ordinary empty-match progress rule.
+    /// on each remaining tail. Bounded byte-class repeats bind their
+    /// selected-value engine once, and front-qualified calls scan each maximal
+    /// class run once. Guarded literal/class-run plans keep the context-aware
+    /// canonical fallback. Reverse-inner tail windows retain absolute offsets
+    /// and stop their shared traversal immediately on callback stop or error.
+    /// Other canonical fallback plans iterate the compact binding with
+    /// unlimited value searches and the ordinary empty-match progress rule.
     ///
     /// # Errors
     ///
@@ -49257,6 +49276,115 @@ mod tests {
             Err(PortableFindIterError::Search(
                 SearchError::LiteralClassRunLiteral(
                     fre_kernels::LiteralClassRunLiteralSearchError::InvalidWindow { .. }
+                )
+            ))
+        ));
+        assert!(!invalid_callback);
+    }
+
+    #[test]
+    fn ordinary_bounded_byte_class_repeat_visits_each_maximal_run_once() {
+        fn selected_spans(
+            regex: &PortableRegex,
+            haystack: &[u8],
+            start: usize,
+        ) -> Vec<(usize, usize)> {
+            let mut cursor = start;
+            let mut spans = Vec::new();
+            while let Some(matched) = regex
+                .find_at_value(haystack, cursor, SearchLimits::unlimited())
+                .unwrap()
+            {
+                assert!(matched.end() > cursor);
+                spans.push((matched.start(), matched.end()));
+                cursor = matched.end();
+            }
+            spans
+        }
+
+        let haystack = b"!aab!!baba!c!abb!aaaaaa!";
+        for pattern in [
+            r"(?-u:[ab]{2,5})",
+            r"(?-u:[ab]{2,5}?)",
+            r"(?-u:[^!]{2,5})",
+            r"(?-u:[aceg]{1,3}?)",
+        ] {
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert!(matches!(
+                &regex.plan,
+                PortablePlan::BoundedByteClassRepeat(_)
+            ));
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(bound_regex)
+                ) if core::ptr::eq(*bound_regex, &regex)
+            ));
+
+            for start in 0..=haystack.len() {
+                let expected = selected_spans(&regex, haystack, start);
+                let mut actual = Vec::new();
+                assert_eq!(
+                    ordinary
+                        .try_visit_spans_at(haystack, start, |matched| {
+                            actual.push((matched.start(), matched.end()));
+                            Ok::<bool, ()>(true)
+                        })
+                        .unwrap(),
+                    Ok(()),
+                    "pattern={pattern:?}, start={start}",
+                );
+                assert_eq!(actual, expected, "pattern={pattern:?}, start={start}");
+            }
+        }
+
+        let regex = PortableBuilder::new(r"(?-u:[ab]{2,5})")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected_first = regex
+            .find_at_value(haystack, 0, SearchLimits::unlimited())
+            .unwrap()
+            .map(|matched| (matched.start(), matched.end()))
+            .unwrap();
+        let mut ordinary = regex.ordinary_session().unwrap();
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |matched| {
+                    stopped.push((matched.start(), matched.end()));
+                    Ok::<bool, &'static str>(false)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(stopped, [expected_first]);
+
+        let mut errored = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(haystack, |matched| {
+                    errored.push((matched.start(), matched.end()));
+                    Err::<bool, _>("callback")
+                })
+                .unwrap(),
+            Err("callback"),
+        );
+        assert_eq!(errored, [expected_first]);
+
+        let mut invalid_callback = false;
+        assert!(matches!(
+            ordinary.try_visit_spans_at(haystack, haystack.len() + 1, |_| {
+                invalid_callback = true;
+                Ok::<bool, ()>(true)
+            }),
+            Err(PortableFindIterError::Search(
+                SearchError::PureByteClassRepeat(
+                    super::PureByteClassRepeatSearchError::InvalidWindow
                 )
             ))
         ));

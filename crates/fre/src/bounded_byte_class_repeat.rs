@@ -22,6 +22,8 @@ const NODE_INSPECTION_WORK: u64 = 1;
 const RANGE_INSPECTION_WORK: u64 = 1;
 const MEMBER_INSERTION_WORK: u64 = 1;
 const LEAF_SELECTION_WORK: u64 = 1;
+const ORDINARY_SPAN_FRONT_PROOF_BYTES: usize = 16;
+const ORDINARY_SPAN_FRONT_MAX_GAP_BYTES: usize = 2;
 
 type SearchError = Error;
 
@@ -232,6 +234,38 @@ impl Plan {
             .expect("the fixed bounded byte-class repeat layouts fit usize")
     }
 
+    /// Whether a bounded, source-independent prefix proof admits direct
+    /// ordinary span traversal from `start`.
+    ///
+    /// Keeping this proof small makes refusal negligible for sparse and miss
+    /// inputs, which retain the established canonical iterator. A qualified
+    /// front proves the direct visitor will produce a span after at most one
+    /// tiny rejected prefix.
+    #[inline]
+    pub(crate) fn ordinary_span_front_is_qualified(
+        &self,
+        haystack: &[u8],
+        start: usize,
+    ) -> bool {
+        let owner = self.owner();
+        let minimum = usize::try_from(owner.minimum)
+            .expect("one repetition minimum fits the target index width");
+        if minimum > ORDINARY_SPAN_FRONT_PROOF_BYTES {
+            return false;
+        }
+        let Some(proof_bytes) = minimum
+            .checked_add(ORDINARY_SPAN_FRONT_MAX_GAP_BYTES)
+        else {
+            return false;
+        };
+        if start > haystack.len() {
+            return false;
+        }
+        let end = start.saturating_add(proof_bytes).min(haystack.len());
+        self.qualifying_search_value(haystack, SearchWindow::new(start, end))
+            .is_some()
+    }
+
     /// Count non-overlapping selected matches in one ordinary full-tail
     /// projection without constructing spans, windows, or accounting.
     ///
@@ -405,6 +439,125 @@ impl Plan {
             };
         }
         count
+    }
+
+    /// Visit non-overlapping selected spans after the ordinary facade has
+    /// selected unlimited execution.
+    ///
+    /// The construction proof seals positive width, so every accepted span
+    /// advances the cursor to its selected end. On ordinary targets one
+    /// validation therefore covers the complete monotone traversal; the
+    /// source-independent metered fallback is retained only for a target whose
+    /// address space can represent a slice wider than `u64`.
+    #[inline(never)]
+    pub(crate) fn try_visit_spans_ordinary<F, E>(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, SearchError>
+    where
+        F: FnMut(Match) -> Result<bool, E>,
+    {
+        let window = SearchWindow::new(start, haystack.len());
+        validate_window(haystack, window)?;
+        let unmetered = unmetered_work_fits(window);
+        if unmetered && self.ordinary_span_front_is_qualified(haystack, start) {
+            let owner = self.owner();
+            let minimum = usize::try_from(owner.minimum)
+                .expect("one repetition minimum fits the target index width");
+            let maximum = usize::try_from(owner.maximum)
+                .expect("one repetition maximum fits the target index width");
+            debug_assert!(minimum > 0 && maximum >= minimum);
+            let selected_width = if owner.greedy { maximum } else { minimum };
+            let mut position = start;
+
+            while let Some(run_start) = owner.member_seek.seek_unmetered(
+                haystack,
+                position,
+                haystack.len(),
+                owner.classifier.as_ref(),
+            ) {
+                let after_first = run_start
+                    .checked_add(1)
+                    .expect("a selected byte before the slice end can advance once");
+                let run_end = owner
+                    .run_end_seek
+                    .seek_unmetered(
+                        haystack,
+                        after_first,
+                        haystack.len(),
+                        owner.classifier.as_ref(),
+                    )
+                    .unwrap_or(haystack.len());
+                let mut matched_start = run_start;
+                while run_end
+                    .checked_sub(matched_start)
+                    .expect("a maximal member run ends after its selected spans")
+                    >= minimum
+                {
+                    let matched_end = matched_start
+                        .saturating_add(selected_width)
+                        .min(run_end);
+                    debug_assert!(matched_end > matched_start);
+                    match visitor(Match {
+                        start: matched_start,
+                        end: matched_end,
+                    }) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(Ok(())),
+                        Err(error) => return Ok(Err(error)),
+                    }
+                    matched_start = matched_end;
+                }
+                position = if run_end < haystack.len() {
+                    run_end
+                        .checked_add(1)
+                        .expect("a run-ending byte before the slice end can advance once")
+                } else {
+                    run_end
+                };
+            }
+            return Ok(Ok(()));
+        }
+
+        if unmetered {
+            let mut cursor = start;
+            while let Some((matched_start, matched_end)) = self.selected_search_value(
+                haystack,
+                SearchWindow::new(cursor, haystack.len()),
+            ) {
+                debug_assert!(matched_end > cursor);
+                cursor = matched_end;
+                match visitor(Match {
+                    start: matched_start,
+                    end: matched_end,
+                }) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Ok(())),
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            return Ok(Ok(()));
+        }
+
+        let mut cursor = start;
+        loop {
+            let Some(matched) = self.find_window_value(
+                haystack,
+                SearchWindow::new(cursor, haystack.len()),
+                SearchLimits::unlimited(),
+            )? else {
+                return Ok(Ok(()));
+            };
+            debug_assert!(matched.end() > cursor);
+            cursor = matched.end();
+            match visitor(matched) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
     }
 
     pub(crate) fn is_match_window(
