@@ -2232,13 +2232,13 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     /// need no special-state classification.
     #[inline(always)]
     fn next_uniform_end(&mut self, pattern_bytes: usize) -> Option<usize> {
-        self.next_uniform_end_impl::<false>(pattern_bytes)
+        self.next_uniform_end_impl::<true>(pattern_bytes)
     }
 
     /// Count-only companion to [`Self::next_uniform_end`]. Four straight
     /// transitions reduce loop edges across the construction-proved
-    /// nonaccepting prefix. Selected-span operations retain the smaller
-    /// scalar projection above.
+    /// nonaccepting prefix. Selected-span operations share that prefix body
+    /// while retaining their separate bounded-near-match control flow.
     #[inline(always)]
     fn next_uniform_count_end(&mut self, pattern_bytes: usize) -> Option<usize> {
         self.next_uniform_end_impl::<true>(pattern_bytes)
