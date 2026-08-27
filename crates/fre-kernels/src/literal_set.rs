@@ -2179,6 +2179,56 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         self.next::<false>().map(|matched| matched.end)
     }
 
+    /// Return the next selected endpoint for a construction-proved uniform
+    /// positive-width language.
+    ///
+    /// Equal widths make the first accepting endpoint authoritative: it is
+    /// also the earliest start, and source priority at that start cannot
+    /// change the exposed endpoint. No acceptance is possible before one
+    /// complete pattern width has been consumed, so the initial transitions
+    /// need no special-state classification.
+    #[inline(always)]
+    fn next_uniform_end(&mut self, pattern_bytes: usize) -> Option<usize> {
+        debug_assert!(pattern_bytes > 0);
+        let anchored = Anchored::No;
+        let mut state = self.start_state;
+        let mut at = self.restart;
+        let classification_start = at
+            .saturating_add(pattern_bytes.saturating_sub(1))
+            .min(self.end);
+        while at < classification_start {
+            state = self.automaton.next_state(anchored, state, self.haystack[at]);
+            at += 1;
+            debug_assert!(
+                !self.automaton.is_special(state),
+                "a uniform positive-width DFA accepted before one complete width",
+            );
+        }
+        while at < self.end {
+            state = self.automaton.next_state(anchored, state, self.haystack[at]);
+            at += 1;
+            debug_assert_eq!(
+                self.automaton.is_special(state),
+                state < self.start_state,
+                "Aho's concrete DFA special-state ordering changed",
+            );
+            if state < self.start_state {
+                if self.automaton.is_dead(state) {
+                    self.restart = self.end;
+                    return None;
+                }
+                debug_assert!(
+                    self.automaton.is_match(state),
+                    "a DFA without a prefilter has no other special states",
+                );
+                self.restart = at;
+                return Some(at);
+            }
+        }
+        self.restart = self.end;
+        None
+    }
+
     #[inline(always)]
     fn next_span(&mut self) -> Option<(usize, usize)> {
         let restart = self.restart;
@@ -2552,6 +2602,23 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         self.direct_dfa_identity.is_some()
     }
 
+    /// Return whether construction proved that every alternative has one
+    /// shared positive byte width.
+    ///
+    /// The equality is authoritative because `pattern_bytes` is the checked
+    /// sum of every alternative width and `minimum_pattern_bytes` is their
+    /// checked minimum. Callers may therefore use earliest acceptance as the
+    /// selected endpoint without recovering a canonical LeftmostFirst seed.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn is_uniform_positive(&self) -> bool {
+        let build = self.plan.build;
+        build.minimum_pattern_bytes > 0
+            && build.minimum_pattern_bytes.checked_mul(build.patterns)
+                == Some(build.pattern_bytes)
+    }
+
     /// Bind the capability to select first acceptance by scanning this same
     /// DFA without consulting its construction-selected prefilter.
     #[doc(hidden)]
@@ -2788,15 +2855,27 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         let mut count = 0_usize;
         if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
             let mut previous_end = window.start();
-            while let Some(selected_end) = scanner.next_end() {
-                debug_assert!(
-                    selected_end > previous_end,
-                    "a positive-width literal-set count must advance",
-                );
-                previous_end = selected_end;
-                // Positive-width, non-overlapping spans bound the final count
-                // by this already-validated window's `usize` byte length.
-                count += 1;
+            let build = self.plan.build;
+            if self.is_uniform_positive() {
+                while let Some(selected_end) =
+                    scanner.next_uniform_end(build.minimum_pattern_bytes)
+                {
+                    debug_assert!(
+                        selected_end > previous_end,
+                        "a positive-width literal-set count must advance",
+                    );
+                    previous_end = selected_end;
+                    count += 1;
+                }
+            } else {
+                while let Some(selected_end) = scanner.next_end() {
+                    debug_assert!(
+                        selected_end > previous_end,
+                        "a positive-width literal-set count must advance",
+                    );
+                    previous_end = selected_end;
+                    count += 1;
+                }
             }
         } else {
             let mut cursor = window.start();
@@ -7080,6 +7159,7 @@ mod tests {
             let plan = LiteralSetPlan::new(patterns, LiteralSetBuildLimits::default()).unwrap();
             assert!(plan.build.minimum_pattern_bytes < plan.automaton.max_pattern_len());
             let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+            assert!(!ordinary.is_uniform_positive());
             for &haystack in haystacks {
                 for start in 0..=haystack.len() {
                     for end in start..=haystack.len() {
@@ -7146,6 +7226,84 @@ mod tests {
                 &[0, 0, 0, 1, 1, 1, 1],
             ],
         );
+    }
+
+    #[test]
+    fn ordinary_uniform_leftmost_count_stops_at_first_possible_acceptance() {
+        let mut patterns = Vec::new();
+        for (root, low, high) in [
+            (b'B', b'p', b'q'),
+            (b'F', b'r', b's'),
+            (b'J', b't', b'u'),
+            (b'N', b'v', b'w'),
+        ] {
+            for ordinal in 0_u8..17 {
+                let mut pattern = vec![low; 16];
+                pattern[0] = root;
+                pattern[1] = high;
+                for bit in 0..5 {
+                    pattern[2 + bit] = if ordinal & (1 << bit) == 0 { low } else { high };
+                }
+                patterns.push(pattern);
+            }
+        }
+        let plan = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        assert_eq!(plan.automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert!(plan.automaton.prefilter().is_none());
+        assert_eq!(plan.build.minimum_pattern_bytes, 16);
+        assert_eq!(plan.build.pattern_bytes, 16 * plan.build.patterns);
+        let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+        assert!(ordinary.direct_count_scanner_supported());
+        assert!(ordinary.is_uniform_positive());
+
+        let mut dense = Vec::new();
+        for index in [0, 18, 36, 54] {
+            dense.extend_from_slice(&patterns[index]);
+            dense.extend_from_slice(b"xx");
+        }
+        let false_roots = b"BxFxJxNx".repeat(8);
+        let repeated = patterns[7].repeat(4);
+        for haystack in [
+            b"no exact root is present".as_slice(),
+            false_roots.as_slice(),
+            dense.as_slice(),
+            repeated.as_slice(),
+        ] {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = Window::new(start, end);
+                    let mut expected = Vec::new();
+                    let mut cursor = start;
+                    while cursor < end {
+                        let Some(matched) = plan
+                            .automaton
+                            .try_find(&Input::new(haystack).span(cursor..end))
+                            .unwrap()
+                        else {
+                            break;
+                        };
+                        expected.push(matched.end());
+                        cursor = matched.end();
+                    }
+
+                    let mut scanner = LiteralSetDfaScanner::new(ordinary, haystack, window)
+                        .expect("the direct endpoint scanner is bound");
+                    let mut actual = Vec::new();
+                    while let Some(end) = scanner.next_uniform_end(16) {
+                        actual.push(end);
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "haystack={haystack:?}, window={window:?}",
+                    );
+                    assert_eq!(
+                        ordinary.count_spans_window_value(haystack, window),
+                        Ok(u64::try_from(expected.len()).unwrap()),
+                        "haystack={haystack:?}, window={window:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
