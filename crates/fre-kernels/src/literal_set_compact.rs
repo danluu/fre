@@ -24,7 +24,33 @@ const MIN_PATTERNS: usize = 129;
 const MAX_PATTERNS: usize = 256;
 const MIN_PATTERN_BYTES: usize = 128;
 const MIN_DENSE_BUILD_WORK: usize = 8 * 1024 * 1024;
+// The ordinary owner retains only the compact NFA. It can therefore admit
+// shorter, wider-cardinality sets without paying the dual owner's persistent
+// DFA cost. Keep a construction-work floor so small canonical DFAs remain on
+// their established path.
+const ORDINARY_MAX_PATTERNS: usize = 4_096;
+const ORDINARY_MIN_PATTERN_BYTES: usize = 8;
+const ORDINARY_MIN_DENSE_BUILD_WORK: usize = 4 * 1024 * 1024;
 const MAX_DENSE_DEPTH: usize = 24;
+
+#[derive(Clone, Copy, Debug)]
+struct CompactAdmission {
+    max_patterns: usize,
+    min_pattern_bytes: usize,
+    min_dense_build_work: usize,
+}
+
+const DUAL_ADMISSION: CompactAdmission = CompactAdmission {
+    max_patterns: MAX_PATTERNS,
+    min_pattern_bytes: MIN_PATTERN_BYTES,
+    min_dense_build_work: MIN_DENSE_BUILD_WORK,
+};
+
+const ORDINARY_ADMISSION: CompactAdmission = CompactAdmission {
+    max_patterns: ORDINARY_MAX_PATTERNS,
+    min_pattern_bytes: ORDINARY_MIN_PATTERN_BYTES,
+    min_dense_build_work: ORDINARY_MIN_DENSE_BUILD_WORK,
+};
 
 #[derive(Clone, Debug)]
 struct CompactEngine {
@@ -155,16 +181,26 @@ enum CompactPreflight {
 /// already-sorted source, the deepest pairwise LCP is witnessed by adjacent
 /// patterns, so one bounded pass finds the exact depth without copying or
 /// sorting construction input.
-fn deepest_branch_dense_depth<P: AsRef<[u8]>>(
+#[cfg(test)]
+fn deepest_branch_dense_depth<P: AsRef<[u8]>>(patterns: &[P], width: usize) -> Option<usize> {
+    deepest_branch_dense_depth_with_limit(patterns, width, MAX_PATTERNS)
+}
+
+fn deepest_branch_dense_depth_with_limit<P: AsRef<[u8]>>(
     patterns: &[P],
     width: usize,
+    max_patterns: usize,
 ) -> Option<usize> {
-    debug_assert!(patterns.iter().all(|pattern| pattern.as_ref().len() == width));
+    debug_assert!(
+        patterns
+            .iter()
+            .all(|pattern| pattern.as_ref().len() == width)
+    );
     let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
     if probe_depth == 0 || patterns.len() < 2 {
         return Some(0);
     }
-    if patterns.len() > MAX_PATTERNS {
+    if patterns.len() > max_patterns {
         return None;
     }
 
@@ -192,8 +228,17 @@ fn deepest_branch_dense_depth<P: AsRef<[u8]>>(
     Some(deepest)
 }
 
+#[cfg(test)]
 fn deepest_branch_build_work_upper_bound(patterns: usize, width: usize) -> Option<usize> {
-    if patterns > MAX_PATTERNS {
+    deepest_branch_build_work_upper_bound_with_limit(patterns, width, MAX_PATTERNS)
+}
+
+fn deepest_branch_build_work_upper_bound_with_limit(
+    patterns: usize,
+    width: usize,
+    max_patterns: usize,
+) -> Option<usize> {
+    if patterns > max_patterns {
         return None;
     }
     let probe_depth = width.saturating_sub(1).min(MAX_DENSE_DEPTH);
@@ -209,19 +254,37 @@ fn compact_preflight<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: LiteralSetBuildLimits,
 ) -> Result<CompactPreflight, LiteralSetError> {
-    if !(MIN_PATTERNS..=MAX_PATTERNS).contains(&patterns.len()) {
+    compact_preflight_with_admission(patterns, limits, DUAL_ADMISSION)
+}
+
+fn compact_ordinary_preflight<P: AsRef<[u8]>>(
+    patterns: &[P],
+    limits: LiteralSetBuildLimits,
+) -> Result<CompactPreflight, LiteralSetError> {
+    compact_preflight_with_admission(patterns, limits, ORDINARY_ADMISSION)
+}
+
+fn compact_preflight_with_admission<P: AsRef<[u8]>>(
+    patterns: &[P],
+    limits: LiteralSetBuildLimits,
+    admission: CompactAdmission,
+) -> Result<CompactPreflight, LiteralSetError> {
+    if !(MIN_PATTERNS..=admission.max_patterns).contains(&patterns.len()) {
         return Ok(CompactPreflight::NotApplicable);
     }
     let canonical_build = preflight(patterns, limits, LiteralSetMatchSemantics::LeftmostFirst)?;
     let width = canonical_build.minimum_pattern_bytes;
-    let uniform_positive = width >= MIN_PATTERN_BYTES
+    let uniform_positive = width >= admission.min_pattern_bytes
         && width.checked_mul(canonical_build.patterns) == Some(canonical_build.pattern_bytes);
-    if !uniform_positive || canonical_build.build_work_upper_bound < MIN_DENSE_BUILD_WORK {
+    if !uniform_positive || canonical_build.build_work_upper_bound < admission.min_dense_build_work
+    {
         return Ok(CompactPreflight::Canonical(canonical_build));
     }
-    let Some(deepest_branch_build_work) =
-        deepest_branch_build_work_upper_bound(canonical_build.patterns, width)
-    else {
+    let Some(deepest_branch_build_work) = deepest_branch_build_work_upper_bound_with_limit(
+        canonical_build.patterns,
+        width,
+        admission.max_patterns,
+    ) else {
         return Ok(CompactPreflight::Canonical(canonical_build));
     };
     // Contiguous conversion writes every encoded transition and then remaps
@@ -243,7 +306,9 @@ fn compact_preflight<P: AsRef<[u8]>>(
     if compact_build_work > limits.max_build_work {
         return Ok(CompactPreflight::Canonical(canonical_build));
     }
-    let Some(dense_depth) = deepest_branch_dense_depth(patterns, width) else {
+    let Some(dense_depth) =
+        deepest_branch_dense_depth_with_limit(patterns, width, admission.max_patterns)
+    else {
         return Ok(CompactPreflight::Canonical(canonical_build));
     };
     // Retain the established three-owner envelope. It conservatively covers
@@ -561,7 +626,7 @@ impl LiteralSetCompactOrdinaryPlan {
         limits: LiteralSetBuildLimits,
     ) -> Result<LiteralSetCompactOrdinaryBuildOutcome, LiteralSetError> {
         let (canonical_build, mut compact_build, width, dense_depth) =
-            match compact_preflight(patterns, limits)? {
+            match compact_ordinary_preflight(patterns, limits)? {
                 CompactPreflight::NotApplicable => {
                     return Ok(LiteralSetCompactOrdinaryBuildOutcome::NotApplicable);
                 }
@@ -964,12 +1029,12 @@ mod tests {
     use aho_corasick::{Anchored, MatchKind};
 
     use super::{
-        ALPHABET_LEN, BYTES_PER_DFA_CELL_ENVELOPE, BYTES_PER_TRIE_STATE_ENVELOPE, CompactPreflight,
-        CompactOrdinaryScanner, LiteralSetCompactBuildOutcome,
+        ALPHABET_LEN, BYTES_PER_DFA_CELL_ENVELOPE, BYTES_PER_TRIE_STATE_ENVELOPE,
+        CompactOrdinaryScanner, CompactPreflight, LiteralSetCompactBuildOutcome,
         LiteralSetCompactOrdinaryBuildOutcome, LiteralSetCompactOrdinaryCandidate,
         LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan, MAX_DENSE_DEPTH, MAX_PATTERNS,
-        MIN_PATTERN_BYTES, compact_ordinary_scanner_probe, compact_preflight,
-        deepest_branch_build_work_upper_bound, deepest_branch_dense_depth,
+        MIN_PATTERN_BYTES, compact_ordinary_preflight, compact_ordinary_scanner_probe,
+        compact_preflight, deepest_branch_build_work_upper_bound, deepest_branch_dense_depth,
     };
     use crate::{
         LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, Window,
@@ -1427,6 +1492,125 @@ mod tests {
     }
 
     #[test]
+    fn wider_ordinary_admission_leaves_dual_policy_and_resource_boundaries_unchanged() {
+        let admitted = public_patterns(1_024, 19);
+        let borrowed = admitted.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert!(matches!(
+            compact_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap(),
+            CompactPreflight::NotApplicable,
+        ));
+        assert!(matches!(
+            compact_ordinary_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap(),
+            CompactPreflight::Eligible { .. },
+        ));
+
+        let below_work = public_patterns(512, 19);
+        let borrowed = below_work.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert!(matches!(
+            compact_ordinary_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap(),
+            CompactPreflight::Canonical(_),
+        ));
+
+        let resource_refused = public_patterns(4_096, 19);
+        let borrowed = resource_refused
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            compact_ordinary_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap(),
+            CompactPreflight::Canonical(_),
+        ));
+
+        let over_cardinality = public_patterns(4_097, 19);
+        let borrowed = over_cardinality
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            compact_ordinary_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap(),
+            CompactPreflight::NotApplicable,
+        ));
+    }
+
+    #[test]
+    fn wider_ordinary_owner_matches_canonical_windows_and_callback_control() {
+        let patterns = public_patterns(1_024, 19);
+        let canonical =
+            LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let canonical = canonical
+            .ordinary_executor()
+            .expect("the uniform canonical DFA binds ordinary search");
+        let ordinary_plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the wider ordinary policy admits 1024x19")
+            .into_ordinary();
+        let ordinary = ordinary_plan.ordinary_executor();
+
+        let mut haystack = vec![0xff, b'x'];
+        haystack.extend_from_slice(&patterns[0]);
+        haystack.push(0x80);
+        haystack.extend_from_slice(&patterns[1_023]);
+        haystack.extend_from_slice(&patterns[17]);
+        haystack.extend_from_slice(b"public000");
+        haystack.push(0xfe);
+
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = Window::new(start, end);
+                assert_eq!(
+                    ordinary.find_window_value(&haystack, window),
+                    canonical.find_window_value(&haystack, window),
+                    "find window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.exists_window_value(&haystack, window),
+                    canonical.exists_window_value(&haystack, window),
+                    "exists window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.count_spans_window_value(&haystack, window),
+                    canonical.count_spans_window_value(&haystack, window),
+                    "count window={window:?}",
+                );
+                let mut expected = Vec::new();
+                canonical
+                    .try_visit_spans_window_value(&haystack, window, |span| {
+                        expected.push(span);
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap()
+                    .unwrap();
+                let mut actual = Vec::new();
+                ordinary
+                    .try_visit_spans_window_value(&haystack, window, |span| {
+                        actual.push(span);
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(actual, expected, "spans window={window:?}");
+            }
+        }
+
+        let full = Window::full(&haystack);
+        let mut stopped = 0;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, full, |_| {
+                stopped += 1;
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(stopped, 1);
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, full, |_| {
+                Err::<bool, _>("wide callback")
+            }),
+            Ok(Err("wide callback")),
+        );
+    }
+
+    #[test]
     fn uniform_spans_match_dense_across_overlap_adjacency_and_windows() {
         let patterns = (0_u16..=255)
             .map(|index| {
@@ -1791,7 +1975,7 @@ mod tests {
             LiteralSetCompactOrdinaryBuildOutcome::NotApplicable,
         ));
 
-        let below_work = public_patterns(129, 253);
+        let below_work = public_patterns(129, 125);
         assert!(matches!(
             ordinary_outcome(&below_work, LiteralSetBuildLimits::default()).unwrap(),
             LiteralSetCompactOrdinaryBuildOutcome::Canonical(_),
