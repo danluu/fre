@@ -3444,6 +3444,11 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                 Ok(false) => return Ok(Ok(())),
                 Err(error) => return Ok(Err(error)),
             }
+            // Root seeking wins when selected spans are sparse, but its
+            // bounded native prefix adds control flow to every dense span.
+            // Two adjacent selections provide source-local evidence for the
+            // incumbent direct scanner without retaining any haystack state.
+            let mut previous_end = first.1;
             if reuse_prepared_root {
                 while let Some(matched) =
                     scanner.next_span_with_prepared_ascii_root(
@@ -3451,10 +3456,25 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                         minimum_bytes,
                     )
                 {
+                    let follows_match_nearby = matched
+                        .0
+                        .saturating_sub(previous_end)
+                        <= ORDINARY_UNIFORM_SPAN_MAX_GAP_BYTES;
                     match visitor(matched) {
                         Ok(true) => {}
                         Ok(false) => return Ok(Ok(())),
                         Err(error) => return Ok(Err(error)),
+                    }
+                    previous_end = matched.1;
+                    if follows_match_nearby {
+                        while let Some(matched) = scanner.next_span() {
+                            match visitor(matched) {
+                                Ok(true) => {}
+                                Ok(false) => return Ok(Ok(())),
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        }
+                        break;
                     }
                 }
             } else {
@@ -3464,10 +3484,25 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                         minimum_bytes,
                     )
                 {
+                    let follows_match_nearby = matched
+                        .0
+                        .saturating_sub(previous_end)
+                        <= ORDINARY_UNIFORM_SPAN_MAX_GAP_BYTES;
                     match visitor(matched) {
                         Ok(true) => {}
                         Ok(false) => return Ok(Ok(())),
                         Err(error) => return Ok(Err(error)),
+                    }
+                    previous_end = matched.1;
+                    if follows_match_nearby {
+                        while let Some(matched) = scanner.next_span() {
+                            match visitor(matched) {
+                                Ok(true) => {}
+                                Ok(false) => return Ok(Ok(())),
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        }
+                        break;
                     }
                 }
             }
