@@ -3972,6 +3972,10 @@ pub struct CompiledModule {
     /// correlated two-byte suffix scanner. This compiler-only bit drives an
     /// exact-incumbent final-object retry and never enters frozen data.
     exact_pair_suffix_lowered: bool,
+    /// Whether the ordinary complete-DFA text owns the additive lazy
+    /// complete-pair relation verifier. This compiler-only bit drives a
+    /// same-route final-object retry and never enters frozen data.
+    complete_pair_relation_handoff_lowered: bool,
     /// Whether this exact Ordered-NFA text specializes the canonical start
     /// closure. This compiler-only bit drives monotone final-object retries;
     /// the immutable V1/V2/V3 object ABI remains unchanged.
@@ -4264,6 +4268,10 @@ struct NativeLowering {
     /// This drives a final-object retry to the exact pre-feature complete-DFA
     /// portfolio and never enters frozen data.
     exact_pair_suffix_lowered: bool,
+    /// Compiler-only receipt for the lazy complete-pair relation verifier.
+    /// This drives a final-object retry that removes only its additive text
+    /// and never enters frozen data.
+    complete_pair_relation_handoff_lowered: bool,
     /// Target-final physical identity of the one public exact-finite Exists
     /// complete-DFA incumbent. The receipt is authenticated before an
     /// additive wrapper may decline for resources and is consumed when that
@@ -5974,17 +5982,40 @@ impl CompiledModule {
         allow_synchronizing_accept_reverse: bool,
         allow_exact_pair: bool,
     ) -> Result<Self, CompileError> {
+        Self::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+            program,
+            target,
+            max_native_data_bytes,
+            allow_synchronizing_accept_reverse,
+            allow_exact_pair,
+            true,
+        )
+    }
+
+    /// Rebuild the exact ordinary complete-DFA portfolio while independently
+    /// selecting its additive suffix scanners and lazy complete-pair relation
+    /// verifier. Final object-size retries use this seam to restore the exact
+    /// pre-verifier incumbent without changing native data or route policy.
+    pub(crate) fn lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+        allow_synchronizing_accept_reverse: bool,
+        allow_exact_pair: bool,
+        allow_complete_pair_relation_handoff: bool,
+    ) -> Result<Self, CompileError> {
         target.validate()?;
         let native = program.native_dfa_view().ok_or(CompileError::InternalInvariant(
             "suffix-accelerator retry has no ordinary complete DFA",
         ))?;
-        let lowering = lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
+        let lowering = lower_native_dfa_with_entry_contract_data_limit_optional_and_handoff_policy(
             native,
             target,
             NativeDfaEntryContract::Public,
             max_native_data_bytes,
             allow_synchronizing_accept_reverse,
             allow_exact_pair,
+            allow_complete_pair_relation_handoff,
         )?
         .ok_or(CompileError::InternalInvariant(
             "suffix-accelerator retry did not restore its complete DFA",
@@ -5997,6 +6028,13 @@ impl CompiledModule {
         if !allow_exact_pair && lowering.exact_pair_suffix_lowered {
             return Err(CompileError::InternalInvariant(
                 "exact-pair retry retained the disabled scanner",
+            ));
+        }
+        if !allow_complete_pair_relation_handoff
+            && lowering.complete_pair_relation_handoff_lowered
+        {
+            return Err(CompileError::InternalInvariant(
+                "complete-pair relation retry retained the disabled verifier",
             ));
         }
         Self::lower_serialized_with_prelowered(
@@ -9817,6 +9855,8 @@ impl CompiledModule {
             synchronizing_accept_reverse_lowered: lowering
                 .synchronizing_accept_reverse_lowered,
             exact_pair_suffix_lowered: lowering.exact_pair_suffix_lowered,
+            complete_pair_relation_handoff_lowered: lowering
+                .complete_pair_relation_handoff_lowered,
             ordered_nfa_start_closure_dispatch_lowered: matches!(
                 prepared_layout.map(|layout| layout.kind),
                 Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
@@ -10626,6 +10666,10 @@ impl CompiledModule {
 
     pub(crate) const fn has_exact_pair_suffix(&self) -> bool {
         self.exact_pair_suffix_lowered
+    }
+
+    pub(crate) const fn has_complete_pair_relation_handoff(&self) -> bool {
+        self.complete_pair_relation_handoff_lowered
     }
 
     /// Carry the selected scheduler transaction's fallback permission onto a
@@ -18610,6 +18654,7 @@ fn lower_runtime_adapter(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -18862,6 +18907,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -19297,6 +19343,7 @@ fn lower_native_endpoint_oracle_prepared(
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -19647,6 +19694,7 @@ fn lower_native_dynamic_rows_prepared(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -19872,6 +19920,7 @@ fn lower_native_slow_partial_with_data_limit(
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         exact_finite_exists_complete_dfa_receipt: None,
         exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
         direct_search_trusted_core: None,
@@ -21169,6 +21218,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -21928,6 +21978,7 @@ fn lower_native_partial_prepared(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -28175,6 +28226,12 @@ struct NativeSeededReverseLayout {
     /// start is globally leftmost, so endpoint contracts may replay forward
     /// immediately instead of scanning later mandatory-factor candidates.
     first_endpoint_proves_no_earlier_match: bool,
+    /// The graph, width, output, and target route jointly prove that the
+    /// installed two-byte prefix relation is the complete fixed-width
+    /// language. This receipt lets AArch64 authenticate suffix-primary hits
+    /// lazily with that exact relation before handing them to the ordinary
+    /// authoritative forward DFA.
+    complete_pair_relation_handoff_eligible: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28275,6 +28332,8 @@ struct NativePrefixRelationFilter {
     /// two-byte word `first | (second << 8)`.
     bitmap_offset: u32,
     vector_plan: Option<NativePrefixRelationVectorPlan>,
+    /// Whether assertion erasure widened the graph-derived pair relation.
+    context_assertions: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29384,6 +29443,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -29543,6 +29603,7 @@ fn lower_selected_native_finite_language(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -29834,11 +29895,18 @@ fn lower_native_dfa_with_data_limit(
     target: Target,
     max_native_data_bytes: usize,
 ) -> Result<Option<NativeLowering>, ObjectError> {
-    lower_native_dfa_with_entry_contract_and_data_limit(
+    // This helper serves speculative slow/K0 owners whose final-object retry
+    // cannot regenerate the same compiler-owned graph. Keep the additive
+    // ordinary complete-pair verifier on the independently reproducible
+    // ordinary route below instead of publishing an unrollbackable receipt.
+    lower_native_dfa_with_entry_contract_data_limit_optional_and_handoff_policy(
         view,
         target,
         NativeDfaEntryContract::Public,
         max_native_data_bytes,
+        false,
+        false,
+        false,
     )
 }
 
@@ -29884,6 +29952,7 @@ fn lower_exact_finite_exists_teddy_incumbent_with_data_limit(
             true,
             true,
             NativeExactFiniteExistsCompleteDfaReceiptPolicy::Capture,
+            true,
         ),
         max_native_data_bytes,
     )
@@ -30240,6 +30309,26 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
     allow_synchronizing_accept_reverse: bool,
     allow_exact_pair: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_optional_and_handoff_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        allow_exact_pair,
+        true,
+    )
+}
+
+fn lower_native_dfa_with_entry_contract_data_limit_optional_and_handoff_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+    allow_complete_pair_relation_handoff: bool,
+) -> Result<Option<NativeLowering>, ObjectError> {
     lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
         view,
         target,
@@ -30248,6 +30337,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
         allow_synchronizing_accept_reverse,
         allow_exact_pair,
         NativeExactFiniteExistsCompleteDfaReceiptPolicy::None,
+        allow_complete_pair_relation_handoff,
     )
 }
 
@@ -30259,6 +30349,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
     allow_synchronizing_accept_reverse: bool,
     allow_exact_pair: bool,
     receipt_policy: NativeExactFiniteExistsCompleteDfaReceiptPolicy,
+    allow_complete_pair_relation_handoff: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
     let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
@@ -30276,6 +30367,12 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
                 && entry_contract == NativeDfaEntryContract::Public,
             allow_exact_pair && entry_contract == NativeDfaEntryContract::Public,
         )?;
+    if (!allow_complete_pair_relation_handoff
+        || entry_contract != NativeDfaEntryContract::Public)
+        && let Some(reverse) = layout.seeded_reverse.as_mut()
+    {
+        reverse.complete_pair_relation_handoff_eligible = false;
+    }
     let synchronizing_accept_reverse_lowered = layout.seeded_reverse.is_some()
         && layout.suffix_filter.is_some_and(|suffix| {
             matches!(suffix.restart, NativeSuffixRestart::Synchronizing { .. })
@@ -30456,6 +30553,12 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
         && layout
             .suffix_filter
             .is_some_and(|suffix| suffix.exact_pair_filter.is_some());
+    let complete_pair_relation_handoff_lowered = entry_contract
+        == NativeDfaEntryContract::Public
+        && layout.mandatory_teddy.is_none()
+        && layout.seeded_reverse.is_some_and(|reverse| {
+            reverse.complete_pair_relation_handoff_eligible
+        });
     let anchored_prefix_filter_bytes = layout
         .prefix_filter
         .map_or(0, |filter| filter.guaranteed_bytes);
@@ -30495,6 +30598,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
         anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
+        complete_pair_relation_handoff_lowered,
         exact_finite_exists_complete_dfa_receipt,
         exact_finite_exists_complete_dfa_expected_receipt_sha256,
         direct_search_trusted_core: emission.direct_search_trusted_core,
@@ -32892,6 +32996,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                     proves_match: machine.proves_match,
                     first_endpoint_proves_no_earlier_match: machine
                         .first_endpoint_proves_no_earlier_match,
+                    complete_pair_relation_handoff_eligible: false,
                 }),
                 bytes,
             )
@@ -33692,6 +33797,34 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         start_filter,
         exact_start_byte_set,
     )?;
+    if let Some(reverse) = seeded_reverse.as_mut() {
+        reverse.complete_pair_relation_handoff_eligible = view
+            .exact_match_width
+            .zip(view.max_match_width)
+            .is_some_and(|(exact, maximum)| {
+                exact == maximum
+                    && exact == 2
+                    && suffix_filter
+                        .is_some_and(|suffix| exact == usize::from(suffix.minimum_width))
+            })
+            && architecture == Architecture::Aarch64
+            && !dfa.initial_pending
+            && partial_layout.is_none()
+            && (view.output == OutputContract::Exists || start_scanner_preserves_pending)
+            && relation_vector_owns_route
+            && prefix_relation_vector.is_some()
+            && prefix_relation
+                .as_ref()
+                .is_some_and(|relation| !relation.context_assertions)
+            && suffix_filter.is_some_and(|suffix| {
+                suffix.minimum_width == 2
+                    && matches!(suffix.restart, NativeSuffixRestart::Bounded { backtrack: 0 })
+                    && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+                    && suffix.exact_pair_filter.is_none()
+                    && suffix.vector_filter.is_none()
+                    && suffix.scalar_filter.is_none()
+            });
+    }
     Ok((
         bytes,
         NativeDfaLayout {
@@ -34241,6 +34374,7 @@ fn append_native_prefix_relation(
     Ok(NativePrefixRelationFilter {
         bitmap_offset,
         vector_plan,
+        context_assertions: relation.context_assertions(),
     })
 }
 
@@ -36971,6 +37105,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -37315,6 +37450,7 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -37845,6 +37981,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -38007,6 +38144,7 @@ fn native_regex_redux_module(
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -38366,6 +38504,7 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -38486,6 +38625,7 @@ fn native_weighted_capture_module(
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -38949,6 +39089,7 @@ fn native_rebar_multi_grep_module_v1(
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -39202,6 +39343,7 @@ fn native_rebar_row_scalar_module_v1(
         bit_parallel_exact_endpoint_lowered: false,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        complete_pair_relation_handoff_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -92754,6 +92896,7 @@ mod tests {
                 .map_or(0, |filter| filter.guaranteed_bytes),
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -93152,6 +93295,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                complete_pair_relation_handoff_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -93407,6 +93551,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                complete_pair_relation_handoff_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -93581,6 +93726,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                complete_pair_relation_handoff_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -93739,6 +93885,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                complete_pair_relation_handoff_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -116789,6 +116936,7 @@ int main(void){{
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                complete_pair_relation_handoff_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -134109,6 +134257,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 bit_parallel_exact_endpoint_lowered: false,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                complete_pair_relation_handoff_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
                 ordered_nfa_start_prefix_lowered: false,
                 ordered_nfa_start_prefix_vector_lowered: false,
@@ -134453,6 +134602,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             bit_parallel_exact_endpoint_lowered: false,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
             ordered_nfa_start_prefix_lowered: false,
             ordered_nfa_start_prefix_vector_lowered: false,
@@ -144339,13 +144489,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             initial,
             ObjectFormat::for_target(target),
             incumbent_object.len(),
-            |allow_synchronizing_accept_reverse, allow_exact_pair| {
-                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            |allow_synchronizing_accept_reverse,
+             allow_exact_pair,
+             allow_complete_pair_relation_handoff| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                     selected.program(),
                     target,
                     usize::MAX,
                     allow_synchronizing_accept_reverse,
                     allow_exact_pair,
+                    allow_complete_pair_relation_handoff,
                 )
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -144383,13 +144536,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             initial,
             ObjectFormat::for_target(target),
             undersized_cap,
-            |allow_synchronizing_accept_reverse, allow_exact_pair| {
-                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            |allow_synchronizing_accept_reverse,
+             allow_exact_pair,
+             allow_complete_pair_relation_handoff| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                     selected.program(),
                     target,
                     usize::MAX,
                     allow_synchronizing_accept_reverse,
                     allow_exact_pair,
+                    allow_complete_pair_relation_handoff,
                 )
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -144484,13 +144640,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 initial,
                 ObjectFormat::for_target(target),
                 cap,
-                |allow_synchronizing_accept_reverse, allow_exact_pair| {
-                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                |allow_synchronizing_accept_reverse,
+                 allow_exact_pair,
+                 allow_complete_pair_relation_handoff| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                         selected.program(),
                         target,
                         usize::MAX,
                         allow_synchronizing_accept_reverse,
                         allow_exact_pair,
+                        allow_complete_pair_relation_handoff,
                     )
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -144581,15 +144740,18 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 initial,
                 object_format,
                 cap,
-                |allow_synchronizing_accept_reverse, allow_exact_pair| {
-                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
-                        selected.program(),
-                        target,
-                        usize::MAX,
-                        allow_synchronizing_accept_reverse,
-                        allow_exact_pair,
-                    )
-                },
+            |allow_synchronizing_accept_reverse,
+             allow_exact_pair,
+             allow_complete_pair_relation_handoff| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+                    selected.program(),
+                    target,
+                    usize::MAX,
+                    allow_synchronizing_accept_reverse,
+                    allow_exact_pair,
+                    allow_complete_pair_relation_handoff,
+                )
+            },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
                 || Err(CompileError::InternalInvariant("unexpected width retry")),
                 |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
@@ -144711,7 +144873,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             feature_empty.clone(),
             ObjectFormat::for_target(scalar_target),
             feature_empty_without_prefix_object.len(),
-            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            |_, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
             || Err(CompileError::InternalInvariant("unexpected width retry")),
             |retain_scalar_prefix| {
@@ -144824,7 +144986,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             vector.clone(),
             format,
             scalar_object.len(),
-            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            |_, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
             || {
                 Err(CompileError::InternalInvariant(
                     "unexpected terminal-set retry",
@@ -144856,7 +145018,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             vector,
             format,
             scalar_object.len(),
-            |_, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            |_, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
             || {
                 Err(CompileError::InternalInvariant(
                     "unexpected terminal-set retry",
@@ -144930,13 +145092,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 initial,
                 ObjectFormat::for_target(target),
                 cap,
-                |allow_synchronizing_accept_reverse, allow_exact_pair| {
-                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                |allow_synchronizing_accept_reverse,
+                 allow_exact_pair,
+                 allow_complete_pair_relation_handoff| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                         selected.program(),
                         target,
                         usize::MAX,
                         allow_synchronizing_accept_reverse,
                         allow_exact_pair,
+                        allow_complete_pair_relation_handoff,
                     )
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -146899,6 +147064,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            complete_pair_relation_handoff_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -154366,6 +154532,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         let relation = layout
             .prefix_relation
             .expect("the two alternatives have a non-Cartesian prefix");
+        assert!(!relation.context_assertions);
         let vector_plan = relation
             .vector_plan
             .expect("two singleton rectangles fit every target budget");
@@ -154398,6 +154565,324 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(words.contains(&aarch64_load_halfword_reg(8, 0, 2).unwrap()));
+    }
+
+    #[test]
+    fn aarch64_fixed_pair_complete_relation_handoff_receipt_is_exact() {
+        const PAIR: &str = r"(?-u:(?:\xd4\xe1|\xd4\xeb|\xd5\xf0))";
+        const TRIPLE: &str = r"(?-u:(?:\xd4\x01\xe1|\xd4\x02\xeb|\xd5\x03\xf0))";
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let aarch64 = Target::aarch64_macos().with_features(asimd).unwrap();
+        let layout_for = |pattern: &str, output: OutputContract, target: Target| {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(output),
+            )
+            .unwrap();
+            build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+                compiled.program().native_dfa_view().unwrap(),
+                target,
+                NativeVectorFilterCostModel::Established,
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+                false,
+                false,
+            )
+            .unwrap()
+            .1
+        };
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let layout = layout_for(PAIR, output, aarch64);
+            let reverse = layout.seeded_reverse.expect("fixed-pair reverse sidecar");
+            assert!(reverse.complete_pair_relation_handoff_eligible);
+            assert!(!layout.initial_pending);
+            assert!(layout.start_scanner_preserves_pending);
+            assert!(layout.prefix_relation.is_some_and(|relation| {
+                !relation.context_assertions && relation.vector_plan.is_some()
+            }));
+            assert!(layout.suffix_filter.is_some_and(|suffix| {
+                suffix.minimum_width == 2
+                    && matches!(suffix.restart, NativeSuffixRestart::Bounded { backtrack: 0 })
+                    && matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+                    && suffix.exact_pair_filter.is_none()
+                    && suffix.vector_filter.is_none()
+                    && suffix.scalar_filter.is_none()
+            }));
+
+            let emitted = lower_aarch64_dfa_for_operating_system(
+                layout,
+                asimd,
+                OperatingSystem::Macos,
+                None,
+            )
+            .unwrap()
+            .0;
+            let mut incumbent = layout;
+            let mut incumbent_reverse = reverse;
+            incumbent_reverse.complete_pair_relation_handoff_eligible = false;
+            incumbent.seeded_reverse = Some(incumbent_reverse);
+            let incumbent = lower_aarch64_dfa_for_operating_system(
+                incumbent,
+                asimd,
+                OperatingSystem::Macos,
+                None,
+            )
+            .unwrap()
+            .0;
+            assert!(emitted.len() > incumbent.len());
+            let words = |code: &[u8]| {
+                code.chunks_exact(4)
+                    .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                    .collect::<Vec<_>>()
+            };
+            let emitted = words(&emitted);
+            let incumbent = words(&incumbent);
+            for instruction in [
+                aarch64_load_halfword_reg(8, 0, 2).unwrap(),
+                aarch64_add_x_imm(2, 2, AARCH64_ASIMD_VECTOR_BYTES).unwrap(),
+            ] {
+                let count = |code: &[u32]| code.iter().filter(|&&word| word == instruction).count();
+                assert!(
+                    count(&emitted) > count(&incumbent),
+                    "missing lazy relation/rearm instruction {instruction:#x} for {output:?}"
+                );
+            }
+            assert!(emitted.contains(&aarch64_add_x_imm(15, 2, 1).unwrap()));
+        }
+
+        let exists = layout_for(PAIR, OutputContract::Exists, aarch64);
+        assert!(exists.seeded_reverse.is_none_or(|reverse| {
+            !reverse.complete_pair_relation_handoff_eligible
+        }));
+
+        let mut forged = layout_for(PAIR, OutputContract::Span, aarch64);
+        let mut forged_relation = forged.prefix_relation.unwrap();
+        forged_relation.context_assertions = true;
+        forged.prefix_relation = Some(forged_relation);
+        assert!(matches!(
+            lower_aarch64_dfa_for_operating_system(
+                forged,
+                asimd,
+                OperatingSystem::Macos,
+                None,
+            ),
+            Err(ObjectError::InvalidModule(
+                "AArch64 seeded reverse complete-pair handoff receipt is inconsistent"
+            ))
+        ));
+
+        let partial_compiled = compile_partial_loop(aarch64, OutputContract::Span);
+        let partial = build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+            partial_compiled
+                .program()
+                .native_partial_dfa_view()
+                .unwrap()
+                .native,
+            aarch64,
+            NativeVectorFilterCostModel::Established,
+            direct_relation_vector_owns_route(aarch64),
+            usize::MAX,
+            false,
+            false,
+        )
+        .unwrap()
+        .1;
+        assert!(partial.partial.is_some());
+
+        for (name, layout, target) in [
+            (
+                "x86",
+                layout_for(PAIR, OutputContract::Span, Target::x86_64_macos()),
+                Target::x86_64_macos(),
+            ),
+            (
+                "scalar-aarch64",
+                layout_for(PAIR, OutputContract::Span, Target::aarch64_macos()),
+                Target::aarch64_macos(),
+            ),
+            (
+                "width-three",
+                layout_for(TRIPLE, OutputContract::Span, aarch64),
+                aarch64,
+            ),
+            ("partial", partial, aarch64),
+        ] {
+            assert!(layout.seeded_reverse.is_none_or(|reverse| {
+                !reverse.complete_pair_relation_handoff_eligible
+            }), "receipt escaped {name}");
+            let mut without_receipt = layout;
+            if let Some(mut reverse) = without_receipt.seeded_reverse {
+                reverse.complete_pair_relation_handoff_eligible = false;
+                without_receipt.seeded_reverse = Some(reverse);
+            }
+            let lower = |layout| match target.architecture {
+                Architecture::X86_64 => lower_x86_64_dfa(layout, target.features).unwrap().0,
+                Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system(
+                    layout,
+                    target.features,
+                    target.operating_system,
+                    None,
+                )
+                .unwrap()
+                .0,
+            };
+            assert_eq!(lower(layout), lower(without_receipt), "{name} object changed");
+        }
+    }
+
+    #[test]
+    fn aarch64_fixed_pair_relation_handoff_object_limit_restores_exact_incumbent() {
+        const PAIR: &str = r"(?-u:(?:\xd4\xe1|\xd4\xeb|\xd5\xf0))";
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let selected = compile(
+            CompileRequest::new(PAIR, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        assert!(selected.module().has_complete_pair_relation_handoff());
+        let selected_reverse = selected.module().has_synchronizing_accept_reverse();
+        let selected_exact_pair = selected.module().has_exact_pair_suffix();
+        let native_data_limit = SlowAotLimits::default().max_native_data_bytes;
+        let incumbent =
+            CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+                selected.program(),
+                target,
+                native_data_limit,
+                selected_reverse,
+                selected_exact_pair,
+                false,
+            )
+            .unwrap();
+        assert!(!incumbent.has_complete_pair_relation_handoff());
+        assert_eq!(
+            selected.module().sections[PROGRAM_SECTION].data,
+            incumbent.sections[PROGRAM_SECTION].data,
+            "the text-only verifier must not consume native-data budget"
+        );
+        let format = ObjectFormat::for_target(target);
+        let incumbent_object = emit_object(&incumbent, format, usize::MAX).unwrap();
+        assert!(incumbent_object.len() < selected.object().len());
+
+        let retry = |cap| {
+            let initial = CompiledModule::lower_optimizing_with_limits(
+                selected.program(),
+                target,
+                SlowAotLimits::default(),
+            )
+            .unwrap();
+            assert!(initial.has_complete_pair_relation_handoff());
+            crate::emit_with_ordered_nfa_accelerator_retries(
+                initial,
+                format,
+                cap,
+                |allow_reverse, allow_exact_pair, allow_handoff| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+                        selected.program(),
+                        target,
+                        native_data_limit,
+                        allow_reverse,
+                        allow_exact_pair,
+                        allow_handoff,
+                    )
+                },
+                || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
+                || Err(CompileError::InternalInvariant("unexpected width retry")),
+                |_| Err(CompileError::InternalInvariant("unexpected prefix retry")),
+                || Err(CompileError::InternalInvariant("unexpected start retry")),
+                || Err(CompileError::InternalInvariant("unexpected terminal retry")),
+                || Err(CompileError::InternalInvariant("unexpected scalar retry")),
+            )
+            .unwrap()
+        };
+
+        let crate::FinalObjectAttempt::Fit { module, object } =
+            retry(incumbent_object.len())
+        else {
+            panic!("exact pre-verifier incumbent did not fit its exact ceiling");
+        };
+        assert!(!module.has_complete_pair_relation_handoff());
+        assert_eq!(object, incumbent_object);
+
+        let undersized_cap = incumbent_object.len() - 1;
+        let incumbent_error = emit_object(&incumbent, format, undersized_cap).unwrap_err();
+        let crate::FinalObjectAttempt::ObjectBytes {
+            module,
+            first_error,
+        } = retry(undersized_cap)
+        else {
+            panic!("undersized pre-verifier incumbent unexpectedly fit");
+        };
+        assert_eq!(first_error, incumbent_error);
+        assert_eq!(
+            emit_object(&module, format, usize::MAX).unwrap(),
+            incumbent_object
+        );
+
+        let later_retries = std::cell::Cell::new(0_u8);
+        let allocation = crate::emit_with_ordered_nfa_accelerator_retries(
+            CompiledModule::lower_optimizing_with_limits(
+                selected.program(),
+                target,
+                SlowAotLimits::default(),
+            )
+            .unwrap(),
+            format,
+            incumbent_object.len(),
+            |_, _, _| {
+                Err(ObjectError::Allocation(
+                    "complete-pair relation rollback seam",
+                )
+                .into())
+            },
+            || {
+                later_retries.set(later_retries.get() + 1);
+                Err(CompileError::InternalInvariant("unexpected terminal-set retry"))
+            },
+            || {
+                later_retries.set(later_retries.get() + 1);
+                Err(CompileError::InternalInvariant("unexpected width retry"))
+            },
+            |_| {
+                later_retries.set(later_retries.get() + 1);
+                Err(CompileError::InternalInvariant("unexpected prefix retry"))
+            },
+            || {
+                later_retries.set(later_retries.get() + 1);
+                Err(CompileError::InternalInvariant("unexpected start retry"))
+            },
+            || {
+                later_retries.set(later_retries.get() + 1);
+                Err(CompileError::InternalInvariant("unexpected terminal retry"))
+            },
+            || {
+                later_retries.set(later_retries.get() + 1);
+                Err(CompileError::InternalInvariant("unexpected scalar retry"))
+            },
+        );
+        assert!(matches!(
+            allocation,
+            Err(CompileError::Object(ObjectError::Allocation(
+                "complete-pair relation rollback seam"
+            )))
+        ));
+        assert_eq!(later_retries.get(), 0);
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = incumbent_object.len();
+        let constrained = compile(
+            CompileRequest::new(PAIR, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(limits),
+        )
+        .unwrap();
+        assert!(!constrained.module().has_complete_pair_relation_handoff());
+        assert_eq!(constrained.object(), incumbent_object);
     }
 
     #[test]
@@ -158289,6 +158774,185 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "links and executes lazy complete-pair relation objects natively"]
+    fn linked_macos_fixed_pair_complete_relation_handoff_is_exact() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        const PATTERN: &str = r"(?-u:(?:\xd4\xe1|\xd4\xeb|\xd5\xf0))";
+        const FIXTURE: [u8; 2] = [0xd4, 0xe1];
+        let features = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let target = Target::aarch64_macos().with_features(features).unwrap();
+        let probe = compile(
+            CompileRequest::new(PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let probe_layout =
+            build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+                probe.program().native_dfa_view().unwrap(),
+                target,
+                NativeVectorFilterCostModel::Established,
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+                false,
+                false,
+            )
+            .unwrap()
+            .1;
+        let suffix = probe_layout.suffix_filter.expect("fixed-pair suffix");
+        let primary = suffix.filter.ranges()[0].start;
+        let primary_offset = usize::from(suffix.filter.scan_offset);
+        let background = b'x';
+        assert!(!suffix
+            .filter
+            .ranges()
+            .iter()
+            .any(|range| range.start <= background && background <= range.end));
+
+        let mut isolated_quiet = vec![background; 4096];
+        isolated_quiet[primary_offset] = primary;
+        let mut burst_quiet = vec![background; 4096];
+        burst_quiet[..64].fill(primary);
+        let dense_decoy = vec![primary; 4096];
+        let mut late_positive = burst_quiet.clone();
+        late_positive[4000..4002].copy_from_slice(&FIXTURE);
+        let mut nonzero = vec![background; 256];
+        nonzero[17 + primary_offset] = primary;
+        nonzero[128..130].copy_from_slice(&FIXTURE);
+        let mut cases = vec![
+            (vec![background; 96], 0_usize, 96_usize),
+            (isolated_quiet, 0, 4096),
+            (burst_quiet, 0, 4096),
+            (dense_decoy, 0, 4096),
+            (late_positive, 0, 4096),
+            (nonzero, 17, 256),
+        ];
+        for start in [15_usize, 16, 63, 64, 190] {
+            let mut haystack = vec![background; 192];
+            haystack[start..start + 2].copy_from_slice(&FIXTURE);
+            cases.push((haystack, 0, 192));
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-complete-pair-relation-{}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
+        for (case, (haystack, _, _)) in cases.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{case}[]={{{bytes}}};").unwrap();
+        }
+        let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+        let mut objects = Vec::new();
+        for (output_index, output) in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let compiled = compile(
+                CompileRequest::new(PATTERN, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(output),
+            )
+            .unwrap();
+            let layout =
+                build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+                    compiled.program().native_dfa_view().unwrap(),
+                    target,
+                    NativeVectorFilterCostModel::Established,
+                    direct_relation_vector_owns_route(target),
+                    usize::MAX,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .1;
+            assert_eq!(
+                layout.seeded_reverse.is_some_and(|reverse| {
+                    reverse.complete_pair_relation_handoff_eligible
+                }),
+                output != OutputContract::Exists,
+                "unexpected complete-pair receipt for {output:?}"
+            );
+            let symbol = compiled.module().entry_symbol();
+            writeln!(
+                source,
+                "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+            )
+            .unwrap();
+            let object = directory.join(format!("case{output_index}.o"));
+            fs::write(&object, compiled.object()).unwrap();
+            objects.push(object);
+
+            for (case, (haystack, start, end)) in cases.iter().enumerate() {
+                let expected = compiled
+                    .search(haystack, SearchWindow::new(*start, *end))
+                    .unwrap();
+                writeln!(
+                    calls,
+                    "r[0]=97;r[1]=98;s={symbol}(h{case},sizeof(h{case}),{start},{end},r);"
+                )
+                .unwrap();
+                let failure = 10 + output_index * cases.len() + case;
+                match expected {
+                    MatchResult::Exists(found) => writeln!(
+                        calls,
+                        "if(s!={})return {failure};",
+                        u32::from(found)
+                    )
+                    .unwrap(),
+                    MatchResult::SelectedEnd(Some(end)) => writeln!(
+                        calls,
+                        "if(s!=1||r[0]!={end}||r[1]!={end})return {failure};"
+                    )
+                    .unwrap(),
+                    MatchResult::Span(Some((start, end))) => writeln!(
+                        calls,
+                        "if(s!=1||r[0]!={start}||r[1]!={end})return {failure};"
+                    )
+                    .unwrap(),
+                    MatchResult::SelectedEnd(None) | MatchResult::Span(None) => {
+                        writeln!(calls, "if(s!=0)return {failure};").unwrap();
+                    }
+                }
+            }
+        }
+        calls.push_str("return 0;}\n");
+        source.push_str(&calls);
+        let c_path = directory.join("complete_pair.c");
+        let executable = directory.join("complete_pair");
+        fs::write(&c_path, source).unwrap();
+        let status = Command::new("clang")
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let output = Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]

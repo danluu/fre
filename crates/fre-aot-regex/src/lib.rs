@@ -1996,14 +1996,17 @@ fn append_prepared_aggregate_exports_to_compiled(
         module,
         format,
         max_object_bytes,
-        |allow_synchronizing_accept_reverse, allow_exact_pair| {
+        |allow_synchronizing_accept_reverse,
+         allow_exact_pair,
+         allow_complete_pair_relation_handoff| {
             let without_reverse =
-                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                 &program,
                 target,
                 effective_native_data_limit_bytes,
                 allow_synchronizing_accept_reverse,
                 allow_exact_pair,
+                allow_complete_pair_relation_handoff,
             )?;
             append_exports(without_reverse)
         },
@@ -2092,20 +2095,23 @@ fn append_prepared_aggregate_exports_to_compiled(
             )?;
             let selected_reverse = module.has_synchronizing_accept_reverse();
             let selected_exact_pair = module.has_exact_pair_suffix();
+            let selected_handoff = module.has_complete_pair_relation_handoff();
             let selected_start = module.start_accelerator();
             let may_continue = module.optimizing_fallbacks_may_continue();
-            let rebuilt = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            let rebuilt = CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                 &program,
                 target,
                 effective_native_data_limit_bytes,
                 selected_reverse,
                 selected_exact_pair,
+                selected_handoff,
             )?
             .with_optimizing_fallbacks_may_continue(may_continue);
             if rebuilt.direct_span_trusted_core_entry_sha256()
                 != Some(expected_entry_sha256)
                 || rebuilt.has_synchronizing_accept_reverse() != selected_reverse
                 || rebuilt.has_exact_pair_suffix() != selected_exact_pair
+                || rebuilt.has_complete_pair_relation_handoff() != selected_handoff
                 || rebuilt.start_accelerator() != selected_start
                 || rebuilt.required_runtime_symbols().next().is_some()
                 || rebuilt.required_prepare_capabilities() != 0
@@ -2180,19 +2186,22 @@ fn append_prepared_aggregate_exports_to_compiled(
             )?;
             let selected_reverse = module.has_synchronizing_accept_reverse();
             let selected_exact_pair = module.has_exact_pair_suffix();
+            let selected_handoff = module.has_complete_pair_relation_handoff();
             let selected_start = module.start_accelerator();
             let may_continue = module.optimizing_fallbacks_may_continue();
-            let fallback = CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+            let fallback = CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                 &program,
                 target,
                 effective_native_data_limit_bytes,
                 selected_reverse,
                 selected_exact_pair,
+                selected_handoff,
             )?
             .with_optimizing_fallbacks_may_continue(may_continue);
             if fallback.direct_span_trusted_core_entry_sha256() != Some(expected_entry_sha256)
                 || fallback.has_synchronizing_accept_reverse() != selected_reverse
                 || fallback.has_exact_pair_suffix() != selected_exact_pair
+                || fallback.has_complete_pair_relation_handoff() != selected_handoff
                 || fallback.start_accelerator() != selected_start
                 || fallback.required_runtime_symbols().next().is_some()
                 || fallback.required_prepare_capabilities() != 0
@@ -3010,7 +3019,7 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         initial,
         format,
         limits.max_object_bytes,
-        |_, _| {
+        |_, _, _| {
             Err(CompileError::InternalInvariant(
                 "prepared Ordered-NFA unexpectedly selected a synchronizing reverse prepass",
             ))
@@ -3543,7 +3552,7 @@ fn emit_with_ordered_nfa_accelerator_retries(
     mut module: CompiledModule,
     format: ObjectFormat,
     max_object_bytes: usize,
-    mut rebuild_complete_dfa_with_suffix_policy: impl FnMut(bool, bool)
+    mut rebuild_complete_dfa_with_suffix_policy: impl FnMut(bool, bool, bool)
         -> Result<CompiledModule, CompileError>,
     rebuild_without_terminal_exact_set: impl FnOnce() -> Result<CompiledModule, CompileError>,
     rebuild_without_whole_window_width_gate: impl FnOnce() -> Result<CompiledModule, CompileError>,
@@ -3573,11 +3582,65 @@ fn emit_with_ordered_nfa_accelerator_retries(
 
     // A final retry may remove an already-selected additive route, but must
     // never re-admit one that the initial native-data/target policy declined.
+    // The lazy complete-pair verifier is text-only, so remove it before any
+    // older suffix route. If the exact pre-feature incumbent remains
+    // oversized, its ObjectBytes receipt replaces the additive candidate's
+    // error just as though this verifier had never been admitted.
+    if module.has_complete_pair_relation_handoff() {
+        let selected_synchronizing_accept_reverse =
+            module.has_synchronizing_accept_reverse();
+        let selected_exact_pair = module.has_exact_pair_suffix();
+        let without_handoff = rebuild_complete_dfa_with_suffix_policy(
+            selected_synchronizing_accept_reverse,
+            selected_exact_pair,
+            false,
+        )?
+        .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+        if without_handoff.has_complete_pair_relation_handoff()
+            || without_handoff.has_synchronizing_accept_reverse()
+                != selected_synchronizing_accept_reverse
+            || without_handoff.has_exact_pair_suffix() != selected_exact_pair
+            || without_handoff.slow_aot_report().is_some()
+            || without_handoff.compiler_k0_aot_report().is_some()
+            || without_handoff.required_runtime_symbols().next().is_some()
+            || without_handoff.required_prepare_capabilities() != 0
+            || without_handoff.start_accelerator() != module.start_accelerator()
+        {
+            return Err(CompileError::InternalInvariant(
+                "complete-pair relation final-object retry changed its complete-DFA route",
+            ));
+        }
+        match emit_object(&without_handoff, format, max_object_bytes) {
+            Ok(object) => {
+                return Ok(FinalObjectAttempt::Fit {
+                    module: without_handoff,
+                    object,
+                });
+            }
+            Err(error @ ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                ..
+            }) => {
+                module = without_handoff;
+                first_error = error;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let complete_pair_relation_handoff_permitted =
+        module.has_complete_pair_relation_handoff();
     let mut exact_pair_permitted = module.has_exact_pair_suffix();
     if module.has_exact_pair_suffix() {
-        let without_pair = rebuild_complete_dfa_with_suffix_policy(true, false)?
-            .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
+        let without_pair = rebuild_complete_dfa_with_suffix_policy(
+            true,
+            false,
+            complete_pair_relation_handoff_permitted,
+        )?
+        .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
         if without_pair.has_exact_pair_suffix()
+            || without_pair.has_complete_pair_relation_handoff()
+                != complete_pair_relation_handoff_permitted
             || without_pair.slow_aot_report().is_some()
             || without_pair.compiler_k0_aot_report().is_some()
             || without_pair.required_runtime_symbols().next().is_some()
@@ -3618,10 +3681,16 @@ fn emit_with_ordered_nfa_accelerator_retries(
 
     if selected_synchronizing_accept_reverse {
         let without_reverse =
-            rebuild_complete_dfa_with_suffix_policy(false, exact_pair_permitted)?
+            rebuild_complete_dfa_with_suffix_policy(
+                false,
+                exact_pair_permitted,
+                complete_pair_relation_handoff_permitted,
+            )?
             .with_optimizing_fallbacks_may_continue(optimizing_fallbacks_may_continue);
         if without_reverse.has_synchronizing_accept_reverse()
             || without_reverse.has_exact_pair_suffix() != module.has_exact_pair_suffix()
+            || without_reverse.has_complete_pair_relation_handoff()
+                != complete_pair_relation_handoff_permitted
             || without_reverse.slow_aot_report().is_some()
             || without_reverse.compiler_k0_aot_report().is_some()
             || without_reverse.required_runtime_symbols().next().is_some()
@@ -3909,13 +3978,16 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
         enabled,
         format,
         max_object_bytes,
-        |allow_synchronizing_accept_reverse, allow_exact_pair| {
-            CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+        |allow_synchronizing_accept_reverse,
+         allow_exact_pair,
+         allow_complete_pair_relation_handoff| {
+            CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                 program,
                 target,
                 max_native_data_bytes,
                 allow_synchronizing_accept_reverse,
                 allow_exact_pair,
+                allow_complete_pair_relation_handoff,
             )
         },
         || {
@@ -3991,13 +4063,16 @@ fn lower_ordinary_with_endpoint_oracle_object_retry(
                 second,
                 format,
                 max_object_bytes,
-                |allow_synchronizing_accept_reverse, allow_exact_pair| {
-                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                |allow_synchronizing_accept_reverse,
+                 allow_exact_pair,
+                 allow_complete_pair_relation_handoff| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                         program,
                         target,
                         max_native_data_bytes,
                         allow_synchronizing_accept_reverse,
                         allow_exact_pair,
+                        allow_complete_pair_relation_handoff,
                     )
                 },
                 || {
@@ -4272,13 +4347,16 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
                 optimized,
                 format,
                 limits.max_object_bytes,
-                |allow_synchronizing_accept_reverse, allow_exact_pair| {
-                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                |allow_synchronizing_accept_reverse,
+                 allow_exact_pair,
+                 allow_complete_pair_relation_handoff| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                         &program,
                         target,
                         effective_native_data_limit_bytes,
                         allow_synchronizing_accept_reverse,
                         allow_exact_pair,
+                        allow_complete_pair_relation_handoff,
                     )
                 },
                 || {
@@ -4362,13 +4440,16 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
                             k0_fallback,
                             format,
                             limits.max_object_bytes,
-                            |allow_synchronizing_accept_reverse, allow_exact_pair| {
-                                CompiledModule::lower_ordinary_complete_dfa_with_suffix_policy(
+                            |allow_synchronizing_accept_reverse,
+                             allow_exact_pair,
+                             allow_complete_pair_relation_handoff| {
+                                CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                                     &program,
                                     target,
                                     effective_native_data_limit_bytes,
                                     allow_synchronizing_accept_reverse,
                                     allow_exact_pair,
+                                    allow_complete_pair_relation_handoff,
                                 )
                             },
                             || {

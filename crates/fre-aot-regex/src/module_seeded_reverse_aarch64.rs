@@ -63,6 +63,8 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     let single_primary_hit = assembler.label()?;
     let batch_hit = assembler.label()?;
     let single_hit = assembler.label()?;
+    let scalar_relation_candidate = assembler.label()?;
+    let relation_candidate = assembler.label()?;
     let candidate = assembler.label()?;
     let reverse_loop = assembler.label()?;
     let record_start = assembler.label()?;
@@ -117,6 +119,36 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             "AArch64 seeded reverse escaped its graph admission gate",
         ));
     }
+    if reverse.complete_pair_relation_handoff_eligible
+        && (layout.initial_pending
+            || layout.partial.is_some()
+            || (layout.output != OutputContract::Exists && !layout.start_scanner_preserves_pending)
+            || suffix.minimum_width != 2
+            || !matches!(
+                suffix.restart,
+                NativeSuffixRestart::Bounded { backtrack: 0 }
+            )
+            || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
+            || reverse.boundary_offset != suffix.minimum_width
+            || suffix.exact_pair_filter.is_some()
+            || suffix.vector_filter.is_some()
+            || suffix.scalar_filter.is_some()
+            || layout.prefix_relation.is_none_or(|relation| {
+                relation.context_assertions || relation.vector_plan.is_none()
+            }))
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 seeded reverse complete-pair handoff receipt is inconsistent",
+        ));
+    }
+    let complete_pair_relation = if reverse.complete_pair_relation_handoff_eligible {
+        Some(layout.prefix_relation.ok_or(ObjectError::InvalidModule(
+            "AArch64 seeded reverse complete-pair relation is absent",
+        ))?)
+    } else {
+        None
+    };
+    let complete_pair_vector = complete_pair_relation.and_then(|relation| relation.vector_plan);
     if use_asimd_batch && !use_asimd {
         return Err(ObjectError::InvalidModule(
             "AArch64 seeded reverse selected an ASIMD batch on a scalar target",
@@ -359,7 +391,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             aarch64_emit_candidate_batch_any(assembler, first_candidates)?;
             assembler.branch_cond(
                 AARCH64_NE,
-                if lazy_vector_filter.is_some() {
+                if lazy_vector_filter.is_some() || complete_pair_vector.is_some() {
                     batch_primary_hit
                 } else if use_exact_asimd_lane || exact_pair_filter.is_some() {
                     batch_hit
@@ -405,7 +437,9 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             aarch64_emit_candidate_any(assembler, 24)?;
             assembler.branch_cond(
                 AARCH64_NE,
-                if use_exact_asimd_lane {
+                if complete_pair_vector.is_some() {
+                    single_primary_hit
+                } else if use_exact_asimd_lane {
                     single_hit
                 } else {
                     scalar
@@ -447,6 +481,46 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             )?;
             assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
             assembler.branch(vector)?;
+        } else if let Some(relation) = complete_pair_vector {
+            assembler.bind(batch_primary_hit)?;
+            if use_asimd_batch {
+                // The primary four-vector load occupies V0..V3, overlapping
+                // the bounded relation-constant bank. Reload the exact
+                // complete-language relation only on a primary-hit edge.
+                aarch64_emit_prefix_relation_constants(assembler, relation)?;
+                let relation_candidates =
+                    aarch64_emit_prefix_relation_batch_candidates(assembler, relation)?;
+                if batch_first_candidates != Some(relation_candidates) {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 complete-pair relation changed its candidate bank",
+                    ));
+                }
+                aarch64_emit_candidate_batch_any(assembler, relation_candidates)?;
+                assembler.branch_cond(AARCH64_NE, batch_hit)?;
+                // Relation masks use V16..V21 as sources and scratch. Restore
+                // the standalone primary constants before rearming its scan.
+                aarch64_emit_start_filter_constants(
+                    assembler,
+                    filter,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+                assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+                assembler.branch(vector)?;
+            } else {
+                assembler.branch(scalar)?;
+            }
+
+            assembler.bind(single_primary_hit)?;
+            aarch64_emit_prefix_relation_constants(assembler, relation)?;
+            aarch64_emit_prefix_relation_vector_test(assembler, relation)?;
+            assembler.branch_cond(AARCH64_NE, single_hit)?;
+            aarch64_emit_start_filter_constants(
+                assembler,
+                filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+            assembler.branch(vector)?;
         } else {
             assembler.bind(batch_primary_hit)?;
             assembler.branch(scalar)?;
@@ -467,14 +541,22 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             && let Some(first_candidates) = batch_first_candidates
         {
             aarch64_emit_first_candidate_in_batch(assembler, first_candidates)?;
-            assembler.branch(selected)?;
+            assembler.branch(if complete_pair_vector.is_some() {
+                relation_candidate
+            } else {
+                selected
+            })?;
         } else {
             assembler.branch(scalar)?;
         }
         assembler.bind(single_hit)?;
         if use_exact_asimd_lane || exact_pair_filter.is_some() {
             aarch64_emit_first_candidate_lane(assembler, 24)?;
-            assembler.branch(selected)?;
+            assembler.branch(if complete_pair_vector.is_some() {
+                relation_candidate
+            } else {
+                selected
+            })?;
         } else {
             assembler.branch(scalar)?;
         }
@@ -504,7 +586,9 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         aarch64_emit_exact_pair_scalar_test(assembler, pair_filter, candidate)?;
     } else {
         aarch64_emit_start_filter_scalar_load(assembler, filter.scan_offset)?;
-        let scalar_candidate = if scalar_filter.is_some() {
+        let scalar_candidate = if complete_pair_relation.is_some() {
+            scalar_relation_candidate
+        } else if scalar_filter.is_some() {
             scalar_columns
         } else {
             candidate
@@ -538,7 +622,26 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         assembler.bind(scalar_columns)?;
         assembler.branch(candidate)?;
         assembler.bind(scalar_reject)?;
-        assembler.branch(scalar)?;
+        if complete_pair_relation.is_some() {
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(vector)?;
+        } else {
+            assembler.branch(scalar)?;
+        }
+    }
+
+    assembler.bind(scalar_relation_candidate)?;
+    if let Some(relation) = complete_pair_relation {
+        // The canonical 65,536-bit matrix independently authenticates the
+        // short scalar tail. A false primary advances the incumbent suffix
+        // scanner; an exact pair can safely enter the ordinary forward DFA.
+        aarch64_emit_prefix_relation(assembler, relation, scalar_reject)?;
+        assembler.branch(relation_candidate)?;
+    }
+
+    assembler.bind(relation_candidate)?;
+    if complete_pair_relation.is_some() {
+        assembler.branch(done)?;
     }
 
     assembler.bind(candidate)?;
@@ -698,6 +801,7 @@ mod tests {
             initial_reaches_start: false,
             proves_match,
             first_endpoint_proves_no_earlier_match: proves_match,
+            complete_pair_relation_handoff_eligible: false,
         };
         let layout = NativeDfaLayout {
             transitions: TransitionLayout::DirectByte,
