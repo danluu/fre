@@ -1064,25 +1064,29 @@ impl LineDomainPlan {
             return match anchor {
                 ValueAnchor::Start { offset } => {
                     let search = candidate.checked_add(offset)?.checked_add(1)?;
-                    self.find_from_value_start_prefiltered::<P>(
+                    self.find_from_value_start_prefiltered(
                         haystack, start, end, offset, search,
                     )
+                    .map(|matched| P::selected(matched.start(), matched.end()))
                 }
                 ValueAnchor::End { trailing } => {
                     let search = self.next_line_start_value(haystack, candidate, end)?;
-                    self.find_from_value_end_prefiltered::<P>(
+                    self.find_from_value_end_prefiltered(
                         haystack, start, end, trailing, search,
                     )
+                    .map(|matched| P::selected(matched.start(), matched.end()))
                 }
             };
         }
         if self.uses_fixed_width_endpoint() {
-            return self.find_from_value_fixed_width::<P>(
-                haystack,
-                start,
-                end,
-                self.minimum_match_bytes,
-            );
+            return self
+                .find_from_value_fixed_width(
+                    haystack,
+                    start,
+                    end,
+                    self.minimum_match_bytes,
+                )
+                .map(|matched| P::selected(matched.start(), matched.end()));
         }
         let mut candidate = self.first_line_start_value(haystack, start, end)?;
         loop {
@@ -1100,13 +1104,13 @@ impl LineDomainPlan {
         self.fixed_width_endpoint
     }
 
-    fn find_from_value_fixed_width<P: ValueProjection>(
+    fn find_from_value_fixed_width(
         &self,
         haystack: &[u8],
         start: usize,
         end: usize,
         width: usize,
-    ) -> Option<P::Output> {
+    ) -> Option<MatchSpan> {
         // Preserve the generic executor's immediate-hit path. After a miss,
         // a false projected endpoint proves that this fixed-width candidate
         // cannot match without reading its body. A true endpoint is only
@@ -1118,13 +1122,13 @@ impl LineDomainPlan {
             return None;
         }
         if let Some(matched_end) = self.match_candidate_value(haystack, candidate, end) {
-            return Some(P::selected(candidate, matched_end));
+            return Some(MatchSpan::new(candidate, matched_end));
         }
         let expected_end = candidate.checked_add(width)?;
         let exact_width = self.is_line_end_value(haystack, expected_end);
         candidate = self.next_line_start_value(haystack, candidate, end)?;
         if exact_width {
-            return self.find_from_value_none_after_candidate::<P>(haystack, candidate, end);
+            return self.find_from_value_none_after_candidate(haystack, candidate, end);
         }
 
         loop {
@@ -1136,40 +1140,40 @@ impl LineDomainPlan {
                 if let Some(matched_end) =
                     self.match_candidate_value(haystack, candidate, end)
                 {
-                    return Some(P::selected(candidate, matched_end));
+                    return Some(MatchSpan::new(candidate, matched_end));
                 }
                 candidate = self.next_line_start_value(haystack, candidate, end)?;
-                return self.find_from_value_none_after_candidate::<P>(haystack, candidate, end);
+                return self.find_from_value_none_after_candidate(haystack, candidate, end);
             }
             candidate = self.next_line_start_value(haystack, candidate, end)?;
         }
     }
 
-    fn find_from_value_none_after_candidate<P: ValueProjection>(
+    fn find_from_value_none_after_candidate(
         &self,
         haystack: &[u8],
         mut candidate: usize,
         end: usize,
-    ) -> Option<P::Output> {
+    ) -> Option<MatchSpan> {
         loop {
             if candidate >= end || input_bytes(candidate, end) < self.minimum_match_bytes {
                 return None;
             }
             if let Some(matched_end) = self.match_candidate_value(haystack, candidate, end) {
-                return Some(P::selected(candidate, matched_end));
+                return Some(MatchSpan::new(candidate, matched_end));
             }
             candidate = self.next_line_start_value(haystack, candidate, end)?;
         }
     }
 
-    fn find_from_value_start_prefiltered<P: ValueProjection>(
+    fn find_from_value_start_prefiltered(
         &self,
         haystack: &[u8],
         start: usize,
         end: usize,
         offset: usize,
         mut search: usize,
-    ) -> Option<P::Output> {
+    ) -> Option<MatchSpan> {
         while search < end {
             let relative = self.value_prefilter.find(haystack.get(search..end)?)?;
             let anchor = search.checked_add(relative)?;
@@ -1180,7 +1184,7 @@ impl LineDomainPlan {
                 && let Some(matched_end) =
                     self.match_candidate_value(haystack, candidate, end)
             {
-                return Some(P::selected(candidate, matched_end));
+                return Some(MatchSpan::new(candidate, matched_end));
             }
 
             // A line-anchored expression has at most one candidate in this
@@ -1194,14 +1198,14 @@ impl LineDomainPlan {
         None
     }
 
-    fn find_from_value_end_prefiltered<P: ValueProjection>(
+    fn find_from_value_end_prefiltered(
         &self,
         haystack: &[u8],
         start: usize,
         end: usize,
         trailing: usize,
         mut search: usize,
-    ) -> Option<P::Output> {
+    ) -> Option<MatchSpan> {
         let needle_width = self.value_prefilter.needle_width()?;
         let suffix_width = trailing.checked_add(needle_width)?;
         while search < end {
@@ -1221,7 +1225,7 @@ impl LineDomainPlan {
                     && self.match_candidate_value(haystack, candidate, line_end)
                         == Some(line_end)
                 {
-                    return Some(P::selected(candidate, line_end));
+                    return Some(MatchSpan::new(candidate, line_end));
                 }
             }
 
