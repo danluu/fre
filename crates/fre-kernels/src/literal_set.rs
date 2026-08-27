@@ -2232,6 +2232,23 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     /// need no special-state classification.
     #[inline(always)]
     fn next_uniform_end(&mut self, pattern_bytes: usize) -> Option<usize> {
+        self.next_uniform_end_impl::<false>(pattern_bytes)
+    }
+
+    /// Count-only companion to [`Self::next_uniform_end`]. Four straight
+    /// transitions reduce loop edges across the construction-proved
+    /// nonaccepting prefix. Selected-span operations retain the smaller
+    /// scalar projection above.
+    #[inline(always)]
+    fn next_uniform_count_end(&mut self, pattern_bytes: usize) -> Option<usize> {
+        self.next_uniform_end_impl::<true>(pattern_bytes)
+    }
+
+    #[inline(always)]
+    fn next_uniform_end_impl<const UNROLL_PREFIX: bool>(
+        &mut self,
+        pattern_bytes: usize,
+    ) -> Option<usize> {
         debug_assert!(pattern_bytes > 0);
         let anchored = Anchored::No;
         let mut state = self.start_state;
@@ -2239,6 +2256,15 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         let classification_start = at
             .saturating_add(pattern_bytes.saturating_sub(1))
             .min(self.end);
+        if UNROLL_PREFIX {
+            while classification_start - at >= 4 {
+                state = self.automaton.next_state(anchored, state, self.haystack[at]);
+                state = self.automaton.next_state(anchored, state, self.haystack[at + 1]);
+                state = self.automaton.next_state(anchored, state, self.haystack[at + 2]);
+                state = self.automaton.next_state(anchored, state, self.haystack[at + 3]);
+                at += 4;
+            }
+        }
         while at < classification_start {
             state = self.automaton.next_state(anchored, state, self.haystack[at]);
             at += 1;
@@ -2974,7 +3000,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
             let build = self.plan.build;
             if self.is_uniform_positive() {
                 while let Some(selected_end) =
-                    scanner.next_uniform_end(build.minimum_pattern_bytes)
+                    scanner.next_uniform_count_end(build.minimum_pattern_bytes)
                 {
                     debug_assert!(
                         selected_end > previous_end,
