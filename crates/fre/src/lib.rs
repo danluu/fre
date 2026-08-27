@@ -19221,16 +19221,15 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from)
             }
-            Self::Native(regex)
-                if let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan
-                    && plan.boundary_semantics()
+            Self::Native(regex) => match &regex.plan {
+                PortablePlan::LiteralClassRunLiteral(plan)
+                    if plan.boundary_semantics()
                         == LiteralClassRunLiteralBoundarySemantics::Unguarded =>
-            {
-                ordinary_literal_class_run_find_at_value(plan, haystack, start)
-            }
-            Self::Native(regex) => {
-                regex.find_window_value(haystack, window, SearchLimits::unlimited())
-            }
+                {
+                    ordinary_literal_class_run_find_at_value(plan, haystack, start)
+                }
+                _ => regex.find_window_value(haystack, window, SearchLimits::unlimited()),
+            },
         }
     }
 
