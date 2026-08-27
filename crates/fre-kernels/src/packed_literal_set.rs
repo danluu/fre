@@ -1150,7 +1150,9 @@ impl PackedLiteralSetPlan {
             });
         }
         let engine =
-            if let Some(native_searcher) = Searcher::new(patterns.iter().map(AsRef::as_ref)) {
+            if patterns.len() <= TEDDY_PATTERNS_PER_SEARCHER
+                && let Some(native_searcher) = Searcher::new(patterns.iter().map(AsRef::as_ref))
+            {
                 // Preserve an already-admitted sparse anchor: a rare byte at
                 // another offset can be more selective than a common fragment.
                 // Fixed-width sets next get exact correlated column masks;
