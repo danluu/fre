@@ -796,10 +796,14 @@ pub type FreAotRegexExactSingletonFirstCandidateV1 =
 /// Status [`STATUS_SUCCESS`] publishes either a byte offset on an LF-delimited
 /// line known to contain a match or [`MATCHING_LF_LINE_WITNESS_MISS`]. A hit is
 /// a candidate line witness, not an exact match boundary or inclusive final
-/// byte. Every nonzero status leaves `matching_line_byte_out` untouched. The
-/// haystack pointer is nonnull and readable for its signed-address-domain
-/// length, including a nonnull zero-length pointer. The output is nonnull,
-/// naturally aligned, writable for one `u64`, and disjoint from the haystack.
+/// byte. The matching-line guarantee additionally requires the producer's
+/// independent proof of an exact finite, nonempty, assertion-free byte
+/// language whose every member is nonempty and LF-free; this ABI alone does
+/// not authenticate that proof. Every nonzero status leaves
+/// `matching_line_byte_out` untouched. The haystack pointer is nonnull and
+/// readable for its signed-address-domain length, including a nonnull
+/// zero-length pointer. The output is nonnull, naturally aligned, writable for
+/// one `u64`, and disjoint from the haystack.
 pub type FreAotRegexMatchingLfLineWitnessV1 =
     unsafe extern "C" fn(*const u8, usize, *mut u64) -> u32;
 

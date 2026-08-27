@@ -1389,12 +1389,17 @@ fn compile_with_independent_exists_batch_policy(
     }
     let target = request.target;
     let max_object_bytes = request.limits.max_object_bytes;
-    let mut compiled = {
+    let mut compiled = if matching_lf_line_witness_requested {
         let scope =
-            module::matching_lf_line_witness_recipe_scope(matching_lf_line_witness_requested);
+            module::matching_lf_line_witness_recipe_scope(true);
         let compiled = compile(request)?;
         drop(scope);
         compiled
+    } else {
+        // Preserve the established batch API's literal pre-feature compile
+        // transaction, including avoiding LF-recipe TLS access and preserving
+        // its failure surface.
+        compile(request)?
     };
     if compiled.module.prepared_exists_batch_symbol().is_some()
         || compiled.module.direct_exists_batch_symbol().is_some()

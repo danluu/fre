@@ -38,6 +38,8 @@ use first_candidate_build::FirstCandidateRegistryBuild;
 use lf_line_witness_build::MatchingLfLineWitnessRegistryBuild;
 use registry_key::manifest_profile_key;
 
+const ENABLE_MATCHING_LF_LINE_WITNESS: bool = false;
+
 #[allow(
     clippy::too_many_lines,
     reason = "artifact compilation and generated registry construction form one build transaction"
@@ -174,7 +176,9 @@ fn main() {
                     .mode(mode)
                     .output(output);
                 let compiled = if output == OutputContract::Exists {
-                    if independent_lf_line_witness_proof.is_some() {
+                    if ENABLE_MATCHING_LF_LINE_WITNESS
+                        && independent_lf_line_witness_proof.is_some()
+                    {
                         compile_with_independent_matching_lf_line_witness(request)
                     } else {
                         compile_with_independent_exists_batch(request)
@@ -542,7 +546,10 @@ fn main() {
     .expect("write generated exact-singleton first-candidate registry");
     fs::write(
         out_dir.join("lf_line_witness_registry.rs"),
-        matching_lf_line_witnesses.finish(target, public_first_candidate_fixture_selected),
+        matching_lf_line_witnesses.finish(
+            target,
+            ENABLE_MATCHING_LF_LINE_WITNESS && public_first_candidate_fixture_selected,
+        ),
     )
     .expect("write generated matching-LF-line witness registry");
     let exact64_generated = generate_exact64_sets(

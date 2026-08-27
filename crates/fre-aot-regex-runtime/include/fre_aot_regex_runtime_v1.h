@@ -158,8 +158,11 @@ typedef uint32_t (*FreAotRegexExactSingletonFirstCandidateV1)(
  * Whole-haystack matching-LF-line witness endpoint. Status 0 publishes a byte
  * offset on an LF-delimited line known to contain a match, or
  * FRE_AOT_REGEX_MATCHING_LF_LINE_WITNESS_MISS. A hit is a candidate line
- * witness, not an exact match boundary or inclusive final byte. Every nonzero
- * status leaves matching_line_byte_out untouched.
+ * witness, not an exact match boundary or inclusive final byte. The
+ * matching-line guarantee additionally requires the producer's independent
+ * proof of an exact finite, nonempty, assertion-free byte language whose every
+ * member is nonempty and LF-free; this ABI alone does not authenticate that
+ * proof. Every nonzero status leaves matching_line_byte_out untouched.
  *
  * haystack_ptr is nonnull even when haystack_len is zero and remains readable
  * for haystack_len bytes; haystack_len is in the signed address domain.

@@ -41342,6 +41342,133 @@ impl X86Assembler {
     }
 
     fn thread_branch_targets(&mut self, removed: &[bool]) -> Result<(), ObjectError> {
+        if !self.track_lf_line_success {
+            return self.thread_branch_targets_without_lf_line_routes(removed);
+        }
+        self.thread_branch_targets_with_lf_line_routes(removed)
+    }
+
+    /// Preserve the parent compiler's exact untracked threading transaction.
+    /// In particular, this scratch remains `Vec<X86Label>` instead of paying
+    /// the larger route-carrying element size for ordinary/public compilation.
+    fn thread_branch_targets_without_lf_line_routes(
+        &mut self,
+        removed: &[bool],
+    ) -> Result<(), ObjectError> {
+        let mut labels = Vec::new();
+        labels
+            .try_reserve_exact(self.fixups.len())
+            .map_err(|_| ObjectError::Allocation("x86 threading"))?;
+        let mut shortened = Vec::new();
+        shortened
+            .try_reserve_exact(self.fixups.len())
+            .map_err(|_| ObjectError::Allocation("x86 threading"))?;
+        shortened.resize(self.fixups.len(), false);
+
+        for (index, fixup) in self.fixups.iter().enumerate() {
+            let original = fixup.label;
+            let mut label = original;
+            let mut resolved = None;
+            let mut retained_cycle_label = None;
+            let mut direct_target_removed = false;
+
+            // There can be at most one direct branch at an instruction
+            // boundary and at most `fixups.len()` distinct trampoline
+            // instructions. One additional lookup therefore distinguishes a
+            // finite chain from a cycle without allocating a visited set.
+            for _ in 0..=self.fixups.len() {
+                let target = self
+                    .labels
+                    .get(label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+                let Ok(index) = self
+                    .fixups
+                    .binary_search_by_key(&target, |candidate| candidate.instruction)
+                else {
+                    resolved = Some(label);
+                    break;
+                };
+                let trampoline = self.fixups[index];
+                if trampoline.short_opcode != Some(0xeb) {
+                    resolved = Some(label);
+                    break;
+                }
+                if removed[index] {
+                    direct_target_removed |= label == original;
+                } else {
+                    retained_cycle_label = Some(label);
+                }
+                label = trampoline.label;
+            }
+
+            // Retaining the original edge for a jump cycle preserves the
+            // exact looping CFG. Thread a finite chain only when its resolved
+            // edge can use rel8 before any other shortening; later monotone
+            // compaction can only bring the destination closer. This avoids
+            // trading a nearby trampoline for a larger source branch.
+            let label = if let Some(label) = resolved {
+                label
+            } else if direct_target_removed {
+                retained_cycle_label
+                    .ok_or(ObjectError::InvalidModule("x86 removed trampoline cycle"))?
+            } else {
+                original
+            };
+            let raw_target =
+                self.labels[label].ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
+            let instruction = self.remap_offset(fixup.instruction, removed, &shortened)?;
+            let mut target = self.remap_offset(raw_target, removed, &shortened)?;
+            let raw_end = fixup
+                .instruction
+                .checked_add(fixup.long_bytes)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 branch extent"))?;
+            if raw_end <= raw_target {
+                target = target
+                    .checked_sub(
+                        fixup
+                            .long_bytes
+                            .checked_sub(2)
+                            .ok_or(ObjectError::InvalidModule("x86 relaxed branch size"))?,
+                    )
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "x86 hypothetical threaded target",
+                    ))?;
+            }
+            let after = instruction
+                .checked_add(2)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 short branch base"))?;
+            let delta = i64::try_from(target)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 threaded branch target"))?
+                .checked_sub(
+                    i64::try_from(after)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 short branch base"))?,
+                )
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 threaded branch displacement",
+                ))?;
+            labels.push(
+                if !removed[index]
+                    && (direct_target_removed
+                        || fixup.short_opcode.is_some() && i8::try_from(delta).is_ok())
+                {
+                    label
+                } else {
+                    original
+                },
+            );
+        }
+        for (fixup, label) in self.fixups.iter_mut().zip(labels) {
+            fixup.label = label;
+        }
+        Ok(())
+    }
+
+    fn thread_branch_targets_with_lf_line_routes(
+        &mut self,
+        removed: &[bool],
+    ) -> Result<(), ObjectError> {
         let mut labels_and_routes = Vec::new();
         labels_and_routes
             .try_reserve_exact(self.fixups.len())
@@ -114648,6 +114775,35 @@ int main(void){{
     }
 
     #[test]
+    fn matching_lf_line_recipe_scope_is_nested_unwind_safe_and_thread_local() {
+        assert!(!matching_lf_line_witness_recipe_enabled());
+        {
+            let outer = matching_lf_line_witness_recipe_scope(true);
+            assert!(matching_lf_line_witness_recipe_enabled());
+            {
+                let inner = matching_lf_line_witness_recipe_scope(false);
+                assert!(!matching_lf_line_witness_recipe_enabled());
+                drop(inner);
+            }
+            assert!(matching_lf_line_witness_recipe_enabled());
+            let other = std::thread::spawn(matching_lf_line_witness_recipe_enabled)
+                .join()
+                .expect("matching-LF-line recipe policy isolation thread");
+            assert!(!other);
+            drop(outer);
+        }
+        assert!(!matching_lf_line_witness_recipe_enabled());
+
+        let unwind = std::panic::catch_unwind(|| {
+            let _scope = matching_lf_line_witness_recipe_scope(true);
+            assert!(matching_lf_line_witness_recipe_enabled());
+            panic!("synthetic matching-LF-line recipe scope unwind");
+        });
+        assert!(unwind.is_err());
+        assert!(!matching_lf_line_witness_recipe_enabled());
+    }
+
+    #[test]
     fn complete_span_recipe_scope_is_nested_unwind_safe_and_thread_local() {
         assert!(!complete_span_reduce_recipe_enabled());
         with_complete_span_reduce_recipe(|| {
@@ -139719,6 +139875,46 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .unwrap();
             assert_eq!(actual, expected, "x86 table changed for {features:?}");
         }
+    }
+
+    #[test]
+    fn matching_lf_line_fixup_receipts_reuse_the_parent_record_padding() {
+        #[allow(dead_code)]
+        struct ParentX86Fixup {
+            instruction: usize,
+            displacement: usize,
+            label: X86Label,
+            short_opcode: Option<u8>,
+            long_bytes: usize,
+        }
+
+        #[allow(dead_code)]
+        struct ParentAarch64Fixup {
+            instruction: usize,
+            label: Aarch64Label,
+            kind: Aarch64FixupKind,
+        }
+
+        // Prove against literal parent record definitions on the compiler and
+        // host that build this crate. Route receipts must consume only existing
+        // padding; the route-carrying x86 threading scratch is separately
+        // isolated behind `track_lf_line_success`.
+        assert_eq!(
+            std::mem::size_of::<X86Fixup>(),
+            std::mem::size_of::<ParentX86Fixup>(),
+        );
+        assert_eq!(
+            std::mem::align_of::<X86Fixup>(),
+            std::mem::align_of::<ParentX86Fixup>(),
+        );
+        assert_eq!(
+            std::mem::size_of::<Aarch64Fixup>(),
+            std::mem::size_of::<ParentAarch64Fixup>(),
+        );
+        assert_eq!(
+            std::mem::align_of::<Aarch64Fixup>(),
+            std::mem::align_of::<ParentAarch64Fixup>(),
+        );
     }
 
     #[test]
