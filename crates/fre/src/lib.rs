@@ -746,7 +746,8 @@ pub use fre_kernels::{
     REVERSE_INNER_UNION_ACCOUNTING_ID, REVERSE_INNER_UNION_PLAN_ID,
     ReverseInnerActualCounters, ReverseInnerBuildAccounting, ReverseInnerBuildError,
     ReverseInnerBuildLimits, ReverseInnerOperation, ReverseInnerOperationIdentity,
-    ReverseInnerPlan, ReverseInnerReduceAccounting, ReverseInnerReduceError,
+    ReverseInnerOrdinaryExecutor, ReverseInnerPlan, ReverseInnerReduceAccounting,
+    ReverseInnerReduceError,
     ReverseInnerReduceLimits, ReverseInnerSearchAccounting, ReverseInnerSearchError,
     ReverseInnerSearchLimits, ReverseInnerSemantics, ReverseInnerUnionMode,
     ReverseInnerUpperBounds,
@@ -18885,6 +18886,80 @@ pub(crate) enum PortableOrdinaryCanonical<'a> {
     Native(&'a PortableRegex),
     ExactLiteral(&'a LiteralPlan),
     FixedPredicateWord64(&'a FixedPredicateWord64Plan),
+    /// Appended so every established compact-binding discriminant remains
+    /// unchanged. One plan pointer binds the source-free single-literal
+    /// capability without growing this two-word projection.
+    ReverseInner(ReverseInnerOrdinaryExecutor<'a>),
+}
+
+#[cfg(test)]
+mod ordinary_reverse_inner_session_probe {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) exists: usize,
+        pub(super) span: usize,
+        pub(super) visit: usize,
+        pub(super) count: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            exists: 0,
+            span: 0,
+            visit: 0,
+            count: 0,
+        }) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                exists: counts.exists.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_span() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                span: counts.span.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_visit() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                visit: counts.visit.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_count() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                count: counts.count.saturating_add(1),
+                ..counts
+            });
+        });
+    }
 }
 
 #[cfg(test)]
@@ -18951,6 +19026,10 @@ impl<'a> PortableOrdinaryCanonical<'a> {
             })),
             PortablePlan::ExactLiteral(plan) => Ok(Self::ExactLiteral(plan)),
             PortablePlan::FixedPredicateWord64(plan) => Ok(Self::FixedPredicateWord64(plan)),
+            PortablePlan::ReverseInner(plan) => match plan.ordinary_executor() {
+                Some(executor) => Ok(Self::ReverseInner(executor)),
+                None => Ok(Self::Native(regex)),
+            },
             _ => Ok(Self::Native(regex)),
         }
     }
@@ -18985,6 +19064,14 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     SearchAccounting::FixedPredicateWord64(accounting),
                 ))
             }
+            Self::ReverseInner(executor) => {
+                let (matched, accounting) = executor.plan().is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )?;
+                Ok((matched, SearchAccounting::ReverseInner(accounting)))
+            }
             Self::Native(regex) => regex.is_match_window(haystack, window, limits),
         }
     }
@@ -19017,6 +19104,15 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     fixed_predicate_word64_search_limits(limits),
                 )
                 .map_err(SearchError::from),
+            Self::ReverseInner(executor) => executor
+                .plan()
+                .is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
             Self::Native(regex) => regex.is_match_window_value(haystack, window, limits),
         }
     }
@@ -19042,6 +19138,15 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+                )
+                .map(|(end, _)| end)
+                .map_err(SearchError::from),
+            Self::ReverseInner(executor) => executor
+                .plan()
+                .shortest_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(SearchLimits::unlimited()),
                 )
                 .map(|(end, _)| end)
                 .map_err(SearchError::from),
@@ -19077,6 +19182,24 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            Self::ReverseInner(executor) => {
+                if start == 0
+                    && let Some(matched) = executor
+                        .find_full_unmetered(haystack)
+                        .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_span();
+                    return Ok(matched.map(|(start, end)| Match { start, end }));
+                }
+                executor.plan().find_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(SearchLimits::unlimited()),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from)
+            }
             Self::Native(regex)
                 if let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan
                     && plan.boundary_semantics()
@@ -19125,6 +19248,40 @@ impl<'a> PortableOrdinaryCanonical<'a> {
             && let PortablePlan::ReverseInner(plan) = &regex.plan
         {
             return plan
+                .try_visit_spans_while_in(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                    ReverseInnerReduceLimits::unlimited(),
+                    |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        })
+                    },
+                )
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search);
+        }
+
+        if let Self::ReverseInner(executor) = self {
+            if start == 0 {
+                let attempt = executor
+                    .try_visit_spans_full_unmetered(haystack, |(matched_start, end)| {
+                        visitor(Match {
+                            start: matched_start,
+                            end,
+                        })
+                    })
+                    .map_err(SearchError::from)
+                    .map_err(PortableFindIterError::Search)?;
+                if let Some(outcome) = attempt {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_visit();
+                    return Ok(outcome);
+                }
+            }
+            return executor
+                .plan()
                 .try_visit_spans_while_in(
                     haystack,
                     LiteralWindow::new(start, haystack.len()),
@@ -25140,6 +25297,25 @@ impl<'r> PortableOrdinarySession<'r> {
                 )?;
                 engine.is_match_at(haystack, start).map_err(SearchError::from)
             }
+            PortableOrdinarySessionPlan::Canonical(
+                PortableOrdinaryCanonical::ReverseInner(executor),
+            ) if start == 0 => {
+                if let Some(matched) = executor
+                    .exists_full_unmetered(haystack)
+                    .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_exists();
+                    return Ok(matched);
+                }
+                executor.plan().is_match_in(
+                    haystack,
+                    LiteralWindow::full(haystack),
+                    reverse_inner_search_limits(SearchLimits::unlimited()),
+                )
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from)
+            }
             PortableOrdinarySessionPlan::Canonical(session) => session
                 .shortest_match_at_value(haystack, start)
                 .map(|endpoint| endpoint.is_some()),
@@ -25786,6 +25962,25 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::Canonical(
                 PortableOrdinaryCanonical::FixedPredicateWord64(plan),
             ) => count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start),
+            PortableOrdinarySessionPlan::Canonical(
+                PortableOrdinaryCanonical::ReverseInner(executor),
+            ) => {
+                if start == 0
+                    && let Some(count) = executor
+                        .count_full_unmetered(haystack)
+                        .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_count();
+                    Ok(Some(count))
+                } else {
+                    count_ordinary_reverse_inner_selected_ends_at(
+                        executor.plan(),
+                        haystack,
+                        start,
+                    )
+                }
+            }
             PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex)) => {
                 match &regex.plan {
                     PortablePlan::LiteralClassRunLiteral(plan) => {
@@ -48773,7 +48968,7 @@ mod tests {
             core::mem::size_of::<super::PortableOrdinarySessionPlan<'static>>();
         let search_plan_bytes =
             core::mem::size_of::<super::PortableSearchSessionPlan<'static>>();
-        assert!(canonical_bytes <= 2 * core::mem::size_of::<usize>());
+        assert_eq!(canonical_bytes, 2 * core::mem::size_of::<usize>());
         assert!(ordinary_plan_bytes < search_plan_bytes);
         assert_eq!(
             core::mem::size_of::<super::PortableOrdinarySession<'static>>(),
@@ -48850,6 +49045,45 @@ mod tests {
                 ..
             } if core::ptr::eq(*bound, &required)
         ));
+
+        let reverse_inner = PortableBuilder::new(r"[abλ]+aa[abλ]+")
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(reverse_inner.build_report().plan, PlanKind::ReverseInner);
+        let PortablePlan::ReverseInner(reverse_inner_plan) = &reverse_inner.plan else {
+            unreachable!("single-literal reverse-inner fixture changed plan")
+        };
+        assert!(reverse_inner_plan.ordinary_single_literal_supported());
+        let reverse_inner_session = reverse_inner.ordinary_session().unwrap();
+        assert!(matches!(
+            &reverse_inner_session.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::ReverseInner(executor)
+            ) if executor.is_bound_to(reverse_inner_plan)
+        ));
+
+        let reverse_inner_union = PortableBuilder::new(
+            r"(?:[abλ]+aa[abλ]+|[abλ]+b[abλ]+)",
+        )
+        .unicode(true)
+        .build()
+        .unwrap();
+        assert_eq!(
+            reverse_inner_union.build_report().plan,
+            PlanKind::ReverseInner,
+        );
+        let PortablePlan::ReverseInner(reverse_inner_union_plan) = &reverse_inner_union.plan else {
+            unreachable!("reverse-inner union fixture changed plan")
+        };
+        assert!(!reverse_inner_union_plan.ordinary_single_literal_supported());
+        let reverse_inner_union_session = reverse_inner_union.ordinary_session().unwrap();
+        assert!(matches!(
+            &reverse_inner_union_session.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::Native(bound_regex)
+            ) if core::ptr::eq(*bound_regex, &reverse_inner_union)
+        ));
     }
 
     #[test]
@@ -48873,6 +49107,9 @@ mod tests {
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::FixedPredicateWord64(_),
                 ) => "canonical-fixed-predicate",
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::ReverseInner(_),
+                ) => "canonical-reverse-inner",
                 super::PortableOrdinarySessionPlan::RequiredLiteral { .. } => {
                     "required-literal"
                 }
@@ -49030,6 +49267,28 @@ mod tests {
             "only the new full-origin call enters the ordinary Exists facade",
         );
 
+        let reverse_inner = PortableBuilder::new(r"[abλ]+aa[abλ]+")
+            .unicode(true)
+            .build()
+            .unwrap();
+        super::ordinary_reverse_inner_session_probe::reset();
+        check(
+            "canonical reverse inner",
+            &reverse_inner,
+            b"!aaaab!",
+            "canonical-reverse-inner",
+            0,
+        );
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot(),
+            super::ordinary_reverse_inner_session_probe::Counts {
+                exists: 2,
+                span: 0,
+                ..super::ordinary_reverse_inner_session_probe::Counts::default()
+            },
+            "both full-origin existence calls use the bound report-free engine",
+        );
+
         let required = PortableBuilder::new(r"(?-u:[a-z]+ZQ)")
             .unicode(false)
             .plan_selection(PlanSelection::ForceRequiredLiteral)
@@ -49168,6 +49427,128 @@ mod tests {
                     "offset-zero route pattern={pattern:?}, haystack={haystack:?}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ordinary_reverse_inner_binding_matches_oracle_at_every_start() {
+        fn sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
+            let mut sources = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..maximum_len {
+                let mut next = Vec::new();
+                for prefix in &level {
+                    for &byte in alphabet {
+                        let mut source = prefix.clone();
+                        source.push(byte);
+                        sources.push(source.clone());
+                        next.push(source);
+                    }
+                }
+                level = next;
+            }
+            sources
+        }
+
+        let pattern = r"[abλ]+aa[abλ]+";
+        let baseline = regex::bytes::Regex::new(pattern).unwrap();
+        let regex = PortableBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        let PortablePlan::ReverseInner(plan) = &regex.plan else {
+            unreachable!("single-literal reverse-inner fixture changed plan")
+        };
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::ReverseInner(executor)
+            ) if executor.is_bound_to(plan)
+        ));
+        assert_eq!(
+            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>(),
+            2 * core::mem::size_of::<usize>(),
+        );
+
+        super::ordinary_reverse_inner_session_probe::reset();
+        let routed = b"!baaaab!";
+        assert_eq!(
+            ordinary
+                .find_at(routed, 0)
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            baseline
+                .find_at(routed, 0)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        assert_eq!(ordinary.is_match_at(routed, 0), Ok(true));
+        assert_eq!(ordinary.is_match(routed), Ok(true));
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot(),
+            super::ordinary_reverse_inner_session_probe::Counts {
+                exists: 2,
+                span: 1,
+                ..super::ordinary_reverse_inner_session_probe::Counts::default()
+            },
+        );
+        assert_eq!(
+            ordinary.shortest_match_at(routed, 0),
+            Ok(baseline.shortest_match_at(routed, 0)),
+        );
+        assert_eq!(
+            ordinary.find_at(routed, 1).unwrap().map(|matched| (
+                matched.start(),
+                matched.end(),
+            )),
+            baseline
+                .find_at(routed, 1)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        assert_eq!(ordinary.is_match_at(routed, 1), Ok(baseline.is_match_at(routed, 1)));
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot(),
+            super::ordinary_reverse_inner_session_probe::Counts {
+                exists: 2,
+                span: 1,
+                ..super::ordinary_reverse_inner_session_probe::Counts::default()
+            },
+            "ranged and shortest operations stay on the canonical window engines",
+        );
+
+        let mut haystacks = sources(&[b'a', b'b', b'!', 0x80, 0xFF], 5);
+        haystacks.extend([
+            "!λaaaabλ!".as_bytes().to_vec(),
+            b"\xffaaaab\x80".to_vec(),
+            b"\xf0\x90\x80aaab!".to_vec(),
+            b"!baa!baa!baaaab!".to_vec(),
+        ]);
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                let expected_find = baseline
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                let actual_find = ordinary
+                    .find_at(haystack, start)
+                    .unwrap()
+                    .map(|matched| (matched.start(), matched.end()));
+                assert_eq!(actual_find, expected_find, "find haystack={haystack:?} start={start}");
+                assert_eq!(
+                    ordinary.is_match_at(haystack, start),
+                    Ok(baseline.is_match_at(haystack, start)),
+                    "exists haystack={haystack:?} start={start}",
+                );
+                assert_eq!(
+                    ordinary.shortest_match_at(haystack, start),
+                    Ok(baseline.shortest_match_at(haystack, start)),
+                    "shortest haystack={haystack:?} start={start}",
+                );
+            }
+            let invalid = haystack.len().checked_add(1).unwrap();
+            assert!(ordinary.find_at(haystack, invalid).is_err());
+            assert!(ordinary.is_match_at(haystack, invalid).is_err());
+            assert!(ordinary.shortest_match_at(haystack, invalid).is_err());
         }
     }
 
@@ -50178,18 +50559,22 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        let PortablePlan::ReverseInner(plan) = &regex.plan else {
+            unreachable!("single-literal reverse-inner fixture changed plan")
+        };
         let mut ordinary = regex.ordinary_session().unwrap();
         assert!(matches!(
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::Canonical(
-                super::PortableOrdinaryCanonical::Native(bound_regex)
-            ) if core::ptr::eq(*bound_regex, &regex)
+                super::PortableOrdinaryCanonical::ReverseInner(executor)
+            ) if executor.is_bound_to(plan)
         ));
-        assert!(
-            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>()
-                <= 2 * core::mem::size_of::<usize>()
+        assert_eq!(
+            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>(),
+            2 * core::mem::size_of::<usize>(),
         );
 
+        super::ordinary_reverse_inner_session_probe::reset();
         for haystack in [
             b"!baaab!abbbaabbb!bbbb!baaab!".as_slice(),
             b"!\xce\xbbbaaab\xce\xbb!abbaabbb!\xce\xbbbaaab!".as_slice(),
@@ -50211,6 +50596,11 @@ mod tests {
                 assert_eq!(actual, expected, "haystack={haystack:?}, start={start}");
             }
         }
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot().visit,
+            3,
+            "only each full-origin traversal uses the report-free visitor",
+        );
 
         let haystack = b"baaab!abbaabbb!bbaabb!";
         let mut stopped = Vec::new();
@@ -50236,6 +50626,11 @@ mod tests {
             Err("callback"),
         );
         assert_eq!(errored, [(0, 5)]);
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot().visit,
+            5,
+            "callback stop and error both stay inside the direct visitor",
+        );
 
         let mut invalid_callback = false;
         assert!(matches!(
@@ -50258,15 +50653,19 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        let PortablePlan::ReverseInner(plan) = &regex.plan else {
+            unreachable!("single-literal reverse-inner fixture changed plan")
+        };
         let haystack = b"!baaab!abbbaabbb!bbbb!baaab!";
         let mut ordinary = regex.ordinary_session().unwrap();
         assert!(matches!(
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::Canonical(
-                super::PortableOrdinaryCanonical::Native(bound_regex)
-            ) if core::ptr::eq(*bound_regex, &regex)
+                super::PortableOrdinaryCanonical::ReverseInner(executor)
+            ) if executor.is_bound_to(plan)
         ));
 
+        super::ordinary_reverse_inner_session_probe::reset();
         for start in 0..=haystack.len() {
             let mut cursor = start;
             let mut expected = 0_u64;
@@ -50284,6 +50683,11 @@ mod tests {
                 "start={start}",
             );
         }
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot().count,
+            1,
+            "only the full-origin count uses the endpoint-only engine",
+        );
         assert!(matches!(
             ordinary.count_positive_width_selected_ends_at(
                 haystack,
