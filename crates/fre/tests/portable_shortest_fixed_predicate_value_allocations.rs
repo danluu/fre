@@ -34,6 +34,9 @@ fn fixed_predicate_shortest_values_allocate_nothing_on_success_or_refusal() {
         max_work: accounting.upper_bounds.work - 1,
         max_scratch_bytes: 0,
     };
+    let mut ordinary = regex
+        .ordinary_session()
+        .expect("ordinary fixed-predicate session binds");
 
     let measured = Region::new(GLOBAL);
     for _ in 0..64 {
@@ -50,6 +53,15 @@ fn fixed_predicate_shortest_values_allocate_nothing_on_success_or_refusal() {
         assert!(
             regex
                 .shortest_match_at_value(matched, matched.len() + 1, exact)
+                .is_err()
+        );
+        assert_eq!(ordinary.first_acceptance_at(matched, 2).unwrap(), Some(16));
+        assert!(ordinary.is_match_at(matched, 2).unwrap());
+        assert_eq!(ordinary.first_acceptance_at(absent, 0).unwrap(), None);
+        assert!(!ordinary.is_match_at(absent, 0).unwrap());
+        assert!(
+            ordinary
+                .first_acceptance_at(matched, matched.len() + 1)
                 .is_err()
         );
     }

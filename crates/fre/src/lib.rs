@@ -14890,6 +14890,9 @@ impl PortableRegex {
                     )
                 }
             }
+            PortablePlan::FixedPredicateWord64(plan) => {
+                PortableOrdinarySessionPlan::FixedPredicateWord64 { plan }
+            }
             PortablePlan::K0(k0) => {
                 let positive =
                     matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0);
@@ -19014,6 +19017,13 @@ enum PortableOrdinarySessionPlan<'a> {
     /// session construction untouched.
     K0WholeLineRunChain {
         engine: k0_whole_line_run_chain::Engine<'a>,
+    },
+    /// Appended so every incumbent ordinary-session variant retains its
+    /// established discriminant. The immutable plan is selected once during
+    /// construction and ordinary operations enter its report-free engines
+    /// without a second compact-canonical discriminant check.
+    FixedPredicateWord64 {
+        plan: &'a FixedPredicateWord64Plan,
     },
 }
 
@@ -25457,6 +25467,53 @@ fn count_ordinary_fixed_predicate_selected_ends_at(
         .map_err(fixed_predicate_word64_unlimited_count_error)
 }
 
+/// Execute the report-free fixed-predicate endpoint projection outside the
+/// shared canonical dispatch body. Keeping this call out of
+/// `PortableOrdinaryCanonical::shortest_match_at_value` leaves every unrelated
+/// canonical route's established inlined layout unchanged.
+#[inline(never)]
+fn ordinary_fixed_predicate_first_acceptance_at_value(
+    plan: &FixedPredicateWord64Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<usize>, SearchError> {
+    plan.earliest_end_window_value(
+        haystack,
+        LiteralWindow::new(start, haystack.len()),
+        fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+    )
+    .map_err(SearchError::from)
+}
+
+#[inline(never)]
+fn ordinary_fixed_predicate_is_match_at_value(
+    plan: &FixedPredicateWord64Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<bool, SearchError> {
+    plan.is_match_window_value(
+        haystack,
+        LiteralWindow::new(start, haystack.len()),
+        fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+    )
+    .map_err(SearchError::from)
+}
+
+#[inline]
+fn ordinary_fixed_predicate_find_at_value(
+    plan: &FixedPredicateWord64Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<Match>, SearchError> {
+    plan.find_window_value(
+        haystack,
+        LiteralWindow::new(start, haystack.len()),
+        fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+    )
+    .map(|matched| matched.map(|(start, end)| Match { start, end }))
+    .map_err(SearchError::from)
+}
+
 impl<'r> PortableOrdinarySession<'r> {
     /// Whether a match exists anywhere in `haystack`.
     ///
@@ -25477,6 +25534,11 @@ impl<'r> PortableOrdinarySession<'r> {
             #[cfg(test)]
             ordinary_session_full_is_match_probe::record_native();
             return regex.try_is_match_ordinary(haystack);
+        }
+        if let PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } = &self.plan {
+            #[cfg(test)]
+            ordinary_session_full_is_match_probe::record_delegated();
+            return ordinary_fixed_predicate_is_match_at_value(plan, haystack, 0);
         }
         #[cfg(test)]
         ordinary_session_full_is_match_probe::record_delegated();
@@ -25532,6 +25594,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 )
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from)
+            }
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                ordinary_fixed_predicate_is_match_at_value(plan, haystack, start)
             }
             PortableOrdinarySessionPlan::Canonical(session) => session
                 .shortest_match_at_value(haystack, start)
@@ -25617,6 +25682,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 engine
                     .first_acceptance_at(haystack, start)
                     .map_err(SearchError::from)
+            }
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                ordinary_fixed_predicate_first_acceptance_at_value(plan, haystack, start)
             }
             PortableOrdinarySessionPlan::Canonical(session) => {
                 session.shortest_match_at_value(haystack, start)
@@ -25739,6 +25807,9 @@ impl<'r> PortableOrdinarySession<'r> {
                     SearchWindow::new(start, haystack.len()),
                     SearchLimits::unlimited(),
                 ),
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                ordinary_fixed_predicate_find_at_value(plan, haystack, start)
+            }
             PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex))
                 if start == 0 =>
             {
@@ -25913,6 +25984,10 @@ impl<'r> PortableOrdinarySession<'r> {
             }
             PortableOrdinarySessionPlan::RequiredLiteral { regex, .. } => {
                 PortableOrdinaryCanonical::Native(regex)
+                    .try_visit_spans_at(haystack, start, visitor)
+            }
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                PortableOrdinaryCanonical::FixedPredicateWord64(plan)
                     .try_visit_spans_at(haystack, start, visitor)
             }
             PortableOrdinarySessionPlan::Canonical(session) => {
@@ -26191,6 +26266,9 @@ impl<'r> PortableOrdinarySession<'r> {
                     *direct_next = true;
                 }
                 Ok(Some(count))
+            }
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start)
             }
             PortableOrdinarySessionPlan::Canonical(
                 PortableOrdinaryCanonical::FixedPredicateWord64(plan),
@@ -49457,9 +49535,7 @@ mod tests {
         let fixed = fixed.ordinary_session().unwrap();
         assert!(matches!(
             fixed.plan,
-            super::PortableOrdinarySessionPlan::Canonical(
-                super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
-            )
+            super::PortableOrdinarySessionPlan::FixedPredicateWord64 { .. }
         ));
 
         let anchored = PortableBuilder::new(r"(?-u:\A[ab]+Z)")
@@ -49550,6 +49626,9 @@ mod tests {
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::FixedPredicateWord64(_),
                 ) => "canonical-fixed-predicate",
+                super::PortableOrdinarySessionPlan::FixedPredicateWord64 { .. } => {
+                    "fixed-predicate"
+                }
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::ReverseInner(_),
                 ) => "canonical-reverse-inner",
@@ -49685,10 +49764,10 @@ mod tests {
         .build()
         .unwrap();
         check(
-            "canonical fixed predicate",
+            "fixed predicate",
             &fixed,
             b"unmatched",
-            "canonical-fixed-predicate",
+            "fixed-predicate",
             0,
         );
 
@@ -49991,8 +50070,8 @@ mod tests {
                 &ordinary.plan,
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::ExactLiteral(_)
-                        | super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
                 )
+                    | super::PortableOrdinarySessionPlan::FixedPredicateWord64 { .. }
             ));
             super::ordinary_session_native_zero_probe::reset();
             assert_eq!(
@@ -51363,9 +51442,7 @@ mod tests {
         let mut ordinary = regex.ordinary_session().unwrap();
         assert!(matches!(
             &ordinary.plan,
-            PortableOrdinarySessionPlan::Canonical(
-                super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
-            )
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { .. }
         ));
 
         for haystack in byte_words(b"acefx", 6) {
@@ -51391,18 +51468,26 @@ mod tests {
 
     #[test]
     fn ordinary_fixed_predicate_count_routes_exact_tails_and_preserves_errors() {
-        fn selected_count(regex: &PortableRegex, haystack: &[u8], start: usize) -> u64 {
+        fn selected_spans(
+            regex: &PortableRegex,
+            haystack: &[u8],
+            start: usize,
+        ) -> Vec<Match> {
             let mut cursor = start;
-            let mut count = 0_u64;
+            let mut spans = Vec::new();
             while let Some(matched) = regex
                 .find_at_value(haystack, cursor, SearchLimits::unlimited())
                 .unwrap()
             {
                 assert!(matched.end() > cursor);
                 cursor = matched.end();
-                count = count.checked_add(1).unwrap();
+                spans.push(matched);
             }
-            count
+            spans
+        }
+
+        fn selected_count(regex: &PortableRegex, haystack: &[u8], start: usize) -> u64 {
+            u64::try_from(selected_spans(regex, haystack, start).len()).unwrap()
         }
 
         for (pattern, haystack) in [
@@ -51417,17 +51502,71 @@ mod tests {
             let mut ordinary = regex.ordinary_session().unwrap();
             assert!(matches!(
                 &ordinary.plan,
-                PortableOrdinarySessionPlan::Canonical(
-                    super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
-                )
+                PortableOrdinarySessionPlan::FixedPredicateWord64 { .. }
             ));
             for start in 0..=haystack.len() {
+                let expected = regex
+                    .find_at_value(haystack, start, SearchLimits::unlimited())
+                    .unwrap();
+                assert_eq!(ordinary.find_at(haystack, start), Ok(expected));
+                assert_eq!(
+                    ordinary.first_acceptance_at(haystack, start),
+                    Ok(expected.map(|matched| matched.end())),
+                );
+                assert_eq!(ordinary.is_match_at(haystack, start), Ok(expected.is_some()));
                 assert_eq!(
                     ordinary.count_positive_width_selected_ends_at(haystack, start),
                     Ok(Some(selected_count(&regex, haystack, start))),
                     "pattern={pattern:?}, start={start}",
                 );
             }
+
+            let visit_start = usize::from(!haystack.is_empty());
+            let expected = selected_spans(&regex, haystack, visit_start);
+            let mut visited = Vec::new();
+            assert_eq!(
+                ordinary
+                    .try_visit_spans_at(haystack, visit_start, |matched| {
+                        visited.push(matched);
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap(),
+                Ok(()),
+            );
+            assert_eq!(visited, expected, "pattern={pattern:?}");
+
+            let mut stopped = Vec::new();
+            assert_eq!(
+                ordinary
+                    .try_visit_spans(haystack, |matched| {
+                        stopped.push(matched);
+                        Ok::<bool, ()>(false)
+                    })
+                    .unwrap(),
+                Ok(()),
+            );
+            assert_eq!(stopped, selected_spans(&regex, haystack, 0)[..stopped.len()]);
+
+            let mut errored = Vec::new();
+            assert_eq!(
+                ordinary
+                    .try_visit_spans(haystack, |matched| {
+                        errored.push(matched);
+                        Err::<bool, _>("callback")
+                    })
+                    .unwrap(),
+                Err("callback"),
+            );
+            assert_eq!(errored, selected_spans(&regex, haystack, 0)[..errored.len()]);
+
+            let mut invalid_callback = false;
+            assert!(ordinary
+                .try_visit_spans_at(haystack, haystack.len() + 1, |_| {
+                    invalid_callback = true;
+                    Ok::<bool, ()>(true)
+                })
+                .is_err());
+            assert!(!invalid_callback);
             assert_eq!(
                 ordinary.count_positive_width_selected_ends_at(haystack, haystack.len() + 1),
                 Err(SearchError::FixedPredicateWord64(
