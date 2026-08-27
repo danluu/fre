@@ -2180,6 +2180,43 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         true
     }
 
+    /// Seek one exact Set4 root after a caller reaches a long selected-span
+    /// fallback. The scanner itself remains range-only, so count and every
+    /// dense uniform operation preserve their established layout and setup.
+    #[inline(always)]
+    fn seek_set4_root_for_selected_span(&mut self, buckets: NonZeroU16) -> bool {
+        let at = self.restart;
+        if self.end - at < ORDINARY_ROOT_SET4_MIN_BYTES {
+            return true;
+        }
+        let bucket_may_contain = |byte: u8| buckets.get() & (1_u16 << (byte >> 4)) != 0;
+        // A marked bucket is only a necessary condition, so retain the exact
+        // DFA whenever either of the first two bytes may be a root. This both
+        // preserves correctness for bucket false positives and avoids cold
+        // Set4 reconstruction on dense adjacent/one-separator matches.
+        if bucket_may_contain(self.haystack[at]) {
+            return true;
+        }
+        if bucket_may_contain(self.haystack[at + 1]) {
+            self.restart = at + 1;
+            return true;
+        }
+        let Some(members) = direct_dfa_set4_members_from_buckets(
+            self.automaton,
+            self.start_state,
+            buckets,
+        ) else {
+            return true;
+        };
+        let remaining = &self.haystack[at..self.end];
+        let Some(relative) = find_direct_dfa_set4_after_initial_miss(members, remaining) else {
+            self.restart = self.end;
+            return false;
+        };
+        self.restart = at + relative;
+        true
+    }
+
     #[inline(always)]
     fn next_end(&mut self) -> Option<usize> {
         self.next::<false>().map(|matched| matched.end)
@@ -2695,7 +2732,15 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
                     }
                 }
             }
-            if !scanner.seek_root_range_for_selected_span() {
+            if let Some(buckets) = self
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root)
+                .and_then(LiteralSetDfaRoot::set4_bucket_mask)
+            {
+                if !scanner.seek_set4_root_for_selected_span(buckets) {
+                    return Ok(None);
+                }
+            } else if !scanner.seek_root_range_for_selected_span() {
                 return Ok(None);
             }
             return Ok(scanner.next_span());
@@ -2854,7 +2899,19 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
                     }
                 }
             }
-            while scanner.seek_root_range_for_selected_span() {
+            let set4_buckets = self
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root)
+                .and_then(LiteralSetDfaRoot::set4_bucket_mask);
+            loop {
+                let may_have_root = if let Some(buckets) = set4_buckets {
+                    scanner.seek_set4_root_for_selected_span(buckets)
+                } else {
+                    scanner.seek_root_range_for_selected_span()
+                };
+                if !may_have_root {
+                    break;
+                }
                 let Some(matched) = scanner.next_span() else {
                     break;
                 };
@@ -8084,7 +8141,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_direct_dfa_root_set4_accelerates_exists_outside_span_scanner() {
+    fn ordinary_direct_dfa_root_set4_accelerates_sparse_span_scans() {
         let patterns = root_set4_patterns();
         let plan = LiteralSetPlan::new_stable(
             &patterns,
@@ -8128,8 +8185,8 @@ mod tests {
 
         ordinary_direct_probe::reset();
         assert_eq!(ordinary.find_window_value(&haystack, window), Ok(Some(expected[0])));
-        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
-        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), 0);
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), gap);
         assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
 
         ordinary_direct_probe::reset();
@@ -8142,9 +8199,30 @@ mod tests {
             Ok(Ok(())),
         );
         assert_eq!(actual, expected);
-        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
-        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), 0);
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 2);
+        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), gap * 2);
         assert_eq!(ordinary_direct_probe::root_range_calls(), 0);
+
+        ordinary_direct_probe::reset();
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |matched| {
+                stopped.push(matched);
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(stopped, [expected[0]]);
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 1);
+
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |_| {
+                Err::<bool, _>("callback")
+            }),
+            Ok(Err("callback")),
+        );
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 1);
 
         // Count deliberately retains the incumbent endpoint loop. This
         // capability must not broaden the repeated-seek experiment into it.
@@ -8171,8 +8249,8 @@ mod tests {
         assert_eq!(dense_spans, dense_repetitions);
         assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
 
-        // Selected-span operations retain the incumbent DFA at both sides of
-        // Exists' separate Set4 threshold.
+        // Selected-span operations retain the scalar DFA below the Set4
+        // threshold and seek at its exact boundary.
         ordinary_direct_probe::reset();
         let short = vec![b'!'; ORDINARY_ROOT_SET4_MIN_BYTES - 1];
         assert_eq!(ordinary.find_window_value(&short, Window::full(&short)), Ok(None));
@@ -8180,8 +8258,8 @@ mod tests {
         ordinary_direct_probe::reset();
         let exact = vec![b'!'; ORDINARY_ROOT_SET4_MIN_BYTES];
         assert_eq!(ordinary.find_window_value(&exact, Window::full(&exact)), Ok(None));
-        assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
-        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), 0);
+        assert_eq!(ordinary_direct_probe::root_set4_calls(), 1);
+        assert_eq!(ordinary_direct_probe::root_set4_skipped_bytes(), exact.len());
 
         for (suffix_bytes, expected_calls) in [
             (ORDINARY_ROOT_SET4_MIN_BYTES.saturating_sub(1), 0),
@@ -8229,7 +8307,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_direct_dfa_root_set4_one_byte_separator_keeps_span_range_only() {
+    fn ordinary_direct_dfa_root_set4_one_byte_separator_stays_in_dfa() {
         let patterns = root_set4_patterns();
         let plan = LiteralSetPlan::new_stable(
             &patterns,
@@ -8240,9 +8318,9 @@ mod tests {
         let first_pattern = patterns[0].as_slice();
         let second_pattern = patterns[51].as_slice();
 
-        // Keep a full Set4 extent after the second match. If Set4 leaked into
-        // selected-span seeking, the one-byte separator would invoke its
-        // leaf. The range-only span scanner instead keeps the incumbent DFA.
+        // Keep a full Set4 extent after the second match. The bucket lookahead
+        // proves the next byte may start a match, so the one-byte separator
+        // stays in the incumbent DFA without reconstructing exact members.
         let mut haystack = first_pattern.to_vec();
         haystack.push(b'!');
         haystack.extend_from_slice(second_pattern);
