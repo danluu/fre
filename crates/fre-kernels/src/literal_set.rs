@@ -2910,10 +2910,11 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     /// Bind one worker-owned engine whose exact ASCII root can be prepared
     /// lazily against this executor's immutable direct-DFA identity.
     ///
-    /// AArch64 retains one exact 5..=48-member ASCII classifier only when its
-    /// direct-DFA identity carries one of the two construction markers. Other
-    /// targets and root shapes retain the unchanged executor alone. The wider
-    /// marker also retains its larger source threshold in the packed identity.
+    /// AArch64 retains one exact 5..=72-member ASCII classifier only when its
+    /// direct-DFA identity carries one of the three construction markers.
+    /// Other targets and root shapes retain the unchanged executor alone. The
+    /// wider markers also retain their larger source thresholds in the packed
+    /// identity.
     /// Binding performs no classifier construction, so short and unused
     /// operations do not pay its setup cost.
     #[doc(hidden)]
@@ -3532,9 +3533,9 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
     /// Count every non-overlapping selected span through the narrow sparse
     /// ASCII root engine used by span visitation.
     ///
-    /// Returns `Ok(None)` for the separately admitted wide tier so its count
-    /// caller can retain the compact endpoint route. Exists and span calls
-    /// continue to use the bound wide engine unchanged.
+    /// Returns `Ok(None)` for the separately admitted wider tiers so their
+    /// count caller can retain the compact endpoint route. Exists and span
+    /// calls continue to use the bound wider engines unchanged.
     ///
     /// # Errors
     ///

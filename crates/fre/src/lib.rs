@@ -18767,11 +18767,12 @@ pub struct PortableSearchSession<'a> {
 /// and leaves its shared ASCII-root engine sidecar unbound. The first endpoint
 /// or span call settles that sidecar once, caching either a qualified AArch64
 /// engine or an unavailable result. Count also settles and reuses the admitted
-/// narrow 5..=24-root engine. The separately admitted 25..=48-root tier keeps
-/// count on the incumbent direct scanner and leaves its sidecar unbound; other
-/// ineligible counts likewise retain their incumbent fallback without settling
-/// the sidecar. A qualified engine still prepares its classifier only when a
-/// call first reaches the branch that can use it.
+/// narrow 5..=24-root engine. The separately admitted 25..=48-root and
+/// 49..=72-root tiers keep count on the incumbent direct scanner and leave
+/// their sidecar unbound; other ineligible counts likewise retain their
+/// incumbent fallback without settling the sidecar. A qualified engine still
+/// prepares its classifier only when a call first reaches the branch that can
+/// use it.
 /// Other matcher families retain only their compact binding. No method on this
 /// type accepts finite limits or publishes accounting; callers that need
 /// either contract should use [`PortableSearchSession`] instead.
