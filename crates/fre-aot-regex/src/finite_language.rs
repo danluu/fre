@@ -1581,6 +1581,17 @@ impl<'a> NativeFiniteExistsChoiceView<'a> {
         self.kind
     }
 
+    /// Return the independently derived Teddy portfolio only for the bounded
+    /// multi-literal Choice. Byte sets and singletons remain owned by their
+    /// narrower direct leaves.
+    pub(crate) const fn teddy_portfolio(self) -> Option<MandatoryTeddyPortfolio> {
+        match self.kind {
+            NativeFiniteExistsChoiceKind::Teddy(portfolio) => Some(portfolio),
+            NativeFiniteExistsChoiceKind::ByteSet { .. }
+            | NativeFiniteExistsChoiceKind::SingleLiteral => None,
+        }
+    }
+
     /// Return only the compact one-byte strategy payload without copying the
     /// larger Teddy planning variant carried by this target-neutral Choice.
     pub(crate) const fn byte_set_membership(&self) -> Option<[u64; 4]> {

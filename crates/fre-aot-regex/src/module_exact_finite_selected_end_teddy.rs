@@ -21,6 +21,7 @@ const EXACT_FINITE_TEDDY_MATERIAL_GAIN_NUMERATOR: u128 = 7;
 const EXACT_FINITE_TEDDY_MATERIAL_GAIN_DENOMINATOR: u128 = 8;
 const EXACT_FINITE_LITERAL_BYTE_VERIFICATION_UNITS: u128 = 11;
 const EXACT_FINITE_LITERAL_DISPATCH_UNITS: u128 = 8;
+const EXACT_FINITE_EXISTS_INCUMBENT_TAIL_SETUP_UNITS: u128 = 64;
 const EXACT_FINITE_TEDDY_RUNTIME_VERIFICATION_BUDGET: u16 = 64;
 const EXACT_FINITE_TEDDY_ASIMD_VERIFIER_BYTES: u16 = 16;
 const EXACT_FINITE_TEDDY_ASIMD_OVERLAP_MIN_RESIDUE: u16 = 5;
@@ -46,10 +47,206 @@ const EXACT_FINITE_TEDDY_SVE_BUCKET_SCRATCH: u8 = 5;
 /// Sixty-four fat slice references occupy 1 KiB on supported 64-bit hosts;
 /// the extra headroom keeps this an explicit compiler resource ceiling.
 const EXACT_FINITE_TEDDY_VALIDATION_SCRATCH_LIMIT_BYTES: usize = 2 * 1024;
+const EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_SITE: &str =
+    "exact finite SelectedEnd Teddy native data";
+
+#[cfg(test)]
+std::thread_local! {
+    static EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_INJECTION: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct ExactFiniteTeddyNativeDataAllocationInjection;
+
+#[cfg(test)]
+impl ExactFiniteTeddyNativeDataAllocationInjection {
+    fn arm() -> Self {
+        EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.replace(1),
+                0,
+                "exact-finite Teddy native-data allocation injection was already armed",
+            );
+        });
+        Self
+    }
+
+    fn assert_failed_once(&self) {
+        EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.get(),
+                2,
+                "exact-finite Teddy native-data allocation injection was not consumed exactly once",
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for ExactFiniteTeddyNativeDataAllocationInjection {
+    fn drop(&mut self) {
+        EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_INJECTION.with(|state| state.set(0));
+    }
+}
+
+fn reserve_exact_finite_teddy_native_data(
+    data: &mut Vec<u8>,
+    additional: usize,
+) -> Result<(), ObjectError> {
+    #[cfg(test)]
+    {
+        let inject = EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_INJECTION.with(|state| {
+            match state.get() {
+                0 => false,
+                1 => {
+                    state.set(2);
+                    true
+                }
+                2 => panic!(
+                    "exact-finite Teddy native-data allocation was retried after failure"
+                ),
+                _ => unreachable!("invalid exact-finite Teddy allocation injection state"),
+            }
+        });
+        if inject {
+            return Err(ObjectError::Allocation(
+                EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_SITE,
+            ));
+        }
+    }
+    data.try_reserve_exact(additional)
+        .map_err(|_| ObjectError::Allocation(EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_SITE))
+}
+
+/// Common, source-authenticated literal surface consumed by the mature Teddy
+/// scanner and exact verifier. Output-specific sidecars project only facts
+/// rechecked at this lowering boundary.
+#[derive(Clone, Copy, Debug)]
+struct ExactFiniteTeddyLiteralView<'a> {
+    artifact_identity: [u8; 32],
+    output: OutputContract,
+    literals: &'a [Vec<u8>],
+    portfolio: MandatoryTeddyPortfolio,
+    minimum_width: u32,
+    maximum_width: u32,
+    root_members: [u64; 4],
+    source_count: u32,
+    total_source_bytes: usize,
+    literal_digest: [u8; 32],
+}
+
+const fn exact_finite_exists_teddy_source_count_is_supported(source_count: usize) -> bool {
+    source_count >= 4 && source_count <= 64
+}
+
+impl<'a> ExactFiniteTeddyLiteralView<'a> {
+    const fn from_selected_end(view: NativeFiniteSelectedEndTeddyView<'a>) -> Self {
+        Self {
+            artifact_identity: view.artifact_identity(),
+            output: OutputContract::SelectedEnd,
+            literals: view.literals(),
+            portfolio: view.portfolio(),
+            minimum_width: view.minimum_width(),
+            maximum_width: view.maximum_width(),
+            root_members: view.root_members(),
+            source_count: view.source_count(),
+            total_source_bytes: view.total_source_bytes(),
+            literal_digest: view.literal_digest(),
+        }
+    }
+
+    fn from_exists(
+        artifact_identity: [u8; 32],
+        view: NativeFiniteExistsChoiceView<'a>,
+    ) -> Option<Self> {
+        let literals = view.literals();
+        let portfolio = view.teddy_portfolio()?;
+        if artifact_identity == [0; 32]
+            || !exact_finite_exists_teddy_source_count_is_supported(literals.len())
+            || literals.iter().any(Vec::is_empty)
+            || view.minimum_width() < 3
+        {
+            return None;
+        }
+        let total_source_bytes = literals
+            .iter()
+            .try_fold(0_usize, |total, literal| total.checked_add(literal.len()))?;
+        let minimum_width = u32::try_from(literals.iter().map(Vec::len).min()?).ok()?;
+        let maximum_width = u32::try_from(literals.iter().map(Vec::len).max()?).ok()?;
+        if total_source_bytes != view.total_source_bytes()
+            || minimum_width != view.minimum_width()
+            || maximum_width != view.maximum_width()
+        {
+            return None;
+        }
+        let mut root_members = [0_u64; 4];
+        let mut digest = Sha256::new();
+        digest.update(u64::try_from(literals.len()).ok()?.to_le_bytes());
+        for literal in literals {
+            let byte = usize::from(*literal.first()?);
+            root_members[byte / 64] |= 1_u64 << (byte % 64);
+            digest.update(u64::try_from(literal.len()).ok()?.to_le_bytes());
+            digest.update(literal);
+        }
+        Some(Self {
+            artifact_identity,
+            output: OutputContract::Exists,
+            literals,
+            portfolio,
+            minimum_width,
+            maximum_width,
+            root_members,
+            source_count: u32::try_from(literals.len()).ok()?,
+            total_source_bytes,
+            literal_digest: digest.finalize().into(),
+        })
+    }
+
+    const fn artifact_identity(self) -> [u8; 32] {
+        self.artifact_identity
+    }
+
+    const fn output(self) -> OutputContract {
+        self.output
+    }
+
+    const fn literals(self) -> &'a [Vec<u8>] {
+        self.literals
+    }
+
+    const fn portfolio(self) -> MandatoryTeddyPortfolio {
+        self.portfolio
+    }
+
+    const fn minimum_width(self) -> u32 {
+        self.minimum_width
+    }
+
+    const fn maximum_width(self) -> u32 {
+        self.maximum_width
+    }
+
+    const fn root_members(self) -> [u64; 4] {
+        self.root_members
+    }
+
+    const fn source_count(self) -> u32 {
+        self.source_count
+    }
+
+    const fn total_source_bytes(self) -> usize {
+        self.total_source_bytes
+    }
+
+    const fn literal_digest(self) -> [u8; 32] {
+        self.literal_digest
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ExactFiniteSelectedEndTeddySelection<'a> {
-    view: NativeFiniteSelectedEndTeddyView<'a>,
+    view: ExactFiniteTeddyLiteralView<'a>,
     plan: MandatoryTeddyPlan,
     isa: MandatoryTeddyIsa,
     target: Target,
@@ -69,6 +266,14 @@ pub(super) enum ExactFiniteSelectedEndTeddyWrapOutcome {
         report: ExactFiniteSelectedEndTeddyAotReport,
     },
     ResourceDeclined(NativeLowering),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactFiniteTeddySuccessMode {
+    SelectedEnd,
+    /// Preserve the verified candidate and tail-enter the exact incumbent at
+    /// that base, retaining its positive result and LF-cursor authority.
+    ExistsReverifyInIncumbent,
 }
 
 fn root_frequency_and_cardinality(membership: [u64; 4]) -> Option<(u16, u16)> {
@@ -103,15 +308,20 @@ fn complete_dfa_incumbent_cost_units(
     if !complete_dfa_baseline_report_has_valid_geometry(incumbent, selection_basis) {
         return None;
     }
-    let per_byte = u128::try_from(incumbent.hot_loads_per_byte)
+    horizon.checked_mul(complete_dfa_incumbent_per_byte_units(incumbent)?)
+}
+
+fn complete_dfa_incumbent_per_byte_units(
+    incumbent: ExactFiniteSelectedEndDfaBaselineReport,
+) -> Option<u128> {
+    u128::try_from(incumbent.hot_loads_per_byte)
         .ok()?
         .checked_mul(4)?
         .checked_add(
             u128::try_from(incumbent.hot_branches_per_byte)
                 .ok()?
                 .checked_mul(3)?,
-        )?;
-    horizon.checked_mul(per_byte)
+        )
 }
 
 fn complete_dfa_baseline_report_has_valid_geometry(
@@ -170,6 +380,7 @@ struct RecomputedExactFiniteSelectedEndTeddySelection {
 
 fn exact_finite_selected_end_teddy_costs<B: AsRef<[u8]>>(
     literals: &[B],
+    output: OutputContract,
     root_members: [u64; 4],
     plan: MandatoryTeddyPlan,
     isa: MandatoryTeddyIsa,
@@ -226,9 +437,30 @@ fn exact_finite_selected_end_teddy_costs<B: AsRef<[u8]>>(
         .checked_mul(expected_candidate_numerator)?
         .checked_add(probability_denominator.checked_sub(1)?)?
         .checked_div(probability_denominator)?;
+    // Exists verifies an exact candidate and then deliberately resumes the
+    // authoritative complete DFA at that base. Charge every fingerprint
+    // candidate as though it were a true hit: maximum literal width times the
+    // incumbent's favorable per-byte lower bound, plus a fixed tail/setup
+    // charge. False candidates normally stay in Teddy, so this is a
+    // result-blind conservative overcharge for unknown workloads.
+    let expected_incumbent_reverify_cost_units = if output == OutputContract::Exists {
+        let maximum_width = literals.iter().try_fold(0_u128, |maximum, literal| {
+            Some(maximum.max(u128::try_from(literal.as_ref().len()).ok()?))
+        })?;
+        let per_candidate = maximum_width
+            .checked_mul(complete_dfa_incumbent_per_byte_units(incumbent)?)?
+            .checked_add(EXACT_FINITE_EXISTS_INCUMBENT_TAIL_SETUP_UNITS)?;
+        per_candidate
+            .checked_mul(expected_candidate_numerator)?
+            .checked_add(probability_denominator.checked_sub(1)?)?
+            .checked_div(probability_denominator)?
+    } else {
+        0
+    };
     let full_cost_units = gate_cost_units
         .checked_mul(EXACT_FINITE_TEDDY_GATE_COST_MULTIPLIER)?
-        .checked_add(expected_verification_cost_units)?;
+        .checked_add(expected_verification_cost_units)?
+        .checked_add(expected_incumbent_reverify_cost_units)?;
     let incumbent_cost_units =
         complete_dfa_incumbent_cost_units(incumbent, horizon, selection_basis)?;
     if full_cost_units.checked_mul(EXACT_FINITE_TEDDY_MATERIAL_GAIN_DENOMINATOR)?
@@ -254,6 +486,7 @@ fn exact_finite_selected_end_teddy_costs<B: AsRef<[u8]>>(
 )]
 fn recompute_exact_finite_selected_end_teddy_selection<B: AsRef<[u8]>>(
     literals: &[B],
+    output: OutputContract,
     portfolio: MandatoryTeddyPortfolio,
     minimum_width: u32,
     root_members: [u64; 4],
@@ -275,6 +508,7 @@ fn recompute_exact_finite_selected_end_teddy_selection<B: AsRef<[u8]>>(
         }
         let Some(costs) = exact_finite_selected_end_teddy_costs(
             literals,
+            output,
             root_members,
             plan,
             isa,
@@ -314,6 +548,7 @@ pub(super) fn select_exact_finite_selected_end_teddy<'a>(
     target: Target,
     incumbent: ExactFiniteSelectedEndDfaBaselineReport,
 ) -> Option<ExactFiniteSelectedEndTeddySelection<'a>> {
+    let view = ExactFiniteTeddyLiteralView::from_selected_end(view);
     let selection_horizon_bytes =
         PARTIAL_DFA_MIN_INPUT_BYTES.checked_mul(COST_HORIZON_MULTIPLIER)?;
     if !complete_dfa_baseline_report_has_valid_geometry(
@@ -324,6 +559,61 @@ pub(super) fn select_exact_finite_selected_end_teddy<'a>(
     }
     let selected = recompute_exact_finite_selected_end_teddy_selection(
         view.literals(),
+        OutputContract::SelectedEnd,
+        view.portfolio(),
+        view.minimum_width(),
+        view.root_members(),
+        target,
+        incumbent,
+        selection_horizon_bytes,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    )?;
+    Some(ExactFiniteSelectedEndTeddySelection {
+        view,
+        plan: selected.plan,
+        isa: selected.isa,
+        target,
+        selection_horizon_bytes,
+        gate_cost_units: selected.costs.gate_cost_units,
+        expected_verification_cost_units: selected.costs.expected_verification_cost_units,
+        full_cost_units: selected.costs.full_cost_units,
+        incumbent_cost_units: selected.costs.incumbent_cost_units,
+        root_frequency_units: selected.costs.root_frequency_units,
+        no_candidate_numerator: selected.costs.no_candidate_numerator,
+        probability_denominator: selected.costs.probability_denominator,
+    })
+}
+
+/// Select the shared correlated scanner for an independently authenticated
+/// finite `Exists` Choice. Valid two- and three-literal choices deliberately
+/// decline with `None` instead of becoming module errors.
+pub(super) fn exact_finite_exists_teddy_is_structurally_eligible(
+    artifact_identity: [u8; 32],
+    view: NativeFiniteExistsChoiceView<'_>,
+    target: Target,
+) -> bool {
+    native_mandatory_teddy_isa(target).is_some()
+        && ExactFiniteTeddyLiteralView::from_exists(artifact_identity, view).is_some()
+}
+
+pub(super) fn select_exact_finite_exists_teddy<'a>(
+    artifact_identity: [u8; 32],
+    view: NativeFiniteExistsChoiceView<'a>,
+    target: Target,
+    incumbent: ExactFiniteSelectedEndDfaBaselineReport,
+) -> Option<ExactFiniteSelectedEndTeddySelection<'a>> {
+    let view = ExactFiniteTeddyLiteralView::from_exists(artifact_identity, view)?;
+    let selection_horizon_bytes =
+        PARTIAL_DFA_MIN_INPUT_BYTES.checked_mul(COST_HORIZON_MULTIPLIER)?;
+    if !complete_dfa_baseline_report_has_valid_geometry(
+        incumbent,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+    ) {
+        return None;
+    }
+    let selected = recompute_exact_finite_selected_end_teddy_selection(
+        view.literals(),
+        OutputContract::Exists,
         view.portfolio(),
         view.minimum_width(),
         view.root_members(),
@@ -356,6 +646,7 @@ pub(super) fn select_exact_finite_selected_end_teddy_forced_v2<'a>(
     target: Target,
     incumbent: ExactFiniteSelectedEndDfaBaselineReport,
 ) -> Option<ExactFiniteSelectedEndTeddySelection<'a>> {
+    let view = ExactFiniteTeddyLiteralView::from_selected_end(view);
     let selection_horizon_bytes =
         PARTIAL_DFA_MIN_INPUT_BYTES.checked_mul(COST_HORIZON_MULTIPLIER)?;
     if !complete_dfa_baseline_report_has_valid_geometry(
@@ -366,6 +657,7 @@ pub(super) fn select_exact_finite_selected_end_teddy_forced_v2<'a>(
     }
     let selected = recompute_exact_finite_selected_end_teddy_selection(
         view.literals(),
+        OutputContract::SelectedEnd,
         view.portfolio(),
         view.minimum_width(),
         view.root_members(),
@@ -823,7 +1115,7 @@ fn exact_finite_selected_end_teddy_required_data_bytes(
 
 fn append_exact_verifier_data(
     data: &mut Vec<u8>,
-    view: NativeFiniteSelectedEndTeddyView<'_>,
+    view: ExactFiniteTeddyLiteralView<'_>,
     teddy: NativeMandatoryTeddyLayout,
     maximum_data_bytes: usize,
 ) -> Result<Option<ExactFiniteSelectedEndTeddyDataLayout>, ObjectError> {
@@ -993,6 +1285,7 @@ fn checked_rebase_relocations(
 fn lower_x86_wrapper(
     incumbent_code: &[u8],
     layout: ExactFiniteSelectedEndTeddyDataLayout,
+    success_mode: ExactFiniteTeddySuccessMode,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>, usize), ObjectError> {
     let teddy = layout.teddy;
     if incumbent_code.is_empty()
@@ -1218,11 +1511,19 @@ fn lower_x86_wrapper(
     assembler.branch(&[0xe9], tail)?;
 
     assembler.bind(matched)?;
-    assembler.instruction(&[0x48, 0x8d, 0x04, 0x0a])?; // selected end
-    assembler.instruction(&[0x49, 0x89, 0x06])?;
-    assembler.instruction(&[0x49, 0x89, 0x46, 0x08])?;
-    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
-    assembler.branch(&[0xe9], returned)?;
+    match success_mode {
+        ExactFiniteTeddySuccessMode::SelectedEnd => {
+            assembler.instruction(&[0x48, 0x8d, 0x04, 0x0a])?; // selected end
+            assembler.instruction(&[0x49, 0x89, 0x06])?;
+            assembler.instruction(&[0x49, 0x89, 0x46, 0x08])?;
+            assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+            assembler.branch(&[0xe9], returned)?;
+        }
+        ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent => {
+            // RDX still names the byte-exact candidate base.
+            assembler.branch(&[0xe9], runtime_fallback)?;
+        }
+    }
 
     assembler.bind(exhausted)?;
     assembler.instruction(&[0x31, 0xc0])?;
@@ -1435,6 +1736,7 @@ fn lower_aarch64_wrapper(
     lane_index_offset: Option<u32>,
     selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
     use_asimd_exact_verifier: bool,
+    success_mode: ExactFiniteTeddySuccessMode,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>, usize), ObjectError> {
     let teddy = layout.teddy;
     if incumbent_code.is_empty()
@@ -2007,14 +2309,22 @@ fn lower_aarch64_wrapper(
         assembler.branch(matched)?;
     }
     assembler.bind(matched)?;
-    assembler.instruction(aarch64_add_x_reg(6, 2, 1)?)?;
-    assembler.instruction(aarch64_store_x(6, 4, 0)?)?;
-    assembler.instruction(aarch64_store_x(6, 4, 8)?)?;
-    assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.instruction(aarch64_load_x_imm(21, 31, 16)?)?;
-    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 0)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
-    assembler.instruction(0xd65f_03c0)?;
+    match success_mode {
+        ExactFiniteTeddySuccessMode::SelectedEnd => {
+            assembler.instruction(aarch64_add_x_reg(6, 2, 1)?)?;
+            assembler.instruction(aarch64_store_x(6, 4, 0)?)?;
+            assembler.instruction(aarch64_store_x(6, 4, 8)?)?;
+            assembler.instruction(aarch64_movz_w(0, 1)?)?;
+            assembler.instruction(aarch64_load_x_imm(21, 31, 16)?)?;
+            assembler.instruction(aarch64_load_pair_x(19, 20, 31, 0)?)?;
+            assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
+            assembler.instruction(0xd65f_03c0)?;
+        }
+        ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent => {
+            // X2 still names the byte-exact candidate base.
+            assembler.branch(runtime_fallback)?;
+        }
+    }
     assembler.bind(exhausted)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(21, 31, 16)?)?;
@@ -2210,6 +2520,7 @@ pub(super) fn wrap_exact_finite_selected_end_teddy(
         target,
         maximum_native_data_bytes,
         ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        ExactFiniteTeddySuccessMode::SelectedEnd,
     )
 }
 
@@ -2227,6 +2538,27 @@ pub(super) fn wrap_exact_finite_selected_end_teddy_forced_v2(
         target,
         maximum_native_data_bytes,
         ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+        ExactFiniteTeddySuccessMode::SelectedEnd,
+    )
+}
+
+/// Compose an `Exists` Teddy negative accelerator with the already selected
+/// complete-DFA incumbent. Positive candidates tail-enter that exact lowering.
+pub(super) fn wrap_exact_finite_exists_teddy(
+    selection: ExactFiniteSelectedEndTeddySelection<'_>,
+    incumbent: NativeLowering,
+    incumbent_complete_dfa: ExactFiniteSelectedEndDfaBaselineReport,
+    target: Target,
+    maximum_native_data_bytes: usize,
+) -> Result<ExactFiniteSelectedEndTeddyWrapOutcome, ObjectError> {
+    wrap_exact_finite_selected_end_teddy_with_basis(
+        selection,
+        incumbent,
+        incumbent_complete_dfa,
+        target,
+        maximum_native_data_bytes,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent,
     )
 }
 
@@ -2237,8 +2569,14 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
     target: Target,
     maximum_native_data_bytes: usize,
     selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    success_mode: ExactFiniteTeddySuccessMode,
 ) -> Result<ExactFiniteSelectedEndTeddyWrapOutcome, ObjectError> {
     if target != selection.target
+        || selection.view.output()
+            != match success_mode {
+                ExactFiniteTeddySuccessMode::SelectedEnd => OutputContract::SelectedEnd,
+                ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent => OutputContract::Exists,
+            }
         || native_mandatory_teddy_isa(target) != Some(selection.isa)
         || !complete_dfa_baseline_report_has_valid_geometry(incumbent_complete_dfa, selection_basis)
         || incumbent_complete_dfa.native_data_bytes != incumbent.data.len()
@@ -2265,10 +2603,7 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
             .ok_or(ObjectError::InvalidModule(
                 "exact finite SelectedEnd Teddy required data regressed",
             ))?;
-    incumbent
-        .data
-        .try_reserve_exact(additional)
-        .map_err(|_| ObjectError::Allocation("exact finite SelectedEnd Teddy native data"))?;
+    reserve_exact_finite_teddy_native_data(&mut incumbent.data, additional)?;
     let incumbent_code = core::mem::take(&mut incumbent.code);
     let incumbent_relocations = core::mem::take(&mut incumbent.relocations);
     let incumbent_relocation_count = incumbent_relocations.len();
@@ -2323,7 +2658,7 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
     let (code, relocations, incumbent_code_offset) = match target.architecture {
         Architecture::X86_64 => {
             let (code, mut wrapper_relocations, core_offset) =
-                lower_x86_wrapper(&incumbent_code, verifier_layout)?;
+                lower_x86_wrapper(&incumbent_code, verifier_layout, success_mode)?;
             let rebased = checked_rebase_relocations(
                 incumbent_relocations,
                 incumbent_code.len(),
@@ -2347,6 +2682,7 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
                 lane_index_offset,
                 selection_basis,
                 use_asimd_exact_verifier,
+                success_mode,
             )?;
             let rebased = checked_rebase_relocations(
                 incumbent_relocations,
@@ -2366,6 +2702,11 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
     incumbent.relocations = relocations;
     incumbent.start_accelerator = report_scanner(selection.isa);
     incumbent.anchored_prefix_filter_bytes = selection.plan.columns();
+    if success_mode == ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent {
+        // Stage one deliberately declines additive direct/LF endpoints instead
+        // of publishing the incumbent's now-stale entry-relative proof.
+        incumbent.direct_search_trusted_core = None;
+    }
     let report = report_for(
         selection,
         verifier_layout,
@@ -2382,13 +2723,23 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
         incumbent_relocation_count,
         incumbent_complete_dfa,
     )?;
-    let report_matches = match selection_basis {
-        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
-            report_matches_lowering(&report, &incumbent, target)?
-        }
-        ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
-            report_matches_lowering_with_basis(&report, &incumbent, target, selection_basis)?
-        }
+    let report_matches = match (success_mode, selection_basis) {
+        (
+            ExactFiniteTeddySuccessMode::SelectedEnd,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        ) => report_matches_lowering(&report, &incumbent, target)?,
+        (
+            ExactFiniteTeddySuccessMode::SelectedEnd,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+        ) => report_matches_lowering_with_basis(&report, &incumbent, target, selection_basis)?,
+        (
+            ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        ) => exists_report_matches_lowering(&report, &incumbent, target)?,
+        (
+            ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+        ) => false,
     };
     if !report_matches {
         return Err(ObjectError::InvalidModule(
@@ -2431,6 +2782,57 @@ fn report_matches_lowering_with_basis(
         lowering.anchored_prefix_filter_bytes,
         target,
         selection_basis,
+        OutputContract::SelectedEnd,
+    )
+}
+
+pub(super) fn exists_report_matches_lowering(
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+    lowering: &NativeLowering,
+    target: Target,
+) -> Result<bool, ObjectError> {
+    report_matches_parts_with_basis(
+        report,
+        &lowering.code,
+        &lowering.data,
+        &lowering.relocations,
+        lowering.needs_runtime,
+        lowering.slow_partial_table.is_some(),
+        lowering.start_accelerator,
+        lowering.anchored_prefix_filter_bytes,
+        target,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        OutputContract::Exists,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the additive boundary re-authenticates every independently stored Exists lowering component"
+)]
+pub(super) fn exists_report_matches_parts(
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+    code: &[u8],
+    data: &[u8],
+    relocations: &[ModuleRelocation],
+    needs_runtime: bool,
+    has_slow_partial_table: bool,
+    start_accelerator: StartAccelerator,
+    anchored_prefix_filter_bytes: u8,
+    target: Target,
+) -> Result<bool, ObjectError> {
+    report_matches_parts_with_basis(
+        report,
+        code,
+        data,
+        relocations,
+        needs_runtime,
+        has_slow_partial_table,
+        start_accelerator,
+        anchored_prefix_filter_bytes,
+        target,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        OutputContract::Exists,
     )
 }
 
@@ -2460,6 +2862,7 @@ pub(super) fn report_matches_parts(
         anchored_prefix_filter_bytes,
         target,
         ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        OutputContract::SelectedEnd,
     )
 }
 
@@ -2490,6 +2893,7 @@ pub(super) fn report_v2_matches_parts(
             anchored_prefix_filter_bytes,
             target,
             report.selection_basis,
+            OutputContract::SelectedEnd,
         )?)
 }
 
@@ -2508,6 +2912,7 @@ fn report_matches_parts_with_basis(
     anchored_prefix_filter_bytes: u8,
     target: Target,
     selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    expected_output: OutputContract,
 ) -> Result<bool, ObjectError> {
     let code_end = report
         .incumbent_code_offset
@@ -2540,7 +2945,8 @@ fn report_matches_parts_with_basis(
         costs_authenticate
             && verifier_data_authenticates(report, data)?
             && report.artifact_identity != [0; 32]
-            && report.output == OutputContract::SelectedEnd
+            && report.output == expected_output
+            && matches!(expected_output, OutputContract::Exists | OutputContract::SelectedEnd)
             && report.source_count >= 4
             && report.source_count <= 64
             && usize::try_from(report.minimum_width)
@@ -2879,6 +3285,7 @@ fn report_costs_authenticate_with_basis(
         )?;
         let selected = recompute_exact_finite_selected_end_teddy_selection(
             &literals,
+            report.output,
             portfolio,
             u32::try_from(minimum_width).ok()?,
             root_members,
@@ -2980,6 +3387,7 @@ pub(super) fn refresh_report_parts(
         anchored_prefix_filter_bytes,
         target,
         ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        OutputContract::SelectedEnd,
     )
 }
 
@@ -2998,6 +3406,7 @@ fn refresh_report_parts_with_basis(
     anchored_prefix_filter_bytes: u8,
     target: Target,
     selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    expected_output: OutputContract,
 ) -> Result<(), ObjectError> {
     report.native_code_sha256 = Sha256::digest(code).into();
     report.native_data_sha256 = Sha256::digest(data).into();
@@ -3016,6 +3425,7 @@ fn refresh_report_parts_with_basis(
         anchored_prefix_filter_bytes,
         target,
         selection_basis,
+        expected_output,
     )? {
         return Err(ObjectError::InvalidModule(
             "exact finite SelectedEnd Teddy aggregate composition changed its ordinary entry",
@@ -3050,6 +3460,7 @@ pub(super) fn refresh_report_v2_parts(
         anchored_prefix_filter_bytes,
         target,
         report.selection_basis,
+        OutputContract::SelectedEnd,
     )?;
     report.route_binding_sha256 = v2_route_binding_digest(report);
     if !report_v2_matches_parts(
@@ -3095,6 +3506,26 @@ mod tests {
             }
             if ordinal == 16 {
                 pattern.push_str("\\xaa");
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
+    fn scanner_free_exact_finite_pattern_variant() -> String {
+        let mut pattern = String::from("(?-u:");
+        for ordinal in 0_u8..17 {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            let first = SCANNER_FREE_BYTES[usize::from(ordinal)];
+            pattern.push_str(&format!("\\x{first:02x}"));
+            let remainder = first ^ 1;
+            for _ in 1..6 {
+                pattern.push_str(&format!("\\x{remainder:02x}"));
+            }
+            if ordinal == 16 {
+                pattern.push_str("\\xab");
             }
         }
         pattern.push(')');
@@ -3459,6 +3890,62 @@ mod tests {
         compiled
     }
 
+    fn compile_exists(pattern: &str, target: Target) -> CompiledRegex {
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile exact finite Exists Teddy fixture");
+        let report = compiled
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .unwrap_or_else(|| {
+                let choice = compiled.program().native_finite_exists_choice_view();
+                let semantic = compiled.program().native_dfa_view().unwrap();
+                let cost = NativeCompleteDfaCost::estimate_exists(&semantic)
+                    .unwrap()
+                    .unwrap();
+                let incumbent = lower_native_dfa(semantic, target).unwrap().unwrap();
+                let baseline = cost.exists_report(&semantic, &incumbent).unwrap();
+                panic!(
+                    "direct exact finite Exists Teddy route: pattern={pattern:?} engine={:?} choice={} static_accelerator={} scanner={:?} baseline={} selection={}",
+                    compiled.receipt().engine,
+                    choice.is_some(),
+                    cost.has_accelerator,
+                    incumbent.start_accelerator,
+                    baseline.is_some(),
+                    choice
+                        .zip(baseline)
+                        .and_then(|(choice, baseline)| select_exact_finite_exists_teddy(
+                            compiled.program().artifact_identity(),
+                            choice,
+                            target,
+                            baseline,
+                        ))
+                        .is_some(),
+                )
+            });
+        assert_eq!(report.output, OutputContract::Exists);
+        assert!((4..=64).contains(&report.source_count));
+        assert!(report.minimum_width >= 3);
+        assert!(compiled.receipt().ordered_finite_language_aot.is_none());
+        assert!(
+            compiled
+                .module()
+                .ordered_finite_language_aot_report()
+                .is_none(),
+        );
+        assert!(
+            compiled
+                .receipt()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+            "the internal Exists proof must not be exposed as SelectedEnd provenance",
+        );
+        compiled
+    }
+
     fn complete_dfa_baseline(
         compiled: &CompiledRegex,
         target: Target,
@@ -3480,7 +3967,158 @@ mod tests {
         (incumbent, report)
     }
 
+    fn complete_exists_dfa_baseline(
+        compiled: &CompiledRegex,
+        target: Target,
+    ) -> (NativeLowering, ExactFiniteSelectedEndDfaBaselineReport) {
+        let semantic = compiled
+            .program()
+            .native_dfa_view()
+            .expect("complete Exists semantic DFA");
+        let cost = NativeCompleteDfaCost::estimate_exists(&semantic)
+            .unwrap()
+            .expect("Exists baseline cost");
+        let incumbent = lower_native_dfa(semantic, target)
+            .unwrap()
+            .expect("Exists baseline lowering");
+        let report = cost
+            .exists_report(&semantic, &incumbent)
+            .unwrap()
+            .expect("Exists baseline report");
+        (incumbent, report)
+    }
+
+    fn wrap_exists_fixture_lowering(
+        compiled: &CompiledRegex,
+        target: Target,
+    ) -> NativeLowering {
+        let choice = compiled
+            .program()
+            .native_finite_exists_choice_view()
+            .expect("authenticated exact finite Exists Choice");
+        let (incumbent, baseline) = complete_exists_dfa_baseline(compiled, target);
+        let selection = select_exact_finite_exists_teddy(
+            compiled.program().artifact_identity(),
+            choice,
+            target,
+            baseline,
+        )
+        .expect("profitable exact finite Exists Teddy selection");
+        let ExactFiniteSelectedEndTeddyWrapOutcome::Selected { lowering, .. } =
+            wrap_exact_finite_exists_teddy(selection, incumbent, baseline, target, usize::MAX)
+                .expect("compose exact finite Exists Teddy fixture")
+        else {
+            panic!("uncapped exact finite Exists Teddy fixture must select")
+        };
+        lowering
+    }
+
+    fn uninstalled_exists_teddy_module(
+        compiled: &CompiledRegex,
+        target: Target,
+    ) -> (CompiledModule, ExactFiniteExistsTeddyAotReport) {
+        let program = compiled.program();
+        let semantic = program.native_dfa_view().expect("complete Exists DFA");
+        let choice = program
+            .native_finite_exists_choice_view()
+            .expect("authenticated exact finite Exists Choice");
+        let cost = NativeCompleteDfaCost::estimate_exists(&semantic)
+            .unwrap()
+            .expect("Exists complete-DFA cost");
+        let incumbent = lower_exact_finite_teddy_incumbent_with_data_limit(
+            semantic,
+            target,
+            usize::MAX,
+        )
+        .unwrap()
+        .expect("Exists ordinary incumbent");
+        let baseline = cost
+            .exists_report(&semantic, &incumbent)
+            .unwrap()
+            .expect("Exists complete-DFA baseline");
+        let selection = select_exact_finite_exists_teddy(
+            program.artifact_identity(),
+            choice,
+            target,
+            baseline,
+        )
+        .expect("Exists Teddy selection");
+        let ExactFiniteSelectedEndTeddyWrapOutcome::Selected { lowering, report } =
+            wrap_exact_finite_exists_teddy(
+                selection,
+                incumbent,
+                baseline,
+                target,
+                usize::MAX,
+            )
+            .unwrap()
+        else {
+            panic!("uncapped Exists Teddy wrapper must select")
+        };
+        let module = CompiledModule::lower_serialized_with_prelowered(
+            program.serialize().unwrap(),
+            Some(lowering),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            program.native_context_program_view(),
+            program.native_bit_parallel_exists_view(),
+            program.native_bit_parallel_endpoint_oracle_view(),
+            program.native_partial_dfa_view(),
+            program.native_dynamic_rows_view(),
+            None,
+            target,
+        )
+        .unwrap();
+        (
+            module,
+            ExactFiniteExistsTeddyAotReport { lowering: report },
+        )
+    }
+
+    fn installed_exists_teddy_module(
+        compiled: &CompiledRegex,
+        target: Target,
+    ) -> CompiledModule {
+        let (mut module, report) = uninstalled_exists_teddy_module(compiled, target);
+        module
+            .install_exact_finite_exists_teddy_aot_report(
+                report,
+                compiled.program().artifact_identity(),
+                compiled.program().native_dfa_view().unwrap(),
+                compiled
+                    .program()
+                    .native_finite_exists_choice_view()
+                    .unwrap(),
+            )
+            .expect("install authenticated Exists Teddy fixture");
+        module
+    }
+
     fn unchanged_selected_end_module(compiled: &CompiledRegex, target: Target) -> CompiledModule {
+        let program = compiled.program();
+        CompiledModule::lower_serialized(
+            program.serialize().unwrap(),
+            program.native_dfa_view(),
+            false,
+            program.native_context_program_view(),
+            program.native_bit_parallel_exists_view(),
+            program.native_bit_parallel_endpoint_oracle_view(),
+            program.native_partial_dfa_view(),
+            program.native_dynamic_rows_view(),
+            program
+                .native_ordered_nfa_view()
+                .map(|view| (view, usize::MAX, true)),
+            target,
+        )
+        .unwrap()
+    }
+
+    fn unchanged_exists_module(compiled: &CompiledRegex, target: Target) -> CompiledModule {
         let program = compiled.program();
         CompiledModule::lower_serialized(
             program.serialize().unwrap(),
@@ -3701,6 +4339,357 @@ mod tests {
     }
 
     #[test]
+    fn exists_teddy_route_is_internal_and_declines_two_or_three_literals_byte_identically() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let compiled = compile_exists(&pattern, target);
+        let report = compiled
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .expect("selected internal Exists Teddy proof");
+        assert!(!report.incumbent_complete_dfa.has_accelerator);
+        assert_eq!(report.scanner, StartAccelerator::X86Avx2);
+        assert!(
+            exists_report_matches_lowering(
+                report,
+                &wrap_exists_fixture_lowering(&compiled, target),
+                target,
+            )
+            .unwrap(),
+        );
+
+        for source_count in [2, 3] {
+            assert!(
+                !exact_finite_exists_teddy_source_count_is_supported(source_count),
+                "valid two/three-literal choices must decline before target lowering",
+            );
+        }
+
+        for pattern in ["alpha|bravo", "alpha|bravo|cider"] {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .expect("compile structurally valid small Exists Choice");
+            assert!(
+                compiled
+                    .module()
+                    .exact_finite_exists_teddy_aot_report()
+                    .is_none(),
+            );
+            let unchanged = unchanged_exists_module(&compiled, target);
+            assert_byte_identical_module(compiled.module(), &unchanged);
+            let unchanged_object = crate::emit_object(
+                &unchanged,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(compiled.object(), unchanged_object);
+        }
+    }
+
+    #[test]
+    fn exists_teddy_installer_rejects_swapped_program_self_signed_tail_and_stale_core() {
+        let target = avx2_target();
+        let compiled_a = compile_exists(&scanner_free_exact_finite_pattern(), target);
+        let compiled_b = compile(
+            CompileRequest::new(scanner_free_exact_finite_pattern_variant(), target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile same-geometry alternate Exists program");
+
+        let (mut module, report) = uninstalled_exists_teddy_module(&compiled_a, target);
+        let mut wrong_artifact = compiled_a.program().artifact_identity();
+        wrong_artifact[0] ^= 1;
+        assert!(module
+            .install_exact_finite_exists_teddy_aot_report(
+                report,
+                wrong_artifact,
+                compiled_a.program().native_dfa_view().unwrap(),
+                compiled_a
+                    .program()
+                    .native_finite_exists_choice_view()
+                    .unwrap(),
+            )
+            .is_err());
+
+        let (mut module, report) = uninstalled_exists_teddy_module(&compiled_a, target);
+        module.serialized_program_identity = compiled_b.module().serialized_program_identity;
+        assert!(module
+            .install_exact_finite_exists_teddy_aot_report(
+                report,
+                compiled_a.program().artifact_identity(),
+                compiled_a.program().native_dfa_view().unwrap(),
+                compiled_a
+                    .program()
+                    .native_finite_exists_choice_view()
+                    .unwrap(),
+            )
+            .is_err());
+
+        let (mut module, report) = uninstalled_exists_teddy_module(&compiled_a, target);
+        assert!(module
+            .install_exact_finite_exists_teddy_aot_report(
+                report,
+                compiled_a.program().artifact_identity(),
+                compiled_b.program().native_dfa_view().unwrap(),
+                compiled_a
+                    .program()
+                    .native_finite_exists_choice_view()
+                    .unwrap(),
+            )
+            .is_err());
+
+        let (mut module, report) = uninstalled_exists_teddy_module(&compiled_a, target);
+        assert!(module
+            .install_exact_finite_exists_teddy_aot_report(
+                report,
+                compiled_a.program().artifact_identity(),
+                compiled_a.program().native_dfa_view().unwrap(),
+                compiled_b
+                    .program()
+                    .native_finite_exists_choice_view()
+                    .unwrap(),
+            )
+            .is_err());
+
+        // Forge the wrapper's final tail jump while refreshing the generic
+        // whole-code hash. Deterministic Exists regeneration must still reject
+        // this otherwise self-consistent record.
+        let (mut module, mut report) = uninstalled_exists_teddy_module(&compiled_a, target);
+        let incumbent = report.lowering.incumbent_code_offset;
+        let tail = module.sections[TEXT_SECTION]
+            .data
+            .get(..incumbent)
+            .unwrap()
+            .windows(5)
+            .enumerate()
+            .find_map(|(offset, bytes)| {
+                if bytes[0] != 0xe9 {
+                    return None;
+                }
+                let displacement = i32::from_le_bytes(bytes[1..].try_into().ok()?);
+                let target = i64::try_from(offset + 5)
+                    .ok()?
+                    .checked_add(i64::from(displacement))?;
+                (usize::try_from(target).ok() == Some(incumbent)).then_some(offset)
+            })
+            .expect("x86 Exists Teddy tail jump");
+        module.sections[TEXT_SECTION].data[tail + 1] ^= 1;
+        report.lowering.native_code_sha256 =
+            Sha256::digest(module.sections[TEXT_SECTION].bytes()).into();
+        assert!(module
+            .install_exact_finite_exists_teddy_aot_report(
+                report,
+                compiled_a.program().artifact_identity(),
+                compiled_a.program().native_dfa_view().unwrap(),
+                compiled_a
+                    .program()
+                    .native_finite_exists_choice_view()
+                    .unwrap(),
+            )
+            .is_err());
+
+        let (mut module, mut report) = uninstalled_exists_teddy_module(&compiled_a, target);
+        report.lowering.output = OutputContract::SelectedEnd;
+        assert!(module
+            .install_exact_finite_exists_teddy_aot_report(
+                report,
+                compiled_a.program().artifact_identity(),
+                compiled_a.program().native_dfa_view().unwrap(),
+                compiled_a
+                    .program()
+                    .native_finite_exists_choice_view()
+                    .unwrap(),
+            )
+            .is_err());
+
+        let (mut module, report) = uninstalled_exists_teddy_module(&compiled_a, target);
+        let semantic = compiled_a.program().native_dfa_view().unwrap();
+        module.native_direct_search_trusted_core =
+            lower_exact_finite_teddy_incumbent_with_data_limit(semantic, target, usize::MAX)
+                .unwrap()
+                .unwrap()
+                .direct_search_trusted_core;
+        assert!(module.native_direct_search_trusted_core.is_some());
+        assert!(module
+            .install_exact_finite_exists_teddy_aot_report(
+                report,
+                compiled_a.program().artifact_identity(),
+                semantic,
+                compiled_a
+                    .program()
+                    .native_finite_exists_choice_view()
+                    .unwrap(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn exists_teddy_grep_count_authenticates_then_drops_only_its_internal_receipt() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let compiled = compile_exists(&pattern, target);
+        let identity = compiled.program().artifact_identity();
+        let module = installed_exists_teddy_module(&compiled, target);
+        let serialized = compiled.program().serialize().unwrap();
+        let report = *module
+            .exact_finite_exists_teddy_aot_report()
+            .expect("installed Exists Teddy report");
+        module
+            .authenticate_exact_finite_exists_teddy_before_additive_surface(
+                identity,
+                serialized.len(),
+            )
+            .expect("authenticate exact ordinary prefix before append");
+
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        assert!(module
+            .authenticate_exact_finite_exists_teddy_before_additive_surface(
+                wrong_identity,
+                serialized.len(),
+            )
+            .is_err());
+
+        let mut forged_entry = module.clone();
+        forged_entry.sections[TEXT_SECTION].data[report.incumbent_code_offset] ^= 1;
+        assert!(forged_entry
+            .authenticate_exact_finite_exists_teddy_before_additive_surface(
+                identity,
+                serialized.len(),
+            )
+            .is_err());
+
+        let mut forged_wrapper = module.clone();
+        let wrapper_prefix = report
+            .incumbent_code_offset
+            .checked_sub(1)
+            .expect("Exists Teddy wrapper prefix byte");
+        forged_wrapper.sections[TEXT_SECTION].data[wrapper_prefix] ^= 1;
+        assert!(forged_wrapper
+            .authenticate_exact_finite_exists_teddy_before_additive_surface(
+                identity,
+                serialized.len(),
+            )
+            .is_err());
+
+        assert!(matches!(
+            module.can_append_exact_finite_selected_end_grep_count(),
+            Err(ObjectError::InvalidModule(
+                "exact-finite SelectedEnd GrepCount cannot compose an Exists Teddy leaf"
+            )),
+        ));
+
+        let aggregate = crate::compile_with_prepared_aggregate_exports(
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+            crate::PreparedAggregateExports::GREP_COUNT,
+        )
+        .expect("compile public Exists Teddy GrepCount aggregate");
+        assert!(aggregate.module().prepared_grep_count_symbol().is_some());
+        assert_eq!(
+            aggregate.module().prepared_aggregate_strategy(),
+            Some(crate::PreparedAggregateStrategy::NativeFused),
+        );
+        assert!(aggregate
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .is_none());
+        assert_eq!(aggregate.module().start_accelerator(), StartAccelerator::X86Avx2);
+    }
+
+    #[test]
+    fn independent_exists_endpoints_preserve_the_native_complete_dfa_incumbent() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let request = || {
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+        };
+        let scalar = compile(request()).expect("compile scalar Exists Teddy fixture");
+        assert!(scalar
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .is_some());
+        assert!(scalar.module().native_direct_search_trusted_core.is_none());
+
+        let endpoint_scope = direct_exists_endpoint_incumbent_scope(true);
+        let ordinary = compile(request()).expect("compile direct endpoint incumbent");
+        drop(endpoint_scope);
+        assert!(ordinary
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .is_none());
+        assert!(ordinary.module().native_direct_search_trusted_core.is_some());
+        assert_eq!(ordinary.module().start_accelerator(), StartAccelerator::None);
+        let identity = ordinary.program().artifact_identity();
+        let expected_batch = ordinary
+            .module()
+            .clone()
+            .append_direct_exists_batch(OutputContract::Exists)
+            .expect("append expected direct Exists batch")
+            .expect("complete DFA owns a direct Exists batch");
+        let expected_batch_object = crate::emit_object(
+            &expected_batch,
+            crate::ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .unwrap();
+
+        let batch = crate::compile_with_independent_exists_batch(request())
+            .expect("compile public independent Exists batch");
+        assert_eq!(batch.module(), &expected_batch);
+        assert_eq!(batch.object(), expected_batch_object);
+        assert!(batch.module().direct_exists_batch_symbol().is_some());
+        assert!(batch
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .is_none());
+        assert_eq!(batch.program().artifact_identity(), identity);
+
+        let endpoint_scope = direct_exists_endpoint_incumbent_scope(true);
+        let witness_scope = matching_lf_line_witness_recipe_scope(true);
+        let tracked = compile(request()).expect("compile tracked direct endpoint incumbent");
+        drop(witness_scope);
+        drop(endpoint_scope);
+        assert!(tracked.module().native_direct_search_trusted_core.is_some());
+        let expected_witness = tracked
+            .module()
+            .clone()
+            .append_direct_exists_batch(OutputContract::Exists)
+            .expect("append tracked direct Exists batch")
+            .expect("tracked complete DFA owns a direct Exists batch")
+            .append_direct_matching_lf_line_witness(OutputContract::Exists)
+            .expect("append expected matching-LF witness")
+            .expect("tracked complete DFA owns a matching-LF witness");
+        let expected_witness_object = crate::emit_object(
+            &expected_witness,
+            crate::ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .unwrap();
+        let witness = crate::compile_with_independent_matching_lf_line_witness(request())
+            .expect("compile public matching-LF-line witness");
+        assert_eq!(witness.module(), &expected_witness);
+        assert_eq!(witness.object(), expected_witness_object);
+        assert!(witness.module().direct_exists_batch_symbol().is_some());
+        assert!(witness
+            .module()
+            .direct_matching_lf_line_witness_symbol()
+            .is_some());
+        assert!(witness
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .is_none());
+    }
+
+    #[test]
     fn accelerator_classes_decline_before_semantic_incumbent_publication_changes() {
         let target = avx2_target();
         let fixtures = [
@@ -3765,6 +4754,49 @@ mod tests {
             assert_byte_identical_module(compiled.module(), disabled.module());
             assert_eq!(compiled.object(), disabled.object(), "{kind}");
             assert_eq!(compiled.receipt(), disabled.receipt(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn exists_teddy_unsupported_isa_and_accelerated_incumbent_decline_byte_identically() {
+        let fixtures = [
+            (
+                "unsupported-isa",
+                Target::x86_64_linux(),
+                scanner_free_exact_finite_pattern(),
+            ),
+            (
+                "accelerated-incumbent",
+                avx2_target(),
+                accelerated_exact_finite_pattern().to_owned(),
+            ),
+        ];
+        for (kind, target, pattern) in fixtures {
+            let compiled = compile(
+                CompileRequest::new(&pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            assert!(
+                compiled
+                    .module()
+                    .exact_finite_exists_teddy_aot_report()
+                    .is_none(),
+                "{kind}",
+            );
+            let unchanged = unchanged_exists_module(&compiled, target);
+            assert_byte_identical_module(compiled.module(), &unchanged);
+            assert_eq!(
+                compiled.object(),
+                crate::emit_object(
+                    &unchanged,
+                    crate::ObjectFormat::for_target(target),
+                    usize::MAX,
+                )
+                .unwrap(),
+                "{kind}",
+            );
         }
     }
 
@@ -3934,6 +4966,141 @@ mod tests {
             ),
             Err(ObjectError::InvalidModule(_)),
         ));
+    }
+
+    #[test]
+    fn exists_teddy_post_selection_allocation_failure_is_terminal_end_to_end() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        compile_exists(&pattern, target);
+
+        let injection = ExactFiniteTeddyNativeDataAllocationInjection::arm();
+        let result = compile(
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        );
+        injection.assert_failed_once();
+        assert!(matches!(
+            result,
+            Err(crate::CompileError::Object(ObjectError::Allocation(
+                EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_SITE,
+            ))),
+        ));
+    }
+
+    #[test]
+    fn exists_teddy_admission_charges_incumbent_reverify_and_retains_material_gain() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let exists = compile_exists(&pattern, target);
+        let selected_end = compile_selected(&pattern, target);
+        let exists = exists
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .unwrap();
+        let selected_end = selected_end
+            .module()
+            .exact_finite_selected_end_teddy_aot_report()
+            .unwrap();
+        assert_eq!(
+            exists.selection_gate_cost_units,
+            selected_end.selection_gate_cost_units,
+        );
+        assert_eq!(
+            exists.selection_expected_verification_cost_units,
+            selected_end.selection_expected_verification_cost_units,
+        );
+        assert!(
+            exists.selection_full_cost_units > selected_end.selection_full_cost_units,
+            "Exists must price the authoritative incumbent replay after an exact hit",
+        );
+        assert!(
+            exists
+                .selection_full_cost_units
+                .checked_mul(EXACT_FINITE_TEDDY_MATERIAL_GAIN_DENOMINATOR)
+                .unwrap()
+                <= exists
+                    .selection_incumbent_cost_units
+                    .checked_mul(EXACT_FINITE_TEDDY_MATERIAL_GAIN_NUMERATOR)
+                    .unwrap(),
+            "the reverify-inclusive cost must still pass the 7/8 material-gain gate",
+        );
+    }
+
+    #[test]
+    fn exists_teddy_tail_restores_public_abi_and_targets_incumbent_on_both_architectures() {
+        let pattern = scanner_free_exact_finite_pattern();
+        for target in [
+            avx2_target(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ] {
+            let compiled = compile_exists(&pattern, target);
+            let report = compiled
+                .module()
+                .exact_finite_exists_teddy_aot_report()
+                .unwrap();
+            let code = compiled.module().sections()[TEXT_SECTION].bytes();
+            let incumbent = report.incumbent_code_offset;
+            assert!(incumbent > 0 && incumbent < code.len(), "{target:?}");
+            match target.architecture {
+                Architecture::X86_64 => {
+                    let restore = [
+                        0x48, 0x89, 0xee, // length <- rbp
+                        0x4c, 0x89, 0xf9, // end <- r15
+                        0x4d, 0x89, 0xf0, // result <- r14
+                        0x5d, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x5b, 0x41, 0x5c,
+                        0xc5, 0xf8, 0x77,
+                    ];
+                    assert!(code[..incumbent]
+                        .windows(restore.len())
+                        .any(|window| window == restore));
+                    assert!(code[..incumbent].windows(5).enumerate().any(
+                        |(offset, bytes)| {
+                            if bytes[0] != 0xe9 {
+                                return false;
+                            }
+                            let displacement =
+                                i32::from_le_bytes(bytes[1..].try_into().unwrap());
+                            i64::try_from(offset + 5)
+                                .ok()
+                                .and_then(|after| after.checked_add(i64::from(displacement)))
+                                .and_then(|target| usize::try_from(target).ok())
+                                == Some(incumbent)
+                        }
+                    ));
+                }
+                Architecture::Aarch64 => {
+                    let words = code[..incumbent]
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    let restore = [
+                        aarch64_mov_x(1, 19).unwrap(),
+                        aarch64_load_x_imm(21, 31, 16).unwrap(),
+                        aarch64_load_pair_x(19, 20, 31, 0).unwrap(),
+                        aarch64_add_x_imm(31, 31, 32).unwrap(),
+                    ];
+                    assert!(words.windows(restore.len()).any(|window| window == restore));
+                    assert!(words.iter().enumerate().any(|(index, &instruction)| {
+                        if instruction & 0xfc00_0000 != 0x1400_0000 {
+                            return false;
+                        }
+                        let immediate = (instruction & 0x03ff_ffff) as i32;
+                        let signed_words = (immediate << 6) >> 6;
+                        i64::try_from(index * 4)
+                            .ok()
+                            .and_then(|offset| {
+                                offset.checked_add(i64::from(signed_words) * 4)
+                            })
+                            .and_then(|target| usize::try_from(target).ok())
+                            == Some(incumbent)
+                    }));
+                }
+            }
+        }
     }
 
     #[test]
@@ -6099,6 +7266,102 @@ mod tests {
     }
 
     #[test]
+    fn exists_declared_native_data_cap_restores_every_incumbent_field() {
+        let target = avx2_target();
+        let compiled = compile_exists(&scanner_free_exact_finite_pattern(), target);
+        let choice = compiled
+            .program()
+            .native_finite_exists_choice_view()
+            .unwrap();
+        let (incumbent, baseline) = complete_exists_dfa_baseline(&compiled, target);
+        let selection = select_exact_finite_exists_teddy(
+            compiled.program().artifact_identity(),
+            choice,
+            target,
+            baseline,
+        )
+        .unwrap();
+        let required =
+            exact_finite_selected_end_teddy_required_data_bytes(selection, incumbent.data.len())
+                .unwrap();
+        let original_code = incumbent.code.clone();
+        let original_data = incumbent.data.clone();
+        let original_relocations = incumbent.relocations.clone();
+        let original_slow_partial = incumbent.slow_partial_table;
+        let original_needs_runtime = incumbent.needs_runtime;
+        let original_scanner = incumbent.start_accelerator;
+        let original_prefix = incumbent.anchored_prefix_filter_bytes;
+        let original_sync = incumbent.synchronizing_accept_reverse_lowered;
+        let original_suffix = incumbent.exact_pair_suffix_lowered;
+        let original_core = incumbent.direct_search_trusted_core;
+        let original_span_reduce = incumbent.complete_span_reduce_source.as_deref().copied();
+        let ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(restored) =
+            wrap_exact_finite_exists_teddy(
+                selection,
+                incumbent,
+                baseline,
+                target,
+                required - 1,
+            )
+            .unwrap()
+        else {
+            panic!("one-byte-short Exists Teddy ceiling must decline")
+        };
+        assert_eq!(restored.code, original_code);
+        assert_eq!(restored.data, original_data);
+        assert_eq!(restored.relocations, original_relocations);
+        assert_eq!(restored.slow_partial_table, original_slow_partial);
+        assert_eq!(restored.needs_runtime, original_needs_runtime);
+        assert_eq!(restored.start_accelerator, original_scanner);
+        assert_eq!(restored.anchored_prefix_filter_bytes, original_prefix);
+        assert_eq!(restored.synchronizing_accept_reverse_lowered, original_sync);
+        assert_eq!(restored.exact_pair_suffix_lowered, original_suffix);
+        assert_eq!(restored.direct_search_trusted_core, original_core);
+        assert_eq!(
+            restored.complete_span_reduce_source.as_deref().copied(),
+            original_span_reduce,
+        );
+
+        let unchanged = unchanged_exists_module(&compiled, target);
+        let capped = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(scanner_free_exact_finite_pattern(), target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+            crate::SlowAotLimits {
+                max_native_data_bytes: required - 1,
+                ..crate::SlowAotLimits::default()
+            },
+        )
+        .expect("composite-only cap decline preserves ordinary Exists compilation");
+        assert!(
+            capped
+                .module()
+                .exact_finite_exists_teddy_aot_report()
+                .is_none(),
+        );
+        assert_byte_identical_module(capped.module(), &unchanged);
+        let unchanged_object = crate::emit_object(
+            &unchanged,
+            crate::ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(capped.object(), unchanged_object);
+
+        let (incumbent, baseline) = complete_exists_dfa_baseline(&compiled, target);
+        let ExactFiniteSelectedEndTeddyWrapOutcome::Selected { lowering, report } =
+            wrap_exact_finite_exists_teddy(selection, incumbent, baseline, target, required)
+                .unwrap()
+        else {
+            panic!("exact Exists Teddy ceiling must admit")
+        };
+        assert_eq!(lowering.data.len(), required);
+        assert_eq!(report.native_data_bytes, required);
+        assert_eq!(report.output, OutputContract::Exists);
+        assert!(lowering.direct_search_trusted_core.is_none());
+    }
+
+    #[test]
     fn prepared_aggregate_refreshes_exact_teddy_receipt() {
         let compiled = crate::compile_with_prepared_aggregate_exports(
             CompileRequest::new(scanner_free_exact_finite_pattern(), avx2_target())
@@ -6397,6 +7660,253 @@ mod tests {
         #[cfg(target_os = "macos")]
         let features = FeatureSet::of(CpuFeature::Aarch64Asimd);
         target.with_features(features).ok()
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn linked_host_exists_teddy_smoke_covers_native_negative_and_positive() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let Some(target) = linked_host_target() else {
+            return;
+        };
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        if Command::new(compiler).arg("--version").output().is_err() {
+            return;
+        }
+        let compiled = compile_exists(&scanner_free_exact_finite_pattern(), target);
+        let literal = compiled
+            .program()
+            .native_finite_exists_choice_view()
+            .unwrap()
+            .literals()[0]
+            .clone();
+        let mut positive = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 64];
+        let base = positive.len() - literal.len();
+        positive[base..].copy_from_slice(&literal);
+        let negative = vec![0xff; positive.len()];
+        let bytes = |haystack: &[u8]| {
+            haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let symbol = compiled.module().entry_symbol();
+        let mut source = format!(
+            "#include <stdint.h>\n#include <stddef.h>\nextern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);\n"
+        );
+        writeln!(source, "static const unsigned char n[]={{{}}};", bytes(&negative)).unwrap();
+        writeln!(source, "static const unsigned char p[]={{{}}};", bytes(&positive)).unwrap();
+        writeln!(source, "int main(void){{size_t r[2]={{9,10}};if({symbol}(n,sizeof(n),0,sizeof(n),r)!=0||r[0]!=0||r[1]!=0)return 1;r[0]=9;r[1]=10;if({symbol}(p,sizeof(p),0,sizeof(p),r)!=1||r[0]!=0||r[1]!=0)return 2;return 0;}}").unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-exists-teddy-smoke-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("smoke.c");
+        let object_path = directory.join("smoke.o");
+        let executable_path = directory.join("smoke");
+        fs::write(&source_path, source).unwrap();
+        fs::write(&object_path, compiled.object()).unwrap();
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&source_path)
+            .arg(&object_path)
+            .arg("-o")
+            .arg(&executable_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "host linker rejected Exists Teddy smoke");
+        let status = Command::new(&executable_path).status().unwrap();
+        assert!(status.success(), "native Exists Teddy smoke failed");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes the actual exact finite Exists Teddy leaf on the host ISA"]
+    fn linked_host_exists_teddy_matches_negative_candidates_and_incumbent_tails() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let Some(target) = linked_host_target() else {
+            return;
+        };
+        let pattern = scanner_free_exact_finite_pattern();
+        let compiled = compile_exists(&pattern, target);
+        let choice = compiled
+            .program()
+            .native_finite_exists_choice_view()
+            .expect("linked Exists Teddy Choice");
+        let report = compiled
+            .module()
+            .exact_finite_exists_teddy_aot_report()
+            .expect("linked Exists Teddy internal proof");
+        let selection = select_exact_finite_exists_teddy(
+            compiled.program().artifact_identity(),
+            choice,
+            target,
+            report.incumbent_complete_dfa,
+        )
+        .expect("linked Exists Teddy selection");
+        let columns = usize::from(selection.plan.columns());
+        let combinations = SCANNER_FREE_BYTES
+            .len()
+            .pow(u32::from(selection.plan.columns()));
+        let mut collision = None;
+        for mut ordinal in 0..combinations {
+            let mut bytes = [0_u8; mandatory_teddy::MAX_MANDATORY_TEDDY_COLUMNS];
+            for byte in bytes.iter_mut().take(columns) {
+                *byte = SCANNER_FREE_BYTES[ordinal % SCANNER_FREE_BYTES.len()];
+                ordinal /= SCANNER_FREE_BYTES.len();
+            }
+            let exact = choice
+                .literals()
+                .iter()
+                .any(|literal| literal[..columns] == bytes[..columns]);
+            if !exact && selection.plan.candidate_buckets(&bytes[..columns]) != 0 {
+                collision = Some(bytes);
+                break;
+            }
+        }
+        let collision = collision.expect("linked fixture has a conservative fingerprint collision");
+        let literal = choice.literals()[0].clone();
+
+        let negative = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256];
+        let mut early_positive = negative.clone();
+        early_positive[32..32 + literal.len()].copy_from_slice(&literal);
+        let mut logical_eof_positive = vec![0xff; negative.len() + 17];
+        let logical_end = logical_eof_positive.len() - 17;
+        logical_eof_positive[logical_end - literal.len()..logical_end]
+            .copy_from_slice(&literal);
+        let mut collision_then_positive = negative.clone();
+        collision_then_positive[64..64 + columns].copy_from_slice(&collision[..columns]);
+        collision_then_positive[192..192 + literal.len()].copy_from_slice(&literal);
+        let mut budget_negative = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 1024];
+        for candidate in 0..usize::from(EXACT_FINITE_TEDDY_RUNTIME_VERIFICATION_BUDGET) + 2 {
+            let base = 64 + candidate * 8;
+            budget_negative[base..base + columns].copy_from_slice(&collision[..columns]);
+        }
+        let mut budget_positive = budget_negative.clone();
+        let budget_positive_base = budget_positive.len() - literal.len();
+        budget_positive[budget_positive_base..].copy_from_slice(&literal);
+        let windows = vec![
+            (negative, 0, EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256),
+            (
+                early_positive,
+                0,
+                EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256,
+            ),
+            (logical_eof_positive, 0, logical_end),
+            (
+                collision_then_positive,
+                0,
+                EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 256,
+            ),
+            (
+                budget_negative,
+                0,
+                EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 1024,
+            ),
+            (
+                budget_positive,
+                0,
+                EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 1024,
+            ),
+        ];
+        let reference = compile(
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile independent portable Exists reference");
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-finite-exists-teddy-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&directory).expect("create Exists Teddy linker directory");
+        let symbol = compiled.module().entry_symbol();
+        let mut source = format!(
+            "#include <stdint.h>\n#include <stddef.h>\nextern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);\nint main(void){{size_t r[2];uint32_t s;\n"
+        );
+        for (index, (haystack, start, end)) in windows.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{index}[]={{{bytes}}};").unwrap();
+            let MatchResult::Exists(expected) = reference
+                .search(haystack, SearchWindow::new(*start, *end))
+                .expect("portable Exists Teddy differential")
+            else {
+                unreachable!()
+            };
+            writeln!(
+                source,
+                "r[0]=91;r[1]=92;s={symbol}(h{index},{},{start},{end},r);if(s!={}||r[0]!=0||r[1]!=0)return {};",
+                haystack.len(),
+                u8::from(expected),
+                20 + index,
+            )
+            .unwrap();
+        }
+        writeln!(
+            source,
+            "r[0]=91;r[1]=92;s={symbol}(h0,{},1,0,r);if(s!=2||r[0]!=91||r[1]!=92)return 90;return 0;}}",
+            windows[0].0.len(),
+        )
+        .unwrap();
+        let c_path = directory.join("exists_teddy.c");
+        let object = directory.join("exists_teddy.o");
+        let executable = directory.join("exists_teddy");
+        fs::write(&c_path, source).expect("write Exists Teddy linker harness");
+        fs::write(&object, compiled.object()).expect("write Exists Teddy object");
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link actual Exists Teddy differential");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute Exists Teddy differential");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::remove_dir_all(directory).expect("remove Exists Teddy linker directory");
     }
 
     #[cfg(all(

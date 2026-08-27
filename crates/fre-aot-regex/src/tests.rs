@@ -36,6 +36,27 @@ fn generated_wide_finite_pattern(count: usize) -> String {
         .join("|")
 }
 
+fn generated_exists_teddy_pattern() -> String {
+    const ROOTS: [u8; 17] = [
+        0x00, 0x12, 0x3f, 0x51, 0x7e, 0x8a, 0x92, 0xa4, 0x0c, 0x18, 0x1e, 0x58, 0x5e, 0x8f,
+        0x98, 0x9e, 0xaa,
+    ];
+    let mut pattern = String::from("(?-u:");
+    for (ordinal, byte) in ROOTS.into_iter().enumerate() {
+        if ordinal != 0 {
+            pattern.push('|');
+        }
+        for _ in 0..6 {
+            write!(pattern, "\\x{byte:02x}").unwrap();
+        }
+        if ordinal + 1 == ROOTS.len() {
+            pattern.push_str("\\xaa");
+        }
+    }
+    pattern.push(')');
+    pattern
+}
+
 fn compile_pre_wide_finite_prepared_incumbent(
     request: CompileRequest,
     exports: PreparedAggregateExports,
@@ -8031,6 +8052,91 @@ fn native_prepared_aggregate_object_limit_has_exact_boundary() {
             required,
         }) if limit.checked_add(1) == Some(baseline.object().len())
             && required == baseline.object().len()
+    ));
+}
+
+#[test]
+fn exists_teddy_grep_count_object_limit_restores_authenticated_dfa_incumbent() {
+    let target = Target::x86_64_linux()
+        .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+        .expect("valid AVX2 target");
+    let pattern = generated_exists_teddy_pattern();
+    let exports = PreparedAggregateExports::GREP_COUNT;
+    let request = |max_object_bytes| {
+        CompileRequest::new(&pattern, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists)
+            .limits(CompileLimitsV1 {
+                max_object_bytes,
+                ..CompileLimitsV1::default()
+            })
+    };
+
+    let ordinary = compile(request(usize::MAX)).expect("unbounded Exists Teddy base");
+    let report = *ordinary
+        .module()
+        .exact_finite_exists_teddy_incumbent_aot_report()
+        .expect("selected internal Exists Teddy report");
+    let serialized = ordinary
+        .program()
+        .serialize()
+        .expect("serialize Exists Teddy fixture");
+    let incumbent = crate::CompiledModule::lower_with_native_data_limit_and_optional_routes(
+        ordinary.program(),
+        target,
+        false,
+        false,
+        report.incumbent_data_bytes,
+    )
+    .expect("restore authenticated Exists complete-DFA incumbent")
+    .append_prepared_aggregate_exports(
+        exports,
+        ordinary.program().artifact_identity(),
+        &serialized,
+    )
+    .expect("append GrepCount to Exists complete-DFA incumbent");
+    assert!(incumbent
+        .exact_finite_exists_teddy_incumbent_aot_report()
+        .is_none());
+    assert_eq!(incumbent.start_accelerator(), report.incumbent_complete_dfa.scanner);
+    let incumbent_object = emit_object(
+        &incumbent,
+        ObjectFormat::for_target(target),
+        usize::MAX,
+    )
+    .expect("emit Exists complete-DFA GrepCount incumbent");
+
+    let candidate = compile_with_prepared_aggregate_exports(request(usize::MAX), exports)
+        .expect("unbounded Exists Teddy GrepCount candidate");
+    assert_eq!(candidate.module().start_accelerator(), StartAccelerator::X86Avx2);
+    assert!(candidate
+        .module()
+        .exact_finite_exists_teddy_incumbent_aot_report()
+        .is_none());
+    assert!(incumbent_object.len() < candidate.object().len());
+
+    let candidate_one_below = candidate.object().len() - 1;
+    assert!(incumbent_object.len() <= candidate_one_below);
+    let declined =
+        compile_with_prepared_aggregate_exports(request(candidate_one_below), exports)
+            .expect("one-byte Teddy aggregate excess restores complete DFA");
+    assert_eq!(declined.module(), &incumbent);
+    assert_eq!(declined.object(), incumbent_object);
+
+    let exact_incumbent =
+        compile_with_prepared_aggregate_exports(request(incumbent_object.len()), exports)
+            .expect("exact Exists complete-DFA aggregate boundary");
+    assert_eq!(exact_incumbent.module(), &incumbent);
+    assert_eq!(exact_incumbent.object(), incumbent_object);
+
+    let incumbent_one_below = incumbent_object.len() - 1;
+    assert!(matches!(
+        compile_with_prepared_aggregate_exports(request(incumbent_one_below), exports),
+        Err(CompileError::Object(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        })) if limit == incumbent_one_below && required > limit
     ));
 }
 

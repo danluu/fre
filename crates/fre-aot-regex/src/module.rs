@@ -796,22 +796,33 @@ pub struct ExactFiniteSelectedEndTeddyAotReportV2 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactFiniteExistsTeddyAotReport {
+    /// Shared scanner/verifier geometry. This record is accepted only after
+    /// the Exists-only installer regenerates the complete incumbent and the
+    /// `ExistsReverifyInIncumbent` wrapper from the current program.
+    lowering: ExactFiniteSelectedEndTeddyAotReport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExactFiniteExistsLeafReport {
     ByteSet(ExactFiniteExistsByteSetAotReport),
     SingleLiteralTwoWay(ExactSingleLiteralAotReport),
+    /// Internal authentication record from the shared Teddy emitter. Its
+    /// `output` is `Exists`; it is never exposed as a SelectedEnd receipt.
+    Teddy(ExactFiniteExistsTeddyAotReport),
 }
 
 impl ExactFiniteExistsLeafReport {
     const fn byte_set(&self) -> Option<&ExactFiniteExistsByteSetAotReport> {
         match self {
             Self::ByteSet(report) => Some(report),
-            Self::SingleLiteralTwoWay(_) => None,
+            Self::SingleLiteralTwoWay(_) | Self::Teddy(_) => None,
         }
     }
 
     const fn single_literal(&self) -> Option<&ExactSingleLiteralAotReport> {
         match self {
-            Self::ByteSet(_) => None,
+            Self::ByteSet(_) | Self::Teddy(_) => None,
             Self::SingleLiteralTwoWay(report) => Some(report),
         }
     }
@@ -1672,8 +1683,40 @@ const MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE: &str =
     "matching-LF-line final-edge tracking is inconsistent";
 
 std::thread_local! {
+    static DIRECT_EXISTS_ENDPOINT_INCUMBENT_REQUESTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static MATCHING_LF_LINE_WITNESS_RECIPE_ENABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct DirectExistsEndpointIncumbentScope {
+    previous: bool,
+}
+
+impl Drop for DirectExistsEndpointIncumbentScope {
+    fn drop(&mut self) {
+        DIRECT_EXISTS_ENDPOINT_INCUMBENT_REQUESTED.with(|requested| {
+            requested.set(self.previous);
+        });
+    }
+}
+
+/// Preserve the established complete-DFA owner while one explicit direct
+/// Exists endpoint API compiles its ordinary module. Stage-1 Teddy has no
+/// authenticated private batch/LF core, so selecting its scalar-only wrapper
+/// here would make the downstream native append decline and restore a Rust
+/// adapter outer loop.
+pub(crate) fn direct_exists_endpoint_incumbent_scope(
+    requested: bool,
+) -> DirectExistsEndpointIncumbentScope {
+    let previous = DIRECT_EXISTS_ENDPOINT_INCUMBENT_REQUESTED.with(|state| {
+        state.replace(requested)
+    });
+    DirectExistsEndpointIncumbentScope { previous }
+}
+
+fn direct_exists_endpoint_incumbent_requested() -> bool {
+    DIRECT_EXISTS_ENDPOINT_INCUMBENT_REQUESTED.with(std::cell::Cell::get)
 }
 
 pub(crate) struct MatchingLfLineWitnessRecipeScope {
@@ -4185,7 +4228,7 @@ impl NativeCompleteDfaCost {
         if view.output != OutputContract::Span {
             return Ok(None);
         }
-        Self::estimate_span_or_selected_end(view)
+        Self::estimate_span_selected_end_or_exists(view)
     }
 
     fn estimate_selected_end(
@@ -4194,19 +4237,27 @@ impl NativeCompleteDfaCost {
         if view.output != OutputContract::SelectedEnd {
             return Ok(None);
         }
-        Self::estimate_span_or_selected_end(view)
+        Self::estimate_span_selected_end_or_exists(view)
     }
 
-    fn estimate_span_or_selected_end(
+    fn estimate_exists(view: &NativeProgramView<'_>) -> Result<Option<Self>, ObjectError> {
+        if view.output != OutputContract::Exists {
+            return Ok(None);
+        }
+        Self::estimate_span_selected_end_or_exists(view)
+    }
+
+    fn estimate_span_selected_end_or_exists(
         view: &NativeProgramView<'_>,
     ) -> Result<Option<Self>, ObjectError> {
         let dfa = view.dfa;
         let selected_end = view.output == OutputContract::SelectedEnd;
+        let exists = view.output == OutputContract::Exists;
         let span = view.output == OutputContract::Span;
         if view.partial_discovered_states.is_some()
             || view.collapse_partial_holes
             || view.exact_product_width.is_some()
-            || (!selected_end && !span)
+            || (!selected_end && !exists && !span)
             || dfa.initial_pending
             || view.exact_match_width.is_some()
             || dfa.class_count == 0
@@ -4217,7 +4268,8 @@ impl NativeCompleteDfaCost {
                 && (dfa.reverse_initial.is_none()
                     || dfa.reverse_cells.is_empty()
                     || !dfa.reverse_cells.len().is_multiple_of(dfa.class_count)))
-            || (selected_end && (dfa.reverse_initial.is_some() || !dfa.reverse_cells.is_empty()))
+            || ((selected_end || exists)
+                && (dfa.reverse_initial.is_some() || !dfa.reverse_cells.is_empty()))
         {
             return Ok(None);
         }
@@ -4313,6 +4365,34 @@ impl NativeCompleteDfaCost {
         lowering: &NativeLowering,
         selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
     ) -> Result<Option<ExactFiniteSelectedEndDfaBaselineReport>, ObjectError> {
+        self.exact_finite_report_with_basis(
+            view,
+            lowering,
+            OutputContract::SelectedEnd,
+            selection_basis,
+        )
+    }
+
+    fn exists_report(
+        self,
+        view: &NativeProgramView<'_>,
+        lowering: &NativeLowering,
+    ) -> Result<Option<ExactFiniteSelectedEndDfaBaselineReport>, ObjectError> {
+        self.exact_finite_report_with_basis(
+            view,
+            lowering,
+            OutputContract::Exists,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        )
+    }
+
+    fn exact_finite_report_with_basis(
+        self,
+        view: &NativeProgramView<'_>,
+        lowering: &NativeLowering,
+        expected_output: OutputContract,
+        selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
+    ) -> Result<Option<ExactFiniteSelectedEndDfaBaselineReport>, ObjectError> {
         let actual_has_accelerator = lowering.start_accelerator != StartAccelerator::None;
         let admitted_accelerator = match selection_basis {
             ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
@@ -4322,7 +4402,8 @@ impl NativeCompleteDfaCost {
                 self.has_accelerator == actual_has_accelerator
             }
         };
-        if view.output != OutputContract::SelectedEnd
+        if view.output != expected_output
+            || !matches!(expected_output, OutputContract::Exists | OutputContract::SelectedEnd)
             || !admitted_accelerator
             || lowering.needs_runtime
             || lowering.slow_partial_table.is_some()
@@ -4337,10 +4418,10 @@ impl NativeCompleteDfaCost {
             .len()
             .checked_div(view.dfa.class_count)
             .ok_or(ObjectError::ArithmeticOverflow(
-                "SelectedEnd complete DFA forward states",
+                "exact-finite complete DFA forward states",
             ))?;
         Ok(Some(ExactFiniteSelectedEndDfaBaselineReport {
-            semantic_dfa_sha256: native_selected_end_dfa_semantic_digest(view)?,
+            semantic_dfa_sha256: native_exact_finite_dfa_semantic_digest(view, expected_output)?,
             forward_states,
             alphabet_classes: view.dfa.class_count,
             transition_cells: self.transition_cells,
@@ -4357,7 +4438,15 @@ impl NativeCompleteDfaCost {
 fn native_selected_end_dfa_semantic_digest(
     view: &NativeProgramView<'_>,
 ) -> Result<[u8; 32], ObjectError> {
-    if view.output != OutputContract::SelectedEnd
+    native_exact_finite_dfa_semantic_digest(view, OutputContract::SelectedEnd)
+}
+
+fn native_exact_finite_dfa_semantic_digest(
+    view: &NativeProgramView<'_>,
+    expected_output: OutputContract,
+) -> Result<[u8; 32], ObjectError> {
+    if view.output != expected_output
+        || !matches!(expected_output, OutputContract::Exists | OutputContract::SelectedEnd)
         || view.dfa.class_count == 0
         || view.dfa.forward_cells.is_empty()
         || !view
@@ -4369,29 +4458,33 @@ fn native_selected_end_dfa_semantic_digest(
         || !view.dfa.reverse_cells.is_empty()
     {
         return Err(ObjectError::InvalidModule(
-            "SelectedEnd complete DFA semantic digest geometry",
+            "exact-finite complete DFA semantic digest geometry",
         ));
     }
     let mut digest = Sha256::new();
-    digest.update(b"fre-selected-end-complete-dfa-v1");
+    digest.update(match expected_output {
+        OutputContract::Exists => b"fre-exists-complete-dfa-v1".as_slice(),
+        OutputContract::SelectedEnd => b"fre-selected-end-complete-dfa-v1".as_slice(),
+        OutputContract::Span => unreachable!(),
+    });
     digest.update(view.dfa.initial_state.to_le_bytes());
     digest.update([u8::from(view.dfa.initial_pending)]);
     digest.update([u8::from(view.dfa.initial_terminal)]);
     digest.update(
         u64::try_from(view.dfa.class_count)
-            .map_err(|_| ObjectError::ArithmeticOverflow("SelectedEnd DFA class count"))?
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite DFA class count"))?
             .to_le_bytes(),
     );
     digest.update(view.dfa.byte_classes);
     digest.update(
         u64::try_from(view.dfa.class_representatives.len())
-            .map_err(|_| ObjectError::ArithmeticOverflow("SelectedEnd DFA representatives"))?
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite DFA representatives"))?
             .to_le_bytes(),
     );
     digest.update(view.dfa.class_representatives);
     digest.update(
         u64::try_from(view.dfa.forward_cells.len())
-            .map_err(|_| ObjectError::ArithmeticOverflow("SelectedEnd DFA transition cells"))?
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite DFA transition cells"))?
             .to_le_bytes(),
     );
     for cell in view.dfa.forward_cells {
@@ -4449,6 +4542,36 @@ fn exact_finite_selected_end_dfa_baseline_authenticates_with_basis(
         && accelerator_is_valid)
 }
 
+fn exact_finite_exists_dfa_baseline_authenticates(
+    view: &NativeProgramView<'_>,
+    report: ExactFiniteSelectedEndDfaBaselineReport,
+) -> Result<bool, ObjectError> {
+    let Some(cost) = NativeCompleteDfaCost::estimate_exists(view)? else {
+        return Ok(false);
+    };
+    let Some(forward_states) = view
+        .dfa
+        .forward_cells
+        .len()
+        .checked_div(view.dfa.class_count)
+    else {
+        return Ok(false);
+    };
+    Ok(view.output == OutputContract::Exists
+        && report.semantic_dfa_sha256
+            == native_exact_finite_dfa_semantic_digest(view, OutputContract::Exists)?
+        && report.forward_states == forward_states
+        && report.alphabet_classes == view.dfa.class_count
+        && report.transition_cells == cost.transition_cells
+        && report.minimum_native_data_bytes == cost.minimum_data_bytes
+        && report.native_data_bytes >= report.minimum_native_data_bytes
+        && report.hot_loads_per_byte == cost.hot_loads_per_byte
+        && report.hot_branches_per_byte == cost.hot_branches_per_byte
+        && !report.has_accelerator
+        && !cost.has_accelerator
+        && report.scanner == StartAccelerator::None)
+}
+
 fn exact_finite_selected_end_dfa_lowering_authenticates(
     view: &NativeProgramView<'_>,
     target: Target,
@@ -4487,6 +4610,34 @@ fn exact_finite_selected_end_dfa_lowering_authenticates_with_basis(
         && lowering.start_accelerator == report.incumbent_complete_dfa.scanner
         && incumbent_anchored_prefix_filter_bytes
             .is_none_or(|bytes| bytes == lowering.anchored_prefix_filter_bytes)
+        && lowering.data.len() == report.incumbent_data_bytes
+        && Sha256::digest(&lowering.code).as_slice() == report.incumbent_code_sha256
+        && Sha256::digest(&lowering.data).as_slice() == report.incumbent_data_sha256
+        && module_exact_finite_selected_end_teddy::relocation_digest(&lowering.relocations)
+            .is_some_and(|digest| digest == report.incumbent_relocations_sha256))
+}
+
+fn exact_finite_exists_dfa_lowering_authenticates(
+    view: &NativeProgramView<'_>,
+    target: Target,
+    report: &ExactFiniteSelectedEndTeddyAotReport,
+) -> Result<bool, ObjectError> {
+    if !exact_finite_exists_dfa_baseline_authenticates(
+        view,
+        report.incumbent_complete_dfa,
+    )? {
+        return Ok(false);
+    }
+    let Some(lowering) = lower_exact_finite_teddy_incumbent_with_data_limit(
+        *view,
+        target,
+        report.incumbent_data_bytes,
+    )? else {
+        return Ok(false);
+    };
+    Ok(!lowering.needs_runtime
+        && lowering.slow_partial_table.is_none()
+        && lowering.start_accelerator == report.incumbent_complete_dfa.scanner
         && lowering.data.len() == report.incumbent_data_bytes
         && Sha256::digest(&lowering.code).as_slice() == report.incumbent_code_sha256
         && Sha256::digest(&lowering.data).as_slice() == report.incumbent_data_sha256
@@ -5555,8 +5706,29 @@ impl CompiledModule {
                 OutputContract::SelectedEnd => {
                     NativeCompleteDfaCost::estimate_selected_end(&semantic_native)?
                 }
+                // Preserve the pre-Teddy finite/AC portfolio exactly. Exists
+                // materializes the same ordinary incumbent below, but its
+                // newly available cost must not admit a different finite
+                // candidate when the speculative Teddy leaf later declines.
                 OutputContract::Exists => None,
             };
+            // Keep every fallible cost/lowering action behind the exact
+            // 4..=64-literal Choice and target-ISA gate. Unsupported targets
+            // and small choices therefore retain the pre-feature error and
+            // object surface byte for byte.
+            let exact_finite_exists_teddy_choice =
+                (semantic_native.output == OutputContract::Exists
+                    && !direct_exists_endpoint_incumbent_requested())
+                    .then(|| program.native_finite_exists_choice_view())
+                    .flatten()
+                    .filter(|&choice| {
+                        module_exact_finite_selected_end_teddy::
+                            exact_finite_exists_teddy_is_structurally_eligible(
+                                program.artifact_identity(),
+                                choice,
+                                target,
+                            )
+                    });
             let finite_view = program.native_finite_language_view();
             let finite_candidate =
                 if let (Some(complete_cost), Some(finite_view)) = (complete_cost, finite_view) {
@@ -5633,6 +5805,73 @@ impl CompiledModule {
                     target,
                 )
                 .map_err(CompileError::from);
+            }
+
+            // Run the Exists Teddy negative accelerator only after the
+            // preferred finite-language/AC comparison and one capped ordinary
+            // materialization. A composite cap decline restores that exact
+            // incumbent; every allocator/backend failure remains terminal.
+            if semantic_native.output == OutputContract::Exists
+                && let Some(choice) = exact_finite_exists_teddy_choice
+                && let Some(incumbent_ref) = incumbent.as_ref()
+                && incumbent_ref.start_accelerator == StartAccelerator::None
+                && !incumbent_ref.synchronizing_accept_reverse_lowered
+                && !incumbent_ref.exact_pair_suffix_lowered
+                && let Some(baseline_cost) = NativeCompleteDfaCost::estimate_exists(&semantic_native)?
+                && !baseline_cost.has_accelerator
+                && let Some(baseline_report) =
+                    baseline_cost.exists_report(&semantic_native, incumbent_ref)?
+                && let Some(selection) = module_exact_finite_selected_end_teddy::
+                    select_exact_finite_exists_teddy(
+                        program.artifact_identity(),
+                        choice,
+                        target,
+                        baseline_report,
+                    )
+            {
+                let incumbent_lowering = incumbent.take().ok_or(
+                    CompileError::InternalInvariant("Exists Teddy lost its materialized incumbent"),
+                )?;
+                match module_exact_finite_selected_end_teddy::wrap_exact_finite_exists_teddy(
+                    selection,
+                    incumbent_lowering,
+                    baseline_report,
+                    target,
+                    effective_native_data_limit_bytes,
+                )? {
+                    module_exact_finite_selected_end_teddy::
+                        ExactFiniteSelectedEndTeddyWrapOutcome::Selected { lowering, report } => {
+                            let mut module = Self::lower_serialized_with_prelowered(
+                                program_bytes,
+                                Some(lowering),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                false,
+                                None,
+                                program.native_context_program_view(),
+                                program.native_bit_parallel_exists_view(),
+                                program.native_bit_parallel_endpoint_oracle_view(),
+                                program.native_partial_dfa_view(),
+                                program.native_dynamic_rows_view(),
+                                None,
+                                target,
+                            )?;
+                            module.install_exact_finite_exists_teddy_aot_report(
+                                ExactFiniteExistsTeddyAotReport { lowering: report },
+                                program.artifact_identity(),
+                                semantic_native,
+                                choice,
+                            )?;
+                            return Ok(module);
+                        }
+                    module_exact_finite_selected_end_teddy::
+                        ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(restored) => {
+                            incumbent = Some(restored);
+                        }
+                }
             }
 
             // At this point the complete DFA is the full established
@@ -7360,6 +7599,10 @@ impl CompiledModule {
                             &report, lowering, target,
                         )
                     }),
+                // The composite Teddy proof is deliberately unavailable to
+                // this generic constructor. It must pass the current-program
+                // regeneration boundary in the Exists-only installer below.
+                ExactFiniteExistsLeafReport::Teddy(_) => false,
             };
             if !valid {
                 return Err(ObjectError::InvalidModule(
@@ -7719,22 +7962,26 @@ impl CompiledModule {
                 "slow contextual lowering retained a runtime dependency",
             ));
         }
-        if exact_finite_exists_leaf_report.is_some_and(|report| match report {
-            ExactFiniteExistsLeafReport::ByteSet(report) => {
-                lowering.needs_runtime
-                    || lowering.slow_partial_table.is_some()
-                    || lowering.data.len() != report.native_data_bytes
-                    || lowering.start_accelerator != report.scanner
+        if let Some(report) = exact_finite_exists_leaf_report {
+            let disagrees = match report {
+                ExactFiniteExistsLeafReport::ByteSet(report) => {
+                    lowering.needs_runtime
+                        || lowering.slow_partial_table.is_some()
+                        || lowering.data.len() != report.native_data_bytes
+                        || lowering.start_accelerator != report.scanner
+                }
+                ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report) => {
+                    !module_single_literal_two_way::report_matches_lowering(
+                        &report, &lowering, target,
+                    )
+                }
+                ExactFiniteExistsLeafReport::Teddy(_) => true,
+            };
+            if disagrees {
+                return Err(ObjectError::InvalidModule(
+                    "exact finite Exists lowering disagrees with its receipt",
+                ));
             }
-            ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report) => {
-                !module_single_literal_two_way::report_matches_lowering(
-                    &report, &lowering, target,
-                )
-            }
-        }) {
-            return Err(ObjectError::InvalidModule(
-                "exact finite Exists lowering disagrees with its receipt",
-            ));
         }
         if lowering.slow_partial_table.is_some() && prepared_layout.is_some() {
             return Err(ObjectError::InvalidModule(
@@ -8808,6 +9055,199 @@ impl CompiledModule {
         }
     }
 
+    #[cfg(test)]
+    pub(super) const fn exact_finite_exists_teddy_aot_report(
+        &self,
+    ) -> Option<&ExactFiniteSelectedEndTeddyAotReport> {
+        self.exact_finite_exists_teddy_incumbent_aot_report()
+    }
+
+    pub(crate) const fn exact_finite_exists_teddy_incumbent_aot_report(
+        &self,
+    ) -> Option<&ExactFiniteSelectedEndTeddyAotReport> {
+        match self.exact_finite_exists_leaf_report.as_ref() {
+            Some(ExactFiniteExistsLeafReport::Teddy(report)) => Some(&report.lowering),
+            Some(
+                ExactFiniteExistsLeafReport::ByteSet(_)
+                | ExactFiniteExistsLeafReport::SingleLiteralTwoWay(_),
+            )
+            | None => None,
+        }
+    }
+
+    fn install_exact_finite_exists_teddy_aot_report(
+        &mut self,
+        report: ExactFiniteExistsTeddyAotReport,
+        artifact_identity: [u8; 32],
+        semantic_native: NativeProgramView<'_>,
+        choice: NativeFiniteExistsChoiceView<'_>,
+    ) -> Result<(), ObjectError> {
+        let lowering_report = report.lowering;
+        if self.exact_finite_selected_end_teddy_aot_report.is_some()
+            || self.exact_finite_selected_end_teddy_aot_report_v2.is_some()
+            || self.exact_finite_exists_leaf_report.is_some()
+            || self.ordered_finite_language_aot_report.is_some()
+            || self.slow_aot_report.is_some()
+            || self.slow_context_aot_report.is_some()
+            || self.compiler_k0_aot_report.is_some()
+            || lowering_report.artifact_identity != artifact_identity
+            || self
+                .serialized_program_identity
+                .is_none_or(|identity| identity.sha256 != artifact_identity)
+            || lowering_report.output != OutputContract::Exists
+            || semantic_native.output != OutputContract::Exists
+            || self.native_direct_search_trusted_core.is_some()
+            || self.native_direct_search_module_surface_seal.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists Teddy provenance is not exclusive",
+            ));
+        }
+        if !exact_finite_exists_dfa_baseline_authenticates(
+            &semantic_native,
+            lowering_report.incumbent_complete_dfa,
+        )? || !exact_finite_exists_dfa_lowering_authenticates(
+            &semantic_native,
+            self.target,
+            &lowering_report,
+        )? {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists Teddy incumbent disagrees with its semantic DFA",
+            ));
+        }
+
+        // Regenerate through the Exists-only wrapper. Equality with this
+        // independently selected transaction authenticates the literal
+        // Choice, cost record, exact verifier, matched-to-incumbent edge, and
+        // the byte-for-byte incumbent tail without trusting a self-signed
+        // code digest as control-flow evidence.
+        let cost = NativeCompleteDfaCost::estimate_exists(&semantic_native)?
+            .ok_or(ObjectError::InvalidModule(
+                "exact finite Exists Teddy has no complete-DFA cost",
+            ))?;
+        let incumbent = lower_exact_finite_teddy_incumbent_with_data_limit(
+            semantic_native,
+            self.target,
+            lowering_report.incumbent_data_bytes,
+        )?
+        .ok_or(ObjectError::InvalidModule(
+            "exact finite Exists Teddy incumbent did not regenerate",
+        ))?;
+        let baseline = cost
+            .exists_report(&semantic_native, &incumbent)?
+            .ok_or(ObjectError::InvalidModule(
+                "exact finite Exists Teddy baseline did not regenerate",
+            ))?;
+        if baseline != lowering_report.incumbent_complete_dfa {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists Teddy regenerated baseline changed",
+            ));
+        }
+        let selection = module_exact_finite_selected_end_teddy::select_exact_finite_exists_teddy(
+            artifact_identity,
+            choice,
+            self.target,
+            baseline,
+        )
+        .ok_or(ObjectError::InvalidModule(
+            "exact finite Exists Teddy selection did not regenerate",
+        ))?;
+        let regenerated =
+            module_exact_finite_selected_end_teddy::wrap_exact_finite_exists_teddy(
+                selection,
+                incumbent,
+                baseline,
+                self.target,
+                lowering_report.native_data_bytes,
+            )?;
+        let module_exact_finite_selected_end_teddy::ExactFiniteSelectedEndTeddyWrapOutcome::Selected {
+            lowering: regenerated_lowering,
+            report: regenerated_report,
+        } = regenerated
+        else {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists Teddy regeneration resource-declined",
+            ));
+        };
+        let text = self.sections.get(TEXT_SECTION).ok_or(
+            ObjectError::InvalidModule("exact finite Exists Teddy module has no text"),
+        )?;
+        let data = self.sections.get(PROGRAM_SECTION).ok_or(
+            ObjectError::InvalidModule("exact finite Exists Teddy module has no data"),
+        )?;
+        if regenerated_report != lowering_report
+            || regenerated_lowering.code.as_slice() != text.bytes()
+            || regenerated_lowering.data.as_slice() != data.bytes()
+            || regenerated_lowering.relocations.as_slice() != self.relocations.as_ref()
+            || regenerated_lowering.needs_runtime
+            || regenerated_lowering.slow_partial_table.is_some()
+            || regenerated_lowering.start_accelerator != self.start_accelerator
+            || regenerated_lowering.anchored_prefix_filter_bytes
+                != self.anchored_prefix_filter_bytes
+            || regenerated_lowering.direct_search_trusted_core.is_some()
+            || self.runtime_symbol_index.is_some()
+            || !module_exact_finite_selected_end_teddy::exists_report_matches_lowering(
+                &lowering_report,
+                &regenerated_lowering,
+                self.target,
+            )?
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists Teddy module changed after regeneration",
+            ));
+        }
+        self.exact_finite_exists_leaf_report =
+            Some(ExactFiniteExistsLeafReport::Teddy(report));
+        Ok(())
+    }
+
+    fn authenticate_exact_finite_exists_teddy_before_additive_surface(
+        &self,
+        artifact_identity: [u8; 32],
+        serialized_program_bytes: usize,
+    ) -> Result<(), ObjectError> {
+        let Some(ExactFiniteExistsLeafReport::Teddy(report)) =
+            self.exact_finite_exists_leaf_report.as_ref()
+        else {
+            return Ok(());
+        };
+        if report.lowering.artifact_identity != artifact_identity
+            || self
+                .serialized_program_identity
+                .is_none_or(|identity| {
+                    identity.sha256 != artifact_identity
+                        || identity.bytes != serialized_program_bytes
+                })
+            || self.native_direct_search_trusted_core.is_some()
+            || self.native_direct_search_module_surface_seal.is_some()
+            || !module_exact_finite_selected_end_teddy::exists_report_matches_parts(
+                &report.lowering,
+                self.sections[TEXT_SECTION].bytes(),
+                self.sections[PROGRAM_SECTION].bytes(),
+                &self.relocations,
+                self.runtime_symbol_index.is_some(),
+                false,
+                self.start_accelerator,
+                self.anchored_prefix_filter_bytes,
+                self.target,
+            )?
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact finite Exists Teddy ordinary entry is not authenticated for aggregate composition",
+            ));
+        }
+        Ok(())
+    }
+
+    fn drop_exact_finite_exists_teddy_after_additive_surface(&mut self) {
+        if matches!(
+            self.exact_finite_exists_leaf_report,
+            Some(ExactFiniteExistsLeafReport::Teddy(_))
+        ) {
+            self.exact_finite_exists_leaf_report = None;
+        }
+    }
+
     fn install_exact_finite_selected_end_teddy_aot_report(
         &mut self,
         report: ExactFiniteSelectedEndTeddyAotReport,
@@ -9741,6 +10181,14 @@ impl CompiledModule {
     pub(crate) fn can_append_exact_finite_selected_end_grep_count(
         &self,
     ) -> Result<bool, ObjectError> {
+        if matches!(
+            self.exact_finite_exists_leaf_report,
+            Some(ExactFiniteExistsLeafReport::Teddy(_))
+        ) {
+            return Err(ObjectError::InvalidModule(
+                "exact-finite SelectedEnd GrepCount cannot compose an Exists Teddy leaf",
+            ));
+        }
         if self
             .exact_finite_selected_end_grep_count_aot_report
             .is_some()
@@ -11104,6 +11552,10 @@ impl CompiledModule {
                 "prepared aggregate module has no program section",
             ));
         }
+        self.authenticate_exact_finite_exists_teddy_before_additive_surface(
+            artifact_identity,
+            serialized_program.len(),
+        )?;
         let ordered_nfa_operation_only_claim = self.required_prepare_capabilities
             == PREPARED_CAPABILITY_ORDERED_NFA_V15
             && self.prepared_bulk_strategy.is_none();
@@ -12771,6 +13223,11 @@ impl CompiledModule {
             )?;
             self.exact_finite_selected_end_teddy_aot_report_v2 = Some(report);
         }
+        // The Exists Teddy receipt authenticates the complete ordinary
+        // wrapper only. The additive reducer remains executable, but its
+        // larger text/data surface deliberately carries no stale or
+        // self-refreshed claim about that wrapper.
+        self.drop_exact_finite_exists_teddy_after_additive_surface();
         Ok(self)
     }
 
@@ -114772,6 +115229,35 @@ int main(void){{
             emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
                 .unwrap_or_else(|error| panic!("large slow object {target:?}: {error}"));
         }
+    }
+
+    #[test]
+    fn direct_exists_endpoint_scope_is_nested_unwind_safe_and_thread_local() {
+        assert!(!direct_exists_endpoint_incumbent_requested());
+        {
+            let outer = direct_exists_endpoint_incumbent_scope(true);
+            assert!(direct_exists_endpoint_incumbent_requested());
+            {
+                let inner = direct_exists_endpoint_incumbent_scope(false);
+                assert!(!direct_exists_endpoint_incumbent_requested());
+                drop(inner);
+            }
+            assert!(direct_exists_endpoint_incumbent_requested());
+            let other = std::thread::spawn(direct_exists_endpoint_incumbent_requested)
+                .join()
+                .expect("direct Exists endpoint policy isolation thread");
+            assert!(!other);
+            drop(outer);
+        }
+        assert!(!direct_exists_endpoint_incumbent_requested());
+
+        let unwind = std::panic::catch_unwind(|| {
+            let _scope = direct_exists_endpoint_incumbent_scope(true);
+            assert!(direct_exists_endpoint_incumbent_requested());
+            panic!("synthetic direct Exists endpoint scope unwind");
+        });
+        assert!(unwind.is_err());
+        assert!(!direct_exists_endpoint_incumbent_requested());
     }
 
     #[test]

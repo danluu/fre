@@ -1389,6 +1389,13 @@ fn compile_with_independent_exists_batch_policy(
     }
     let target = request.target;
     let max_object_bytes = request.limits.max_object_bytes;
+    // Stage-1 Exists Teddy intentionally has no authenticated private core.
+    // Preserve the established complete-DFA owner for these explicit native
+    // endpoint APIs until a later composite lowering can publish one; a
+    // scalar-only Teddy selection would make the append decline and restore
+    // the Rust descriptor/line outer loop.
+    let endpoint_incumbent_scope =
+        module::direct_exists_endpoint_incumbent_scope(true);
     let mut compiled = if matching_lf_line_witness_requested {
         let scope =
             module::matching_lf_line_witness_recipe_scope(true);
@@ -1396,11 +1403,11 @@ fn compile_with_independent_exists_batch_policy(
         drop(scope);
         compiled
     } else {
-        // Preserve the established batch API's literal pre-feature compile
-        // transaction, including avoiding LF-recipe TLS access and preserving
-        // its failure surface.
+        // The established batch API still avoids LF-recipe TLS access and its
+        // separate final-edge tracking allocation/failure surface.
         compile(request)?
     };
+    drop(endpoint_incumbent_scope);
     if compiled.module.prepared_exists_batch_symbol().is_some()
         || compiled.module.direct_exists_batch_symbol().is_some()
     {
@@ -1918,7 +1925,12 @@ fn append_prepared_aggregate_exports_to_compiled(
     let serialized_program = program.serialize()?;
     let exact_teddy_incumbent = module
         .exact_finite_selected_end_teddy_aot_report()
-        .copied();
+        .copied()
+        .or_else(|| {
+            module
+                .exact_finite_exists_teddy_incumbent_aot_report()
+                .copied()
+        });
     // Exact singletons already own a later, independently authenticated
     // Count-v3/SpanSum portfolio. Suppress this generic complete-reducer
     // recipe for every exact singleton so both that portfolio's selections
@@ -2246,6 +2258,9 @@ fn append_prepared_aggregate_exports_to_compiled(
                 if fallback
                     .exact_finite_selected_end_teddy_aot_report()
                     .is_some()
+                    || fallback
+                        .exact_finite_exists_teddy_incumbent_aot_report()
+                        .is_some()
                     || fallback.exact_finite_exists_byte_set_aot_report().is_some()
                     || fallback.exact_single_literal_aot_report().is_some()
                     || fallback.ordered_finite_language_aot_report().is_some()
@@ -2266,7 +2281,7 @@ fn append_prepared_aggregate_exports_to_compiled(
                     ) != Some(report.incumbent_relocations_sha256)
                 {
                     return Err(CompileError::InternalInvariant(
-                        "exact finite SelectedEnd Teddy aggregate fallback did not restore the authenticated semantic DFA incumbent",
+                        "exact finite Teddy aggregate fallback did not restore the authenticated semantic DFA incumbent",
                     ));
                 }
             }
