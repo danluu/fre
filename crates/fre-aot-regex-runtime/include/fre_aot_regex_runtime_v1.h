@@ -12,6 +12,7 @@
 #define FRE_AOT_REGEX_STATUS_INVALID_HANDLE 5u
 #define FRE_AOT_REGEX_STATUS_PARTIAL_PREFLIGHT_ENTER 6u
 #define FRE_AOT_REGEX_STATUS_SUCCESS 0u
+#define FRE_AOT_REGEX_EXACT_SINGLETON_FIRST_CANDIDATE_MISS UINT64_MAX
 #define FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES 32u
 #define FRE_AOT_REGEX_PARTIAL_ENTRY_BYPASS 0u
 #define FRE_AOT_REGEX_PARTIAL_ENTRY_ENTER 1u
@@ -140,6 +141,17 @@ typedef uint32_t (*FreAotRegexIndependentExistsBatchV1)(
     size_t count,
     uint8_t *matched_out,
     size_t *processed_out);
+
+/*
+ * Exact-singleton whole-haystack earliest-candidate endpoint. Status 0
+ * publishes the inclusive final-byte offset of the earliest full match, or
+ * FRE_AOT_REGEX_EXACT_SINGLETON_FIRST_CANDIDATE_MISS. Every nonzero status
+ * leaves inclusive_final_byte_out untouched.
+ */
+typedef uint32_t (*FreAotRegexExactSingletonFirstCandidateV1)(
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *inclusive_final_byte_out);
 
 /*
  * Full-haystack match reducers for an exclusively prepared Span program.

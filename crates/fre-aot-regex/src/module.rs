@@ -495,6 +495,69 @@ pub struct ExactSingleLiteralAotReport {
     pub native_data_bytes: usize,
 }
 
+/// Schema version for [`ExactSingletonFirstCandidateAotReport`].
+pub const EXACT_SINGLETON_FIRST_CANDIDATE_AOT_SCHEMA_VERSION: u32 = 1;
+
+/// Miss value published by the exact-singleton first-candidate endpoint.
+pub const EXACT_SINGLETON_FIRST_CANDIDATE_MISS: u64 = u64::MAX;
+
+/// Search result represented by an exact-singleton first-candidate endpoint.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactSingletonFirstCandidateSemantics {
+    /// The inclusive final-byte offset of the earliest full match.
+    EarliestInclusiveFinalByteV1,
+}
+
+/// Callable contract authenticated for an exact-singleton first-candidate
+/// endpoint.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactSingletonFirstCandidateAbi {
+    /// `(haystack, length, value_out) -> status`, where status zero publishes
+    /// either an inclusive final-byte offset or the canonical miss sentinel.
+    HaystackLenU64OutStatusV1,
+}
+
+/// Physical register carrying the start of the accepted literal when the
+/// authenticated Two-Way core returns a match.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactSingletonFirstCandidateCursorRegister {
+    X86Rdx,
+    Aarch64X2,
+}
+
+/// Authentication receipt for the additive exact-singleton whole-window
+/// earliest-candidate entry.
+///
+/// The object digest remains in [`crate::CompileReceipt::object_sha256`].
+/// This receipt binds the source-independent native surface inside that
+/// object and is intentionally absent when the endpoint was not appended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactSingletonFirstCandidateAotReport {
+    pub schema_version: u32,
+    pub semantics: ExactSingletonFirstCandidateSemantics,
+    pub abi: ExactSingletonFirstCandidateAbi,
+    pub miss_sentinel: u64,
+    pub target: Target,
+    pub required_features: FeatureSet,
+    pub emitted_isa: ExactSingleLiteralAotIsa,
+    pub literal_bytes: usize,
+    pub literal_sha256: [u8; 32],
+    pub cursor_register: ExactSingletonFirstCandidateCursorRegister,
+    pub success_edge_count: u8,
+    pub success_edges_sha256: [u8; 32],
+    pub trusted_core_offset: usize,
+    pub trusted_core_sha256: [u8; 32],
+    pub ordinary_entry_symbol_sha256: [u8; 32],
+    pub ordinary_entry_code_sha256: [u8; 32],
+    pub wrapper_entry_offset: usize,
+    pub wrapper_bytes: usize,
+    pub wrapper_sha256: [u8; 32],
+    pub endpoint_symbol_sha256: [u8; 32],
+    pub native_code_sha256: [u8; 32],
+    pub relocations_sha256: [u8; 32],
+    pub runtime_call_count: u8,
+}
+
 /// Actual instruction family emitted by the direct exact-finite
 /// `SelectedEnd` Teddy leaf. Stronger targets may reuse an audited narrower
 /// sequence, so this is distinct from the authorizing target tier.
@@ -1412,6 +1475,18 @@ struct NativeDirectSearchTrustedCore {
     entry_code_sha256: [u8; 32],
     prologue: NativeDirectSearchTrustedCorePrologue,
     landmark: NativeDirectSearchTrustedCoreLandmark,
+    success_cursor: Option<NativeDirectSearchSuccessCursor>,
+}
+
+/// Compiler-private physical proof consumed before an endpoint may observe a
+/// register left live by the trusted core. Each listed instruction is a
+/// success edge into the one authenticated matched terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDirectSearchSuccessCursor {
+    register: ExactSingletonFirstCandidateCursorRegister,
+    matched_offset: usize,
+    edge_offsets: [usize; 2],
+    edge_count: u8,
 }
 
 /// Exact selected-layout receipt from which an aggregate-only complete Span
@@ -1688,6 +1763,180 @@ impl NativeDirectSearchTrustedCorePrologue {
     }
 }
 
+const EXACT_SINGLETON_FIRST_CANDIDATE_SUCCESS_EDGES_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/exact-singleton-first-candidate-success-edges-v1\0";
+
+fn exact_singleton_first_candidate_success_edges_digest(
+    architecture: Architecture,
+    text: &[u8],
+    proof: NativeDirectSearchSuccessCursor,
+) -> Result<[u8; 32], ObjectError> {
+    let edge_count = usize::from(proof.edge_count);
+    if !(1..=proof.edge_offsets.len()).contains(&edge_count) {
+        return Err(ObjectError::InvalidModule(
+            "exact-singleton cursor success-edge count is invalid",
+        ));
+    }
+    let expected_register = match architecture {
+        Architecture::X86_64 => ExactSingletonFirstCandidateCursorRegister::X86Rdx,
+        Architecture::Aarch64 => ExactSingletonFirstCandidateCursorRegister::Aarch64X2,
+    };
+    if proof.register != expected_register
+        || proof.edge_offsets[..edge_count]
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact-singleton cursor register or success-edge order is invalid",
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(EXACT_SINGLETON_FIRST_CANDIDATE_SUCCESS_EDGES_IDENTITY_DOMAIN);
+    digest.update([match proof.register {
+        ExactSingletonFirstCandidateCursorRegister::X86Rdx => 1,
+        ExactSingletonFirstCandidateCursorRegister::Aarch64X2 => 2,
+    }]);
+    digest.update([proof.edge_count]);
+    digest.update(
+        u64::try_from(proof.matched_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("exact-singleton matched offset"))?
+            .to_le_bytes(),
+    );
+    for &edge in &proof.edge_offsets[..edge_count] {
+        let (target, instruction_bytes) = match architecture {
+            Architecture::X86_64 => {
+                let first = *text.get(edge).ok_or(ObjectError::InvalidModule(
+                    "x86 exact-singleton success edge is outside text",
+                ))?;
+                if matches!(first, 0x74 | 0x76) {
+                    let displacement = i8::from_le_bytes([*text.get(edge + 1).ok_or(
+                        ObjectError::InvalidModule(
+                            "x86 exact-singleton short success edge is truncated",
+                        ),
+                    )?]);
+                    let after = edge.checked_add(2).ok_or(ObjectError::ArithmeticOverflow(
+                        "x86 exact-singleton short success edge",
+                    ))?;
+                    let target = usize::try_from(
+                        i64::try_from(after)
+                            .map_err(|_| ObjectError::ArithmeticOverflow(
+                                "x86 exact-singleton short success edge",
+                            ))?
+                            .checked_add(i64::from(displacement))
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "x86 exact-singleton short success target",
+                            ))?,
+                    )
+                    .map_err(|_| ObjectError::InvalidModule(
+                        "x86 exact-singleton short success target is negative",
+                    ))?;
+                    (target, 2)
+                } else if text.get(edge..edge.saturating_add(2))
+                    == Some([0x0f, 0x84].as_slice())
+                    || text.get(edge..edge.saturating_add(2))
+                        == Some([0x0f, 0x86].as_slice())
+                {
+                    let displacement = i32::from_le_bytes(
+                        text.get(edge + 2..edge.saturating_add(6))
+                            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                            .ok_or(ObjectError::InvalidModule(
+                                "x86 exact-singleton long success edge is truncated",
+                            ))?,
+                    );
+                    let after = edge.checked_add(6).ok_or(ObjectError::ArithmeticOverflow(
+                        "x86 exact-singleton long success edge",
+                    ))?;
+                    let target = usize::try_from(
+                        i64::try_from(after)
+                            .map_err(|_| ObjectError::ArithmeticOverflow(
+                                "x86 exact-singleton long success edge",
+                            ))?
+                            .checked_add(i64::from(displacement))
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "x86 exact-singleton long success target",
+                            ))?,
+                    )
+                    .map_err(|_| ObjectError::InvalidModule(
+                        "x86 exact-singleton long success target is negative",
+                    ))?;
+                    (target, 6)
+                } else {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 exact-singleton success edge has the wrong opcode",
+                    ));
+                }
+            }
+            Architecture::Aarch64 => {
+                let instruction = u32::from_le_bytes(
+                    text.get(edge..edge.saturating_add(4))
+                        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                        .ok_or(ObjectError::InvalidModule(
+                            "AArch64 exact-singleton success edge is truncated",
+                        ))?,
+                );
+                let immediate = if instruction & 0xff00_001f
+                    == (0x5400_0000 | u32::from(AARCH64_LS))
+                {
+                    ((instruction >> 5) & 0x7_ffff) as i32
+                } else if instruction & 0x7f00_001f == 0x3400_0009 {
+                    ((instruction >> 5) & 0x7_ffff) as i32
+                } else {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 exact-singleton success edge has the wrong opcode",
+                    ));
+                };
+                let signed_words = (immediate << 13) >> 13;
+                let target = usize::try_from(
+                    i64::try_from(edge)
+                        .map_err(|_| ObjectError::ArithmeticOverflow(
+                            "AArch64 exact-singleton success edge",
+                        ))?
+                        .checked_add(i64::from(signed_words) * 4)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 exact-singleton success target",
+                        ))?,
+                )
+                .map_err(|_| ObjectError::InvalidModule(
+                    "AArch64 exact-singleton success target is negative",
+                ))?;
+                (target, 4)
+            }
+        };
+        if target != proof.matched_offset {
+            return Err(ObjectError::InvalidModule(
+                "exact-singleton success edge does not target the matched terminal",
+            ));
+        }
+        digest.update(
+            u64::try_from(edge)
+                .map_err(|_| ObjectError::ArithmeticOverflow(
+                    "exact-singleton success edge offset",
+                ))?
+                .to_le_bytes(),
+        );
+        digest.update(text.get(edge..edge.saturating_add(instruction_bytes)).ok_or(
+            ObjectError::InvalidModule("exact-singleton success instruction is outside text"),
+        )?);
+    }
+    let x86_matched_terminal = [0xb8, 1, 0, 0, 0];
+    let aarch64_matched_terminal = aarch64_movz_w(0, 1)?.to_le_bytes();
+    let matched_terminal = match architecture {
+        Architecture::X86_64 => x86_matched_terminal.as_slice(),
+        Architecture::Aarch64 => aarch64_matched_terminal.as_slice(),
+    };
+    if text.get(
+        proof.matched_offset
+            ..proof.matched_offset.saturating_add(matched_terminal.len()),
+    ) != Some(matched_terminal)
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact-singleton matched terminal is malformed",
+        ));
+    }
+    digest.update(matched_terminal);
+    Ok(digest.finalize().into())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1725,6 +1974,33 @@ fn authenticate_native_direct_search_trusted_core(
         return Err(ObjectError::InvalidModule(
             "direct search trusted core contract is inconsistent",
         ));
+    }
+    match core.landmark {
+        NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1 => {
+            if core.success_cursor.is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "complete DFA trusted core unexpectedly publishes a cursor",
+                ));
+            }
+        }
+        NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 { .. } => {
+            let cursor = core.success_cursor.ok_or(ObjectError::InvalidModule(
+                "exact-singleton trusted core has no success cursor proof",
+            ))?;
+            if cursor.matched_offset <= core.code_offset || cursor.matched_offset >= entry_end {
+                return Err(ObjectError::InvalidModule(
+                    "exact-singleton matched terminal is outside its trusted core",
+                ));
+            }
+            exact_singleton_first_candidate_success_edges_digest(architecture, text, cursor)?;
+            for &edge in &cursor.edge_offsets[..usize::from(cursor.edge_count)] {
+                if edge < core.code_offset || edge >= cursor.matched_offset {
+                    return Err(ObjectError::InvalidModule(
+                        "exact-singleton success edge is outside its trusted core",
+                    ));
+                }
+            }
+        }
     }
     let entry = text
         .get(entry_start..entry_end)
@@ -2574,6 +2850,14 @@ pub enum DirectExistsBatchStrategy {
     NativeOrdinaryEntryLoop,
 }
 
+/// Implementation selected behind an exact-singleton first-candidate symbol.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExactSingletonFirstCandidateStrategy {
+    /// One validated whole-window call enters the authenticated exact-literal
+    /// Two-Way core and consumes its proved match-start cursor.
+    NativeTwoWayTrustedCoreV1,
+}
+
 /// Prepared-handle capability bit required by an object whose aggregate/fill
 /// benchmark path is published through the native Ordered-TNFA iterator.
 /// This value is intentionally identical to runtime V3's capability bit but
@@ -2718,6 +3002,8 @@ pub struct CompiledModule {
     prepared_span_fill_symbol_index: Option<usize>,
     prepared_exists_batch_symbol_index: Option<usize>,
     direct_exists_batch_symbol_index: Option<usize>,
+    direct_exact_singleton_first_candidate:
+        Option<(usize, ExactSingletonFirstCandidateAotReport)>,
     native_direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
     native_complete_span_reduce_source: Option<Box<NativeCompleteSpanReduceSource>>,
     native_complete_span_reduce_core: Option<NativeCompleteSpanReduceCore>,
@@ -2912,6 +3198,10 @@ const PREPARED_EXISTS_BATCH_SYMBOL_PREFIX: &str =
 const DIRECT_EXISTS_BATCH_SYMBOL_PREFIX: &str = "fre_aot_regex_is_match_batch_v1_";
 const DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN: &[u8] =
     b"fre-aot-regex/direct-exists-batch-trusted-full-window-v2\0";
+const DIRECT_EXACT_SINGLETON_FIRST_CANDIDATE_SYMBOL_PREFIX: &str =
+    "fre_aot_regex_exact_singleton_first_candidate_v1_";
+const DIRECT_EXACT_SINGLETON_FIRST_CANDIDATE_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/exact-singleton-first-candidate-v1\0";
 const PREPARED_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_count_exclusive_v1_";
 const PREPARED_SPAN_SUM_SYMBOL_PREFIX: &str = "fre_aot_regex_span_sum_exclusive_v1_";
 const PREPARED_GREP_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_grep_count_exclusive_v1_";
@@ -7708,6 +7998,7 @@ impl CompiledModule {
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
             direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
             native_direct_search_trusted_core: lowering.direct_search_trusted_core,
             native_complete_span_reduce_source: lowering.complete_span_reduce_source,
             native_complete_span_reduce_core: None,
@@ -8271,6 +8562,40 @@ impl CompiledModule {
             Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop)
         } else {
             None
+        }
+    }
+
+    /// Return the additive exact-singleton whole-haystack earliest-candidate
+    /// entry, when the explicit independent-batch transaction could
+    /// authenticate the underlying Two-Way cursor contract.
+    #[must_use]
+    pub fn direct_exact_singleton_first_candidate_symbol(&self) -> Option<&str> {
+        self.direct_exact_singleton_first_candidate
+            .and_then(|(index, _)| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return how the exact-singleton first-candidate symbol executes.
+    #[must_use]
+    pub const fn direct_exact_singleton_first_candidate_strategy(
+        &self,
+    ) -> Option<ExactSingletonFirstCandidateStrategy> {
+        if self.direct_exact_singleton_first_candidate.is_some() {
+            Some(ExactSingletonFirstCandidateStrategy::NativeTwoWayTrustedCoreV1)
+        } else {
+            None
+        }
+    }
+
+    /// Return the complete authentication receipt for the exact-singleton
+    /// first-candidate entry.
+    #[must_use]
+    pub const fn direct_exact_singleton_first_candidate_aot_report(
+        &self,
+    ) -> Option<&ExactSingletonFirstCandidateAotReport> {
+        match &self.direct_exact_singleton_first_candidate {
+            Some((_, report)) => Some(report),
+            None => None,
         }
     }
 
@@ -9392,6 +9717,285 @@ impl CompiledModule {
         });
         self.symbols = symbols.into_boxed_slice();
         self.direct_exists_batch_symbol_index = Some(batch_symbol_index);
+        Ok(Some(self))
+    }
+
+    /// Append the exact-singleton whole-window earliest-candidate endpoint to
+    /// an already completed direct Exists-batch module. A non-Two-Way trusted
+    /// core is a structural decline; once the exact landmark is present every
+    /// authentication, construction, and backend inconsistency is terminal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "core authentication, cursor proof, wrapper identity, and publication are one failure-atomic transaction"
+    )]
+    pub(crate) fn append_direct_exact_singleton_first_candidate(
+        mut self,
+        output: OutputContract,
+    ) -> Result<Option<Self>, ObjectError> {
+        if output != OutputContract::Exists
+            || self.prepared_entry_symbol_index.is_some()
+            || self.runtime_symbol_index.is_some()
+        {
+            return Ok(None);
+        }
+        if self.direct_exact_singleton_first_candidate.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "exact-singleton first-candidate endpoint was appended more than once",
+            ));
+        }
+        if self.direct_exists_batch_symbol_index.is_none() {
+            return Err(ObjectError::InvalidModule(
+                "exact-singleton first-candidate endpoint has no direct batch incumbent",
+            ));
+        }
+        let Some(trusted_core) = self.native_direct_search_trusted_core else {
+            return Ok(None);
+        };
+        let NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+            program_bytes,
+            program_sha256,
+        } = trusted_core.landmark
+        else {
+            return Ok(None);
+        };
+        let success_cursor = trusted_core.success_cursor.ok_or(ObjectError::InvalidModule(
+            "exact-singleton first-candidate core has no cursor proof",
+        ))?;
+        let exact_report = self
+            .exact_single_literal_aot_report()
+            .copied()
+            .ok_or(ObjectError::InvalidModule(
+                "exact-singleton first-candidate core has no literal receipt",
+            ))?;
+        if exact_report.literal_bytes != program_bytes
+            || exact_report.literal_sha256 != program_sha256
+            || exact_report.native_data_bytes != program_bytes
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-singleton first-candidate literal receipts disagree",
+            ));
+        }
+
+        let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("exact-singleton first-candidate entry index is invalid"),
+        )?;
+        let entry_start = usize::try_from(entry.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("exact-singleton first-candidate entry offset")
+        })?;
+        let entry_size = usize::try_from(entry.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("exact-singleton first-candidate entry size")
+        })?;
+        let entry_end = entry_start.checked_add(entry_size).ok_or(
+            ObjectError::ArithmeticOverflow("exact-singleton first-candidate entry extent"),
+        )?;
+        let text_len = self.sections.get(TEXT_SECTION).ok_or(
+            ObjectError::InvalidModule("exact-singleton first-candidate module has no text"),
+        )?.data.len();
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-singleton first-candidate target is not a complete text function",
+            ));
+        }
+        let program = self.sections.get(PROGRAM_SECTION).ok_or(
+            ObjectError::InvalidModule("exact-singleton first-candidate module has no program"),
+        )?;
+        authenticate_native_direct_search_trusted_program_surface(
+            program,
+            &self.symbols,
+            trusted_core,
+        )?;
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &self.sections[TEXT_SECTION].data,
+            entry_start,
+            entry_end,
+            program.data.as_ref(),
+            &self.relocations,
+            trusted_core,
+            OutputContract::Exists,
+        )?;
+        let success_edges_sha256 = exact_singleton_first_candidate_success_edges_digest(
+            self.target.architecture,
+            &self.sections[TEXT_SECTION].data,
+            success_cursor,
+        )?;
+        let wrapper = match self.target.architecture {
+            Architecture::X86_64 => {
+                lower_x86_64_exact_singleton_first_candidate(program_bytes)?
+            }
+            Architecture::Aarch64 => {
+                lower_aarch64_exact_singleton_first_candidate(program_bytes)?
+            }
+        };
+        let alignment_mask = match self.target.architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let code_offset = text_len.checked_add(alignment_mask).ok_or(
+            ObjectError::ArithmeticOverflow("exact-singleton endpoint alignment"),
+        )? & !alignment_mask;
+        let final_text_len = code_offset.checked_add(wrapper.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("exact-singleton endpoint extent"),
+        )?;
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("exact-singleton first-candidate text"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(code_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < code_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &wrapper.code)?;
+        let call_offset = code_offset.checked_add(wrapper.search_call_offset).ok_or(
+            ObjectError::ArithmeticOverflow("exact-singleton endpoint local call"),
+        )?;
+        let trampoline_offset = code_offset.checked_add(wrapper.trampoline_offset).ok_or(
+            ObjectError::ArithmeticOverflow("exact-singleton endpoint trampoline"),
+        )?;
+        let core_jump_offset = code_offset.checked_add(wrapper.core_jump_offset).ok_or(
+            ObjectError::ArithmeticOverflow("exact-singleton endpoint core jump"),
+        )?;
+        match self.target.architecture {
+            Architecture::X86_64 => {
+                patch_x86_64_local_call(&mut text, call_offset, trampoline_offset)?;
+                patch_x86_64_local_jump(&mut text, core_jump_offset, trusted_core.code_offset)?;
+            }
+            Architecture::Aarch64 => {
+                patch_aarch64_local_call(&mut text, call_offset, trampoline_offset)?;
+                patch_aarch64_local_branch(&mut text, core_jump_offset, trusted_core.code_offset)?;
+            }
+        }
+
+        let ordinary_entry_symbol_sha256: [u8; 32] = Sha256::digest(entry.name.as_bytes()).into();
+        let ordinary_entry_code_sha256: [u8; 32] = Sha256::digest(
+            text.get(entry_start..entry_end).ok_or(ObjectError::InvalidModule(
+                "exact-singleton ordinary entry moved outside final text",
+            ))?,
+        ).into();
+        if ordinary_entry_code_sha256 != trusted_core.entry_code_sha256 {
+            return Err(ObjectError::InvalidModule(
+                "exact-singleton ordinary entry identity changed",
+            ));
+        }
+        let trusted_core_sha256: [u8; 32] = Sha256::digest(
+            text.get(trusted_core.code_offset..entry_end).ok_or(
+                ObjectError::InvalidModule("exact-singleton trusted core is outside entry"),
+            )?,
+        ).into();
+        let wrapper_bytes = text.get(code_offset..final_text_len).ok_or(
+            ObjectError::InvalidModule("exact-singleton wrapper is outside final text"),
+        )?;
+        let wrapper_sha256: [u8; 32] = Sha256::digest(wrapper_bytes).into();
+        let relocations_sha256 = exact_finite_selected_end_relocation_digest(&self.relocations)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "exact-singleton endpoint relocation receipt",
+            ))?;
+        let mut identity = Sha256::new();
+        identity.update(DIRECT_EXACT_SINGLETON_FIRST_CANDIDATE_IDENTITY_DOMAIN);
+        identity.update([match self.target.architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        }]);
+        identity.update([match self.target.operating_system {
+            OperatingSystem::Linux => 1,
+            OperatingSystem::Macos => 2,
+        }]);
+        identity.update(self.target.features.bits().to_le_bytes());
+        identity.update(program_sha256);
+        identity.update(u64::try_from(program_bytes).map_err(|_| {
+            ObjectError::ArithmeticOverflow("exact-singleton endpoint literal identity")
+        })?.to_le_bytes());
+        identity.update(ordinary_entry_symbol_sha256);
+        identity.update(ordinary_entry_code_sha256);
+        identity.update(trusted_core_sha256);
+        identity.update(success_edges_sha256);
+        identity.update(wrapper_sha256);
+        identity.update(relocations_sha256);
+        let identity: [u8; 32] = identity.finalize().into();
+        let endpoint_name = identity_symbol(
+            DIRECT_EXACT_SINGLETON_FIRST_CANDIDATE_SYMBOL_PREFIX,
+            &identity,
+        )?;
+        let endpoint_symbol_sha256: [u8; 32] = Sha256::digest(endpoint_name.as_bytes()).into();
+
+        let required_features = match exact_report.emitted_isa {
+            ExactSingleLiteralAotIsa::X86Scalar | ExactSingleLiteralAotIsa::Aarch64Scalar => {
+                FeatureSet::EMPTY
+            }
+            ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter => {
+                FeatureSet::of(CpuFeature::Aarch64Asimd)
+            }
+        };
+        if !self.target.features.contains(required_features) {
+            return Err(ObjectError::InvalidModule(
+                "exact-singleton endpoint target omits emitted ISA features",
+            ));
+        }
+        let native_code_sha256: [u8; 32] = Sha256::digest(&text).into();
+        if let Some(ExactFiniteExistsLeafReport::SingleLiteralTwoWay(report)) =
+            &mut self.exact_finite_exists_leaf_report
+        {
+            report.native_code_sha256 = native_code_sha256;
+        }
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        symbols.try_reserve_exact(1).map_err(|_| {
+            ObjectError::Allocation("exact-singleton first-candidate symbol")
+        })?;
+        let symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: endpoint_name,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: u64::try_from(code_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact-singleton endpoint code offset")
+            })?,
+            size: u64::try_from(wrapper.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("exact-singleton endpoint code size")
+            })?,
+        });
+        self.symbols = symbols.into_boxed_slice();
+        self.direct_exact_singleton_first_candidate = Some((
+            symbol_index,
+            ExactSingletonFirstCandidateAotReport {
+                schema_version: EXACT_SINGLETON_FIRST_CANDIDATE_AOT_SCHEMA_VERSION,
+                semantics:
+                    ExactSingletonFirstCandidateSemantics::EarliestInclusiveFinalByteV1,
+                abi: ExactSingletonFirstCandidateAbi::HaystackLenU64OutStatusV1,
+                miss_sentinel: EXACT_SINGLETON_FIRST_CANDIDATE_MISS,
+                target: self.target,
+                required_features,
+                emitted_isa: exact_report.emitted_isa,
+                literal_bytes: program_bytes,
+                literal_sha256: program_sha256,
+                cursor_register: success_cursor.register,
+                success_edge_count: success_cursor.edge_count,
+                success_edges_sha256,
+                trusted_core_offset: trusted_core.code_offset,
+                trusted_core_sha256,
+                ordinary_entry_symbol_sha256,
+                ordinary_entry_code_sha256,
+                wrapper_entry_offset: code_offset,
+                wrapper_bytes: wrapper.code.len(),
+                wrapper_sha256,
+                endpoint_symbol_sha256,
+                native_code_sha256,
+                relocations_sha256,
+                runtime_call_count: 0,
+            },
+        ));
         Ok(Some(self))
     }
 
@@ -14318,6 +14922,13 @@ struct NativePreparedBulkWrapper {
 }
 
 struct NativeDirectExistsBatchWrapper {
+    code: Vec<u8>,
+    search_call_offset: usize,
+    trampoline_offset: usize,
+    core_jump_offset: usize,
+}
+
+struct NativeExactSingletonFirstCandidateWrapper {
     code: Vec<u8>,
     search_call_offset: usize,
     trampoline_offset: usize,
@@ -33344,8 +33955,9 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-        direct_exists_batch_symbol_index: None,
-        native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -33683,8 +34295,9 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-        direct_exists_batch_symbol_index: None,
-        native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -34204,8 +34817,9 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-        direct_exists_batch_symbol_index: None,
-        native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -34365,8 +34979,9 @@ fn native_regex_redux_module(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-        direct_exists_batch_symbol_index: None,
-        native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -34719,8 +35334,9 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-        direct_exists_batch_symbol_index: None,
-        native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -34834,8 +35450,9 @@ fn native_weighted_capture_module(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-        direct_exists_batch_symbol_index: None,
-        native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -35292,8 +35909,9 @@ fn native_rebar_multi_grep_module_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-        direct_exists_batch_symbol_index: None,
-        native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -35540,8 +36158,9 @@ fn native_rebar_row_scalar_module_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-        direct_exists_batch_symbol_index: None,
-        native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -48224,6 +48843,7 @@ fn lower_x86_64_dfa_with_entry_contract(
                     save_r14_r15: uses_seeded_reverse,
                 },
                 landmark: NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
+                success_cursor: None,
             }
         }),
     })
@@ -55271,6 +55891,207 @@ fn lower_aarch64_direct_exists_batch(
         ));
     }
     Ok(NativeDirectExistsBatchWrapper {
+        code,
+        search_call_offset: offsets[0],
+        trampoline_offset,
+        core_jump_offset,
+    })
+}
+
+fn lower_x86_64_exact_singleton_first_candidate(
+    literal_bytes: usize,
+) -> Result<NativeExactSingletonFirstCandidateWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 40;
+    let literal_bytes = u64::try_from(literal_bytes)
+        .map_err(|_| ObjectError::ArithmeticOverflow("exact-singleton literal width"))?;
+    if literal_bytes == 0 {
+        return Err(ObjectError::InvalidModule(
+            "exact-singleton first-candidate literal is empty",
+        ));
+    }
+    let mut assembler = X86Assembler::new();
+    let miss = assembler.label()?;
+    let frame_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+    let trampoline = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // value_out
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc2, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // signed address-domain length
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // haystack
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x08, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x48, 0x89, 0xf1])?;
+    assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let search_call = assembler.label()?;
+    assembler.bind(search_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], miss)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x85], frame_invalid)?;
+
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x10])?;
+    assembler.instruction(&[0x49, 0x89, 0xd2])?;
+    assembler.instruction(&[0x4d, 0x29, 0xca])?;
+    assembler.branch(&[0x0f, 0x82], frame_invalid)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x18])?;
+    let mut load_literal = vec![0x48, 0xb8];
+    load_literal.extend_from_slice(&literal_bytes.to_le_bytes());
+    assembler.instruction(&load_literal)?;
+    assembler.instruction(&[0x49, 0x29, 0xc3])?;
+    assembler.branch(&[0x0f, 0x82], frame_invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x87], frame_invalid)?;
+    let mut load_last = vec![0x48, 0xb8];
+    load_last.extend_from_slice(&(literal_bytes - 1).to_le_bytes());
+    assembler.instruction(&load_last)?;
+    assembler.instruction(&[0x49, 0x01, 0xc2])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x20])?;
+    assembler.instruction(&[0x4d, 0x89, 0x13])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(miss)?;
+    assembler.instruction(&[0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x20])?;
+    assembler.instruction(&[0x4d, 0x89, 0x13])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(frame_invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(trampoline)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0xe9])?;
+    let core_jump = assembler.label()?;
+    assembler.bind(core_jump)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativeExactSingletonFirstCandidateWrapper {
+        search_call_offset: finished.label_offset(search_call)?,
+        trampoline_offset: finished.label_offset(trampoline)?,
+        core_jump_offset: finished.label_offset(core_jump)?,
+        code: finished.code,
+    })
+}
+
+fn lower_aarch64_exact_singleton_first_candidate(
+    literal_bytes: usize,
+) -> Result<NativeExactSingletonFirstCandidateWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 64;
+    let literal_bytes = u64::try_from(literal_bytes)
+        .map_err(|_| ObjectError::ArithmeticOverflow("exact-singleton literal width"))?;
+    if literal_bytes == 0 {
+        return Err(ObjectError::InvalidModule(
+            "exact-singleton first-candidate literal is empty",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let miss = assembler.label()?;
+    let frame_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(2, invalid)?;
+    assembler.instruction(aarch64_and_low_x(3, 2, 3)?)?;
+    assembler.branch_nonzero_x(3, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(0, invalid)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_store_x(31, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 31, 8)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+    let search_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, miss)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_NE, frame_invalid)?;
+    assembler.instruction(aarch64_cmp_x(2, 19)?)?;
+    assembler.branch_cond(AARCH64_LO, frame_invalid)?;
+    assembler.instruction(aarch64_sub_x_reg(9, 2, 19)?)?;
+    aarch64_load_u64_constant(&mut assembler, 10, literal_bytes)?;
+    assembler.instruction(aarch64_cmp_x(20, 10)?)?;
+    assembler.branch_cond(AARCH64_LO, frame_invalid)?;
+    assembler.instruction(aarch64_sub_x_reg(11, 20, 10)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 11)?)?;
+    assembler.branch_cond(AARCH64_HI, frame_invalid)?;
+    aarch64_load_u64_constant(&mut assembler, 10, literal_bytes - 1)?;
+    assembler.instruction(aarch64_add_x_reg(9, 9, 10)?)?;
+    assembler.instruction(aarch64_store_x(9, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(miss)?;
+    aarch64_load_u64_constant(&mut assembler, 9, u64::MAX)?;
+    assembler.instruction(aarch64_store_x(9, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(frame_invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let trampoline_offset = assembler.code.len();
+    assembler.instruction(0xf100_001f)?; // cmp x0, #0
+    let core_jump = assembler.instruction(0x1400_0000)?;
+    if core_jump != trampoline_offset.saturating_add(4) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-singleton trampoline is not cmp-and-branch",
+        ));
+    }
+    let mut offsets = [search_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    let core_jump_offset = code.len().checked_sub(4).ok_or(ObjectError::InvalidModule(
+        "AArch64 exact-singleton trampoline is absent",
+    ))?;
+    let trampoline_offset = core_jump_offset.checked_sub(4).ok_or(
+        ObjectError::InvalidModule("AArch64 exact-singleton trampoline cmp is absent"),
+    )?;
+    if code.get(trampoline_offset..core_jump_offset)
+        != Some(0xf100_001f_u32.to_le_bytes().as_slice())
+        || code.get(core_jump_offset..)
+            != Some(0x1400_0000_u32.to_le_bytes().as_slice())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-singleton trampoline was rewritten",
+        ));
+    }
+    Ok(NativeExactSingletonFirstCandidateWrapper {
         code,
         search_call_offset: offsets[0],
         trampoline_offset,
@@ -72812,6 +73633,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 entry_code_sha256,
                 prologue: NativeDirectSearchTrustedCorePrologue::Aarch64,
                 landmark: NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
+                success_cursor: None,
             }
         }),
     })
@@ -128390,8 +129212,9 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_entry_symbol_index: Some(PREPARED_ENTRY_SYMBOL),
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
-                direct_exists_batch_symbol_index: None,
-                native_direct_search_trusted_core: None,
+            direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
+            native_direct_search_trusted_core: None,
                 native_complete_span_reduce_source: None,
                 native_complete_span_reduce_core: None,
                 prepared_count_symbol_index: None,
@@ -128730,6 +129553,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_span_fill_symbol_index: None,
             prepared_exists_batch_symbol_index: None,
             direct_exists_batch_symbol_index: None,
+            direct_exact_singleton_first_candidate: None,
             native_direct_search_trusted_core: None,
             native_complete_span_reduce_source: None,
             native_complete_span_reduce_core: None,

@@ -127,6 +127,10 @@ pub use grep_count::{
 pub use module::{
     Architecture, CallAbi, CompiledModule, CompilerK0AotReport, CpuFeature,
     DirectExistsBatchStrategy,
+    EXACT_SINGLETON_FIRST_CANDIDATE_AOT_SCHEMA_VERSION,
+    EXACT_SINGLETON_FIRST_CANDIDATE_MISS, ExactSingletonFirstCandidateAbi,
+    ExactSingletonFirstCandidateAotReport, ExactSingletonFirstCandidateCursorRegister,
+    ExactSingletonFirstCandidateSemantics, ExactSingletonFirstCandidateStrategy,
     ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndDfaBaselineReport,
     ExactFiniteSelectedEndGrepCountAotReport, ExactFiniteSelectedEndTeddyAotIsa,
     ExactFiniteSelectedEndTeddyAotReport,
@@ -770,6 +774,9 @@ pub struct CompileReceipt {
     /// Authenticated direct exact wide single-literal `Exists` lowering, when
     /// selected.
     pub exact_single_literal_aot: Option<ExactSingleLiteralAotReport>,
+    /// Additive authenticated exact-singleton earliest-candidate endpoint,
+    /// when explicitly requested with the independent Exists batch.
+    pub exact_singleton_first_candidate_aot: Option<ExactSingletonFirstCandidateAotReport>,
     /// Direct exact finite-language Teddy `SelectedEnd` leaf, when selected.
     pub exact_finite_selected_end_teddy_aot: Option<ExactFiniteSelectedEndTeddyAotReport>,
     /// Authenticated target-neutral and native-data geometry for a selected
@@ -1148,6 +1155,9 @@ pub fn compile_with_exact_finite_selected_end_grep_count(
         module.exact_finite_exists_byte_set_aot_report().copied();
     compiled.receipt.exact_single_literal_aot =
         module.exact_single_literal_aot_report().copied();
+    compiled.receipt.exact_singleton_first_candidate_aot = module
+        .direct_exact_singleton_first_candidate_aot_report()
+        .copied();
     compiled.receipt.exact_finite_selected_end_teddy_aot =
         module.exact_finite_selected_end_teddy_aot_report().copied();
     compiled.receipt.ordered_finite_language_aot =
@@ -1170,6 +1180,7 @@ pub fn compile_with_exact_finite_selected_end_grep_count(
     compiled.receipt.object_bytes = object.len();
     compiled.module = module;
     compiled.object = object.into_boxed_slice();
+
     Ok(compiled)
 }
 
@@ -1297,6 +1308,7 @@ pub fn compile_with_independent_exists_batch(
     compiled.receipt.object_bytes = object.len();
     compiled.module = module;
     compiled.object = object.into_boxed_slice();
+
     Ok(compiled)
 }
 
@@ -2948,6 +2960,7 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         compiler_k0_aot: None,
         exact_finite_exists_byte_set_aot: None,
         exact_single_literal_aot: None,
+        exact_singleton_first_candidate_aot: None,
         exact_finite_selected_end_teddy_aot: None,
         ordered_finite_language_aot: None,
         slow_context_aot: None,
@@ -4261,6 +4274,9 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
             .exact_finite_exists_byte_set_aot_report()
             .copied(),
         exact_single_literal_aot: module.exact_single_literal_aot_report().copied(),
+        exact_singleton_first_candidate_aot: module
+            .direct_exact_singleton_first_candidate_aot_report()
+            .copied(),
         exact_finite_selected_end_teddy_aot: module
             .exact_finite_selected_end_teddy_aot_report()
             .copied(),
