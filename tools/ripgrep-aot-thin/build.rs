@@ -22,6 +22,7 @@ mod first_candidate_build;
 mod first_candidate_receipt;
 mod lf_line_witness_build;
 mod lf_line_witness_receipt;
+mod prepared_factory;
 mod registry_key;
 
 use build_proof::{
@@ -36,6 +37,7 @@ use build_target::{CARGO_TARGET_FEATURE_ENV, FEATURES_ENV, selected_features};
 use exact64_set_build::generate as generate_exact64_sets;
 use first_candidate_build::FirstCandidateRegistryBuild;
 use lf_line_witness_build::MatchingLfLineWitnessRegistryBuild;
+use prepared_factory::authenticate_prepared_factory;
 use registry_key::manifest_profile_key;
 
 const ENABLE_MATCHING_LF_LINE_WITNESS: bool = true;
@@ -53,6 +55,7 @@ fn main() {
     println!("cargo:rerun-if-changed=first_candidate_receipt.rs");
     println!("cargo:rerun-if-changed=lf_line_witness_build.rs");
     println!("cargo:rerun-if-changed=lf_line_witness_receipt.rs");
+    println!("cargo:rerun-if-changed=prepared_factory.rs");
     println!("cargo:rerun-if-changed=registry_key.rs");
     println!("cargo:rerun-if-env-changed={FEATURES_ENV}");
     println!("cargo:rerun-if-env-changed={CARGO_TARGET_FEATURE_ENV}");
@@ -269,6 +272,24 @@ fn main() {
                 let backend = if let Some(prepared_entry_symbol) =
                     compiled.module().prepared_entry_symbol()
                 {
+                    let required_prepare_capabilities = receipt.required_prepare_capabilities;
+                    assert_eq!(
+                        compiled.module().required_prepare_capabilities(),
+                        required_prepare_capabilities,
+                        "compiled prepared entry {prepared_entry_symbol:?} for {stem} has mismatched module/receipt prepare capabilities"
+                    );
+                    authenticate_prepared_factory(
+                        output,
+                        compiled.module().prepared_bulk_strategy(),
+                        required_prepare_capabilities,
+                        compiled.module().prepared_span_fill_symbol().is_some(),
+                        compiled.module().prepared_exists_batch_symbol().is_some(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "compiled prepared entry {prepared_entry_symbol:?} for {stem} failed factory authentication: {error}"
+                        )
+                    });
                     let object = out_dir.join(format!("{stem}.o"));
                     fs::write(&object, compiled.object()).unwrap_or_else(|error| {
                         panic!("write generated object {}: {error}", object.display())
@@ -331,7 +352,7 @@ fn main() {
                         "None".to_owned()
                     };
                     format!(
-                        "BackendFactory::Prepared {{ search: {declaration}, program: unsafe {{ &{program_declaration} }}, span_fill: {span_fill}, exists_batch: {exists_batch} }}"
+                        "BackendFactory::Prepared {{ search: {declaration}, program: unsafe {{ &{program_declaration} }}, span_fill: {span_fill}, exists_batch: {exists_batch}, required_prepare_capabilities: {required_prepare_capabilities:#x} }}"
                     )
                 } else if route == "direct-native" {
                     let object = out_dir.join(format!("{stem}.o"));

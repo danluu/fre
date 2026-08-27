@@ -8,7 +8,7 @@ use std::mem::MaybeUninit;
 use fre_aot_regex::{
     EXACT_SINGLETON_FIRST_CANDIDATE_AOT_SCHEMA_VERSION, EXACT_SINGLETON_FIRST_CANDIDATE_MISS,
     MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION, MATCHING_LF_LINE_WITNESS_MISS, MatchResult,
-    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15, REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
     REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR,
     REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH,
     REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE,
@@ -20,11 +20,19 @@ use fre_aot_regex_runtime::{
     FreAotRegexExactSingletonFirstCandidateV1, FreAotRegexExclusiveExistsBatchV1,
     FreAotRegexExclusiveGrepCountV1, FreAotRegexExclusiveHandleV1, FreAotRegexExclusiveSpanFillV1,
     FreAotRegexHaystackV1, FreAotRegexIndependentExistsBatchV1, FreAotRegexIterStateV1,
-    FreAotRegexMatchingLfLineWitnessV1, FreAotRegexResultV1, ITER_FINISHED, ITER_HAS_LAST,
-    ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PreparedAotMatches, PreparedAotRegex,
+    FreAotRegexMatchingLfLineWitnessV1, FreAotRegexPrepareConfigV3, FreAotRegexResultV1,
+    ITER_FINISHED, ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY,
+    PREPARE_CAPABILITY_KNOWN_FLAGS, PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_OPERATION_COUNT,
+    PREPARE_OPERATION_SPAN_SUM, PreparedAotMatches, PreparedAotRegex,
     fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v1,
+    fre_aot_regex_runtime_prepare_exclusive_v3,
 };
 use sha2::{Digest, Sha256};
+
+const _: () = assert!(
+    PREPARED_CAPABILITY_ORDERED_NFA_V15 == PREPARE_CAPABILITY_ORDERED_NFA_V15,
+    "compiler/runtime Ordered-NFA V15 capability bits must remain identical"
+);
 
 #[path = "../registry_key.rs"]
 mod registry_key;
@@ -906,6 +914,14 @@ type PreparedSearch = unsafe extern "C" fn(
     usize,
     *mut AbiResult,
 ) -> u32;
+type PrepareExclusiveV1 =
+    unsafe extern "C" fn(*const u8, usize, *mut FreAotRegexExclusiveHandleV1) -> u32;
+type PrepareExclusiveV3 = unsafe extern "C" fn(
+    *const u8,
+    usize,
+    *const FreAotRegexPrepareConfigV3,
+    *mut FreAotRegexExclusiveHandleV1,
+) -> u32;
 const NATIVE_SPAN_BUFFER_CAPACITY: usize = 64;
 /// Maximum number of line haystacks the thin adapter sends through one
 /// compiled Exists-batch invocation.
@@ -945,6 +961,7 @@ enum BackendFactory {
         program: &'static [u8],
         span_fill: Option<PreparedSpanFillFactory>,
         exists_batch: Option<PreparedExistsBatch>,
+        required_prepare_capabilities: u64,
     },
     #[allow(
         dead_code,
@@ -1029,6 +1046,10 @@ mod build_proof_tests;
 #[path = "../build_target.rs"]
 mod build_target_tests;
 
+#[cfg(test)]
+#[path = "../prepared_factory.rs"]
+mod prepared_factory_tests;
+
 #[derive(Debug)]
 enum Backend {
     Native {
@@ -1038,6 +1059,91 @@ enum Backend {
     },
     Prepared(PreparedNative),
     Runtime(Box<PreparedAotRegex>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedHandlePreparation {
+    V1,
+    V3(FreAotRegexPrepareConfigV3),
+}
+
+fn prepared_handle_preparation(
+    output: AotOutput,
+    span_fill: Option<PreparedSpanFillFactory>,
+    exists_batch: Option<PreparedExistsBatch>,
+    required_prepare_capabilities: u64,
+) -> Result<PreparedHandlePreparation, String> {
+    if required_prepare_capabilities == 0 {
+        return Ok(PreparedHandlePreparation::V1);
+    }
+    if required_prepare_capabilities & !PREPARE_CAPABILITY_KNOWN_FLAGS != 0 {
+        return Err(format!(
+            "compiled prepared factory requires unknown runtime capabilities {required_prepare_capabilities:#x}"
+        ));
+    }
+    if required_prepare_capabilities != PREPARE_CAPABILITY_ORDERED_NFA_V15 {
+        return Err(format!(
+            "compiled prepared factory requires unsupported runtime capability combination {required_prepare_capabilities:#x}"
+        ));
+    }
+    if output != AotOutput::Span
+        || !matches!(span_fill, Some(PreparedSpanFillFactory::Compiled(_)))
+        || exists_batch.is_some()
+    {
+        return Err(
+            "compiled Ordered-NFA V15 factory is incompatible with its required Span/SpanFill shape"
+                .to_owned(),
+        );
+    }
+
+    let mut config =
+        FreAotRegexPrepareConfigV3::new(PREPARE_OPERATION_COUNT | PREPARE_OPERATION_SPAN_SUM);
+    config.required_capabilities = PREPARE_CAPABILITY_ORDERED_NFA_V15;
+    Ok(PreparedHandlePreparation::V3(config))
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the selected runtime prepare ABI validates and copies compiler-exported program bytes"
+)]
+fn prepare_exclusive_handle_with(
+    program: &[u8],
+    preparation: PreparedHandlePreparation,
+    prepare_v1: PrepareExclusiveV1,
+    prepare_v3: PrepareExclusiveV3,
+) -> Result<FreAotRegexExclusiveHandleV1, String> {
+    let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
+    match preparation {
+        PreparedHandlePreparation::V1 => {
+            // SAFETY: the caller supplies a readable complete program extent,
+            // and `handle` is aligned, writable, and disjoint.
+            let status = unsafe { prepare_v1(program.as_ptr(), program.len(), &raw mut handle) };
+            if status != 0 || handle.is_invalid() {
+                return Err(format!(
+                    "prepare compiled AOT exclusive handle failed with status {status}"
+                ));
+            }
+        }
+        PreparedHandlePreparation::V3(config) => {
+            // SAFETY: the caller supplies a readable complete program extent;
+            // `config` is aligned and readable, while `handle` is aligned,
+            // writable, and disjoint from both sources.
+            let status = unsafe {
+                prepare_v3(
+                    program.as_ptr(),
+                    program.len(),
+                    &raw const config,
+                    &raw mut handle,
+                )
+            };
+            if status != 0 || handle.is_invalid() {
+                return Err(format!(
+                    "prepare compiled AOT exclusive V3 handle failed with status {status}"
+                ));
+            }
+        }
+    }
+    Ok(handle)
 }
 
 #[derive(Debug)]
@@ -1063,26 +1169,25 @@ impl PreparedNative {
         reason = "the runtime copies and validates the exact compiler-exported program before returning an exclusively owned handle"
     )]
     fn new(
+        output: AotOutput,
         search: PreparedSearch,
         program: &'static [u8],
         span_fill: Option<PreparedSpanFillFactory>,
         exists_batch: Option<PreparedExistsBatch>,
+        required_prepare_capabilities: u64,
     ) -> Result<Self, String> {
-        let mut handle = FreAotRegexExclusiveHandleV1::INVALID;
-        // SAFETY: the compiler-exported static is readable for its complete
-        // declared length, and `handle` is aligned, writable, and disjoint.
-        let status = unsafe {
-            fre_aot_regex_runtime_prepare_exclusive_v1(
-                program.as_ptr(),
-                program.len(),
-                &raw mut handle,
-            )
-        };
-        if status != 0 || handle.is_invalid() {
-            return Err(format!(
-                "prepare compiled AOT exclusive handle failed with status {status}"
-            ));
-        }
+        let preparation = prepared_handle_preparation(
+            output,
+            span_fill,
+            exists_batch,
+            required_prepare_capabilities,
+        )?;
+        let handle = prepare_exclusive_handle_with(
+            program,
+            preparation,
+            fre_aot_regex_runtime_prepare_exclusive_v1,
+            fre_aot_regex_runtime_prepare_exclusive_v3,
+        )?;
         Ok(Self {
             search,
             span_fill,
@@ -1943,11 +2048,14 @@ impl AotMatcher {
                 program,
                 span_fill,
                 exists_batch,
+                required_prepare_capabilities,
             } => Backend::Prepared(PreparedNative::new(
+                spec.output,
                 search,
                 program,
                 span_fill,
                 exists_batch,
+                required_prepare_capabilities,
             )?),
             BackendFactory::Runtime(bytes) => Backend::Runtime(Box::new(
                 PreparedAotRegex::deserialize(bytes)
@@ -2781,6 +2889,9 @@ mod tests {
     static PREPARED_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DIRECT_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXISTS_BATCH_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static PREPARE_V1_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PREPARE_V3_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PREPARE_SELECTION_TEST_LOCK: Mutex<()> = Mutex::new(());
     static SINGLETON_EXISTS_SCALAR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SINGLETON_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXACT64_FIRST_ANY_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -3651,6 +3762,47 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn rejecting_prepare_v1(
+        _program: *const u8,
+        _program_len: usize,
+        _handle: *mut FreAotRegexExclusiveHandleV1,
+    ) -> u32 {
+        PREPARE_V1_CALLS.fetch_add(1, Ordering::Relaxed);
+        41
+    }
+
+    unsafe extern "C" fn rejecting_expected_v15_prepare_v3(
+        _program: *const u8,
+        _program_len: usize,
+        config: *const FreAotRegexPrepareConfigV3,
+        _handle: *mut FreAotRegexExclusiveHandleV1,
+    ) -> u32 {
+        PREPARE_V3_CALLS.fetch_add(1, Ordering::Relaxed);
+        if config.is_null() {
+            return 43;
+        }
+        // SAFETY: the preparation seam supplies one aligned readable config
+        // for the duration of this stand-in call.
+        let config = unsafe { config.read() };
+        if config.operation_flags == PREPARE_OPERATION_COUNT | PREPARE_OPERATION_SPAN_SUM
+            && config.required_capabilities == PREPARE_CAPABILITY_ORDERED_NFA_V15
+        {
+            42
+        } else {
+            43
+        }
+    }
+
+    unsafe extern "C" fn unavailable_prepare_v3(
+        _program: *const u8,
+        _program_len: usize,
+        _config: *const FreAotRegexPrepareConfigV3,
+        _handle: *mut FreAotRegexExclusiveHandleV1,
+    ) -> u32 {
+        PREPARE_V3_CALLS.fetch_add(1, Ordering::Relaxed);
+        77
+    }
+
     fn native_matcher(search: NativeSearch, fill: NativeFill) -> AotMatcher {
         AotMatcher {
             output: AotOutput::Span,
@@ -3678,6 +3830,130 @@ mod tests {
                 handle: FreAotRegexExclusiveHandleV1::INVALID,
             }),
         }
+    }
+
+    #[test]
+    fn zero_prepare_capabilities_keep_the_exact_v1_prepare_path() {
+        let _guard = PREPARE_SELECTION_TEST_LOCK
+            .lock()
+            .expect("prepare test lock");
+        PREPARE_V1_CALLS.store(0, Ordering::Relaxed);
+        PREPARE_V3_CALLS.store(0, Ordering::Relaxed);
+        let preparation = prepared_handle_preparation(AotOutput::Exists, None, None, 0)
+            .expect("legacy preparation selection");
+        assert_eq!(preparation, PreparedHandlePreparation::V1);
+
+        let error = prepare_exclusive_handle_with(
+            b"public synthetic program",
+            preparation,
+            rejecting_prepare_v1,
+            rejecting_expected_v15_prepare_v3,
+        )
+        .expect_err("stand-in V1 prepare rejects");
+        assert_eq!(
+            error,
+            "prepare compiled AOT exclusive handle failed with status 41"
+        );
+        assert_eq!(PREPARE_V1_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(PREPARE_V3_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ordered_nfa_v15_selects_v3_with_exact_count_span_sum_declaration() {
+        let _guard = PREPARE_SELECTION_TEST_LOCK
+            .lock()
+            .expect("prepare test lock");
+        PREPARE_V1_CALLS.store(0, Ordering::Relaxed);
+        PREPARE_V3_CALLS.store(0, Ordering::Relaxed);
+        let preparation = prepared_handle_preparation(
+            AotOutput::Span,
+            Some(PreparedSpanFillFactory::Compiled(dense_prepared_span_fill)),
+            None,
+            PREPARE_CAPABILITY_ORDERED_NFA_V15,
+        )
+        .expect("Ordered-NFA V15 preparation selection");
+        let PreparedHandlePreparation::V3(config) = preparation else {
+            panic!("V15 capability selected legacy V1 preparation");
+        };
+        assert_eq!(
+            config.operation_flags,
+            PREPARE_OPERATION_COUNT | PREPARE_OPERATION_SPAN_SUM
+        );
+        assert_eq!(
+            config.required_capabilities,
+            PREPARE_CAPABILITY_ORDERED_NFA_V15
+        );
+
+        let error = prepare_exclusive_handle_with(
+            b"public synthetic program",
+            preparation,
+            rejecting_prepare_v1,
+            rejecting_expected_v15_prepare_v3,
+        )
+        .expect_err("stand-in V3 prepare rejects after checking config");
+        assert_eq!(
+            error,
+            "prepare compiled AOT exclusive V3 handle failed with status 42"
+        );
+        assert_eq!(PREPARE_V1_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(PREPARE_V3_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn ordered_nfa_v15_prepare_failure_is_terminal_without_v1_fallback() {
+        let _guard = PREPARE_SELECTION_TEST_LOCK
+            .lock()
+            .expect("prepare test lock");
+        PREPARE_V1_CALLS.store(0, Ordering::Relaxed);
+        PREPARE_V3_CALLS.store(0, Ordering::Relaxed);
+        let preparation = prepared_handle_preparation(
+            AotOutput::Span,
+            Some(PreparedSpanFillFactory::Compiled(dense_prepared_span_fill)),
+            None,
+            PREPARE_CAPABILITY_ORDERED_NFA_V15,
+        )
+        .expect("Ordered-NFA V15 preparation selection");
+
+        let error = prepare_exclusive_handle_with(
+            b"public synthetic program",
+            preparation,
+            rejecting_prepare_v1,
+            unavailable_prepare_v3,
+        )
+        .expect_err("unavailable V15 capability must fail closed");
+        assert_eq!(
+            error,
+            "prepare compiled AOT exclusive V3 handle failed with status 77"
+        );
+        assert_eq!(PREPARE_V1_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(PREPARE_V3_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn nonzero_prepare_capabilities_reject_unknown_bits_and_wrong_factory_shape() {
+        let unknown = prepared_handle_preparation(
+            AotOutput::Span,
+            Some(PreparedSpanFillFactory::Compiled(dense_prepared_span_fill)),
+            None,
+            PREPARE_CAPABILITY_ORDERED_NFA_V15 | (1 << 9),
+        )
+        .expect_err("unknown prepare capability must fail closed");
+        assert!(
+            unknown.contains("unknown runtime capabilities"),
+            "{unknown:?}"
+        );
+
+        let wrong_shape = prepared_handle_preparation(
+            AotOutput::Exists,
+            None,
+            Some(contains_x_prepared_exists_batch),
+            PREPARE_CAPABILITY_ORDERED_NFA_V15,
+        )
+        .expect_err("V15 Exists factory must fail closed");
+        assert!(
+            wrong_shape.contains("incompatible with its required Span/SpanFill shape"),
+            "{wrong_shape:?}"
+        );
     }
 
     fn direct_exists_test_matcher(batch: NativeExistsBatch) -> AotMatcher {
@@ -5660,6 +5936,53 @@ mod tests {
             assert!(
                 optimizing_runtime_bulk > 0,
                 "Optimizing fallback silently bypassed its runtime-owned bulk entry"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_prepared_factories_carry_authenticated_prepare_capabilities() {
+        if generated::BUILD_VARIANT_POLICY == "optimizing-grep-count" {
+            assert!(generated::SPECS.is_empty());
+            return;
+        }
+        let mut v15_factories = 0;
+        for spec in generated::SPECS {
+            let BackendFactory::Prepared {
+                span_fill,
+                exists_batch,
+                required_prepare_capabilities,
+                ..
+            } = spec.backend
+            else {
+                continue;
+            };
+            let ordered_nfa = spec.description.contains("bulk=native-ordered-nfa-loop");
+            match required_prepare_capabilities {
+                0 => assert!(
+                    !ordered_nfa,
+                    "Ordered-NFA factory lost its required V15 bit: {}",
+                    spec.description
+                ),
+                PREPARE_CAPABILITY_ORDERED_NFA_V15 => {
+                    v15_factories += 1;
+                    assert!(ordered_nfa, "V15 bit attached to non-Ordered-NFA factory");
+                    assert_eq!(spec.output, AotOutput::Span);
+                    assert!(matches!(
+                        span_fill,
+                        Some(PreparedSpanFillFactory::Compiled(_))
+                    ));
+                    assert!(exists_batch.is_none());
+                    AotMatcher::new(spec.mode, spec.output, spec.pattern, spec.case_insensitive)
+                        .expect("authenticated generated V15 factory must prepare through V3");
+                }
+                other => panic!("generated factory carries unknown capability mask {other:#x}"),
+            }
+        }
+        if generated::BUILD_VARIANT_POLICY == "all" {
+            assert!(
+                v15_factories > 0,
+                "default public registry must exercise real V3 preparation"
             );
         }
     }
