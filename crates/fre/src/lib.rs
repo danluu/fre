@@ -26092,6 +26092,29 @@ impl<'r> PortableOrdinarySession<'r> {
         }
     }
 
+    /// Count LF-delimited lines containing at least one selected match.
+    ///
+    /// This report-free projection is available only for the compact literal
+    /// owner and only when the embedding supplies its independently retained
+    /// proof that LF is absent from every literal. Unsupported calls return
+    /// `Ok(None)` before inspecting `haystack`.
+    #[doc(hidden)]
+    #[inline]
+    pub fn count_matching_lf_lines(
+        &mut self,
+        haystack: &[u8],
+        lf_is_excluded: bool,
+    ) -> Result<Option<u64>, SearchError> {
+        let PortableOrdinarySessionPlan::LiteralSetCompact { executor } =
+            &self.plan
+        else {
+            return Ok(None);
+        };
+        executor
+            .count_matching_lf_lines_value(haystack, lf_is_excluded)
+            .map_err(SearchError::from)
+    }
+
     /// Count selected positive-width matches at or after `start` using only
     /// their ordered endpoints.
     ///
