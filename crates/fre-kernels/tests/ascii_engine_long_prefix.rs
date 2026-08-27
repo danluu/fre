@@ -69,6 +69,11 @@ fn ascii_engine_preserves_long_partial_prefixes_across_native_boundary() {
                 "visit window={window:?}",
             );
             assert_eq!(actual_spans, expected_spans, "spans window={window:?}");
+            assert_eq!(
+                engine.try_count_spans_window_value(&haystack, window),
+                Ok(Some(u64::try_from(expected_spans.len()).unwrap())),
+                "count window={window:?}",
+            );
         }
     }
 }

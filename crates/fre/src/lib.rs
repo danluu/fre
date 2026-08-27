@@ -14703,6 +14703,11 @@ impl PortableRegex {
                             executor,
                             direct_next: false,
                         }
+                    } else if executor.narrow_ascii_count_engine_supported() {
+                        PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                            executor,
+                            ascii_engine: PortableOrdinaryLiteralSetEngine::Unbound,
+                        }
                     } else {
                         PortableOrdinarySessionPlan::LiteralSetDfa {
                             executor,
@@ -18663,11 +18668,14 @@ pub struct PortableSearchSession<'a> {
 /// full-source count; a nonzero start retains the canonical context-aware
 /// fallback.
 /// A positive leftmost-first literal set similarly binds one compact executor
-/// and leaves its shared ASCII-root engine sidecar unbound. The first eligible
-/// endpoint or span call settles that sidecar once, caching both a qualified
-/// AArch64 engine and an unavailable result. A qualified engine still prepares
-/// its classifier only when a call first reaches the branch that can use it.
-/// Count-only calls retain the compact executor directly.
+/// and leaves its shared ASCII-root engine sidecar unbound. The first endpoint
+/// or span call settles that sidecar once, caching either a qualified AArch64
+/// engine or an unavailable result. Count also settles and reuses the admitted
+/// narrow 5..=24-root engine. The separately admitted 25..=48-root tier keeps
+/// count on the incumbent direct scanner and leaves its sidecar unbound; other
+/// ineligible counts likewise retain their incumbent fallback without settling
+/// the sidecar. A qualified engine still prepares its classifier only when a
+/// call first reaches the branch that can use it.
 /// Other matcher families retain only their compact binding. No method on this
 /// type accepts finite limits or publishes accounting; callers that need
 /// either contract should use [`PortableSearchSession`] instead.
@@ -18732,8 +18740,9 @@ enum PortableOrdinarySessionPlan<'a> {
     },
     LiteralSetDfa {
         executor: LiteralSetOrdinaryExecutor<'a>,
-        /// A lazily sealed shared endpoint/span engine. Keeping it beside the
-        /// compact executor lets count retain its established direct route.
+        /// A lazily sealed shared endpoint/span/count engine. Keeping it beside
+        /// the compact executor preserves the established count route when the
+        /// exact arbitrary-ASCII root capability is absent.
         ascii_engine: PortableOrdinaryLiteralSetEngine<'a>,
     },
     LiteralSetUniformStandardDfa {
@@ -18753,6 +18762,12 @@ enum PortableOrdinarySessionPlan<'a> {
     /// ordinary-session discriminant retain their established representation.
     ExactLiteralRetainedCount {
         executor: ExactLiteralOrdinaryExecutor<'a>,
+    },
+    /// Appended so the narrow sparse-ASCII count engine cannot perturb the
+    /// incumbent variant or its wide/ineligible count dispatch.
+    LiteralSetDfaNarrowAscii {
+        executor: LiteralSetOrdinaryExecutor<'a>,
+        ascii_engine: PortableOrdinaryLiteralSetEngine<'a>,
     },
 }
 
@@ -24918,6 +24933,10 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::LiteralSetDfa {
                 executor,
                 ascii_engine,
+            }
+            | PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                executor,
+                ascii_engine,
             } => {
                 let window = LiteralWindow::new(start, haystack.len());
                 if let Some(engine) = ascii_engine.get_or_bind(*executor) {
@@ -24988,6 +25007,10 @@ impl<'r> PortableOrdinarySession<'r> {
                 .selected_end_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa {
+                executor,
+                ascii_engine,
+            }
+            | PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
                 executor,
                 ascii_engine,
             } => {
@@ -25086,6 +25109,10 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa {
+                executor,
+                ascii_engine,
+            }
+            | PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
                 executor,
                 ascii_engine,
             } => {
@@ -25234,6 +25261,10 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map_err(PortableFindIterError::Search)
             }
             PortableOrdinarySessionPlan::LiteralSetDfa {
+                executor,
+                ascii_engine,
+            }
+            | PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
                 executor,
                 ascii_engine,
             } => {
@@ -25396,7 +25427,9 @@ impl<'r> PortableOrdinarySession<'r> {
                 )
                 .map(Some)
                 .map_err(SearchError::from),
-            PortableOrdinarySessionPlan::LiteralSetDfa { executor, .. } => {
+            PortableOrdinarySessionPlan::LiteralSetDfa {
+                executor, ..
+            } => {
                 if executor.direct_count_scanner_supported() {
                     count_ordinary_literal_set_dfa_with_selected_seed(
                         executor, haystack, start,
@@ -25409,6 +25442,32 @@ impl<'r> PortableOrdinarySession<'r> {
                             haystack,
                             LiteralWindow::new(start, haystack.len()),
                         )
+                        .map(Some)
+                        .map_err(SearchError::from)
+                }
+            }
+            PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                executor,
+                ascii_engine,
+            } => {
+                let window = LiteralWindow::new(start, haystack.len());
+                if let Some(engine) = ascii_engine.get_or_bind(*executor) {
+                    if let Some(count) = engine
+                        .try_count_spans_window_value(haystack, window)
+                        .map_err(SearchError::from)?
+                    {
+                        return Ok(Some(count));
+                    }
+                }
+                if executor.direct_count_scanner_supported() {
+                    count_ordinary_literal_set_dfa_with_selected_seed(
+                        executor, haystack, start,
+                    )
+                    .map(Some)
+                    .map_err(SearchError::from)
+                } else {
+                    executor
+                        .count_spans_window_value(haystack, window)
                         .map(Some)
                         .map_err(SearchError::from)
                 }
@@ -48529,7 +48588,8 @@ mod tests {
                 super::PortableOrdinarySessionPlan::PackedLiteralSet { .. } => {
                     "packed-literal-set"
                 }
-                super::PortableOrdinarySessionPlan::LiteralSetDfa { .. } => {
+                super::PortableOrdinarySessionPlan::LiteralSetDfa { .. }
+                | super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii { .. } => {
                     "literal-set-dfa"
                 }
                 super::PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa { .. } => {
@@ -48550,6 +48610,9 @@ mod tests {
         ) -> (&'static str, bool) {
             match &session.plan {
                 super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                    ascii_engine, ..
+                }
+                | super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
                     ascii_engine, ..
                 } => (
                     match ascii_engine {
@@ -51314,7 +51377,7 @@ mod tests {
         assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
         assert!(matches!(
             &ordinary.plan,
-            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+            super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
                 ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
                 ..
             }
@@ -51356,7 +51419,7 @@ mod tests {
         assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
         assert!(matches!(
             &ordinary.plan,
-            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+            super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
                 ascii_engine: super::PortableOrdinaryLiteralSetEngine::Bound(_),
                 ..
             }
@@ -51365,7 +51428,7 @@ mod tests {
         assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
         assert!(matches!(
             &ordinary.plan,
-            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+            super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
                 ascii_engine: super::PortableOrdinaryLiteralSetEngine::Bound(_),
                 ..
             }
@@ -51375,6 +51438,82 @@ mod tests {
             Ok(Some(matched_start + 4)),
         );
         assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
+
+        // Count can be the first operation to settle the same lazy sidecar.
+        super::literal_set_dfa_ordinary_engine_bind_probe::reset();
+        let mut count_first = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &count_first.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                ..
+            }
+        ));
+        assert_eq!(
+            count_first.count_positive_width_selected_ends_at(&haystack, 0),
+            Ok(Some(1)),
+        );
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
+        assert!(matches!(
+            &count_first.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Bound(_),
+                ..
+            }
+        ));
+
+        // The separately admitted wide tier keeps count on the incumbent
+        // direct scanner without settling its shared Exists/span sidecar.
+        let wide_source = (b'0'..=b'9')
+            .chain(b'A'..=b'O')
+            .flat_map(|root| {
+                let root = char::from(root);
+                (4_usize..=20).map(move |width| root.to_string().repeat(width))
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        let wide_regex = PortableBuilder::new(&wide_source)
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(wide_regex.build_report().plan, PlanKind::LiteralSetDfa);
+        super::literal_set_dfa_ordinary_engine_bind_probe::reset();
+        let mut wide = wide_regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &wide.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                ..
+            }
+        ));
+        assert_eq!(
+            wide.count_positive_width_selected_ends_at(b"!!!!AAAA!!!!", 0),
+            Ok(Some(1)),
+        );
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
+        assert!(matches!(
+            &wide.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                ..
+            }
+        ));
+        assert_eq!(wide.is_match_at(b"!!!!AAAA!!!!", 0), Ok(true));
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
+        assert!(matches!(
+            &wide.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Bound(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -51391,6 +51530,28 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        // An ineligible count retains the incumbent count path without
+        // settling the lazy endpoint/span sidecar.
+        super::literal_set_dfa_ordinary_engine_bind_probe::reset();
+        let mut count_only = regex.ordinary_session().unwrap();
+        assert_eq!(
+            count_only.count_positive_width_selected_ends_at(b"abc", 0),
+            Ok(Some(1)),
+        );
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
+        assert!(matches!(
+            &count_only.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                ..
+            }
+        ));
+        assert_eq!(
+            count_only.count_positive_width_selected_ends_at(b"abc", 0),
+            Ok(Some(1)),
+        );
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
+
         super::literal_set_dfa_ordinary_engine_bind_probe::reset();
         let mut ordinary = regex.ordinary_session().unwrap();
         assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);

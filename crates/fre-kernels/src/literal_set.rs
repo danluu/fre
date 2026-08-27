@@ -2919,6 +2919,18 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         self.direct_dfa_identity.is_some()
     }
 
+    /// Return whether this executor carries the narrow sparse-ASCII root
+    /// marker admitted to the shared ordinary count engine.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn narrow_ascii_count_engine_supported(&self) -> bool {
+        self.direct_dfa_identity
+            .and_then(LiteralSetDirectDfaIdentity::root)
+            .and_then(LiteralSetDfaRoot::ascii_sparse_min_bytes)
+            == Some(ORDINARY_ROOT_ASCII_MIN_BYTES)
+    }
+
     /// Return whether construction proved that every alternative has one
     /// shared positive byte width.
     ///
@@ -3383,6 +3395,84 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
         Ok(executor.try_visit_spans_window_value_total(
             haystack, window, visitor,
         ))
+    }
+
+    /// Count every non-overlapping selected span through the narrow sparse
+    /// ASCII root engine used by span visitation.
+    ///
+    /// Returns `Ok(None)` for the separately admitted wide tier so its count
+    /// caller can retain the compact endpoint route. Exists and span calls
+    /// continue to use the bound wide engine unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralSetError::InvalidWindow`] when `window` lies outside
+    /// the original haystack, or an arithmetic error if the count cannot be
+    /// represented as `u64`.
+    #[doc(hidden)]
+    #[inline]
+    pub fn try_count_spans_window_value(
+        &mut self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<u64>, LiteralSetError> {
+        validate_window(window, haystack.len())?;
+        if self.ascii_root_minimum_bytes() != ORDINARY_ROOT_ASCII_MIN_BYTES {
+            return Ok(None);
+        }
+        self.count_narrow_spans_window_value(haystack, window)
+            .map(Some)
+    }
+
+    #[inline(never)]
+    fn count_narrow_spans_window_value(
+        &mut self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<u64, LiteralSetError> {
+        let executor = self.executor;
+        let mut count = 0_usize;
+        let mut cursor = window.start();
+        let mut previous_end = window.start();
+        loop {
+            let Some(matched) = self.find_window_value(
+                haystack,
+                Window::new(cursor, window.end()),
+            )? else {
+                break;
+            };
+            let follows_match_nearby = count != 0
+                && matched.0.saturating_sub(previous_end)
+                    <= ORDINARY_UNIFORM_SPAN_MAX_GAP_BYTES;
+            // Positive width bounds successful callbacks by the source byte
+            // length, so this saturating addition cannot reach its ceiling.
+            count = count.saturating_add(1);
+            debug_assert!(matched.1 > cursor);
+            cursor = matched.1;
+            previous_end = matched.1;
+            if follows_match_nearby {
+                // Root-seeking span recovery is useful on sparse roots, but
+                // loses to the compact endpoint loop once two selected spans
+                // establish the existing dense/near shape.
+                let tail = executor.count_spans_window_value(
+                    haystack,
+                    Window::new(cursor, window.end()),
+                )?;
+                let count = u64::try_from(count).map_err(|_| {
+                    LiteralSetError::ArithmeticOverflow {
+                        computation: "positive-width literal-set match count",
+                    }
+                })?;
+                return count.checked_add(tail).ok_or(
+                    LiteralSetError::ArithmeticOverflow {
+                        computation: "positive-width literal-set match count",
+                    },
+                );
+            }
+        }
+        u64::try_from(count).map_err(|_| LiteralSetError::ArithmeticOverflow {
+            computation: "positive-width literal-set match count",
+        })
     }
 
     /// Return whether any literal accepts inside `window` through the shared
@@ -9186,7 +9276,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ordinary_direct_dfa_ascii_root_admits_extended_public_proxy_counts() {
-        for root_count in [9_usize, 12, 16, ORDINARY_ROOT_ASCII_MAX_MEMBERS] {
+        for root_count in [5_usize, 9, 12, 16, ORDINARY_ROOT_ASCII_MAX_MEMBERS] {
             let patterns = root_ascii_patterns_for_roots(&ROOT_ASCII_24[..root_count]);
             let plan = LiteralSetPlan::new_stable(
                 &patterns,
@@ -9195,6 +9285,7 @@ mod tests {
             .unwrap();
             assert!(plan.automaton.prefilter().is_none());
             let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            assert!(ordinary.narrow_ascii_count_engine_supported());
             assert!(ordinary
                 .direct_dfa_identity
                 .and_then(LiteralSetDirectDfaIdentity::root)
@@ -9246,6 +9337,7 @@ mod tests {
             .unwrap();
             assert!(plan.automaton.prefilter().is_none());
             let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            assert!(!ordinary.narrow_ascii_count_engine_supported());
             let root = ordinary
                 .direct_dfa_identity
                 .and_then(LiteralSetDirectDfaIdentity::root)
@@ -9353,8 +9445,8 @@ mod tests {
             .copy_from_slice(&patterns[0]);
 
         // Binding and execution through the compact executor never construct
-        // the worker engine's classifier. Count deliberately retains that
-        // route, while span operations opt into the engine explicitly.
+        // the worker engine's classifier. This is also the exact fallback an
+        // engine count uses after observing the established dense shape.
         assert_eq!(
             ordinary.find_window_value(&haystack, Window::full(&haystack)),
             Ok(Some((root_offset, root_offset + patterns[0].len()))),
@@ -9488,7 +9580,26 @@ mod tests {
             Ok(Ok(())),
         );
         assert_eq!(spans, [(root_offset, root_offset + patterns[0].len())]);
+        assert_eq!(
+            prepared.try_count_spans_window_value(&haystack, Window::full(&haystack)),
+            Ok(Some(1)),
+        );
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+
+        // Two nearby spans hand the remaining dense tail to the compact
+        // endpoint loop without consulting the arbitrary-root classifier.
+        let mut dense = Vec::new();
+        for index in 0..64 {
+            dense.extend_from_slice(&patterns[(index % ROOT_ASCII_24.len()) * 17]);
+            dense.extend_from_slice(b"!!");
+        }
+        ordinary_direct_probe::reset();
+        assert_eq!(
+            prepared.try_count_spans_window_value(&dense, Window::full(&dense)),
+            Ok(Some(64)),
+        );
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -9560,6 +9671,11 @@ mod tests {
                     Ok(Ok(())),
                 );
                 assert_eq!(actual_spans, expected_spans, "spans window={window:?}");
+                assert_eq!(
+                    prepared.try_count_spans_window_value(&haystack, window),
+                    Ok(Some(u64::try_from(expected_spans.len()).unwrap())),
+                    "count window={window:?}",
+                );
             }
         }
     }
@@ -9648,6 +9764,16 @@ mod tests {
                     Ok(Ok(())),
                 );
                 assert_eq!(actual_spans, expected_spans, "spans window={window:?}");
+                assert_eq!(
+                    ordinary.count_spans_window_value(&haystack, window),
+                    Ok(u64::try_from(expected_spans.len()).unwrap()),
+                    "compact count window={window:?}",
+                );
+                assert_eq!(
+                    engine.try_count_spans_window_value(&haystack, window),
+                    Ok(None),
+                    "wide engine count gate window={window:?}",
+                );
             }
         }
     }
