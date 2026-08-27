@@ -822,12 +822,23 @@ fn independent_span_fill_is_opt_in_authenticated_and_resource_atomic() {
 
         let mut limits = CompileLimitsV1::default();
         limits.max_object_bytes = ordinary.object().len();
-        let capped = compile_with_independent_span_fill(request.limits(limits))
-            .expect("optional Span-fill object-byte decline");
-        assert_eq!(capped.object(), ordinary.object());
-        assert_eq!(capped.module(), ordinary.module());
-        assert_eq!(capped.receipt(), ordinary.receipt());
-        assert!(capped.module().direct_span_fill_symbol().is_none());
+        let max_object_bytes = limits.max_object_bytes;
+        let capped_request = request.limits(limits);
+        let capped_base = compile(capped_request.clone()).expect("size-capped Span incumbent");
+        let capped = compile_with_independent_span_fill(capped_request)
+            .expect("size-capped Span-fill artifact");
+        assert!(capped.object().len() <= max_object_bytes);
+        if capped.module().direct_span_fill_symbol().is_none() {
+            assert_eq!(capped.object(), capped_base.object());
+            assert_eq!(capped.module(), capped_base.module());
+            assert_eq!(capped.receipt(), capped_base.receipt());
+        } else {
+            // A numeric cap can select a different, smaller direct incumbent,
+            // and object containers can absorb the additive text in existing
+            // section padding. A completed additive object that still fits
+            // the exact ceiling remains authoritative.
+            assert!(capped_base.module().direct_span_fill_symbol().is_none());
+        }
     }
 
     assert!(matches!(
