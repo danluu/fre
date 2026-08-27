@@ -808,8 +808,12 @@ impl CompactEngine {
             .try_find_iter(input)
             .expect("the compact literal NFA supports unanchored iteration");
         for matched in matches {
-            let span = self.absolute_span(matched)?;
-            match visitor(span) {
+            // Aho already derives this absolute start while constructing its
+            // match. Reuse it instead of subtracting the uniform width again
+            // for every tail match.
+            let span = matched.span();
+            debug_assert_eq!(span.end - span.start, self.width);
+            match visitor((span.start, span.end)) {
                 Ok(true) => {}
                 Ok(false) => return Ok(Ok(())),
                 Err(error) => return Ok(Err(error)),
@@ -2212,5 +2216,64 @@ mod tests {
             Ok(Err("callback")),
         );
         assert_eq!(compact_ordinary_scanner_probe::binds(), 0);
+    }
+
+    #[test]
+    fn prefiltered_tail_spans_keep_absolute_nonzero_windows_and_callback_control() {
+        let patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        let compact = compact(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .unwrap();
+        let ordinary = compact.ordinary_executor();
+
+        let mut haystack = vec![b'x'];
+        let start = haystack.len();
+        haystack.extend_from_slice(&patterns[3]);
+        let adjacent = haystack.len();
+        haystack.extend_from_slice(&patterns[7]);
+        let end = haystack.len();
+        haystack.push(b'x');
+        let window = Window::new(start, end);
+        let expected = [(start, adjacent), (adjacent, end)];
+
+        assert!(ordinary.engine.automaton.prefilter().is_some());
+        assert!(CompactOrdinaryScanner::new(ordinary.engine, &haystack, window).is_none());
+        assert_eq!(
+            ordinary.find_window_value(&haystack, window),
+            Ok(Some(expected[0]))
+        );
+        assert_eq!(ordinary.count_spans_window_value(&haystack, window), Ok(2));
+
+        let mut spans = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |span| {
+                spans.push(span);
+                Ok::<bool, &'static str>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(spans, expected);
+
+        let mut stop_calls = 0;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |span| {
+                stop_calls += 1;
+                assert_eq!(span, expected[0]);
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(stop_calls, 1);
+
+        let mut error_calls = 0;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |span| {
+                error_calls += 1;
+                assert_eq!(span, expected[0]);
+                Err::<bool, _>("callback")
+            }),
+            Ok(Err("callback")),
+        );
+        assert_eq!(error_calls, 1);
     }
 }
