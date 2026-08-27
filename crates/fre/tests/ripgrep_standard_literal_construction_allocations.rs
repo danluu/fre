@@ -67,3 +67,60 @@ fn borrowed_literals_avoid_the_owned_hir_leaf_graph() {
         );
     }
 }
+
+#[test]
+fn borrowed_fixed_metacharacters_avoid_the_owned_hir_leaf_graph() {
+    let metacharacters = [
+        '.', '[', ']', '(', ')', '{', '}', '*', '+', '?', '|', '^', '$', '\\', '-', '&', '~',
+        '#',
+    ];
+    let patterns = (0..64)
+        .map(|index| {
+            format!(
+                "{}fixed{index:04}é",
+                metacharacters[index % metacharacters.len()]
+            )
+        })
+        .collect::<Vec<_>>();
+    let pattern_refs = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let borrowed_region = Region::new(GLOBAL);
+    let (borrowed, _census) = PortableBuilder::new("")
+        .multi_line(true)
+        .retained_find_iter(true)
+        .build_ripgrep_fixed_literals_ordinary_with_census(
+            &pattern_refs,
+            usize::MAX,
+            None,
+        )
+        .expect("borrowed fixed-string construction completes")
+        .expect("borrowed fixed strings are admitted");
+    let RipgrepStandardLiteralsBuild::Portable(borrowed) = borrowed else {
+        panic!("focused fixed strings retained an ordinary-only owner");
+    };
+    let borrowed_allocations = borrowed_region.change().allocations;
+
+    let hir_region = Region::new(GLOBAL);
+    let hir = Hir::alternation(
+        patterns
+            .iter()
+            .map(|pattern| Hir::literal(pattern.as_bytes()))
+            .collect(),
+    );
+    let owned = PortableBuilder::new("")
+        .multi_line(true)
+        .retained_find_iter(true)
+        .build_ripgrep_standard_literal_hir_owned(hir, usize::MAX)
+        .expect("owned fixed-string HIR construction completes");
+    let RipgrepStandardLiteralHirBuild::Built(owned) = owned else {
+        panic!("owned fixed-string HIR was refused");
+    };
+    let hir_allocations = hir_region.change().allocations;
+
+    assert_eq!(borrowed.as_str(), owned.as_str());
+    assert_eq!(borrowed.build_report(), owned.build_report());
+    assert!(
+        hir_allocations >= borrowed_allocations.saturating_add(patterns.len()),
+        "borrowed={borrowed_allocations}, owned-HIR={hir_allocations}",
+    );
+}
