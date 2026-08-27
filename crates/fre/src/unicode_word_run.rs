@@ -1998,6 +1998,24 @@ impl Plan {
                 needed: u64::MAX,
                 limit: limits.max_work,
             })?;
+            // A nonempty run shorter than a required minimum of two cannot
+            // match. The scanner would classify the following nonword and the
+            // outer loop would then charge and classify it again. Preserve
+            // that charge chronology, but consume the proved delimiter once
+            // and resume directly at the next possible run start.
+            if minimum_scalars > 1
+                && position < window.end()
+                && !is_ascii_word(haystack[position])
+            {
+                charge(&mut accounting, limits)?;
+                accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
+                accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
+                position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
+                    needed: u64::MAX,
+                    limit: limits.max_work,
+                })?;
+                continue;
+            }
             let continuation = scanner
                 .scan_forward(&haystack[position..window.end()])
                 .member_run_len();
@@ -3971,6 +3989,7 @@ mod tests {
             b"",
             b"---abc---",
             b"a_b 012345 x",
+            b"x!Y!!0!_!!!",
             &[0xFF, b'a', b'b', b'c', 0x80, b'd', b'e', b'f'],
             b"word_that_crosses_several_fixed_blocks!",
         ];
