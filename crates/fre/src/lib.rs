@@ -19334,6 +19334,24 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 .map_err(PortableFindIterError::Search);
         }
 
+        // The bounded-delimited construction is positive-width and has no
+        // assertions. Bind its ordinary traversal once so the initial window
+        // preflight covers every shrinking tail instead of redispatching and
+        // rebuilding the same envelope after each selected end.
+        if let Self::Native(regex) = self
+            && let PortablePlan::BoundedDelimitedSegmentRepeat(plan) = &regex.plan
+        {
+            return plan
+                .try_visit_spans_ordinary(haystack, start, |(matched_start, end)| {
+                    visitor(Match {
+                        start: matched_start,
+                        end,
+                    })
+                })
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search);
+        }
+
         // Pure byte-class-repeat construction admits exactly CLASS+ or
         // CLASS+?, modulo transparent captures. Every match therefore has
         // positive width and no assertion can observe the discarded prefix,
@@ -25626,11 +25644,13 @@ impl<'r> PortableOrdinarySession<'r> {
     /// to that projection after two nearby canonical spans; sparse traversal
     /// retains the canonical iterator. Bounded byte-class repeats bind their
     /// selected-value engine once, and front-qualified calls scan each maximal
-    /// class run once. Guarded literal/class-run plans keep the context-aware
-    /// canonical fallback. Reverse-inner tail windows retain absolute offsets
-    /// and stop their shared traversal immediately on callback stop or error.
-    /// Other canonical fallback plans iterate the compact binding with
-    /// unlimited value searches and the ordinary empty-match progress rule.
+    /// class run once. Bounded-delimited segment repeats preflight their outer
+    /// envelope once and reuse a bound suffix executor across shrinking tails.
+    /// Guarded literal/class-run plans keep the context-aware canonical
+    /// fallback. Reverse-inner tail windows retain absolute offsets and stop
+    /// their shared traversal immediately on callback stop or error. Other
+    /// canonical fallback plans iterate the compact binding with unlimited
+    /// value searches and the ordinary empty-match progress rule.
     ///
     /// # Errors
     ///
@@ -25798,9 +25818,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Unicode scalar-run plan over an exact tail window, an unanchored
     /// required literal, a legacy literal/class-run plan over a full or
     /// unguarded tail window, a pure or bounded byte-class repeat, a bounded
-    /// byte-class sequence, a packed literal set, or an ordinary non-uniform
-    /// or uniform-standard literal-set plan. Each construction seals nonempty
-    /// selected spans.
+    /// byte-class sequence, a bounded-delimited segment repeat, a packed
+    /// literal set, or an ordinary non-uniform or uniform-standard literal-set
+    /// plan. Each construction seals nonempty selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25811,8 +25831,11 @@ impl<'r> PortableOrdinarySession<'r> {
     /// error rather than risking an infinite loop. Packed literal sets use
     /// their bound non-overlapping span iterator. A bounded byte-class
     /// sequence validates one absolute tail and retains its report-free
-    /// selected-end admission while that tail shrinks. An ordinary non-uniform
-    /// literal set advances through its construction-selected DFA endpoints.
+    /// selected-end admission while that tail shrinks. A bounded-delimited
+    /// segment repeat similarly retains its outer preflight and suffix binding,
+    /// while each suffix search still validates its literal window. An ordinary
+    /// non-uniform literal set advances through its construction-selected DFA
+    /// endpoints.
     /// When that DFA seals direct leftmost-first counting, one canonical
     /// selected match seeds the direct scanner at the selected endpoint.
     /// A uniform-standard literal set consumes any preceding near-acceptance
@@ -26068,6 +26091,10 @@ impl<'r> PortableOrdinarySession<'r> {
                         .ordinary_count_selected_ends_at(haystack, start)
                         .map(Some)
                         .map_err(SearchError::BoundedByteClassSequence),
+                    PortablePlan::BoundedDelimitedSegmentRepeat(plan) => plan
+                        .ordinary_count_selected_ends_at(haystack, start)
+                        .map(Some)
+                        .map_err(SearchError::from),
                     _ => Ok(None),
                 }
             }
@@ -44980,6 +45007,43 @@ mod tests {
                 .unwrap()
                 .0,
             ordinary_expected.is_some(),
+        );
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 0),
+        );
+
+        let expected_spans = upstream
+            .find_iter(ordinary_haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::Native(bound_regex)
+            ) if core::ptr::eq(*bound_regex, &regex)
+        ));
+        super::universal_finite_greedy_corridor::value_path_probe::reset();
+        let mut actual_spans = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(ordinary_haystack, |matched| {
+                    actual_spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(actual_spans, expected_spans);
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 0),
+        );
+        super::universal_finite_greedy_corridor::value_path_probe::reset();
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(ordinary_haystack, 0),
+            Ok(Some(u64::try_from(expected_spans.len()).unwrap())),
         );
         assert_eq!(
             super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
