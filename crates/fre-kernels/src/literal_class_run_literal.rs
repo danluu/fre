@@ -1518,8 +1518,9 @@ impl LiteralClassRunLiteralPlan {
 
     /// Return the selected ordinary full-haystack span without retaining
     /// diagnostic accounting for general prefix/suffix, contained-suffix, and
-    /// complete ASCII-word geometry. Ranged, finite, accounted, session,
-    /// iterator, and reusable value APIs continue to use [`Self::find_window`].
+    /// complete ASCII-word geometry. Assertion-free ordinary tail searches may
+    /// rebase this full-tail projection. Guarded, finite, and accounted APIs
+    /// continue to use [`Self::find_window`].
     #[doc(hidden)]
     #[inline]
     pub fn find_full_ordinary_value(

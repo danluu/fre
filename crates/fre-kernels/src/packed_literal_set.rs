@@ -82,6 +82,14 @@ const UNIFORM_WORD64_MASK_BYTES: usize = 256 * size_of::<u64>();
 const RETAINED_ITER_DENSE_GAP_BYTES: usize = 16;
 #[cfg(not(feature = "static-dispatch"))]
 const RETAINED_ITER_DENSE_MATCHES: u8 = 2;
+// Three nearby selected spans admit one bounded direct-column probe. A miss
+// proves at most the next 17 starts before returning to the construction-
+// selected native filter, so a dense prefix cannot commit a long sparse tail
+// to scalar column verification.
+#[cfg(not(feature = "static-dispatch"))]
+const SHARED_COLUMNS_DIRECT_DENSE_GAP_BYTES: usize = 16;
+#[cfg(not(feature = "static-dispatch"))]
+const SHARED_COLUMNS_DIRECT_DENSE_MATCHES: u8 = 3;
 // UniformWord64 admits at least two equal-width literals in one word, so no
 // retained literal is wider than half its state. After nearby hits, keep the
 // native short-tail path only when even that widest literal cannot fit.
@@ -697,6 +705,48 @@ impl SharedFragment {
 }
 
 impl SharedColumns {
+    #[cfg(not(feature = "static-dispatch"))]
+    #[inline(never)]
+    fn find_dense_bounded(
+        &self,
+        haystack: &[u8],
+        minimum_start: usize,
+    ) -> SharedColumnsFilterResult {
+        #[cfg(test)]
+        shared_columns_direct_scan_probe::record();
+        let Some(last_start) = haystack.len().checked_sub(self.width) else {
+            return SharedColumnsFilterResult::Exhausted;
+        };
+        if minimum_start > last_start {
+            return SharedColumnsFilterResult::Exhausted;
+        }
+        let last_probe = minimum_start
+            .saturating_add(SHARED_COLUMNS_DIRECT_DENSE_GAP_BYTES)
+            .min(last_start);
+        let mut candidate = minimum_start;
+        while candidate <= last_probe {
+            let anchor = candidate
+                .checked_add(self.anchor_offset)
+                .expect("the admitted fixed-width candidate contains its anchor");
+            if haystack[anchor] == self.anchor_byte
+                && let Some(end) = self.verify_at(haystack, candidate)
+            {
+                return SharedColumnsFilterResult::Match {
+                    start: candidate,
+                    end,
+                };
+            }
+            candidate = candidate
+                .checked_add(1)
+                .expect("the bounded candidate remains inside the haystack");
+        }
+        if candidate <= last_start {
+            SharedColumnsFilterResult::ResumeAt(candidate)
+        } else {
+            SharedColumnsFilterResult::Exhausted
+        }
+    }
+
     fn earliest_possible_start_from(&self, haystack: &[u8], minimum_start: usize) -> Option<usize> {
         let last_start = haystack.len().checked_sub(self.width)?;
         if minimum_start > last_start {
@@ -1798,8 +1848,21 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
         validate_window(window, haystack.len())?;
         #[cfg(not(feature = "static-dispatch"))]
         let mut retained = self.plan.search_cursor(&haystack[..window.end()]);
+        #[cfg(not(feature = "static-dispatch"))]
+        let shared_columns = match &self.plan.engine {
+            PackedLiteralEngine::NativeSharedColumns { shared_columns, .. } => {
+                Some(shared_columns.as_ref())
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "static-dispatch"))]
+        let mut shared_columns_close_matches = 0_u8;
+        #[cfg(not(feature = "static-dispatch"))]
+        let mut shared_columns_direct = false;
         let mut start = window.start();
         loop {
+            #[cfg(not(feature = "static-dispatch"))]
+            let mut shared_columns_resume = None;
             #[cfg(not(feature = "static-dispatch"))]
             let matched = if let Some(cursor) = retained.as_mut() {
                 // This cursor is private to this positive-width loop, so each
@@ -1810,6 +1873,18 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
                 );
                 cursor.last_start = Some(start);
                 cursor.find_at_value_unmetered_forward_validated(start)
+            } else if shared_columns_direct && let Some(columns) = shared_columns {
+                match columns.find_dense_bounded(&haystack[..window.end()], start) {
+                    SharedColumnsFilterResult::Exhausted => None,
+                    SharedColumnsFilterResult::Match {
+                        start: matched_start,
+                        end,
+                    } => Some((matched_start, end)),
+                    SharedColumnsFilterResult::ResumeAt(resume) => {
+                        shared_columns_resume = Some(resume);
+                        None
+                    }
+                }
             } else {
                 self.plan.find_window_value_unmetered_validated(
                     haystack,
@@ -1824,8 +1899,27 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
                 None,
             );
             let Some(matched) = matched else {
+                #[cfg(not(feature = "static-dispatch"))]
+                if let Some(resume) = shared_columns_resume {
+                    start = resume;
+                    shared_columns_close_matches = 0;
+                    shared_columns_direct = false;
+                    continue;
+                }
                 return Ok(Ok(()));
             };
+            #[cfg(not(feature = "static-dispatch"))]
+            if shared_columns.is_some() {
+                let gap = matched.0.saturating_sub(start);
+                if gap <= SHARED_COLUMNS_DIRECT_DENSE_GAP_BYTES {
+                    shared_columns_close_matches = shared_columns_close_matches.saturating_add(1);
+                    shared_columns_direct = shared_columns_close_matches
+                        >= SHARED_COLUMNS_DIRECT_DENSE_MATCHES;
+                } else {
+                    shared_columns_close_matches = 0;
+                    shared_columns_direct = false;
+                }
+            }
             if matched.1 <= start {
                 return Err(PackedLiteralSetError::ArithmeticOverflow {
                     computation: "packed ordinary positive-width iterator progress",
@@ -2922,6 +3016,27 @@ mod retained_iter_owner_allocation_probe {
 
     pub(super) fn take_failure() -> bool {
         FAIL_NEXT.with(|fail| fail.replace(false))
+    }
+}
+
+#[cfg(all(test, not(feature = "static-dispatch")))]
+mod shared_columns_direct_scan_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.with(|calls| calls.set(0));
+    }
+
+    pub(super) fn record() {
+        CALLS.with(|calls| calls.set(calls.get().checked_add(1).unwrap()));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.with(Cell::get)
     }
 }
 
@@ -6342,6 +6457,143 @@ mod tests {
             ordinary.count_spans_window_value(&dense, dense_window),
             Ok(u64::try_from(dense_window.end() - dense_window.start()).unwrap()),
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "static-dispatch"))]
+    fn ordinary_shared_columns_dense_probe_preserves_spans_and_callbacks() {
+        for duplicate_last in [false, true] {
+            let mut patterns = fixed_patterns(64, 4);
+            if duplicate_last {
+                patterns[63] = patterns[0].clone();
+            }
+            let refs = pattern_refs(&patterns);
+            let plan = PackedLiteralSetPlan::new(
+                &refs,
+                PackedLiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                &plan.engine,
+                PackedLiteralEngine::NativeSharedColumns { .. }
+            ));
+            let ordinary = plan.ordinary_executor();
+            let mut haystack = vec![0xff; 112];
+            for (start, pattern) in [
+                (5, 0_usize),
+                (9, 1),
+                (13, 2),
+                (17, 3),
+                (80, 62),
+            ] {
+                haystack[start..start + 4].copy_from_slice(&patterns[pattern]);
+            }
+
+            for window_start in 0..=haystack.len() {
+                for window_end in window_start..=haystack.len() {
+                    let window = Window::new(window_start, window_end);
+                    let mut expected = Vec::new();
+                    let mut start = window.start();
+                    while let Some(matched) = plan
+                        .find_window(
+                            &haystack,
+                            Window::new(start, window.end()),
+                            PackedLiteralSetSearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .0
+                    {
+                        expected.push(matched);
+                        start = matched.1;
+                    }
+
+                    super::shared_columns_direct_scan_probe::reset();
+                    let mut actual = Vec::new();
+                    assert_eq!(
+                        ordinary
+                            .try_visit_spans_window_value(
+                                &haystack,
+                                window,
+                                |matched| {
+                                    actual.push(matched);
+                                    Ok::<bool, &'static str>(true)
+                                },
+                            )
+                            .unwrap(),
+                        Ok(()),
+                    );
+                    assert_eq!(actual, expected, "window={window:?}");
+                    if window == Window::full(&haystack) {
+                        assert!(super::shared_columns_direct_scan_probe::calls() > 0);
+                    }
+                    assert_eq!(
+                        ordinary.count_spans_window_value(&haystack, window),
+                        Ok(u64::try_from(expected.len()).unwrap()),
+                    );
+                }
+            }
+
+            let mut stopped = Vec::new();
+            assert_eq!(
+                ordinary
+                    .try_visit_spans_window_value(
+                        &haystack,
+                        Window::full(&haystack),
+                        |matched| {
+                            stopped.push(matched);
+                            Ok::<bool, &'static str>(stopped.len() < 4)
+                        },
+                    )
+                    .unwrap(),
+                Ok(()),
+            );
+            assert_eq!(stopped, [(5, 9), (9, 13), (13, 17), (17, 21)]);
+            let mut seen = 0_usize;
+            assert_eq!(
+                ordinary
+                    .try_visit_spans_window_value(
+                        &haystack,
+                        Window::full(&haystack),
+                        |_| {
+                            seen = seen.checked_add(1).unwrap();
+                            if seen == 4 {
+                                Err("callback")
+                            } else {
+                                Ok(true)
+                            }
+                        },
+                    )
+                    .unwrap(),
+                Err("callback"),
+            );
+            assert_eq!(seen, 4);
+            let mut reused = Vec::new();
+            ordinary
+                .try_visit_spans_window_value(
+                    &haystack,
+                    Window::full(&haystack),
+                    |matched| {
+                        reused.push(matched);
+                        Ok::<bool, ()>(true)
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(reused, [(5, 9), (9, 13), (13, 17), (17, 21), (80, 84)]);
+            for invalid in [
+                Window::new(haystack.len() + 1, haystack.len()),
+                Window::new(0, haystack.len() + 1),
+            ] {
+                assert!(matches!(
+                    ordinary.try_visit_spans_window_value(
+                        &haystack,
+                        invalid,
+                        |_| Ok::<bool, ()>(true),
+                    ),
+                    Err(PackedLiteralSetError::InvalidWindow { .. })
+                ));
+            }
+        }
     }
 
     #[test]

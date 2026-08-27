@@ -39,8 +39,8 @@ use core::mem::size_of;
 use fre_automata::SearchWindow;
 use fre_kernels::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
-    DispatchPolicy,
-    LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits,
+    DispatchPolicy, ExactLiteralOrdinaryExecutor, LiteralBuildLimits, LiteralError, LiteralPlan,
+    LiteralSearchLimits,
     RequiredLiteralSearchAccounting as SearchAccounting,
     RequiredLiteralSearchError as SearchError, RequiredLiteralSearchLimits as SearchLimits,
     SimdDispatchContext, Window as LiteralWindow,
@@ -1367,6 +1367,88 @@ impl BoundedDelimitedSegmentPlan {
         limits: SearchLimits,
     ) -> Result<Option<(usize, usize)>, SearchError> {
         self.preflight_delimited_segment(haystack.len(), window, limits)?;
+        self.find_delimited_segment_window_value_preflighted(haystack, window, None)
+    }
+
+    /// Visit non-overlapping selected spans after the ordinary facade has
+    /// selected unlimited execution.
+    ///
+    /// Construction proves a positive-width, assertion-free byte language.
+    /// One successful bounded-delimited preflight for the initial window
+    /// therefore validates every later outer envelope: each continuation starts
+    /// at a selected end and can only shrink the source-dependent upper bounds.
+    /// The retained literal executor still validates each suffix window. The
+    /// checked canonical entry points retain their per-call outer preflights and
+    /// accounting receipts.
+    #[inline(never)]
+    pub(crate) fn try_visit_spans_ordinary<F, E>(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, SearchError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        let initial = SearchWindow::new(start, haystack.len());
+        self.preflight_delimited_segment(haystack.len(), initial, SearchLimits::unlimited())?;
+        let suffix_executor = self
+            .suffix
+            .ordinary_executor()
+            .expect("bounded-delimited construction retains a nonempty suffix");
+        let mut cursor = start;
+        loop {
+            let window = SearchWindow::new(cursor, haystack.len());
+            let Some((matched_start, matched_end)) = self
+                .find_delimited_segment_window_value_preflighted(
+                    haystack,
+                    window,
+                    Some(suffix_executor),
+                )?
+            else {
+                return Ok(Ok(()));
+            };
+            if matched_end <= cursor {
+                return Err(SearchError::ArithmeticOverflow {
+                    computation: "bounded-delimited positive-width selected-end progress",
+                });
+            }
+            cursor = matched_end;
+            match visitor((matched_start, matched_end)) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+    }
+
+    /// Count through the same preflighted next-span substrate as the ordinary
+    /// visitor.
+    #[inline(never)]
+    pub(crate) fn ordinary_count_selected_ends_at(
+        &self,
+        haystack: &[u8],
+        start: usize,
+    ) -> Result<u64, SearchError> {
+        let mut count = 0_u64;
+        let outcome = self.try_visit_spans_ordinary(haystack, start, |_| {
+            count = count
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "bounded-delimited selected-match count",
+                })?;
+            Ok::<bool, SearchError>(true)
+        })?;
+        outcome?;
+        Ok(count)
+    }
+
+    fn find_delimited_segment_window_value_preflighted(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        suffix_executor: Option<ExactLiteralOrdinaryExecutor<'_>>,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
         let segment = &self.segment;
         let Some(mut search_start) = window
             .start()
@@ -1377,14 +1459,17 @@ impl BoundedDelimitedSegmentPlan {
         if search_start > window.end() {
             return Ok(None);
         }
-        let found = self
-            .suffix
-            .find_window_value(
+        let literal_window = LiteralWindow::new(search_start, window.end());
+        let found = if let Some(executor) = suffix_executor {
+            executor.find_window_value(haystack, literal_window)
+        } else {
+            self.suffix.find_window_value(
                 haystack,
-                LiteralWindow::new(search_start, window.end()),
+                literal_window,
                 LiteralSearchLimits::unlimited(),
             )
-            .map_err(map_literal_search_error)?;
+        }
+        .map_err(map_literal_search_error)?;
         let Some((suffix_start, suffix_end)) = found else {
             return Ok(None);
         };
@@ -2230,6 +2315,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bounded_delimited_ordinary_reducer_matches_upstream_and_callback_lifecycle() {
+        let pattern = r"(?-u:(?:[ab]{1,2}/){1,2}X)";
+        let plan = delimited_plan(pattern);
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        for haystack in [
+            b"".as_slice(),
+            b"!!X!aa/X".as_slice(),
+            b"a/Xb/X!a/a/X!aaa/X".as_slice(),
+            b"\xffa/X\xe2\x98\x83bb/X\x80a/a/X".as_slice(),
+        ] {
+            for start in 0..=haystack.len() {
+                let mut expected = Vec::new();
+                let mut cursor = start;
+                while let Some(matched) = upstream.find_at(haystack, cursor) {
+                    expected.push((matched.start(), matched.end()));
+                    cursor = matched.end();
+                }
+
+                super::value_path_probe::reset();
+                let mut actual = Vec::new();
+                assert_eq!(
+                    plan.try_visit_spans_ordinary(haystack, start, |span| {
+                        actual.push(span);
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap(),
+                    Ok(()),
+                    "visit haystack={haystack:?}, start={start}",
+                );
+                assert_eq!(actual, expected, "haystack={haystack:?}, start={start}");
+                assert_eq!(super::value_path_probe::snapshot(), (0, 0));
+
+                super::value_path_probe::reset();
+                assert_eq!(
+                    plan.ordinary_count_selected_ends_at(haystack, start),
+                    Ok(u64::try_from(expected.len()).unwrap()),
+                    "count haystack={haystack:?}, start={start}",
+                );
+                assert_eq!(super::value_path_probe::snapshot(), (0, 0));
+            }
+        }
+
+        let haystack = b"a/X!bb/X";
+        let mut stopped = Vec::new();
+        assert_eq!(
+            plan.try_visit_spans_ordinary(haystack, 0, |span| {
+                stopped.push(span);
+                Ok::<bool, &'static str>(false)
+            })
+            .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(stopped, [(0, 3)]);
+
+        let mut errored = Vec::new();
+        assert_eq!(
+            plan.try_visit_spans_ordinary(haystack, 0, |span| {
+                errored.push(span);
+                Err::<bool, _>("callback")
+            })
+            .unwrap(),
+            Err("callback"),
+        );
+        assert_eq!(errored, [(0, 3)]);
+
+        let mut called = false;
+        assert!(matches!(
+            plan.try_visit_spans_ordinary(haystack, haystack.len() + 1, |_| {
+                called = true;
+                Ok::<bool, ()>(true)
+            }),
+            Err(SearchError::InvalidWindow { .. }),
+        ));
+        assert!(!called);
+        assert!(matches!(
+            plan.ordinary_count_selected_ends_at(haystack, usize::MAX),
+            Err(SearchError::InvalidWindow { .. }),
+        ));
     }
 
     #[test]

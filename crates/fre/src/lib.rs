@@ -746,7 +746,8 @@ pub use fre_kernels::{
     REVERSE_INNER_UNION_ACCOUNTING_ID, REVERSE_INNER_UNION_PLAN_ID,
     ReverseInnerActualCounters, ReverseInnerBuildAccounting, ReverseInnerBuildError,
     ReverseInnerBuildLimits, ReverseInnerOperation, ReverseInnerOperationIdentity,
-    ReverseInnerPlan, ReverseInnerReduceAccounting, ReverseInnerReduceError,
+    ReverseInnerOrdinaryExecutor, ReverseInnerPlan, ReverseInnerReduceAccounting,
+    ReverseInnerReduceError,
     ReverseInnerReduceLimits, ReverseInnerSearchAccounting, ReverseInnerSearchError,
     ReverseInnerSearchLimits, ReverseInnerSemantics, ReverseInnerUnionMode,
     ReverseInnerUpperBounds,
@@ -18885,6 +18886,148 @@ pub(crate) enum PortableOrdinaryCanonical<'a> {
     Native(&'a PortableRegex),
     ExactLiteral(&'a LiteralPlan),
     FixedPredicateWord64(&'a FixedPredicateWord64Plan),
+    /// Appended so every established compact-binding discriminant remains
+    /// unchanged. One plan pointer binds the source-free single-literal
+    /// capability without growing this two-word projection.
+    ReverseInner(ReverseInnerOrdinaryExecutor<'a>),
+}
+
+#[cfg(test)]
+mod ordinary_reverse_inner_session_probe {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct Counts {
+        pub(super) exists: usize,
+        pub(super) endpoint: usize,
+        pub(super) span: usize,
+        pub(super) visit: usize,
+        pub(super) count: usize,
+    }
+
+    std::thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            exists: 0,
+            endpoint: 0,
+            span: 0,
+            visit: 0,
+            count: 0,
+        }) };
+    }
+
+    pub(super) fn reset() {
+        COUNTS.set(Counts::default());
+    }
+
+    pub(super) fn snapshot() -> Counts {
+        COUNTS.get()
+    }
+
+    pub(super) fn record_exists() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                exists: counts.exists.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_endpoint() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                endpoint: counts.endpoint.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_span() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                span: counts.span.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_visit() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                visit: counts.visit.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+
+    pub(super) fn record_count() {
+        COUNTS.with(|slot| {
+            let counts = slot.get();
+            slot.set(Counts {
+                count: counts.count.saturating_add(1),
+                ..counts
+            });
+        });
+    }
+}
+
+#[cfg(test)]
+mod ordinary_literal_class_run_find_at_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
+/// Search one assertion-free literal/class-run tail without reconstructing
+/// the finite/accounted search envelope. The same bounded offset projection is
+/// shared by the first ordinary `find_at` and every later span continuation.
+#[inline]
+fn ordinary_literal_class_run_find_at_value(
+    plan: &LiteralClassRunLiteralPlan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<Match>, SearchError> {
+    #[cfg(test)]
+    ordinary_literal_class_run_find_at_probe::record();
+    let tail = haystack.get(start..).ok_or_else(|| {
+        SearchError::from(LiteralClassRunLiteralSearchError::InvalidWindow {
+            start,
+            end: haystack.len(),
+            haystack_len: haystack.len(),
+        })
+    })?;
+    let Some((relative_start, relative_end)) =
+        plan.find_full_ordinary_value(tail).map_err(SearchError::from)?
+    else {
+        return Ok(None);
+    };
+    let matched_start = start
+        .checked_add(relative_start)
+        .expect("a relative tail match remains in the haystack");
+    let matched_end = start
+        .checked_add(relative_end)
+        .expect("a relative tail match remains in the haystack");
+    Ok(Some(Match {
+        start: matched_start,
+        end: matched_end,
+    }))
 }
 
 impl<'a> PortableOrdinaryCanonical<'a> {
@@ -18895,6 +19038,10 @@ impl<'a> PortableOrdinaryCanonical<'a> {
             })),
             PortablePlan::ExactLiteral(plan) => Ok(Self::ExactLiteral(plan)),
             PortablePlan::FixedPredicateWord64(plan) => Ok(Self::FixedPredicateWord64(plan)),
+            PortablePlan::ReverseInner(plan) => match plan.ordinary_executor() {
+                Some(executor) => Ok(Self::ReverseInner(executor)),
+                None => Ok(Self::Native(regex)),
+            },
             _ => Ok(Self::Native(regex)),
         }
     }
@@ -18929,6 +19076,14 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     SearchAccounting::FixedPredicateWord64(accounting),
                 ))
             }
+            Self::ReverseInner(executor) => {
+                let (matched, accounting) = executor.plan().is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )?;
+                Ok((matched, SearchAccounting::ReverseInner(accounting)))
+            }
             Self::Native(regex) => regex.is_match_window(haystack, window, limits),
         }
     }
@@ -18961,6 +19116,15 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                     fixed_predicate_word64_search_limits(limits),
                 )
                 .map_err(SearchError::from),
+            Self::ReverseInner(executor) => executor
+                .plan()
+                .is_match_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(limits),
+                )
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from),
             Self::Native(regex) => regex.is_match_window_value(haystack, window, limits),
         }
     }
@@ -18989,6 +19153,24 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|(end, _)| end)
                 .map_err(SearchError::from),
+            Self::ReverseInner(executor) => {
+                if start == 0
+                    && let Some(acceptance) = executor
+                        .first_acceptance_full_unmetered(haystack)
+                        .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_endpoint();
+                    return Ok(acceptance);
+                }
+                executor.plan().shortest_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(SearchLimits::unlimited()),
+                )
+                .map(|(end, _)| end)
+                .map_err(SearchError::from)
+            }
             Self::Native(regex) => regex.shortest_match_window_value(
                 haystack,
                 window,
@@ -19021,6 +19203,31 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            Self::ReverseInner(executor) => {
+                if start == 0
+                    && let Some(matched) = executor
+                        .find_full_unmetered(haystack)
+                        .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_span();
+                    return Ok(matched.map(|(start, end)| Match { start, end }));
+                }
+                executor.plan().find_in(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    reverse_inner_search_limits(SearchLimits::unlimited()),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from)
+            }
+            Self::Native(regex)
+                if let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan
+                    && plan.boundary_semantics()
+                        == LiteralClassRunLiteralBoundarySemantics::Unguarded =>
+            {
+                ordinary_literal_class_run_find_at_value(plan, haystack, start)
+            }
             Self::Native(regex) => {
                 regex.find_window_value(haystack, window, SearchLimits::unlimited())
             }
@@ -19051,47 +19258,8 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 haystack.len(),
                 start,
                 |search_start| {
-                    let tail = haystack.get(search_start..).ok_or_else(|| {
-                        PortableFindIterError::Search(SearchError::from(
-                            LiteralClassRunLiteralSearchError::InvalidWindow {
-                                start: search_start,
-                                end: haystack.len(),
-                                haystack_len: haystack.len(),
-                            },
-                        ))
-                    })?;
-                    let Some((relative_start, relative_end)) = plan
-                        .find_full_ordinary_value(tail)
-                        .map_err(SearchError::from)
-                        .map_err(PortableFindIterError::Search)?
-                    else {
-                        return Ok(None);
-                    };
-                    let matched_start = search_start.checked_add(relative_start).ok_or_else(
-                        || {
-                            PortableFindIterError::Search(SearchError::from(
-                                LiteralClassRunLiteralSearchError::from(
-                                    LiteralClassRunLiteralReduceError::ArithmeticOverflow {
-                                        computation:
-                                            "ordinary literal/class-run match start",
-                                    },
-                                ),
-                            ))
-                        },
-                    )?;
-                    let matched_end = search_start.checked_add(relative_end).ok_or_else(|| {
-                        PortableFindIterError::Search(SearchError::from(
-                            LiteralClassRunLiteralSearchError::from(
-                                LiteralClassRunLiteralReduceError::ArithmeticOverflow {
-                                    computation: "ordinary literal/class-run match end",
-                                },
-                            ),
-                        ))
-                    })?;
-                    Ok(Some(Match {
-                        start: matched_start,
-                        end: matched_end,
-                    }))
+                    ordinary_literal_class_run_find_at_value(plan, haystack, search_start)
+                        .map_err(PortableFindIterError::Search)
                 },
                 visitor,
             );
@@ -19101,6 +19269,40 @@ impl<'a> PortableOrdinaryCanonical<'a> {
             && let PortablePlan::ReverseInner(plan) = &regex.plan
         {
             return plan
+                .try_visit_spans_while_in(
+                    haystack,
+                    LiteralWindow::new(start, haystack.len()),
+                    ReverseInnerReduceLimits::unlimited(),
+                    |span| {
+                        visitor(Match {
+                            start: span.start,
+                            end: span.end,
+                        })
+                    },
+                )
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search);
+        }
+
+        if let Self::ReverseInner(executor) = self {
+            if start == 0 {
+                let attempt = executor
+                    .try_visit_spans_full_unmetered(haystack, |(matched_start, end)| {
+                        visitor(Match {
+                            start: matched_start,
+                            end,
+                        })
+                    })
+                    .map_err(SearchError::from)
+                    .map_err(PortableFindIterError::Search)?;
+                if let Some(outcome) = attempt {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_visit();
+                    return Ok(outcome);
+                }
+            }
+            return executor
+                .plan()
                 .try_visit_spans_while_in(
                     haystack,
                     LiteralWindow::new(start, haystack.len()),
@@ -19128,6 +19330,24 @@ impl<'a> PortableOrdinaryCanonical<'a> {
         {
             return plan
                 .try_visit_spans_ordinary(haystack, start, visitor)
+                .map_err(SearchError::from)
+                .map_err(PortableFindIterError::Search);
+        }
+
+        // The bounded-delimited construction is positive-width and has no
+        // assertions. Bind its ordinary traversal once so the initial window
+        // preflight covers every shrinking tail instead of redispatching and
+        // rebuilding the same envelope after each selected end.
+        if let Self::Native(regex) = self
+            && let PortablePlan::BoundedDelimitedSegmentRepeat(plan) = &regex.plan
+        {
+            return plan
+                .try_visit_spans_ordinary(haystack, start, |(matched_start, end)| {
+                    visitor(Match {
+                        start: matched_start,
+                        end,
+                    })
+                })
                 .map_err(SearchError::from)
                 .map_err(PortableFindIterError::Search);
         }
@@ -25116,6 +25336,25 @@ impl<'r> PortableOrdinarySession<'r> {
                 )?;
                 engine.is_match_at(haystack, start).map_err(SearchError::from)
             }
+            PortableOrdinarySessionPlan::Canonical(
+                PortableOrdinaryCanonical::ReverseInner(executor),
+            ) if start == 0 => {
+                if let Some(matched) = executor
+                    .exists_full_unmetered(haystack)
+                    .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_exists();
+                    return Ok(matched);
+                }
+                executor.plan().is_match_in(
+                    haystack,
+                    LiteralWindow::full(haystack),
+                    reverse_inner_search_limits(SearchLimits::unlimited()),
+                )
+                .map(|(matched, _)| matched)
+                .map_err(SearchError::from)
+            }
             PortableOrdinarySessionPlan::Canonical(session) => session
                 .shortest_match_at_value(haystack, start)
                 .map(|endpoint| endpoint.is_some()),
@@ -25405,11 +25644,13 @@ impl<'r> PortableOrdinarySession<'r> {
     /// to that projection after two nearby canonical spans; sparse traversal
     /// retains the canonical iterator. Bounded byte-class repeats bind their
     /// selected-value engine once, and front-qualified calls scan each maximal
-    /// class run once. Guarded literal/class-run plans keep the context-aware
-    /// canonical fallback. Reverse-inner tail windows retain absolute offsets
-    /// and stop their shared traversal immediately on callback stop or error.
-    /// Other canonical fallback plans iterate the compact binding with
-    /// unlimited value searches and the ordinary empty-match progress rule.
+    /// class run once. Bounded-delimited segment repeats preflight their outer
+    /// envelope once and reuse a bound suffix executor across shrinking tails.
+    /// Guarded literal/class-run plans keep the context-aware canonical
+    /// fallback. Reverse-inner tail windows retain absolute offsets and stop
+    /// their shared traversal immediately on callback stop or error. Other
+    /// canonical fallback plans iterate the compact binding with unlimited
+    /// value searches and the ordinary empty-match progress rule.
     ///
     /// # Errors
     ///
@@ -25577,9 +25818,9 @@ impl<'r> PortableOrdinarySession<'r> {
     /// Unicode scalar-run plan over an exact tail window, an unanchored
     /// required literal, a legacy literal/class-run plan over a full or
     /// unguarded tail window, a pure or bounded byte-class repeat, a bounded
-    /// byte-class sequence, a packed literal set, or an ordinary non-uniform
-    /// or uniform-standard literal-set plan. Each construction seals nonempty
-    /// selected spans.
+    /// byte-class sequence, a bounded-delimited segment repeat, a packed
+    /// literal set, or an ordinary non-uniform or uniform-standard literal-set
+    /// plan. Each construction seals nonempty selected spans.
     /// Unsupported plans return `Ok(None)` before validating `start` or
     /// searching the haystack. This lets an embedding fall back without
     /// duplicating partial work. Once execution begins, every error is
@@ -25590,8 +25831,11 @@ impl<'r> PortableOrdinarySession<'r> {
     /// error rather than risking an infinite loop. Packed literal sets use
     /// their bound non-overlapping span iterator. A bounded byte-class
     /// sequence validates one absolute tail and retains its report-free
-    /// selected-end admission while that tail shrinks. An ordinary non-uniform
-    /// literal set advances through its construction-selected DFA endpoints.
+    /// selected-end admission while that tail shrinks. A bounded-delimited
+    /// segment repeat similarly retains its outer preflight and suffix binding,
+    /// while each suffix search still validates its literal window. An ordinary
+    /// non-uniform literal set advances through its construction-selected DFA
+    /// endpoints.
     /// When that DFA seals direct leftmost-first counting, one canonical
     /// selected match seeds the direct scanner at the selected endpoint.
     /// A uniform-standard literal set consumes any preceding near-acceptance
@@ -25762,6 +26006,25 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::Canonical(
                 PortableOrdinaryCanonical::FixedPredicateWord64(plan),
             ) => count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start),
+            PortableOrdinarySessionPlan::Canonical(
+                PortableOrdinaryCanonical::ReverseInner(executor),
+            ) => {
+                if start == 0
+                    && let Some(count) = executor
+                        .count_full_unmetered(haystack)
+                        .map_err(SearchError::from)?
+                {
+                    #[cfg(test)]
+                    ordinary_reverse_inner_session_probe::record_count();
+                    Ok(Some(count))
+                } else {
+                    count_ordinary_reverse_inner_selected_ends_at(
+                        executor.plan(),
+                        haystack,
+                        start,
+                    )
+                }
+            }
             PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex)) => {
                 match &regex.plan {
                     PortablePlan::LiteralClassRunLiteral(plan) => {
@@ -25828,6 +26091,10 @@ impl<'r> PortableOrdinarySession<'r> {
                         .ordinary_count_selected_ends_at(haystack, start)
                         .map(Some)
                         .map_err(SearchError::BoundedByteClassSequence),
+                    PortablePlan::BoundedDelimitedSegmentRepeat(plan) => plan
+                        .ordinary_count_selected_ends_at(haystack, start)
+                        .map(Some)
+                        .map_err(SearchError::from),
                     _ => Ok(None),
                 }
             }
@@ -31647,6 +31914,19 @@ mod tests {
             .collect()
     }
 
+    fn public_short_uniform_ripgrep_literals(count: usize, width: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                let suffix = format!("{index:04x}");
+                assert!(suffix.len() <= width);
+                let mut pattern = String::with_capacity(width);
+                pattern.extend(core::iter::repeat_n('q', width - suffix.len()));
+                pattern.push_str(&suffix);
+                pattern
+            })
+            .collect()
+    }
+
     fn build_public_uniform_ripgrep_literals(patterns: &[String]) -> PortableRegex {
         let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
         PortableBuilder::new("")
@@ -32061,20 +32341,23 @@ mod tests {
 
     #[test]
     fn ripgrep_ordinary_builder_preserves_portable_fallbacks_and_global_limits() {
-        let short = public_uniform_ripgrep_literals(256, 127);
+        let below_ordinary_width = public_short_uniform_ripgrep_literals(4_096, 7);
         assert!(matches!(
-            build_public_uniform_ripgrep_ordinary(&short),
+            build_public_uniform_ripgrep_ordinary(&below_ordinary_width),
             RipgrepStandardLiteralsBuild::Portable(_),
         ));
 
-        let wide = public_uniform_ripgrep_literals(256, 128);
+        let exact_ordinary_width = public_short_uniform_ripgrep_literals(4_096, 8);
         let RipgrepStandardLiteralsBuild::Ordinary(admitted) =
-            build_public_uniform_ripgrep_ordinary(&wide)
+            build_public_uniform_ripgrep_ordinary(&exact_ordinary_width)
         else {
             panic!("eligible ripgrep literals retained a portable owner");
         };
         let exact = admitted.build_report().charged_persistent_bytes;
-        let borrowed = wide.iter().map(String::as_str).collect::<Vec<_>>();
+        let borrowed = exact_ordinary_width
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let exact_owner = PortableBuilder::new("")
             .multi_line(true)
             .limits(BuildLimits {
@@ -44730,6 +45013,43 @@ mod tests {
             (0, 0),
         );
 
+        let expected_spans = upstream
+            .find_iter(ordinary_haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::Native(bound_regex)
+            ) if core::ptr::eq(*bound_regex, &regex)
+        ));
+        super::universal_finite_greedy_corridor::value_path_probe::reset();
+        let mut actual_spans = Vec::new();
+        assert_eq!(
+            ordinary
+                .try_visit_spans(ordinary_haystack, |matched| {
+                    actual_spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .unwrap(),
+            Ok(()),
+        );
+        assert_eq!(actual_spans, expected_spans);
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 0),
+        );
+        super::universal_finite_greedy_corridor::value_path_probe::reset();
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(ordinary_haystack, 0),
+            Ok(Some(u64::try_from(expected_spans.len()).unwrap())),
+        );
+        assert_eq!(
+            super::universal_finite_greedy_corridor::value_path_probe::snapshot(),
+            (0, 0),
+        );
+
         for haystack in [
             b"".as_slice(),
             b"DONE".as_slice(),
@@ -48733,7 +49053,7 @@ mod tests {
             core::mem::size_of::<super::PortableOrdinarySessionPlan<'static>>();
         let search_plan_bytes =
             core::mem::size_of::<super::PortableSearchSessionPlan<'static>>();
-        assert!(canonical_bytes <= 2 * core::mem::size_of::<usize>());
+        assert_eq!(canonical_bytes, 2 * core::mem::size_of::<usize>());
         assert!(ordinary_plan_bytes < search_plan_bytes);
         assert_eq!(
             core::mem::size_of::<super::PortableOrdinarySession<'static>>(),
@@ -48810,6 +49130,45 @@ mod tests {
                 ..
             } if core::ptr::eq(*bound, &required)
         ));
+
+        let reverse_inner = PortableBuilder::new(r"[abλ]+aa[abλ]+")
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(reverse_inner.build_report().plan, PlanKind::ReverseInner);
+        let PortablePlan::ReverseInner(reverse_inner_plan) = &reverse_inner.plan else {
+            unreachable!("single-literal reverse-inner fixture changed plan")
+        };
+        assert!(reverse_inner_plan.ordinary_single_literal_supported());
+        let reverse_inner_session = reverse_inner.ordinary_session().unwrap();
+        assert!(matches!(
+            &reverse_inner_session.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::ReverseInner(executor)
+            ) if executor.is_bound_to(reverse_inner_plan)
+        ));
+
+        let reverse_inner_union = PortableBuilder::new(
+            r"(?:[abλ]+aa[abλ]+|[abλ]+b[abλ]+)",
+        )
+        .unicode(true)
+        .build()
+        .unwrap();
+        assert_eq!(
+            reverse_inner_union.build_report().plan,
+            PlanKind::ReverseInner,
+        );
+        let PortablePlan::ReverseInner(reverse_inner_union_plan) = &reverse_inner_union.plan else {
+            unreachable!("reverse-inner union fixture changed plan")
+        };
+        assert!(!reverse_inner_union_plan.ordinary_single_literal_supported());
+        let reverse_inner_union_session = reverse_inner_union.ordinary_session().unwrap();
+        assert!(matches!(
+            &reverse_inner_union_session.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::Native(bound_regex)
+            ) if core::ptr::eq(*bound_regex, &reverse_inner_union)
+        ));
     }
 
     #[test]
@@ -48833,6 +49192,9 @@ mod tests {
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::FixedPredicateWord64(_),
                 ) => "canonical-fixed-predicate",
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::ReverseInner(_),
+                ) => "canonical-reverse-inner",
                 super::PortableOrdinarySessionPlan::RequiredLiteral { .. } => {
                     "required-literal"
                 }
@@ -48990,6 +49352,28 @@ mod tests {
             "only the new full-origin call enters the ordinary Exists facade",
         );
 
+        let reverse_inner = PortableBuilder::new(r"[abλ]+aa[abλ]+")
+            .unicode(true)
+            .build()
+            .unwrap();
+        super::ordinary_reverse_inner_session_probe::reset();
+        check(
+            "canonical reverse inner",
+            &reverse_inner,
+            b"!aaaab!",
+            "canonical-reverse-inner",
+            0,
+        );
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot(),
+            super::ordinary_reverse_inner_session_probe::Counts {
+                exists: 2,
+                span: 0,
+                ..super::ordinary_reverse_inner_session_probe::Counts::default()
+            },
+            "both full-origin existence calls use the bound report-free engine",
+        );
+
         let required = PortableBuilder::new(r"(?-u:[a-z]+ZQ)")
             .unicode(false)
             .plan_selection(PlanSelection::ForceRequiredLiteral)
@@ -49128,6 +49512,138 @@ mod tests {
                     "offset-zero route pattern={pattern:?}, haystack={haystack:?}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ordinary_reverse_inner_binding_matches_oracle_at_every_start() {
+        fn sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
+            let mut sources = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..maximum_len {
+                let mut next = Vec::new();
+                for prefix in &level {
+                    for &byte in alphabet {
+                        let mut source = prefix.clone();
+                        source.push(byte);
+                        sources.push(source.clone());
+                        next.push(source);
+                    }
+                }
+                level = next;
+            }
+            sources
+        }
+
+        let pattern = r"[abλ]+aa[abλ]+";
+        let baseline = regex::bytes::Regex::new(pattern).unwrap();
+        let regex = PortableBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        let PortablePlan::ReverseInner(plan) = &regex.plan else {
+            unreachable!("single-literal reverse-inner fixture changed plan")
+        };
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::Canonical(
+                super::PortableOrdinaryCanonical::ReverseInner(executor)
+            ) if executor.is_bound_to(plan)
+        ));
+        assert_eq!(
+            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>(),
+            2 * core::mem::size_of::<usize>(),
+        );
+
+        super::ordinary_reverse_inner_session_probe::reset();
+        let routed = b"!baaaab!";
+        assert_eq!(
+            ordinary
+                .find_at(routed, 0)
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            baseline
+                .find_at(routed, 0)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        assert_eq!(ordinary.is_match_at(routed, 0), Ok(true));
+        assert_eq!(ordinary.is_match(routed), Ok(true));
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot(),
+            super::ordinary_reverse_inner_session_probe::Counts {
+                exists: 2,
+                span: 1,
+                ..super::ordinary_reverse_inner_session_probe::Counts::default()
+            },
+        );
+        assert_eq!(
+            ordinary.shortest_match_at(routed, 0),
+            Ok(baseline.shortest_match_at(routed, 0)),
+        );
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot(),
+            super::ordinary_reverse_inner_session_probe::Counts {
+                exists: 2,
+                endpoint: 1,
+                span: 1,
+                ..super::ordinary_reverse_inner_session_probe::Counts::default()
+            },
+        );
+        assert_eq!(
+            ordinary.find_at(routed, 1).unwrap().map(|matched| (
+                matched.start(),
+                matched.end(),
+            )),
+            baseline
+                .find_at(routed, 1)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+        assert_eq!(ordinary.is_match_at(routed, 1), Ok(baseline.is_match_at(routed, 1)));
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot(),
+            super::ordinary_reverse_inner_session_probe::Counts {
+                exists: 2,
+                endpoint: 1,
+                span: 1,
+                ..super::ordinary_reverse_inner_session_probe::Counts::default()
+            },
+            "nonzero ranged operations stay on the canonical window engines",
+        );
+
+        let mut haystacks = sources(&[b'a', b'b', b'!', 0x80, 0xFF], 5);
+        haystacks.extend([
+            "!λaaaabλ!".as_bytes().to_vec(),
+            b"\xffaaaab\x80".to_vec(),
+            b"\xf0\x90\x80aaab!".to_vec(),
+            b"!baa!baa!baaaab!".to_vec(),
+        ]);
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                let expected_find = baseline
+                    .find_at(haystack, start)
+                    .map(|matched| (matched.start(), matched.end()));
+                let actual_find = ordinary
+                    .find_at(haystack, start)
+                    .unwrap()
+                    .map(|matched| (matched.start(), matched.end()));
+                assert_eq!(actual_find, expected_find, "find haystack={haystack:?} start={start}");
+                assert_eq!(
+                    ordinary.is_match_at(haystack, start),
+                    Ok(baseline.is_match_at(haystack, start)),
+                    "exists haystack={haystack:?} start={start}",
+                );
+                assert_eq!(
+                    ordinary.shortest_match_at(haystack, start),
+                    Ok(baseline.shortest_match_at(haystack, start)),
+                    "shortest haystack={haystack:?} start={start}",
+                );
+            }
+            let invalid = haystack.len().checked_add(1).unwrap();
+            assert!(ordinary.find_at(haystack, invalid).is_err());
+            assert!(ordinary.is_match_at(haystack, invalid).is_err());
+            assert!(ordinary.shortest_match_at(haystack, invalid).is_err());
         }
     }
 
@@ -49498,6 +50014,74 @@ mod tests {
             ordinary.count_positive_width_selected_ends_at(haystack, usize::MAX),
             Ok(None),
         );
+    }
+
+    #[test]
+    fn ordinary_literal_class_run_binding_finds_report_free_tails() {
+        for (pattern, haystack) in [
+            (
+                r"(?-u:ab[xy]+cd)",
+                b"zabxcd--abyycd--abxyce--abxxxcd".as_slice(),
+            ),
+            (
+                r"(?-u:[ab]+aba)",
+                b"aababa!aba!bbaba!aababa".as_slice(),
+            ),
+        ] {
+            let baseline = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+            let mut ordinary = regex.ordinary_session().unwrap();
+            for start in 0..=haystack.len() {
+                let expected = baseline.find_at(haystack, start).map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+                super::ordinary_literal_class_run_find_at_probe::reset();
+                assert_eq!(
+                    ordinary.find_at(haystack, start),
+                    Ok(expected),
+                    "pattern={pattern:?}, start={start}",
+                );
+                assert_eq!(super::ordinary_literal_class_run_find_at_probe::calls(), 1);
+            }
+
+            super::ordinary_literal_class_run_find_at_probe::reset();
+            assert!(matches!(
+                ordinary.find_at(haystack, haystack.len() + 1),
+                Err(SearchError::LiteralClassRunLiteral(
+                    fre_kernels::LiteralClassRunLiteralSearchError::InvalidWindow { .. }
+                )),
+            ));
+            assert_eq!(super::ordinary_literal_class_run_find_at_probe::calls(), 1);
+        }
+
+        let pattern = r"(?-u:\b\w+ing\b)";
+        let baseline = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let guarded = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(guarded.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        let haystack = b"testing singing xing bringing";
+        let start = 1;
+        let expected = baseline.find_at(haystack, start).map(|matched| Match {
+            start: matched.start(),
+            end: matched.end(),
+        });
+        let mut ordinary = guarded.ordinary_session().unwrap();
+        super::ordinary_literal_class_run_find_at_probe::reset();
+        assert_eq!(ordinary.find_at(haystack, start), Ok(expected));
+        assert_eq!(super::ordinary_literal_class_run_find_at_probe::calls(), 0);
     }
 
     #[test]
@@ -50070,18 +50654,22 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        let PortablePlan::ReverseInner(plan) = &regex.plan else {
+            unreachable!("single-literal reverse-inner fixture changed plan")
+        };
         let mut ordinary = regex.ordinary_session().unwrap();
         assert!(matches!(
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::Canonical(
-                super::PortableOrdinaryCanonical::Native(bound_regex)
-            ) if core::ptr::eq(*bound_regex, &regex)
+                super::PortableOrdinaryCanonical::ReverseInner(executor)
+            ) if executor.is_bound_to(plan)
         ));
-        assert!(
-            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>()
-                <= 2 * core::mem::size_of::<usize>()
+        assert_eq!(
+            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>(),
+            2 * core::mem::size_of::<usize>(),
         );
 
+        super::ordinary_reverse_inner_session_probe::reset();
         for haystack in [
             b"!baaab!abbbaabbb!bbbb!baaab!".as_slice(),
             b"!\xce\xbbbaaab\xce\xbb!abbaabbb!\xce\xbbbaaab!".as_slice(),
@@ -50103,6 +50691,11 @@ mod tests {
                 assert_eq!(actual, expected, "haystack={haystack:?}, start={start}");
             }
         }
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot().visit,
+            3,
+            "only each full-origin traversal uses the report-free visitor",
+        );
 
         let haystack = b"baaab!abbaabbb!bbaabb!";
         let mut stopped = Vec::new();
@@ -50128,6 +50721,11 @@ mod tests {
             Err("callback"),
         );
         assert_eq!(errored, [(0, 5)]);
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot().visit,
+            5,
+            "callback stop and error both stay inside the direct visitor",
+        );
 
         let mut invalid_callback = false;
         assert!(matches!(
@@ -50150,15 +50748,19 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::ReverseInner);
+        let PortablePlan::ReverseInner(plan) = &regex.plan else {
+            unreachable!("single-literal reverse-inner fixture changed plan")
+        };
         let haystack = b"!baaab!abbbaabbb!bbbb!baaab!";
         let mut ordinary = regex.ordinary_session().unwrap();
         assert!(matches!(
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::Canonical(
-                super::PortableOrdinaryCanonical::Native(bound_regex)
-            ) if core::ptr::eq(*bound_regex, &regex)
+                super::PortableOrdinaryCanonical::ReverseInner(executor)
+            ) if executor.is_bound_to(plan)
         ));
 
+        super::ordinary_reverse_inner_session_probe::reset();
         for start in 0..=haystack.len() {
             let mut cursor = start;
             let mut expected = 0_u64;
@@ -50176,6 +50778,11 @@ mod tests {
                 "start={start}",
             );
         }
+        assert_eq!(
+            super::ordinary_reverse_inner_session_probe::snapshot().count,
+            1,
+            "only the full-origin count uses the endpoint-only engine",
+        );
         assert!(matches!(
             ordinary.count_positive_width_selected_ends_at(
                 haystack,

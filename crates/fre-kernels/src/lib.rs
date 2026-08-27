@@ -23,7 +23,8 @@ pub use fre_simd_kernels::{
     BytePairBarrierScan, BytePairBarrierScanner, ByteSet256, ByteSetClassifier, DispatchPolicy,
     DispatchProfile, Feature, FeatureSet, SelectionReceipt, SimdDispatchContext, TuningClass,
     UnsupportedRequiredFeatures, VectorKind, classify_byte_delta_16, classify_byte_set1_16,
-    classify_byte_set4_16, classify_byte_set4_32, dispatch_profile, find_byte_delta,
+    classify_byte_set2_16, classify_byte_set3_16, classify_byte_set4_16, classify_byte_set4_32,
+    dispatch_profile, find_byte_delta,
 };
 
 mod anchored_line_capture;
@@ -674,7 +675,8 @@ pub use reverse_inner::{
     PLAN_ID as REVERSE_INNER_PLAN_ID, ReduceAccounting as ReverseInnerReduceAccounting,
     ReduceActualCounters as ReverseInnerActualCounters, ReduceError as ReverseInnerReduceError,
     ReduceLimits as ReverseInnerReduceLimits, ReduceUpperBounds as ReverseInnerUpperBounds,
-    ReverseInnerPlan, SEARCH_OPERATION_ID as REVERSE_INNER_SEARCH_OPERATION_ID,
+    ReverseInnerOrdinaryExecutor, ReverseInnerPlan,
+    SEARCH_OPERATION_ID as REVERSE_INNER_SEARCH_OPERATION_ID,
     SHORTEST_SEARCH_OPERATION_ID as REVERSE_INNER_SHORTEST_SEARCH_OPERATION_ID,
     SPAN_SUM_OPERATION_ID as REVERSE_INNER_SPAN_SUM_OPERATION_ID,
     SPAN_VISIT_OPERATION_ID as REVERSE_INNER_SPAN_VISIT_OPERATION_ID,
