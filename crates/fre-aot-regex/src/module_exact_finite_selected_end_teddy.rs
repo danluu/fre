@@ -1405,6 +1405,7 @@ fn aarch64_emit_exact_teddy_sve_batch_route(
     single: Aarch64Label,
     batch_candidate: Aarch64Label,
     single_prefix: bool,
+    batch_candidate_is_fallthrough: bool,
 ) -> Result<(), ObjectError> {
     assembler.bind(vector)?;
     // Retry setup retains the last base with a complete four-vector batch in
@@ -1418,14 +1419,23 @@ fn aarch64_emit_exact_teddy_sve_batch_route(
         vector,
         single_prefix,
     )?;
-    aarch64_emit_mandatory_teddy_sve_batch4_any(assembler)?;
-    assembler.branch_cond(AARCH64_NE, batch_candidate)?;
+    // Preserve the established singleton/pair gates above: their surviving
+    // prefixes are common for long misses, so speculating there taxes the hot
+    // path. Only the terminal gate advances eagerly. The reduction overwrites
+    // NZCV after ADDVL, leaving its PTEST adjacent to the inverted miss edge.
     assembler.instruction(aarch64_sve_addvl(
         2,
         2,
         EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS,
     )?)?;
-    assembler.branch(vector)?;
+    aarch64_emit_mandatory_teddy_sve_batch4_any(assembler)?;
+    assembler.branch_cond(AARCH64_EQ, vector)?;
+    // An optional earlier route is not physically adjacent to the shared
+    // candidate block. Its uncommon survivor needs one explicit jump; the
+    // last (or sole) route falls through.
+    if !batch_candidate_is_fallthrough {
+        assembler.branch(batch_candidate)?;
+    }
     Ok(())
 }
 
@@ -1620,6 +1630,7 @@ fn lower_aarch64_wrapper(
                 single,
                 batch_candidate,
                 false,
+                single_prefix_vector.is_none(),
             )?;
             if let Some(single_prefix_vector) = single_prefix_vector {
                 aarch64_emit_exact_teddy_sve_batch_route(
@@ -1628,6 +1639,7 @@ fn lower_aarch64_wrapper(
                     single_prefix_vector,
                     single,
                     batch_candidate,
+                    true,
                     true,
                 )?;
             }
@@ -1650,6 +1662,15 @@ fn lower_aarch64_wrapper(
             // The reduction proved a hit. Recomputing through the one-vector
             // path is a safe progress fallback if a future emitter violates
             // the retained-predicate invariant.
+            assembler.instruction(aarch64_sve_addvl_signed(
+                2,
+                2,
+                -i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "AArch64 exact finite SelectedEnd Teddy batch vectors",
+                    )
+                })?,
+            )?)?;
             assembler.branch(single)?;
             for (block, &hit) in batch_hits.iter().enumerate() {
                 assembler.bind(hit)?;
@@ -1658,11 +1679,21 @@ fn lower_aarch64_wrapper(
                         "AArch64 exact finite SelectedEnd Teddy batch hit block",
                     )
                 })?;
-                if block == 0 {
-                    assembler.instruction(aarch64_mov_x(21, 2)?)?;
-                } else {
-                    assembler.instruction(aarch64_sve_addvl(21, 2, block)?)?;
-                }
+                let old_base_offset = i8::try_from(block)
+                    .ok()
+                    .and_then(|block| {
+                        i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS)
+                            .ok()
+                            .and_then(|batch_vectors| block.checked_sub(batch_vectors))
+                    })
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "AArch64 exact finite SelectedEnd Teddy retained block base",
+                    ))?;
+                assembler.instruction(aarch64_sve_addvl_signed(
+                    21,
+                    2,
+                    old_base_offset,
+                )?)?;
                 assembler.instruction(aarch64_movz_w(7, u16::from(block + 1))?)?;
                 let predicate = block + 1;
                 if predicate != 1 {
@@ -4758,6 +4789,94 @@ mod tests {
     }
 
     #[test]
+    fn sve_terminal_batch_advance_encodings_match_independent_oracles() {
+        assert_eq!(
+            aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+            0x0422_5082,
+            "ADDVL X2, X2, #4",
+        );
+        assert_eq!(
+            aarch64_sve_addvl_signed(
+                2,
+                2,
+                -i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+            )
+            .unwrap(),
+            0x0422_5782,
+            "ADDVL X2, X2, #-4",
+        );
+        for (block, encoding) in [
+            (0_i8, 0x0422_5795),
+            (1, 0x0422_57b5),
+            (2, 0x0422_57d5),
+            (3, 0x0422_57f5),
+        ] {
+            assert_eq!(
+                aarch64_sve_addvl_signed(
+                    21,
+                    2,
+                    block - i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+                )
+                .unwrap(),
+                encoding,
+                "ADDVL X21, X2, #({block}-4)",
+            );
+        }
+    }
+
+    #[test]
+    fn sve_terminal_batch_advance_preserves_every_candidate_base() {
+        let batch_vectors = usize::from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS);
+        for vector_bytes in (usize::from(AARCH64_SVE_MIN_VECTOR_BYTES)
+            ..=usize::from(AARCH64_SVE_MAX_VECTOR_BYTES))
+            .step_by(usize::from(AARCH64_SVE_MIN_VECTOR_BYTES))
+        {
+            let batch_bytes = batch_vectors.checked_mul(vector_bytes).unwrap();
+            for original_base in [
+                0x1_0000_usize,
+                0x1_0001,
+                0x1_0000 + vector_bytes - 1,
+            ] {
+                // Optional singleton/pair survivors leave X2 unchanged. Only
+                // the terminal gate publishes the next-batch cursor.
+                let advanced = original_base.checked_add(batch_bytes).unwrap();
+                assert_eq!(
+                    advanced.checked_sub(batch_bytes),
+                    Some(original_base),
+                    "the defensive fallback must recover the one-vector base",
+                );
+                for block in 0..batch_vectors {
+                    let signed_block_from_advanced = isize::try_from(block).unwrap()
+                        - isize::try_from(batch_vectors).unwrap();
+                    let derived_block_base = advanced
+                        .checked_add_signed(
+                            signed_block_from_advanced * isize::try_from(vector_bytes).unwrap(),
+                        )
+                        .unwrap();
+                    let old_block_base = original_base
+                        .checked_add(block.checked_mul(vector_bytes).unwrap())
+                        .unwrap();
+                    assert_eq!(
+                        derived_block_base, old_block_base,
+                        "VL={vector_bytes} base={original_base} block={block}",
+                    );
+                    for lane in 0..vector_bytes {
+                        let candidate = derived_block_base.checked_add(lane).unwrap();
+                        assert_eq!(candidate, old_block_base + lane);
+                        for columns in [3_usize, 4] {
+                            let end = original_base
+                                .checked_add(batch_bytes)
+                                .and_then(|end| end.checked_add(columns - 1))
+                                .unwrap();
+                            assert!(candidate + columns - 1 <= end - 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sve_single_prefix_wrapper_hoists_runtime_vl_dispatch() {
         let pattern = sparse_single_prefix_pattern();
         let target = Target::aarch64_linux()
@@ -4917,27 +5036,69 @@ mod tests {
                 .map(|(index, _)| route + index)
                 .collect::<Vec<_>>();
             assert_eq!(checks.len(), expected_checks);
-            for check in checks {
-                let survivor = check + existence.len();
+            for (ordinal, check) in checks.into_iter().enumerate() {
+                let branch = check + existence.len();
+                if ordinal + 1 != expected_checks {
+                    assert_eq!(
+                        words[branch] & 0xff00_001f,
+                        0x5400_0000 | u32::from(AARCH64_NE),
+                        "optional survivors must retain their established taken edge",
+                    );
+                    assert!(
+                        conditional_target(branch).is_some_and(|target| target > branch + 2),
+                        "an optional survivor must skip its complete miss path",
+                    );
+                    assert_eq!(
+                        words[branch + 1],
+                        aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS)
+                            .unwrap(),
+                    );
+                    assert_eq!(
+                        unconditional_target(branch + 2),
+                        Some(route),
+                        "an optional miss must return to its own loop",
+                    );
+                    continue;
+                }
+
                 assert_eq!(
-                    words[survivor] & 0xff00_001f,
-                    0x5400_0000 | u32::from(AARCH64_NE),
-                );
-                assert!(
-                    conditional_target(survivor).is_some_and(|target| target > survivor + 2),
-                    "every survivor edge must skip its complete miss path",
-                );
-                assert_eq!(
-                    words[survivor + 1],
+                    words[check - 1],
                     aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+                    "only the terminal check may speculatively advance",
                 );
                 assert_eq!(
-                    unconditional_target(survivor + 2),
+                    words[branch] & 0xff00_001f,
+                    0x5400_0000 | u32::from(AARCH64_EQ),
+                    "PTEST must be adjacent to the inverted terminal miss edge",
+                );
+                assert_eq!(
+                    conditional_target(branch),
                     Some(route),
-                    "every singleton/pair/final miss must return to its own loop",
+                    "a terminal miss must return to its own loop",
                 );
             }
         }
+
+        let final_checks = [wide_route, sparse_route].map(|route| {
+            words[route..]
+                .windows(existence.len())
+                .enumerate()
+                .filter(|(_, window)| *window == existence)
+                .nth(if route == wide_route { 1 } else { 2 })
+                .map(|(index, _)| route + index)
+                .unwrap()
+        });
+        let shared_candidate = final_checks[1] + existence.len() + 1;
+        assert_eq!(
+            words[shared_candidate],
+            aarch64_sve_cmpne_zero_b(1, 24).unwrap(),
+            "the physically last route must fall through to hit materialization",
+        );
+        assert_eq!(
+            unconditional_target(final_checks[0] + existence.len() + 1),
+            Some(shared_candidate),
+            "the earlier route survivor must target the shared candidate block",
+        );
     }
 
     #[test]
@@ -5376,6 +5537,9 @@ mod tests {
                 suffix.extend(sve_batch_column_schedule(column, false));
                 assert!(index < 2, "at most two lazy columns");
             }
+            suffix.push(
+                aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+            );
             suffix.extend_from_slice(&existence);
             assert_eq!(
                 words.get(suffix_at..suffix_at + suffix.len()),
@@ -5407,20 +5571,29 @@ mod tests {
             let reduction_at = suffix_at + suffix.len();
             assert_eq!(
                 words[reduction_at] & 0xff00_001f,
-                0x5400_0000 | u32::from(AARCH64_NE),
+                0x5400_0000 | u32::from(AARCH64_EQ),
+                "the adjacent PTEST/B.EQ pair must return a terminal miss to the batch loop",
             );
+            let miss_immediate =
+                (i32::try_from((words[reduction_at] >> 5) & 0x7_ffff).unwrap() << 13) >> 13;
+            let miss_target = isize::try_from(reduction_at)
+                .unwrap()
+                .checked_add(isize::try_from(miss_immediate).unwrap())
+                .and_then(|target| usize::try_from(target).ok());
+            let vector_route = words
+                .windows(frontier.len())
+                .position(|window| window == frontier)
+                .unwrap()
+                + frontier.len()
+                - 1;
+            assert_eq!(miss_target, Some(vector_route));
             assert_eq!(
-                words[reduction_at + 1],
-                aarch64_sve_addvl(2, 2, EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
-                "a complete full-miss batch advances by exactly four VLs",
-            );
-            assert_eq!(
-                words.get(reduction_at + 3..reduction_at + 3 + predicates.len()),
+                words.get(reduction_at + 1..reduction_at + 1 + predicates.len()),
                 Some(predicates.as_slice()),
                 "durable predicates must be materialized only on the hit edge",
             );
 
-            let mut probe_at = reduction_at + 3 + predicates.len();
+            let mut probe_at = reduction_at + 1 + predicates.len();
             for predicate in 1..=EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
                 let relative = words[probe_at..]
                     .iter()
@@ -5434,15 +5607,29 @@ mod tests {
                 );
                 probe_at += 2;
             }
+            assert_eq!(
+                words[probe_at],
+                aarch64_sve_addvl_signed(
+                    2,
+                    2,
+                    -i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+                )
+                .unwrap(),
+                "the defensive single-vector fallback must recover the old base",
+            );
 
             for block in 0..EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS {
                 let predicate = block + 1;
                 let mut hit = Vec::new();
-                hit.push(if block == 0 {
-                    aarch64_mov_x(21, 2).unwrap()
-                } else {
-                    aarch64_sve_addvl(21, 2, block).unwrap()
-                });
+                hit.push(
+                    aarch64_sve_addvl_signed(
+                        21,
+                        2,
+                        i8::try_from(block).unwrap()
+                            - i8::try_from(EXACT_FINITE_TEDDY_SVE_BATCH_VECTORS).unwrap(),
+                    )
+                    .unwrap(),
+                );
                 hit.push(aarch64_movz_w(7, u16::from(block + 1)).unwrap());
                 if predicate != 1 {
                     hit.push(aarch64_sve_orr_b(1, predicate, predicate).unwrap());
