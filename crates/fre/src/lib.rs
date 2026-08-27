@@ -18776,6 +18776,9 @@ pub struct PortableSearchSession<'a> {
 /// Other matcher families retain only their compact binding. No method on this
 /// type accepts finite limits or publishes accounting; callers that need
 /// either contract should use [`PortableSearchSession`] instead.
+/// A compact native binding also recognizes zero-origin selected-span calls
+/// and enters the matcher's existing full-window ordinary API; nonzero ranged
+/// calls retain the canonical context-preserving projection.
 ///
 /// A session never retains a haystack. It can therefore be reused across
 /// unrelated sources by one mutable, thread-confined worker. An eligible
@@ -19678,6 +19681,27 @@ mod ordinary_session_full_is_match_probe {
                 ..counts
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod ordinary_session_native_zero_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
     }
 }
 
@@ -25524,8 +25548,10 @@ impl<'r> PortableOrdinarySession<'r> {
     /// uniform-standard literal set likewise selects its endpoint first, then
     /// subtracts its sealed common width; its ordinary route and direct misses
     /// retain the canonical selected span. Other packed and DFA literal sets
-    /// use their bound selected-span engines. Canonical fallback plans retain
-    /// their existing selected-span implementation with unlimited limits.
+    /// use their bound selected-span engines. A compact native owner at offset
+    /// zero enters the matcher's full-window ordinary selected-span API. Other
+    /// canonical fallback calls retain their ranged selected-span implementation
+    /// with unlimited limits.
     /// Assertions inspect the complete original haystack and offsets remain
     /// relative to it.
     ///
@@ -25573,6 +25599,13 @@ impl<'r> PortableOrdinarySession<'r> {
                     SearchWindow::new(start, haystack.len()),
                     SearchLimits::unlimited(),
                 ),
+            PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex))
+                if start == 0 =>
+            {
+                #[cfg(test)]
+                ordinary_session_native_zero_probe::record();
+                regex.try_find_ordinary(haystack)
+            }
             PortableOrdinarySessionPlan::Canonical(session) => {
                 session.find_at_value(haystack, start)
             }
@@ -49527,6 +49560,211 @@ mod tests {
                     Ok(expected),
                     "offset-zero route pattern={pattern:?}, haystack={haystack:?}",
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_session_native_zero_span_route_is_isolated() {
+        fn check_native(
+            label: &str,
+            regex: &PortableRegex,
+            haystack: &[u8],
+            nonzero: usize,
+        ) {
+            let unlimited = SearchLimits::unlimited();
+            let expected_span = regex.find_at_value(haystack, 0, unlimited).unwrap();
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(bound)
+                ) if core::ptr::eq(*bound, regex)
+            ));
+
+            super::ordinary_session_native_zero_probe::reset();
+            assert_eq!(
+                ordinary.find_at(haystack, 0),
+                Ok(expected_span),
+                "span label={label}",
+            );
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                1,
+                "zero-origin route label={label}",
+            );
+
+            super::ordinary_session_native_zero_probe::reset();
+            assert_eq!(
+                ordinary.find_at(haystack, nonzero),
+                regex.find_at_value(haystack, nonzero, unlimited),
+                "nonzero span label={label}",
+            );
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                0,
+                "nonzero calls retain the canonical ranged route label={label}",
+            );
+
+            let invalid = haystack.len().checked_add(1).unwrap();
+            assert!(ordinary.find_at(haystack, invalid).is_err());
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                0,
+                "invalid nonzero calls retain their typed-error route label={label}",
+            );
+
+            let mut checked = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                checked.find_at_value(haystack, 0, unlimited).unwrap(),
+                expected_span,
+            );
+            assert_eq!(
+                regex.find_at(haystack, 0, unlimited).unwrap().0,
+                expected_span,
+            );
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                0,
+                "checked and accounted APIs remain outside the ordinary route label={label}",
+            );
+        }
+
+        let prefix = PortableBuilder::new(r"(?-u:ERROR_[0-9]+|WARN_[A-Z]+)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(prefix.build_report().plan, PlanKind::PrefixClassAlternation);
+        check_native("prefix class", &prefix, b"!WARN_AZ!ERROR_123!", 2);
+
+        let anchored = PortableBuilder::new(r"(?-u:\A[ab]+Z)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(anchored.build_report().plan, PlanKind::ForwardAnchored);
+        check_native("forward anchored", &anchored, b"abbaZ", 1);
+
+        let word = PortableBuilder::new(r"\b\w{2,}\b").build().unwrap();
+        assert_eq!(word.build_report().plan, PlanKind::UnicodeWordRun);
+        check_native("unicode word", &word, "!αβ ab!".as_bytes(), 1);
+
+        let scalar = PortableBuilder::new(r"\p{Greek}+").build().unwrap();
+        assert_eq!(scalar.build_report().plan, PlanKind::UnicodeScalarRun);
+        check_native("unicode scalar", &scalar, "!αβ!".as_bytes(), 1);
+
+        let line = PortableBuilder::new(r"(?m)^(?-u:[\x00\xE1])$")
+            .build()
+            .unwrap();
+        assert_eq!(line.build_report().plan, PlanKind::LineDomainByteAtoms);
+        check_native("line atoms", &line, b"a\n\xE1\n", 1);
+
+        for (label, regex, haystack) in [
+            (
+                "canonical exact",
+                PortableBuilder::new("").unicode(false).build().unwrap(),
+                b"source".as_slice(),
+            ),
+            (
+                "canonical fixed predicate",
+                PortableBuilder::new(
+                    r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
+                )
+                .unicode(false)
+                .build()
+                .unwrap(),
+                b"unmatched".as_slice(),
+            ),
+        ] {
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::ExactLiteral(_)
+                        | super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
+                )
+            ));
+            super::ordinary_session_native_zero_probe::reset();
+            assert_eq!(
+                ordinary.find_at(haystack, 0),
+                regex.find_at_value(haystack, 0, SearchLimits::unlimited()),
+                "span label={label}",
+            );
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                0,
+                "non-Native canonical owner keeps its incumbent route label={label}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_session_native_zero_span_matches_oracle_exhaustively() {
+        fn sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
+            let mut sources = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..maximum_len {
+                let mut next = Vec::new();
+                for prefix in &level {
+                    for &byte in alphabet {
+                        let mut source = prefix.clone();
+                        source.push(byte);
+                        sources.push(source.clone());
+                        next.push(source);
+                    }
+                }
+                level = next;
+            }
+            sources
+        }
+
+        let mut haystacks = sources(&[b'a', b'b', b'Z', b'!', b'\n', 0, 0x80, 0xE1], 3);
+        haystacks.extend([
+            "!αβ!".as_bytes().to_vec(),
+            "AΩ!β".as_bytes().to_vec(),
+            vec![0xCE, b'a', 0x80, b'!', 0xFF],
+            b"a\nA\n\xE1\n!".to_vec(),
+            b"!WARN_AZ!ERROR_123!".to_vec(),
+            b"ERROX_123 WARM_AZ ERROR_0".to_vec(),
+        ]);
+
+        for (pattern, expected_plan) in [
+            (r"(?-u:\A[ab]+Z)", PlanKind::ForwardAnchored),
+            (
+                r"(?-u:ERROR_[0-9]+|WARN_[A-Z]+)",
+                PlanKind::PrefixClassAlternation,
+            ),
+            (r"\b\w{2,}\b", PlanKind::UnicodeWordRun),
+            (r"\p{Greek}+", PlanKind::UnicodeScalarRun),
+            (
+                r"(?m)^(?-u:[\x00\xE1])$",
+                PlanKind::LineDomainByteAtoms,
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            assert_eq!(regex.build_report().plan, expected_plan, "pattern={pattern:?}");
+            let baseline = regex::bytes::Regex::new(pattern).unwrap();
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(bound)
+                ) if core::ptr::eq(*bound, &regex)
+            ));
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    let expected_span = baseline.find_at(haystack, start).map(|matched| Match {
+                        start: matched.start(),
+                        end: matched.end(),
+                    });
+                    assert_eq!(
+                        ordinary.find_at(haystack, start),
+                        Ok(expected_span),
+                        "span pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                    );
+                }
             }
         }
     }
