@@ -3739,6 +3739,25 @@ mod tests {
         pattern
     }
 
+    /// Public, shape-derived counterexample to treating an optimal four-range
+    /// cover as the actual start-scanner decision. The production coalescer's
+    /// deterministic merge order leaves a 65-byte cover, while every root is
+    /// valid ASCII and the stable aggregate byte-frequency weight is small.
+    fn deterministic_coalescer_ascii_pattern() -> String {
+        const ROOTS: [u8; 8] = [0x0b, 0x1b, 0x1c, 0x2b, 0x3c, 0x59, 0x6b, 0x7f];
+        let mut pattern = String::from("(?:");
+        for (ordinal, root) in ROOTS.into_iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for _ in 0..6 + usize::from(ordinal + 1 == ROOTS.len()) {
+                pattern.push_str(&format!("\\x{root:02x}"));
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
     fn x86_rel32_target(code: &[u8], displacement_offset: usize) -> usize {
         let displacement = i64::from(i32::from_le_bytes(
             code[displacement_offset..displacement_offset + 4]
@@ -4571,6 +4590,32 @@ mod tests {
                 .exact_finite_selected_end_teddy_aot
                 .is_none()
         );
+    }
+
+    #[test]
+    fn valid_ascii_deterministic_coalescer_shape_selects_exists_teddy() {
+        let pattern = deterministic_coalescer_ascii_pattern();
+        for target in [
+            avx2_target(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ] {
+            let compiled = compile_exists(&pattern, target);
+            let report = compiled
+                .module()
+                .exact_finite_exists_teddy_aot_report()
+                .expect("valid-ASCII shape selects direct Exists Teddy");
+            assert_eq!(report.source_count, 8);
+            assert_eq!(report.source_bytes, 49);
+            assert_eq!((report.minimum_width, report.maximum_width), (6, 7));
+            assert_ne!(report.scanner, StartAccelerator::None);
+            assert!(!report.incumbent_complete_dfa.has_accelerator);
+            assert_eq!(
+                report.incumbent_complete_dfa.scanner,
+                StartAccelerator::None,
+            );
+        }
     }
 
     #[test]

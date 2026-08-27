@@ -138,11 +138,18 @@ where every member is nonempty and contains no LF. It records a raw-free
 language digest, member count, total bytes, and minimum/maximum width. Width-one
 languages are safe to prove but may be declined by the compiler.
 
-A row is published only when the compiler supplies the complete-DFA trusted
-core strategy and the module report agrees with the compile receipt, serialized
-program, ordinary entry, success-edge route counts, wrapper, endpoint symbol,
-native code, relocations, target, call-free property, and complete object. The
-generated registry contains no regex source or finite-language member bytes.
+A row is published only when the compiler supplies an authenticated trusted
+core strategy: either the complete-DFA core or the direct exact-finite Teddy
+scanner and verifier with its retained complete-DFA tail. The module report
+must agree with the compile receipt, serialized program, strategy identity,
+ordinary entry, success-edge route counts, wrapper, endpoint symbol, native
+code, relocations, target, call-free property, and complete object. A direct
+Teddy decline preserves the complete-DFA strategy. The generated registry
+contains no regex source or finite-language member bytes.
+
+The generated receipt names the complete-DFA route as strategy 1 and the
+direct Teddy route as strategy 2. Consumers authenticate that value; they do
+not infer a strategy from target features or registry membership.
 
 Call `AotMatchingLfLineWitnessFactory::select` with the ordinary `(mode,
 output, pattern, case_insensitive)` tuple before obtaining a haystack.
