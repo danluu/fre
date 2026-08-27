@@ -15,7 +15,7 @@ use super::*;
 // scalar and ASIMD scanners. All five registers are AAPCS64 caller-saved; X18
 // remains untouched because platforms may reserve it.
 const REVERSE_CLASS_MAP: u8 = 10;
-const REVERSE_FUEL: u8 = 13;
+pub(super) const REVERSE_FUEL: u8 = 13;
 const REVERSE_MINIMUM: u8 = 14;
 const REVERSE_NEXT_BASE: u8 = 15;
 const REVERSE_CURSOR: u8 = 16;
@@ -23,6 +23,13 @@ const REVERSE_CURSOR: u8 = 16;
 // records the one-way replacement of projected ASIMD constants by the exact
 // relation bank across every reverse-candidate verification.
 pub(super) const REVERSE_RELATION_PHASE: u8 = 7;
+
+// Four-vector complete-pair scans carry a wider native body and more hot
+// SIMD state than the independently retained one-vector incumbent. Keep the
+// incumbent for short calls, where its lower fixed cost dominates, and use
+// the batch only once that setup is amortized. This is a runtime input-length
+// policy: it does not depend on the authenticated language or observed data.
+pub(super) const COMPLETE_PAIR_BATCH_MIN_WINDOW_BYTES_LSL12: u16 = 4;
 
 fn aarch64_movn_zero_x(destination: u8) -> Result<u32, ObjectError> {
     // MOVN Xd, #0 materializes the all-ones sentinel without consuming a
@@ -63,6 +70,9 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     let single_primary_hit = assembler.label()?;
     let batch_hit = assembler.label()?;
     let single_hit = assembler.label()?;
+    let complete_pair_short_vector = assembler.label()?;
+    let complete_pair_short_primary_hit = assembler.label()?;
+    let complete_pair_short_hit = assembler.label()?;
     let scalar_relation_candidate = assembler.label()?;
     let relation_candidate = assembler.label()?;
     let candidate = assembler.label()?;
@@ -205,6 +215,10 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     let exact_pair_primary_candidate = exact_pair_primary_cold_filter
         .map(|_| assembler.label())
         .transpose()?;
+    let complete_pair_persistent_batch_hit = complete_pair_registers
+        .filter(|receipt| receipt.batch_vectors == 4)
+        .map(|_| assembler.label())
+        .transpose()?;
     if exact_pair_primary_cold_filter.is_some() && layout.output != OutputContract::Exists {
         return Err(ObjectError::InvalidModule(
             "AArch64 seeded exact-pair primary phase escaped Exists admission",
@@ -274,6 +288,51 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     // Unlike the ordinary DFA's optional compact/direct layout, the sidecar
     // always owns an independent exact raw-byte class map.
     aarch64_set_table_address(assembler, REVERSE_CLASS_MAP, reverse.class_map_offset)?;
+
+    if let Some(receipt) = complete_pair_registers.filter(|receipt| receipt.batch_vectors == 4) {
+        let relation = complete_pair_vector.ok_or(ObjectError::InvalidModule(
+            "AArch64 persistent complete-pair batch lost its vector plan",
+        ))?;
+        assembler.instruction(aarch64_cmp_x_imm_lsl12(
+            REVERSE_FUEL,
+            COMPLETE_PAIR_BATCH_MIN_WINDOW_BYTES_LSL12,
+        )?)?;
+        assembler.branch_cond(AARCH64_HS, vector)?;
+
+        // Preserve the exact pre-batch one-vector algorithm for short
+        // windows. Its false-primary and false-relation edges rearm this
+        // label directly, so a short call cannot drift into the batch loop.
+        assembler.bind(complete_pair_short_vector)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        let vector_bytes = u16::from(maximum_scan_offset).checked_add(16).ok_or(
+            ObjectError::ArithmeticOverflow("AArch64 complete-pair short filter width"),
+        )?;
+        assembler.instruction(aarch64_cmp_x_imm(12, vector_bytes)?)?;
+        assembler.branch_cond(AARCH64_LO, scalar)?;
+        aarch64_emit_start_filter_address(assembler, filter.scan_offset)?;
+        assembler.instruction(aarch64_load_q(0, 12)?)?;
+        aarch64_emit_start_filter_vector_candidates(
+            assembler,
+            filter,
+            0,
+            AARCH64_COMPLETE_PAIR_RELATION_CANDIDATES,
+            AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT,
+        )?;
+        aarch64_emit_candidate_any(assembler, AARCH64_COMPLETE_PAIR_RELATION_CANDIDATES)?;
+        assembler.branch_cond(AARCH64_NE, complete_pair_short_primary_hit)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_ASIMD_VECTOR_BYTES)?)?;
+        assembler.branch(complete_pair_short_vector)?;
+
+        assembler.bind(complete_pair_short_primary_hit)?;
+        aarch64_emit_complete_pair_relation_vector_test(assembler, relation, receipt)?;
+        assembler.branch_cond(AARCH64_NE, complete_pair_short_hit)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_ASIMD_VECTOR_BYTES)?)?;
+        assembler.branch(complete_pair_short_vector)?;
+
+        assembler.bind(complete_pair_short_hit)?;
+        aarch64_emit_first_candidate_lane(assembler, AARCH64_COMPLETE_PAIR_RELATION_CANDIDATES)?;
+        assembler.branch(relation_candidate)?;
+    }
 
     let mut batch_first_candidates = None;
     if use_asimd {
@@ -404,7 +463,9 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
                     pair_filter.vector_plan,
                 )?
             } else {
-                let first_register = if lazy_vector_filter.is_some() {
+                let first_register = if complete_pair_registers.is_some() {
+                    AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT
+                } else if lazy_vector_filter.is_some() {
                     AARCH64_VECTOR_FILTER_FIRST_CONSTANT
                 } else {
                     AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
@@ -512,26 +573,39 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         } else if let Some(relation) = complete_pair_vector {
             assembler.bind(batch_primary_hit)?;
             if use_asimd_batch {
-                // The primary four-vector load occupies V0..V3, overlapping
-                // the bounded relation-constant bank. Reload the exact
-                // complete-language relation only on a primary-hit edge.
-                aarch64_emit_prefix_relation_constants(assembler, relation)?;
-                let relation_candidates =
-                    aarch64_emit_prefix_relation_batch_candidates(assembler, relation)?;
+                let relation_candidates = if let Some(receipt) = complete_pair_registers {
+                    aarch64_emit_complete_pair_relation_batch_candidates(
+                        assembler,
+                        relation,
+                        receipt,
+                    )?
+                } else {
+                    // The legacy primary four-vector load occupies V0..V3,
+                    // overlapping the bounded relation-constant bank. Reload
+                    // the exact relation only on a primary-hit edge.
+                    aarch64_emit_prefix_relation_constants(assembler, relation)?;
+                    aarch64_emit_prefix_relation_batch_candidates(assembler, relation)?
+                };
                 if batch_first_candidates != Some(relation_candidates) {
                     return Err(ObjectError::InvalidModule(
                         "AArch64 complete-pair relation changed its candidate bank",
                     ));
                 }
                 aarch64_emit_candidate_batch_any(assembler, relation_candidates)?;
-                assembler.branch_cond(AARCH64_NE, batch_hit)?;
-                // Relation masks use V16..V21 as sources and scratch. Restore
-                // the standalone primary constants before rearming its scan.
-                aarch64_emit_start_filter_constants(
-                    assembler,
-                    filter,
-                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                assembler.branch_cond(
+                    AARCH64_NE,
+                    complete_pair_persistent_batch_hit.unwrap_or(batch_hit),
                 )?;
+                if complete_pair_registers.is_none() {
+                    // Relation masks use V16..V21 as sources and scratch.
+                    // Restore the standalone primary constants before
+                    // rearming the legacy scan.
+                    aarch64_emit_start_filter_constants(
+                        assembler,
+                        filter,
+                        AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                    )?;
+                }
                 assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
                 assembler.branch(vector)?;
             } else {
@@ -560,6 +634,16 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             assembler.branch(scalar)?;
             assembler.bind(single_primary_hit)?;
             assembler.branch(scalar)?;
+        }
+
+        if let Some(persistent_batch_hit) = complete_pair_persistent_batch_hit {
+            assembler.bind(persistent_batch_hit)?;
+            // The exact relation batch uses V30 for its overlapping second
+            // column. Restore the lane-advance immediate only when an exact
+            // relation hit will consume it; false batches keep the hot miss
+            // edge free of constant rematerialization.
+            assembler.instruction(aarch64_movi_16b(30, 16)?)?;
+            assembler.branch(batch_hit)?;
         }
 
         let selected = if exact_pair_filter.is_some()

@@ -1569,6 +1569,9 @@ struct NativeDfaEmission {
     /// Target-final proof that the width-two lazy verifier kept its primary
     /// and complete-relation constants live in disjoint ASIMD banks.
     complete_pair_relation_persistent_banks: bool,
+    /// Stronger target-final proof that the same complete relation owns a
+    /// four-vector exact-rejection batch rather than only the tail loop.
+    complete_pair_relation_persistent_batch: bool,
     direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
 }
 
@@ -3979,6 +3982,10 @@ pub struct CompiledModule {
     /// complete-pair relation verifier. This compiler-only bit drives a
     /// same-route final-object retry and never enters frozen data.
     complete_pair_relation_handoff_lowered: bool,
+    /// Whether the lazy complete-pair verifier forced its additive persistent
+    /// four-vector batch. This compiler-only bit restores the exact
+    /// single-vector incumbent before the handoff itself may be removed.
+    complete_pair_relation_persistent_batch_lowered: bool,
     /// Whether this exact Ordered-NFA text specializes the canonical start
     /// closure. This compiler-only bit drives monotone final-object retries;
     /// the immutable V1/V2/V3 object ABI remains unchanged.
@@ -4275,6 +4282,10 @@ struct NativeLowering {
     /// This drives a final-object retry that removes only its additive text
     /// and never enters frozen data.
     complete_pair_relation_handoff_lowered: bool,
+    /// Compiler-only receipt for the additive persistent four-vector
+    /// complete-pair batch. A final-object retry removes only this batch
+    /// before it may remove the independently selected handoff.
+    complete_pair_relation_persistent_batch_lowered: bool,
     /// Target-final physical identity of the one public exact-finite Exists
     /// complete-DFA incumbent. The receipt is authenticated before an
     /// additive wrapper may decline for resources and is consumed when that
@@ -6007,11 +6018,35 @@ impl CompiledModule {
         allow_exact_pair: bool,
         allow_complete_pair_relation_handoff: bool,
     ) -> Result<Self, CompileError> {
+        Self::lower_ordinary_complete_dfa_with_suffix_relation_handoff_and_batch_policy(
+            program,
+            target,
+            max_native_data_bytes,
+            allow_synchronizing_accept_reverse,
+            allow_exact_pair,
+            allow_complete_pair_relation_handoff,
+            true,
+        )
+    }
+
+    /// Rebuild the exact ordinary complete-DFA portfolio while independently
+    /// selecting the additive complete-pair handoff and its forced four-vector
+    /// register batch. A final `ObjectBytes` retry disables only that new batch
+    /// before it may remove the already-selected single-vector handoff.
+    pub(crate) fn lower_ordinary_complete_dfa_with_suffix_relation_handoff_and_batch_policy(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+        allow_synchronizing_accept_reverse: bool,
+        allow_exact_pair: bool,
+        allow_complete_pair_relation_handoff: bool,
+        allow_complete_pair_relation_batch: bool,
+    ) -> Result<Self, CompileError> {
         target.validate()?;
         let native = program.native_dfa_view().ok_or(CompileError::InternalInvariant(
             "suffix-accelerator retry has no ordinary complete DFA",
         ))?;
-        let lowering = lower_native_dfa_with_entry_contract_data_limit_optional_and_handoff_policy(
+        let lowering = lower_native_dfa_with_entry_contract_data_limit_optional_handoff_and_batch_policy(
             native,
             target,
             NativeDfaEntryContract::Public,
@@ -6019,6 +6054,7 @@ impl CompiledModule {
             allow_synchronizing_accept_reverse,
             allow_exact_pair,
             allow_complete_pair_relation_handoff,
+            allow_complete_pair_relation_batch,
         )?
         .ok_or(CompileError::InternalInvariant(
             "suffix-accelerator retry did not restore its complete DFA",
@@ -9860,6 +9896,8 @@ impl CompiledModule {
             exact_pair_suffix_lowered: lowering.exact_pair_suffix_lowered,
             complete_pair_relation_handoff_lowered: lowering
                 .complete_pair_relation_handoff_lowered,
+            complete_pair_relation_persistent_batch_lowered: lowering
+                .complete_pair_relation_persistent_batch_lowered,
             ordered_nfa_start_closure_dispatch_lowered: matches!(
                 prepared_layout.map(|layout| layout.kind),
                 Some(PreparedEntryKind::OrderedNfa(PreparedOrderedNfaEntryLayout {
@@ -10673,6 +10711,19 @@ impl CompiledModule {
 
     pub(crate) const fn has_complete_pair_relation_handoff(&self) -> bool {
         self.complete_pair_relation_handoff_lowered
+    }
+
+    pub(crate) const fn has_complete_pair_relation_persistent_batch(&self) -> bool {
+        self.complete_pair_relation_persistent_batch_lowered
+    }
+
+    pub(crate) fn has_same_program_data_as(&self, other: &Self) -> bool {
+        self.sections.get(PROGRAM_SECTION).is_some_and(|section| {
+            other
+                .sections
+                .get(PROGRAM_SECTION)
+                .is_some_and(|other| section.data == other.data)
+        })
     }
 
     /// Carry the selected scheduler transaction's fallback permission onto a
@@ -18658,6 +18709,7 @@ fn lower_runtime_adapter(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -18911,6 +18963,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -19347,6 +19400,7 @@ fn lower_native_endpoint_oracle_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -19698,6 +19752,7 @@ fn lower_native_dynamic_rows_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -19924,6 +19979,7 @@ fn lower_native_slow_partial_with_data_limit(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         exact_finite_exists_complete_dfa_receipt: None,
         exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
         direct_search_trusted_core: None,
@@ -21222,6 +21278,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -21982,6 +22039,7 @@ fn lower_native_partial_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -28219,6 +28277,11 @@ enum NativeSuffixReverseSeed {
 struct Aarch64CompletePairRelationRegisterReceipt {
     primary_constant_count: u8,
     relation_constant_count: u8,
+    /// One vector for the established tail loop or four vectors for the
+    /// target-final complete-relation batch. The latter is valid only because
+    /// the independently authenticated relation is the entire width-two
+    /// language and its masks replace, rather than refine, the primary masks.
+    batch_vectors: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28246,8 +28309,9 @@ struct NativeSeededReverseLayout {
     /// authoritative forward DFA.
     complete_pair_relation_handoff_eligible: bool,
     /// Target-final AArch64 register-liveness receipt. This is installed only
-    /// after the selected suffix scanner is known to be the single-vector
-    /// ASIMD route and is revalidated by the emitter before use.
+    /// after the selected suffix scanner is known to be either the retained
+    /// single-vector route or the additive exact-relation four-vector route;
+    /// the emitter revalidates its explicit batch width before use.
     complete_pair_relation_registers: Option<Aarch64CompletePairRelationRegisterReceipt>,
 }
 
@@ -29461,6 +29525,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -29621,6 +29686,7 @@ fn lower_selected_native_finite_language(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -29969,6 +30035,7 @@ fn lower_exact_finite_exists_teddy_incumbent_with_data_limit(
             true,
             true,
             NativeExactFiniteExistsCompleteDfaReceiptPolicy::Capture,
+            true,
             true,
         ),
         max_native_data_bytes,
@@ -30346,6 +30413,32 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_handoff_policy(
     allow_exact_pair: bool,
     allow_complete_pair_relation_handoff: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_optional_handoff_and_batch_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        allow_exact_pair,
+        allow_complete_pair_relation_handoff,
+        true,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the final-object retry independently ablates one additive batch"
+)]
+fn lower_native_dfa_with_entry_contract_data_limit_optional_handoff_and_batch_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+    allow_complete_pair_relation_handoff: bool,
+    allow_complete_pair_relation_batch: bool,
+) -> Result<Option<NativeLowering>, ObjectError> {
     lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
         view,
         target,
@@ -30355,6 +30448,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_handoff_policy(
         allow_exact_pair,
         NativeExactFiniteExistsCompleteDfaReceiptPolicy::None,
         allow_complete_pair_relation_handoff,
+        allow_complete_pair_relation_batch,
     )
 }
 
@@ -30367,6 +30461,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
     allow_exact_pair: bool,
     receipt_policy: NativeExactFiniteExistsCompleteDfaReceiptPolicy,
     allow_complete_pair_relation_handoff: bool,
+    allow_complete_pair_relation_batch: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
     lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_register_policy(
         view,
@@ -30378,6 +30473,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
         receipt_policy,
         allow_complete_pair_relation_handoff,
         true,
+        allow_complete_pair_relation_batch,
     )
 }
 
@@ -30395,6 +30491,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
     receipt_policy: NativeExactFiniteExistsCompleteDfaReceiptPolicy,
     allow_complete_pair_relation_handoff: bool,
     allow_persistent_pair_registers: bool,
+    allow_complete_pair_relation_batch: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
     let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
@@ -30513,6 +30610,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
                 sve_suffix_kind,
                 entry_contract,
                 allow_persistent_pair_registers,
+                allow_complete_pair_relation_batch,
             )?
         }
     };
@@ -30614,6 +30712,22 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
             "persistent complete-pair registers have no lowered handoff",
         ));
     }
+    if emission.complete_pair_relation_persistent_batch
+        && !emission.complete_pair_relation_persistent_banks
+    {
+        return Err(ObjectError::InvalidModule(
+            "persistent complete-pair batch has no register-bank receipt",
+        ));
+    }
+    let complete_pair_relation_persistent_batch_lowered =
+        emission.complete_pair_relation_persistent_batch;
+    if complete_pair_relation_persistent_batch_lowered
+        && !complete_pair_relation_handoff_lowered
+    {
+        return Err(ObjectError::InvalidModule(
+            "persistent complete-pair batch has no lowered handoff",
+        ));
+    }
     let anchored_prefix_filter_bytes = layout
         .prefix_filter
         .map_or(0, |filter| filter.guaranteed_bytes);
@@ -30654,6 +30768,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
         complete_pair_relation_handoff_lowered,
+        complete_pair_relation_persistent_batch_lowered,
         exact_finite_exists_complete_dfa_receipt,
         exact_finite_exists_complete_dfa_expected_receipt_sha256,
         direct_search_trusted_core: emission.direct_search_trusted_core,
@@ -37162,6 +37277,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -37507,6 +37623,7 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -38038,6 +38155,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -38201,6 +38319,7 @@ fn native_regex_redux_module(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -38561,6 +38680,7 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -38682,6 +38802,7 @@ fn native_weighted_capture_module(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -39146,6 +39267,7 @@ fn native_rebar_multi_grep_module_v1(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -39400,6 +39522,7 @@ fn native_rebar_row_scalar_module_v1(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         complete_pair_relation_handoff_lowered: false,
+        complete_pair_relation_persistent_batch_lowered: false,
         ordered_nfa_start_closure_dispatch_lowered: false,
         ordered_nfa_start_prefix_lowered: false,
         ordered_nfa_start_prefix_vector_lowered: false,
@@ -52521,6 +52644,7 @@ fn lower_x86_64_dfa_with_entry_contract(
         suffix_scanner,
         conjunction,
         complete_pair_relation_persistent_banks: false,
+        complete_pair_relation_persistent_batch: false,
         direct_search_trusted_core: direct_search_trusted_core_offset.map(|code_offset| {
             NativeDirectSearchTrustedCore {
                 code_offset,
@@ -72754,11 +72878,20 @@ fn aarch64_complete_pair_relation_registers_are_disjoint(
     if receipt.primary_constant_count == 0
         || receipt.primary_constant_count > 2
         || receipt.relation_constant_count > MAX_AARCH64_PREFIX_RELATION_CONSTANTS
+        || !matches!(receipt.batch_vectors, 1 | 4)
     {
         return false;
     }
-    let primary_clobbers = [0_u8, 5, 6, 7, 24, 28, 29, 30, 31];
-    let relation_clobbers = [0_u8, 1, 2, 3, 4, 5, 6, 7, 24, 29, 30, 31];
+    // Use the four-vector supersets for both receipt shapes. The primary
+    // batch owns V0..V7 and V24..V31 transiently. The exact relation batch
+    // retains its four masks in V0..V3, uses V4..V7/V28 as predicates, loads
+    // source bytes through V24..V27, and forms the adjacent column in V30.
+    let primary_clobbers = [
+        0_u8, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31,
+    ];
+    let relation_clobbers = [
+        0_u8, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31,
+    ];
     let relation_constants = AARCH64_COMPLETE_PAIR_RELATION_FIRST_CONSTANT
         ..AARCH64_COMPLETE_PAIR_RELATION_FIRST_CONSTANT + receipt.relation_constant_count;
     let primary_constants = AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT
@@ -72780,9 +72913,9 @@ fn aarch64_complete_pair_relation_register_receipt_is_valid(
     use_exact_asimd_lane: bool,
 ) -> bool {
     if !use_asimd_suffix
-        || use_asimd_suffix_batch
         || !use_exact_asimd_lane
         || layout.mandatory_teddy.is_some()
+        || receipt.batch_vectors != if use_asimd_suffix_batch { 4 } else { 1 }
     {
         return false;
     }
@@ -72812,6 +72945,34 @@ fn aarch64_complete_pair_relation_register_receipt_is_valid(
     true
 }
 
+fn expected_aarch64_complete_pair_relation_register_receipt(
+    layout: NativeDfaLayout,
+    use_asimd_suffix: bool,
+    use_asimd_suffix_batch: bool,
+    use_exact_asimd_lane: bool,
+    allow_persistent_registers: bool,
+) -> Option<Aarch64CompletePairRelationRegisterReceipt> {
+    let suffix = allow_persistent_registers
+        .then_some(layout.seeded_reverse)
+        .flatten()
+        .filter(|reverse| reverse.complete_pair_relation_handoff_eligible)
+        .and_then(|_| layout.suffix_filter)?;
+    let relation = layout.prefix_relation?.vector_plan?;
+    let receipt = Aarch64CompletePairRelationRegisterReceipt {
+        primary_constant_count: u8::try_from(suffix.filter.constant_count()).ok()?,
+        relation_constant_count: relation.constant_count,
+        batch_vectors: if use_asimd_suffix_batch { 4 } else { 1 },
+    };
+    aarch64_complete_pair_relation_register_receipt_is_valid(
+        receipt,
+        layout,
+        use_asimd_suffix,
+        use_asimd_suffix_batch,
+        use_exact_asimd_lane,
+    )
+    .then_some(receipt)
+}
+
 fn install_aarch64_complete_pair_relation_register_receipt(
     layout: &mut NativeDfaLayout,
     use_asimd_suffix: bool,
@@ -72819,26 +72980,13 @@ fn install_aarch64_complete_pair_relation_register_receipt(
     use_exact_asimd_lane: bool,
     allow_persistent_registers: bool,
 ) -> Result<(), ObjectError> {
-    let expected = allow_persistent_registers
-        .then_some(layout.seeded_reverse)
-        .flatten()
-        .filter(|reverse| reverse.complete_pair_relation_handoff_eligible)
-        .and_then(|_| {
-            let suffix = layout.suffix_filter?;
-            let relation = layout.prefix_relation?.vector_plan?;
-            let receipt = Aarch64CompletePairRelationRegisterReceipt {
-                primary_constant_count: u8::try_from(suffix.filter.constant_count()).ok()?,
-                relation_constant_count: relation.constant_count,
-            };
-            aarch64_complete_pair_relation_register_receipt_is_valid(
-                receipt,
-                *layout,
-                use_asimd_suffix,
-                use_asimd_suffix_batch,
-                use_exact_asimd_lane,
-            )
-            .then_some(receipt)
-        });
+    let expected = expected_aarch64_complete_pair_relation_register_receipt(
+        *layout,
+        use_asimd_suffix,
+        use_asimd_suffix_batch,
+        use_exact_asimd_lane,
+        allow_persistent_registers,
+    );
     let Some(reverse) = layout.seeded_reverse.as_mut() else {
         return Ok(());
     };
@@ -74125,11 +74273,70 @@ fn aarch64_emit_prefix_relation_predicate(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64CompletePairRelationScratch {
+    negation: u8,
+    range: u8,
+    predicate: u8,
+    first_predicate: u8,
+    second_predicate: u8,
+}
+
+const AARCH64_COMPLETE_PAIR_SINGLE_SCRATCH: Aarch64CompletePairRelationScratch =
+    Aarch64CompletePairRelationScratch {
+        negation: AARCH64_COMPLETE_PAIR_RELATION_NEGATION_SCRATCH,
+        range: AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+        predicate: AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+        first_predicate: AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+        second_predicate: AARCH64_COMPLETE_PAIR_RELATION_SECOND_PREDICATE,
+    };
+
+const AARCH64_COMPLETE_PAIR_BATCH_SECOND_SOURCE: u8 = 30;
+const AARCH64_COMPLETE_PAIR_BATCH_SCRATCH: Aarch64CompletePairRelationScratch =
+    Aarch64CompletePairRelationScratch {
+        negation: 4,
+        range: 5,
+        predicate: 6,
+        first_predicate: 7,
+        second_predicate: 28,
+    };
+
+fn aarch64_complete_pair_relation_scratch_is_valid(
+    scratch: Aarch64CompletePairRelationScratch,
+    first_source: u8,
+    second_source: u8,
+    destination: u8,
+) -> bool {
+    let constants = AARCH64_COMPLETE_PAIR_RELATION_FIRST_CONSTANT
+        ..AARCH64_COMPLETE_PAIR_RELATION_FIRST_CONSTANT + MAX_AARCH64_PREFIX_RELATION_CONSTANTS;
+    let registers = [
+        scratch.negation,
+        scratch.range,
+        scratch.predicate,
+        scratch.first_predicate,
+        scratch.second_predicate,
+    ];
+    registers.iter().enumerate().all(|(index, &register)| {
+        aarch64_caller_saved_simd(register)
+            && !constants.contains(&register)
+            && register != first_source
+            && register != second_source
+            && register != destination
+            && !registers[..index].contains(&register)
+    }) && first_source != second_source
+        && first_source != destination
+        && second_source != destination
+        && aarch64_caller_saved_simd(first_source)
+        && aarch64_caller_saved_simd(second_source)
+        && aarch64_caller_saved_simd(destination)
+}
+
 fn aarch64_emit_complete_pair_relation_predicate(
     assembler: &mut Aarch64Assembler,
     predicate: NativePrefixRelationPredicate,
     source: u8,
     destination: u8,
+    scratch: Aarch64CompletePairRelationScratch,
 ) -> Result<(), ObjectError> {
     if predicate.any {
         assembler.instruction(aarch64_cmeq_16b(destination, source, source)?)?;
@@ -74147,14 +74354,14 @@ fn aarch64_emit_complete_pair_relation_predicate(
                 index,
             )?;
             assembler.instruction(aarch64_cmeq_16b(
-                AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+                scratch.predicate,
                 source,
                 constant,
             )?)?;
             assembler.instruction(aarch64_orr_16b(
                 destination,
                 destination,
-                AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+                scratch.predicate,
             )?)?;
         }
     } else {
@@ -74175,45 +74382,45 @@ fn aarch64_emit_complete_pair_relation_predicate(
                     ))?,
             )?;
             assembler.instruction(aarch64_cmhs_16b(
-                AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                scratch.range,
                 source,
                 low,
             )?)?;
             assembler.instruction(aarch64_cmhs_16b(
-                AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+                scratch.predicate,
                 high,
                 source,
             )?)?;
             assembler.instruction(aarch64_and_16b(
-                AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
-                AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
-                AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+                scratch.range,
+                scratch.range,
+                scratch.predicate,
             )?)?;
             if index == 0 {
                 assembler.instruction(aarch64_orr_16b(
                     destination,
-                    AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
-                    AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                    scratch.range,
+                    scratch.range,
                 )?)?;
             } else {
                 assembler.instruction(aarch64_orr_16b(
                     destination,
                     destination,
-                    AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                    scratch.range,
                 )?)?;
             }
         }
     }
     if predicate.negated {
         assembler.instruction(aarch64_cmeq_16b(
-            AARCH64_COMPLETE_PAIR_RELATION_NEGATION_SCRATCH,
+            scratch.negation,
             source,
             source,
         )?)?;
         assembler.instruction(aarch64_eor_16b(
             destination,
             destination,
-            AARCH64_COMPLETE_PAIR_RELATION_NEGATION_SCRATCH,
+            scratch.negation,
         )?)?;
     }
     Ok(())
@@ -74255,10 +74462,21 @@ fn aarch64_emit_complete_pair_relation_mask(
     first_source: u8,
     second_source: u8,
     destination: u8,
+    scratch: Aarch64CompletePairRelationScratch,
 ) -> Result<(), ObjectError> {
     if plan.rectangles().is_empty() {
         return Err(ObjectError::InvalidModule(
             "empty AArch64 prefix-relation vector plan",
+        ));
+    }
+    if !aarch64_complete_pair_relation_scratch_is_valid(
+        scratch,
+        first_source,
+        second_source,
+        destination,
+    ) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete-pair relation scratch registers overlap",
         ));
     }
     for (index, rectangle) in plan.rectangles().iter().copied().enumerate() {
@@ -74266,32 +74484,34 @@ fn aarch64_emit_complete_pair_relation_mask(
             assembler,
             rectangle.first,
             first_source,
-            AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+            scratch.first_predicate,
+            scratch,
         )?;
         if !rectangle.second.any {
             aarch64_emit_complete_pair_relation_predicate(
                 assembler,
                 rectangle.second,
                 second_source,
-                AARCH64_COMPLETE_PAIR_RELATION_SECOND_PREDICATE,
+                scratch.second_predicate,
+                scratch,
             )?;
             assembler.instruction(aarch64_and_16b(
-                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
-                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
-                AARCH64_COMPLETE_PAIR_RELATION_SECOND_PREDICATE,
+                scratch.first_predicate,
+                scratch.first_predicate,
+                scratch.second_predicate,
             )?)?;
         }
         if index == 0 {
             assembler.instruction(aarch64_orr_16b(
                 destination,
-                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
-                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+                scratch.first_predicate,
+                scratch.first_predicate,
             )?)?;
         } else {
             assembler.instruction(aarch64_orr_16b(
                 destination,
                 destination,
-                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+                scratch.first_predicate,
             )?)?;
         }
     }
@@ -74338,8 +74558,65 @@ fn aarch64_emit_complete_pair_relation_vector_test(
         AARCH64_COMPLETE_PAIR_RELATION_FIRST_SOURCE,
         AARCH64_COMPLETE_PAIR_RELATION_SECOND_SOURCE,
         AARCH64_COMPLETE_PAIR_RELATION_CANDIDATES,
+        AARCH64_COMPLETE_PAIR_SINGLE_SCRATCH,
     )?;
     aarch64_emit_candidate_any(assembler, AARCH64_COMPLETE_PAIR_RELATION_CANDIDATES)
+}
+
+/// Produce four exact adjacent relation masks in V0..V3 while preserving the
+/// target-final relation constants in V16..V21 and primary constants in
+/// V22..V23. V24..V27 retain the 64 source bytes, V30 forms the overlapping
+/// second column, and V4..V7/V28 are dead predicate scratch. The caller
+/// restores only V30's lane-advance constant on the rare exact-hit edge.
+fn aarch64_emit_complete_pair_relation_batch_candidates(
+    assembler: &mut Aarch64Assembler,
+    plan: NativePrefixRelationVectorPlan,
+    receipt: Aarch64CompletePairRelationRegisterReceipt,
+) -> Result<u8, ObjectError> {
+    const FIRST_SOURCE: u8 = 24;
+    const FIRST_CANDIDATES: u8 = 0;
+    if receipt.batch_vectors != 4 || receipt.relation_constant_count != plan.constant_count {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete-pair batch register receipt changed",
+        ));
+    }
+    aarch64_emit_start_filter_address(assembler, 0)?;
+    assembler.instruction(aarch64_ld1_four_16b(FIRST_SOURCE, 12)?)?;
+    for block in 0_u8..4 {
+        let source = FIRST_SOURCE
+            .checked_add(block)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 complete-pair batch source",
+            ))?;
+        let candidates = FIRST_CANDIDATES
+            .checked_add(block)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 complete-pair batch candidates",
+            ))?;
+        if block < 3 {
+            assembler.instruction(aarch64_ext_16b(
+                AARCH64_COMPLETE_PAIR_BATCH_SECOND_SOURCE,
+                source,
+                source + 1,
+                1,
+            )?)?;
+        } else {
+            aarch64_emit_start_filter_address(assembler, 49)?;
+            assembler.instruction(aarch64_load_q(
+                AARCH64_COMPLETE_PAIR_BATCH_SECOND_SOURCE,
+                12,
+            )?)?;
+        }
+        aarch64_emit_complete_pair_relation_mask(
+            assembler,
+            plan,
+            source,
+            AARCH64_COMPLETE_PAIR_BATCH_SECOND_SOURCE,
+            candidates,
+            AARCH64_COMPLETE_PAIR_BATCH_SCRATCH,
+        )?;
+    }
+    Ok(FIRST_CANDIDATES)
 }
 
 /// Produce four exact adjacent relation masks in V24..V27. The first byte
@@ -76902,6 +77179,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         sve_suffix_kind,
         entry_contract,
         true,
+        true,
     )
 }
 
@@ -76919,6 +77197,7 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
     sve_suffix_kind: Option<Aarch64SveFilterKind>,
     entry_contract: NativeDfaEntryContract,
     allow_persistent_pair_registers: bool,
+    allow_complete_pair_relation_batch: bool,
 ) -> Result<NativeDfaEmission, ObjectError> {
     if !native_default_exception_layout_is_valid(&layout) {
         return Err(ObjectError::InvalidModule(
@@ -77118,10 +77397,28 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
         && layout.mandatory_teddy.is_none_or(|teddy| {
             teddy.isa == MandatoryTeddyIsa::Aarch64Asimd
         });
-    let use_asimd_suffix_batch = use_asimd_suffix
+    // Exact lane extraction wins on Apple Silicon, while generic Linux
+    // AArch64 retains SIMD block rejection and refines a hit scalarly. This
+    // target cost policy applies to every graph-derived filter uniformly.
+    let use_exact_asimd_lane = aarch64_use_exact_first_lane(operating_system);
+    let established_suffix_batch = use_asimd_suffix
         && layout
             .suffix_filter
             .is_some_and(|suffix| use_aarch64_filter_batch(suffix.filter));
+    // A complete width-two relation can reject all 64 lanes exactly after a
+    // primary hit. Its target-final register receipt therefore permits the
+    // four-vector loop even when the primary membership alone is too common
+    // for the established necessary-filter frequency gate.
+    let use_asimd_suffix_batch = established_suffix_batch
+        || (allow_complete_pair_relation_batch
+            && expected_aarch64_complete_pair_relation_register_receipt(
+                layout,
+                use_asimd_suffix,
+                true,
+                use_exact_asimd_lane,
+                allow_persistent_pair_registers,
+            )
+            .is_some());
     let sve_loop_kind = selected_aarch64_sve_loop_kind(&layout, features, operating_system);
     let loop_use_runtime_vl_dispatch = sve_loop_kind.is_some()
         && features.has(CpuFeature::Aarch64Asimd)
@@ -77172,16 +77469,17 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
         // a necessary filter, and the unchanged scalar pair bitmap verifies
         // every selected candidate exactly.
         .filter(|_| !pure_sve_filter);
-    // Exact lane extraction wins on Apple Silicon, while generic Linux
-    // AArch64 retains SIMD block rejection and refines a hit scalarly. This
-    // target cost policy applies to every graph-derived filter uniformly.
-    let use_exact_asimd_lane = aarch64_use_exact_first_lane(operating_system);
     install_aarch64_complete_pair_relation_register_receipt(
         &mut layout,
         use_asimd_suffix,
         use_asimd_suffix_batch,
         use_exact_asimd_lane,
-        allow_persistent_pair_registers,
+        // Preserve the exact pre-feature implementation for an already
+        // established frequency-gated batch. Only the additive batch forced
+        // by the complete relation may install the wider persistent receipt;
+        // its compiler-only fact can then ablate that implementation without
+        // also removing the incumbent batch route.
+        allow_persistent_pair_registers && !established_suffix_batch,
     )?;
     let vector_filter = if prefix_relation_vector.is_some() {
         None
@@ -78461,6 +78759,15 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
         complete_pair_relation_persistent_banks: layout.seeded_reverse.is_some_and(|reverse| {
             reverse.complete_pair_relation_registers.is_some()
         }),
+        // Receipt only the additive force-batch introduced for a complete
+        // exact pair. An established frequency-gated four-vector scanner is
+        // part of the pre-feature incumbent and must not be ablated.
+        complete_pair_relation_persistent_batch: !established_suffix_batch
+            && layout.seeded_reverse.is_some_and(|reverse| {
+                reverse
+                    .complete_pair_relation_registers
+                    .is_some_and(|receipt| receipt.batch_vectors == 4)
+            }),
         direct_search_trusted_core: direct_search_trusted_core_offset.map(|code_offset| {
             NativeDirectSearchTrustedCore {
                 code_offset,
@@ -93364,6 +93671,7 @@ mod tests {
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -93763,6 +94071,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 complete_pair_relation_handoff_lowered: false,
+                complete_pair_relation_persistent_batch_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -94019,6 +94328,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 complete_pair_relation_handoff_lowered: false,
+                complete_pair_relation_persistent_batch_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -94194,6 +94504,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 complete_pair_relation_handoff_lowered: false,
+                complete_pair_relation_persistent_batch_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -94353,6 +94664,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 complete_pair_relation_handoff_lowered: false,
+                complete_pair_relation_persistent_batch_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -117404,6 +117716,7 @@ int main(void){{
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 complete_pair_relation_handoff_lowered: false,
+                complete_pair_relation_persistent_batch_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
                 exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
@@ -134725,6 +135038,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 complete_pair_relation_handoff_lowered: false,
+                complete_pair_relation_persistent_batch_lowered: false,
                 ordered_nfa_start_closure_dispatch_lowered: false,
                 ordered_nfa_start_prefix_lowered: false,
                 ordered_nfa_start_prefix_vector_lowered: false,
@@ -135070,6 +135384,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             ordered_nfa_start_closure_dispatch_lowered: false,
             ordered_nfa_start_prefix_lowered: false,
             ordered_nfa_start_prefix_vector_lowered: false,
@@ -144958,14 +145273,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             incumbent_object.len(),
             |allow_synchronizing_accept_reverse,
              allow_exact_pair,
-             allow_complete_pair_relation_handoff| {
-                CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+             allow_complete_pair_relation_handoff,
+             allow_complete_pair_relation_batch| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_relation_handoff_and_batch_policy(
                     selected.program(),
                     target,
                     usize::MAX,
                     allow_synchronizing_accept_reverse,
                     allow_exact_pair,
                     allow_complete_pair_relation_handoff,
+                    allow_complete_pair_relation_batch,
                 )
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -145005,14 +145322,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             undersized_cap,
             |allow_synchronizing_accept_reverse,
              allow_exact_pair,
-             allow_complete_pair_relation_handoff| {
-                CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+             allow_complete_pair_relation_handoff,
+             allow_complete_pair_relation_batch| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_relation_handoff_and_batch_policy(
                     selected.program(),
                     target,
                     usize::MAX,
                     allow_synchronizing_accept_reverse,
                     allow_exact_pair,
                     allow_complete_pair_relation_handoff,
+                    allow_complete_pair_relation_batch,
                 )
             },
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -145109,14 +145428,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 cap,
                 |allow_synchronizing_accept_reverse,
                  allow_exact_pair,
-                 allow_complete_pair_relation_handoff| {
-                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+                 allow_complete_pair_relation_handoff,
+                 allow_complete_pair_relation_batch| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_relation_handoff_and_batch_policy(
                         selected.program(),
                         target,
                         usize::MAX,
                         allow_synchronizing_accept_reverse,
                         allow_exact_pair,
                         allow_complete_pair_relation_handoff,
+                        allow_complete_pair_relation_batch,
                     )
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -145209,14 +145530,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 cap,
             |allow_synchronizing_accept_reverse,
              allow_exact_pair,
-             allow_complete_pair_relation_handoff| {
-                CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+             allow_complete_pair_relation_handoff,
+             allow_complete_pair_relation_batch| {
+                CompiledModule::lower_ordinary_complete_dfa_with_suffix_relation_handoff_and_batch_policy(
                     selected.program(),
                     target,
                     usize::MAX,
                     allow_synchronizing_accept_reverse,
                     allow_exact_pair,
                     allow_complete_pair_relation_handoff,
+                    allow_complete_pair_relation_batch,
                 )
             },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -145340,7 +145663,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             feature_empty.clone(),
             ObjectFormat::for_target(scalar_target),
             feature_empty_without_prefix_object.len(),
-            |_, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            |_, _, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
             || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
             || Err(CompileError::InternalInvariant("unexpected width retry")),
             |retain_scalar_prefix| {
@@ -145453,7 +145776,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             vector.clone(),
             format,
             scalar_object.len(),
-            |_, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            |_, _, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
             || {
                 Err(CompileError::InternalInvariant(
                     "unexpected terminal-set retry",
@@ -145485,7 +145808,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             vector,
             format,
             scalar_object.len(),
-            |_, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
+            |_, _, _, _| Err(CompileError::InternalInvariant("unexpected suffix retry")),
             || {
                 Err(CompileError::InternalInvariant(
                     "unexpected terminal-set retry",
@@ -145561,14 +145884,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 cap,
                 |allow_synchronizing_accept_reverse,
                  allow_exact_pair,
-                 allow_complete_pair_relation_handoff| {
-                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+                 allow_complete_pair_relation_handoff,
+                 allow_complete_pair_relation_batch| {
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_relation_handoff_and_batch_policy(
                         selected.program(),
                         target,
                         usize::MAX,
                         allow_synchronizing_accept_reverse,
                         allow_exact_pair,
                         allow_complete_pair_relation_handoff,
+                        allow_complete_pair_relation_batch,
                     )
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -147532,6 +147857,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             complete_pair_relation_handoff_lowered: false,
+            complete_pair_relation_persistent_batch_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
             exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
@@ -155037,6 +155363,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     #[test]
     fn aarch64_fixed_pair_complete_relation_handoff_receipt_is_exact() {
         const PAIR: &str = r"(?-u:(?:\xd4\xe1|\xd4\xeb|\xd5\xf0))";
+        const RANGE_PAIR: &str = r"(?-u:(?:a[b-c]|d[e-f]))";
         const TRIPLE: &str = r"(?-u:(?:\xd4\x01\xe1|\xd4\x02\xeb|\xd5\x03\xf0))";
         let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
         let aarch64 = Target::aarch64_macos().with_features(asimd).unwrap();
@@ -155087,6 +155414,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             )
             .unwrap();
             assert!(emitted.complete_pair_relation_persistent_banks);
+            assert!(emitted.complete_pair_relation_persistent_batch);
             let legacy =
                 lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
                     layout,
@@ -155096,10 +155424,12 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     None,
                     NativeDfaEntryContract::Public,
                     false,
+                    true,
                 )
                 .unwrap();
             assert!(!legacy.complete_pair_relation_persistent_banks);
-            assert!(emitted.code.len() < legacy.code.len());
+            assert!(!legacy.complete_pair_relation_persistent_batch);
+            assert_ne!(emitted.code, legacy.code);
             assert_eq!(emitted.relocations, legacy.relocations);
             let mut incumbent = layout;
             let mut incumbent_reverse = reverse;
@@ -155132,12 +155462,82 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 );
             }
             assert!(emitted.contains(&aarch64_add_x_imm(15, 2, 1).unwrap()));
+            assert!(emitted.contains(&aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES).unwrap()));
+            assert!(emitted.contains(
+                &aarch64_cmp_x_imm_lsl12(
+                    module_seeded_reverse_aarch64::REVERSE_FUEL,
+                    module_seeded_reverse_aarch64::COMPLETE_PAIR_BATCH_MIN_WINDOW_BYTES_LSL12,
+                )
+                .unwrap()
+            ));
         }
 
         let exists = layout_for(PAIR, OutputContract::Exists, aarch64);
         assert!(exists.seeded_reverse.is_none_or(|reverse| {
             !reverse.complete_pair_relation_handoff_eligible
         }));
+
+        let range_pair = layout_for(RANGE_PAIR, OutputContract::Span, aarch64);
+        let range_plan = range_pair
+            .prefix_relation
+            .and_then(|relation| relation.vector_plan)
+            .expect("range pair relation plan");
+        assert!(range_plan.rectangles().iter().any(|rectangle| {
+            !rectangle.first.filter.is_exact() || !rectangle.second.filter.is_exact()
+        }));
+        let range_emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            range_pair,
+            asimd,
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        assert!(range_emission.complete_pair_relation_persistent_banks);
+        assert!(range_emission.complete_pair_relation_persistent_batch);
+
+        // Model the future-reachability seam where this authenticated handoff
+        // control-flow shape carries an established frequency-gated batch.
+        // This non-executed target-final policy control changes only its
+        // necessary-filter bytes, avoiding dependence on which full compiler
+        // portfolio currently wins for a second source pattern. The new
+        // force-batch policy must leave the established implementation's
+        // exact decline/error behavior unchanged under both policy values
+        // instead of installing an unreceipted wider relation batch.
+        let mut established = layout_for(PAIR, OutputContract::Span, aarch64);
+        assert!(established.seeded_reverse.is_some_and(|reverse| {
+            reverse.complete_pair_relation_handoff_eligible
+        }));
+        let mut established_suffix = established.suffix_filter.unwrap();
+        established_suffix.filter.ranges[0] = NativeByteRange { start: 1, end: 1 };
+        established_suffix.filter.ranges[1] = NativeByteRange { start: 2, end: 2 };
+        established_suffix.filter.range_count = 2;
+        established_suffix.filter.candidate_bytes = 2;
+        established.suffix_filter = Some(established_suffix);
+        assert!(established
+            .suffix_filter
+            .is_some_and(|suffix| use_aarch64_filter_batch(suffix.filter)));
+        let lower_established = |allow_registers, allow_batch| {
+            lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+                established,
+                asimd,
+                OperatingSystem::Macos,
+                None,
+                None,
+                NativeDfaEntryContract::Public,
+                allow_registers,
+                allow_batch,
+            )
+        };
+        let established_selected = lower_established(true, true);
+        let established_incumbent = lower_established(false, false);
+        for result in [established_selected, established_incumbent] {
+            assert!(matches!(
+                result,
+                Err(ObjectError::InvalidModule(
+                    "AArch64 complete-pair relation changed its candidate bank"
+                ))
+            ));
+        }
 
         let mut forged = layout_for(PAIR, OutputContract::Span, aarch64);
         let mut forged_relation = forged.prefix_relation.unwrap();
@@ -155172,6 +155572,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .expect("single-vector pair receipt");
         assert_eq!(forged_receipt.primary_constant_count, 2);
         assert!(forged_receipt.relation_constant_count <= 6);
+        assert_eq!(forged_receipt.batch_vectors, 1);
         assert!(aarch64_complete_pair_relation_registers_are_disjoint(
             forged_receipt
         ));
@@ -155202,18 +155603,20 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             ))
         ));
 
-        let mut batch_decline = layout_for(PAIR, OutputContract::Span, aarch64);
+        let mut batch_selected = layout_for(PAIR, OutputContract::Span, aarch64);
         install_aarch64_complete_pair_relation_register_receipt(
-            &mut batch_decline,
+            &mut batch_selected,
             true,
             true,
             true,
             true,
         )
         .unwrap();
-        assert!(batch_decline.seeded_reverse.is_some_and(|reverse| {
+        assert!(batch_selected.seeded_reverse.is_some_and(|reverse| {
             reverse.complete_pair_relation_handoff_eligible
-                && reverse.complete_pair_relation_registers.is_none()
+                && reverse
+                    .complete_pair_relation_registers
+                    .is_some_and(|receipt| receipt.batch_vectors == 4)
         }));
 
         let mut crowded_primary = layout_for(PAIR, OutputContract::Span, aarch64);
@@ -155240,6 +155643,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 )
                 .unwrap(),
                 relation_constant_count: crowded_relation_constants,
+                batch_vectors: 1,
             },
             crowded_primary,
             true,
@@ -155255,6 +155659,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 None,
                 NativeDfaEntryContract::Public,
                 true,
+                true,
             )
             .unwrap();
         let crowded_incumbent =
@@ -155266,9 +155671,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 None,
                 NativeDfaEntryContract::Public,
                 false,
+                true,
             )
             .unwrap();
         assert!(!crowded_selected.complete_pair_relation_persistent_banks);
+        assert!(!crowded_selected.complete_pair_relation_persistent_batch);
         assert_eq!(crowded_selected.code, crowded_incumbent.code);
         assert_eq!(crowded_selected.relocations, crowded_incumbent.relocations);
 
@@ -155337,6 +155744,59 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn aarch64_complete_pair_batch_policy_is_inert_when_unselected() {
+        fn assert_inert(pattern: &str, target: Target, expect_handoff_layout: bool) {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            let layout =
+                build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
+                    compiled.program().native_dfa_view().unwrap(),
+                    target,
+                    NativeVectorFilterCostModel::Established,
+                    direct_relation_vector_owns_route(target),
+                    usize::MAX,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .1;
+            assert_eq!(
+                layout.seeded_reverse.is_some_and(|reverse| {
+                    reverse.complete_pair_relation_handoff_eligible
+                }),
+                expect_handoff_layout
+            );
+            let lower = |allow_batch| {
+                lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+                    layout,
+                    target.features,
+                    target.operating_system,
+                    None,
+                    None,
+                    NativeDfaEntryContract::Public,
+                    true,
+                    allow_batch,
+                )
+                .unwrap()
+            };
+            let selected = lower(true);
+            let disabled = lower(false);
+            assert!(!selected.complete_pair_relation_persistent_batch);
+            assert_eq!(selected.code, disabled.code);
+            assert_eq!(selected.relocations, disabled.relocations);
+        }
+
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let macos = Target::aarch64_macos().with_features(asimd).unwrap();
+        assert_inert(r"(?-u:(?:a[^\n]|bX))", macos, false);
+        assert_inert(r"(?-u:(?:abc|def))", macos, false);
+    }
+
+    #[test]
     fn aarch64_fixed_pair_relation_handoff_object_limit_restores_exact_incumbent() {
         const PAIR: &str = r"(?-u:(?:\xd4\xe1|\xd4\xeb|\xd5\xf0))";
         let target = Target::aarch64_macos()
@@ -155349,6 +155809,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         )
         .unwrap();
         assert!(selected.module().has_complete_pair_relation_handoff());
+        assert!(selected
+            .module()
+            .has_complete_pair_relation_persistent_batch());
         let selected_reverse = selected.module().has_synchronizing_accept_reverse();
         let selected_exact_pair = selected.module().has_exact_pair_suffix();
         let native_data_limit = SlowAotLimits::default().max_native_data_bytes;
@@ -155362,11 +155825,13 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 selected_exact_pair,
                 NativeExactFiniteExistsCompleteDfaReceiptPolicy::None,
                 true,
+                true,
                 false,
             )
             .unwrap()
             .expect("legacy lazy complete-pair lowering");
         assert!(legacy_lowering.complete_pair_relation_handoff_lowered);
+        assert!(!legacy_lowering.complete_pair_relation_persistent_batch_lowered);
         assert_eq!(
             selected.module().sections[PROGRAM_SECTION].data.as_ref(),
             legacy_lowering.data.as_slice(),
@@ -155392,10 +155857,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         )
         .unwrap();
         assert!(legacy.has_complete_pair_relation_handoff());
-        assert!(
-            selected.module().sections[TEXT_SECTION].data.len()
-                < legacy.sections[TEXT_SECTION].data.len(),
-            "persistent registers must strictly shrink the selected text"
+        assert!(!legacy.has_complete_pair_relation_persistent_batch());
+        assert_ne!(
+            selected.module().sections[TEXT_SECTION].data,
+            legacy.sections[TEXT_SECTION].data,
+            "the exact batch must differ from the single-vector incumbent"
         );
         let incumbent =
             CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
@@ -155415,12 +155881,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         );
         let format = ObjectFormat::for_target(target);
         let legacy_object = emit_object(&legacy, format, usize::MAX).unwrap();
-        assert!(
-            selected.object().len() <= legacy_object.len(),
-            "persistent registers must not grow the emitted object"
-        );
+        assert_ne!(selected.object(), legacy_object);
+        assert!(legacy_object.len() < selected.object().len());
         let incumbent_object = emit_object(&incumbent, format, usize::MAX).unwrap();
-        assert!(incumbent_object.len() < selected.object().len());
+        assert!(incumbent_object.len() < legacy_object.len());
 
         let retry = |cap| {
             let initial = CompiledModule::lower_optimizing_with_limits(
@@ -155430,18 +155894,21 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             )
             .unwrap();
             assert!(initial.has_complete_pair_relation_handoff());
+            assert!(initial.has_complete_pair_relation_persistent_batch());
             crate::emit_with_ordered_nfa_accelerator_retries(
                 initial,
                 format,
                 cap,
-                |allow_reverse, allow_exact_pair, allow_handoff| {
-                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
+                |allow_reverse, allow_exact_pair, allow_handoff, allow_batch| {
+                    assert!(!allow_batch, "ObjectBytes retry re-admitted the batch");
+                    CompiledModule::lower_ordinary_complete_dfa_with_suffix_relation_handoff_and_batch_policy(
                         selected.program(),
                         target,
                         native_data_limit,
                         allow_reverse,
                         allow_exact_pair,
                         allow_handoff,
+                        allow_batch,
                     )
                 },
                 || Err(CompileError::InternalInvariant("unexpected terminal-set retry")),
@@ -155454,12 +155921,20 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .unwrap()
         };
 
+        let crate::FinalObjectAttempt::Fit { module, object } = retry(legacy_object.len()) else {
+            panic!("exact single-vector incumbent did not fit its exact ceiling");
+        };
+        assert!(module.has_complete_pair_relation_handoff());
+        assert!(!module.has_complete_pair_relation_persistent_batch());
+        assert_eq!(object, legacy_object);
+
         let crate::FinalObjectAttempt::Fit { module, object } =
             retry(incumbent_object.len())
         else {
             panic!("exact pre-verifier incumbent did not fit its exact ceiling");
         };
         assert!(!module.has_complete_pair_relation_handoff());
+        assert!(!module.has_complete_pair_relation_persistent_batch());
         assert_eq!(object, incumbent_object);
 
         let undersized_cap = incumbent_object.len() - 1;
@@ -155486,8 +155961,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             )
             .unwrap(),
             format,
-            incumbent_object.len(),
-            |_, _, _| {
+            legacy_object.len(),
+            |_, _, _, _| {
                 Err(ObjectError::Allocation(
                     "complete-pair relation rollback seam",
                 )
@@ -155527,6 +156002,20 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(later_retries.get(), 0);
 
         let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = legacy_object.len();
+        let constrained = compile(
+            CompileRequest::new(PAIR, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(limits),
+        )
+        .unwrap();
+        assert!(constrained.module().has_complete_pair_relation_handoff());
+        assert!(!constrained
+            .module()
+            .has_complete_pair_relation_persistent_batch());
+        assert_eq!(constrained.object(), legacy_object);
+
         limits.max_object_bytes = incumbent_object.len();
         let constrained = compile(
             CompileRequest::new(PAIR, target)
@@ -155536,6 +156025,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         )
         .unwrap();
         assert!(!constrained.module().has_complete_pair_relation_handoff());
+        assert!(!constrained
+            .module()
+            .has_complete_pair_relation_persistent_batch());
         assert_eq!(constrained.object(), incumbent_object);
     }
 
@@ -155581,15 +156073,14 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         }
 
         let complement = raw_relation(r"(?-u:(?:[^a]X|aY))");
-        let complement_plan =
-            derive_native_prefix_relation_vector(&complement, Architecture::X86_64)
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let complement_plan = derive_native_prefix_relation_vector(&complement, architecture)
                 .expect("a dense leaf is represented by its exact complement");
-        assert!(
-            complement_plan
+            assert!(complement_plan
                 .rectangles()
                 .iter()
-                .any(|rectangle| { rectangle.first.negated || rectangle.second.negated })
-        );
+                .any(|rectangle| { rectangle.first.negated || rectangle.second.negated }));
+        }
 
         let structural =
             raw_relation(r"(?:(?:(?:(?:(?:(?:Kh|UZ|GX8)){1,4}){1,2}?)+?)+(?-u:[\x00-\xFF]))");
@@ -159436,12 +159927,22 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     fn linked_macos_fixed_pair_complete_relation_handoff_is_exact() {
         use std::{fmt::Write as _, fs, process::Command};
 
-        const PATTERN: &str = r"(?-u:(?:\xd4\xe1|\xd4\xeb|\xd5\xf0))";
-        const FIXTURE: [u8; 2] = [0xd4, 0xe1];
         let features = FeatureSet::of(CpuFeature::Aarch64Asimd);
         let target = Target::aarch64_macos().with_features(features).unwrap();
+        let fixtures: [(&str, [u8; 2], &[u8], bool); 2] = [
+            (
+                r"(?-u:(?:\xd4\xe1|\xd4\xeb|\xd5\xf0))",
+                [0xd4, 0xe1],
+                &[],
+                false,
+            ),
+            (r"(?-u:(?:a[b-c]|d[e-f]))", *b"ab", b"aedb", true),
+        ];
+        for (fixture_index, (pattern, fixture, dense_seed, require_range)) in
+            fixtures.into_iter().enumerate()
+        {
         let probe = compile(
-            CompileRequest::new(PATTERN, target)
+            CompileRequest::new(pattern, target)
                 .mode(CompileMode::Optimizing)
                 .output(OutputContract::Span),
         )
@@ -159458,6 +159959,15 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             )
             .unwrap()
             .1;
+        let relation_plan = probe_layout
+            .prefix_relation
+            .and_then(|relation| relation.vector_plan)
+            .unwrap_or_else(|| panic!("fixed-pair relation vector plan fixture {fixture_index}"));
+        if require_range {
+            assert!(relation_plan.rectangles().iter().any(|rectangle| {
+                !rectangle.first.filter.is_exact() || !rectangle.second.filter.is_exact()
+            }));
+        }
         let suffix = probe_layout.suffix_filter.expect("fixed-pair suffix");
         let primary = suffix.filter.ranges()[0].start;
         let primary_offset = usize::from(suffix.filter.scan_offset);
@@ -159472,12 +159982,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         isolated_quiet[primary_offset] = primary;
         let mut burst_quiet = vec![background; 4096];
         burst_quiet[..64].fill(primary);
-        let dense_decoy = vec![primary; 4096];
+        let dense_decoy = if dense_seed.is_empty() {
+            vec![primary; 4096]
+        } else {
+            dense_seed.iter().copied().cycle().take(4096).collect()
+        };
         let mut late_positive = burst_quiet.clone();
-        late_positive[4000..4002].copy_from_slice(&FIXTURE);
+        late_positive[4000..4002].copy_from_slice(&fixture);
         let mut nonzero = vec![background; 256];
         nonzero[17 + primary_offset] = primary;
-        nonzero[128..130].copy_from_slice(&FIXTURE);
+        nonzero[128..130].copy_from_slice(&fixture);
         let mut cases = vec![
             (vec![background; 96], 0_usize, 96_usize),
             (isolated_quiet, 0, 4096),
@@ -159488,12 +160002,41 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         ];
         for start in [15_usize, 16, 63, 64, 190] {
             let mut haystack = vec![background; 192];
-            haystack[start..start + 2].copy_from_slice(&FIXTURE);
+            haystack[start..start + 2].copy_from_slice(&fixture);
             cases.push((haystack, 0, 192));
         }
+        let batch_threshold = usize::from(
+            module_seeded_reverse_aarch64::COMPLETE_PAIR_BATCH_MIN_WINDOW_BYTES_LSL12,
+        ) << 12;
+        cases.push((vec![background; batch_threshold - 1], 0, batch_threshold - 1));
+        cases.push((vec![background; batch_threshold], 0, batch_threshold));
+        let mut threshold_late = vec![background; batch_threshold + 1];
+        threshold_late[batch_threshold - 1..batch_threshold + 1].copy_from_slice(&fixture);
+        cases.push((threshold_late, 0, batch_threshold + 1));
+        for start in [63_usize, 64] {
+            let mut haystack = vec![background; batch_threshold + 128];
+            haystack[start..start + 2].copy_from_slice(&fixture);
+            cases.push((haystack, 0, batch_threshold + 128));
+        }
+        let threshold_dense = if dense_seed.is_empty() {
+            vec![primary; batch_threshold + 128]
+        } else {
+            dense_seed
+                .iter()
+                .copied()
+                .cycle()
+                .take(batch_threshold + 128)
+                .collect()
+        };
+        cases.push((threshold_dense, 0, batch_threshold + 128));
+        let nonzero_start = 32_usize;
+        let nonzero_end = nonzero_start + batch_threshold;
+        let mut threshold_nonzero = vec![background; nonzero_end + 32];
+        threshold_nonzero[nonzero_end - 2..nonzero_end].copy_from_slice(&fixture);
+        cases.push((threshold_nonzero, nonzero_start, nonzero_end));
 
         let directory = std::env::temp_dir().join(format!(
-            "fre-aot-complete-pair-relation-{}",
+            "fre-aot-complete-pair-relation-{}-{fixture_index}",
             std::process::id(),
         ));
         fs::create_dir_all(&directory).unwrap();
@@ -159517,7 +160060,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         .enumerate()
         {
             let compiled = compile(
-                CompileRequest::new(PATTERN, target)
+                CompileRequest::new(pattern, target)
                     .mode(CompileMode::Optimizing)
                     .output(output),
             )
@@ -159552,6 +160095,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 target_emission.complete_pair_relation_persistent_banks,
                 output != OutputContract::Exists,
                 "unexpected persistent-bank receipt for {output:?}"
+            );
+            assert_eq!(
+                target_emission.complete_pair_relation_persistent_batch,
+                output != OutputContract::Exists,
+                "unexpected persistent-batch receipt for {output:?}"
             );
             let symbol = compiled.module().entry_symbol();
             writeln!(
@@ -159619,6 +160167,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             String::from_utf8_lossy(&output.stderr),
         );
         fs::remove_dir_all(&directory).unwrap();
+        }
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
