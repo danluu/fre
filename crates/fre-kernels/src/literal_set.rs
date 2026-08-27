@@ -19,6 +19,7 @@ use crate::folded_literal_trie::{
     FoldedLiteralTriePlan, RootCandidateOutcome, ScanAttemptError as FoldedScanAttemptError,
     ScanError as FoldedScanError, ScanUpperBounds as FoldedScanUpperBounds,
 };
+use crate::packed_literal_set::packed_literal_anchor_frequency_rank;
 
 // A short folded search performs one necessary-root pass, verifies at most one
 // classifier-sized exact block and leaves any remainder to the incumbent DFA.
@@ -4296,6 +4297,82 @@ pub trait LiteralSetStablePattern: stable_pattern::Sealed {}
 
 impl<P: stable_pattern::Sealed> LiteralSetStablePattern for P {}
 
+const PINNED_AHO_PREFILTER_TEDDY_MAX_PATTERNS: usize = 64;
+
+/// Whether the pinned aho-corasick 1.1.4 prefilter builder must decline.
+///
+/// Above Teddy's 64-pattern ceiling, memmem and packed prefilters are
+/// unavailable. Aho's remaining choices admit at most three ASCII start bytes
+/// or three rare bytes. Stable inputs let this reproduce exactly those two
+/// admission facts without changing the retained DFA.
+fn pinned_aho_prefilter_is_unavailable<P: stable_pattern::Sealed>(
+    patterns: &[P],
+) -> bool {
+    if patterns.len() <= PINNED_AHO_PREFILTER_TEDDY_MAX_PATTERNS {
+        return false;
+    }
+    let mut starts = [false; 256];
+    let mut start_count = 0_usize;
+    let mut rare = [false; 256];
+    let mut rare_count = 0_usize;
+    let mut rare_available = true;
+    for pattern in patterns {
+        let bytes = pattern.as_ref();
+        if bytes.is_empty() {
+            return true;
+        }
+        if start_count <= 3 {
+            let first = usize::from(bytes[0]);
+            if !starts[first] {
+                starts[first] = true;
+                start_count += 1;
+            }
+        }
+        if !rare_available {
+            if start_count > 3 {
+                return true;
+            }
+            continue;
+        }
+        if rare_count > 3 || bytes.len() >= 256 {
+            rare_available = false;
+            if start_count > 3 {
+                return true;
+            }
+            continue;
+        }
+        let mut rarest = bytes[0];
+        let mut rarest_rank = packed_literal_anchor_frequency_rank(rarest);
+        let mut found = false;
+        for &byte in bytes {
+            if found {
+                continue;
+            }
+            if rare[usize::from(byte)] {
+                found = true;
+                continue;
+            }
+            let rank = packed_literal_anchor_frequency_rank(byte);
+            if rank < rarest_rank {
+                rarest = byte;
+                rarest_rank = rank;
+            }
+        }
+        if !found && !rare[usize::from(rarest)] {
+            rare[usize::from(rarest)] = true;
+            rare_count += 1;
+            if start_count > 3 && rare_count > 3 {
+                return true;
+            }
+        }
+    }
+    let start_available = start_count <= 3
+        && start_count > 0
+        && !starts[usize::from(0x80_u8)..].contains(&true);
+    let rare_available = rare_available && (1..=3).contains(&rare_count);
+    !start_available && !rare_available
+}
+
 impl LiteralSetPlan {
     /// Compile stable owned literal alternatives into a DFA.
     ///
@@ -4340,6 +4417,32 @@ impl LiteralSetPlan {
         limits: LiteralSetBuildLimits,
     ) -> Result<Self, LiteralSetError> {
         Self::new_stable_patterns(patterns, limits)
+    }
+
+    /// Compile stable borrowed literals with leftmost-first DFA semantics.
+    ///
+    /// A prefilter attempt is skipped only when the pinned builder must
+    /// decline. Every other input retains Aho's complete incumbent selection.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    pub fn new_stable_leftmost_borrowed<P: LiteralSetStablePattern>(
+        patterns: &[P],
+        limits: LiteralSetBuildLimits,
+    ) -> Result<Self, LiteralSetError> {
+        let semantics = LiteralSetMatchSemantics::LeftmostFirst;
+        let build = preflight(patterns, limits, semantics)?;
+        let mut builder = DFA::builder();
+        builder.match_kind(MatchKind::LeftmostFirst);
+        if pinned_aho_prefilter_is_unavailable(patterns) {
+            builder.prefilter(false);
+        }
+        let automaton = builder
+            .build(patterns.iter().map(AsRef::as_ref))
+            .map_err(|error| LiteralSetError::AutomatonBuild {
+                detail: error.to_string(),
+            })?;
+        Self::from_preflight_dfa(build, automaton, limits)
     }
 
     fn new_stable_patterns<P: stable_pattern::Sealed>(
@@ -6439,12 +6542,13 @@ mod tests {
         ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
         ORDINARY_ROOT_ASCII_MAX_MEMBERS, ORDINARY_ROOT_ASCII_MIN_BYTES,
         ORDINARY_ROOT_SET4_MIN_BYTES, ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES,
+        PINNED_AHO_PREFILTER_TEDDY_MAX_PATTERNS,
         decode_direct_dfa_start_state, encode_direct_dfa_start_state,
         direct_dfa_set4_contains, direct_dfa_set4_members_from_buckets,
         first_acceptance_end_for_count, first_acceptance_end_for_span_visit,
         first_acceptance_end_without_prefilter,
         ordinary_direct_dfa_first_acceptance_end, ordinary_direct_probe,
-        preflight,
+        pinned_aho_prefilter_is_unavailable, preflight,
     };
     use crate::Window;
 
@@ -6719,6 +6823,152 @@ mod tests {
         )
         .unwrap();
         assert_eq!(generic.automaton.match_kind(), MatchKind::LeftmostFirst);
+    }
+
+    #[test]
+    fn stable_leftmost_skips_only_proven_unavailable_prefilters() {
+        let roots = [b'B', b'F', b'J', b'N'];
+        let patterns = (0_u8..68)
+            .map(|id| vec![roots[usize::from(id) % roots.len()], id])
+            .collect::<Vec<_>>();
+        let refs = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert!(pinned_aho_prefilter_is_unavailable(&refs));
+        let reference = DFA::builder()
+            .match_kind(MatchKind::LeftmostFirst)
+            .build(refs.iter().copied())
+            .unwrap();
+        assert!(reference.prefilter().is_none());
+        let optimized = LiteralSetPlan::new_stable_leftmost_borrowed(
+            &refs,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(optimized.automaton.match_kind(), MatchKind::LeftmostFirst);
+        assert!(optimized.automaton.prefilter().is_none());
+        assert_eq!(optimized.automaton.memory_usage(), reference.memory_usage());
+        assert_eq!(
+            format!("{reference:?}"),
+            format!("{:?}", optimized.automaton),
+        );
+        assert_leftmost_window_differential(&patterns, &optimized, 4);
+
+        let start_patterns = (0_u8..68).map(|id| vec![b'Q', id]).collect::<Vec<_>>();
+        let start_refs = start_patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert!(!pinned_aho_prefilter_is_unavailable(&start_refs));
+        let start = LiteralSetPlan::new_stable_leftmost_borrowed(
+            &start_refs,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(start.automaton.prefilter().is_some());
+
+        let rare_patterns = (0_u8..68)
+            .map(|id| vec![roots[usize::from(id) % roots.len()], b'\x1f', id])
+            .collect::<Vec<_>>();
+        let rare_refs = rare_patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert!(!pinned_aho_prefilter_is_unavailable(&rare_refs));
+        let rare = LiteralSetPlan::new_stable_leftmost_borrowed(
+            &rare_refs,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        assert!(rare.automaton.prefilter().is_some());
+        assert!(!pinned_aho_prefilter_is_unavailable(&refs[..64]));
+    }
+
+    #[test]
+    fn stable_leftmost_prefilter_unavailability_proof_is_conservative() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        fn check(label: &str, patterns: &[Vec<u8>]) -> (bool, bool) {
+            assert!(patterns.len() > PINNED_AHO_PREFILTER_TEDDY_MAX_PATTERNS);
+            let refs = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let proved = pinned_aho_prefilter_is_unavailable(&refs);
+            let reference = DFA::builder()
+                .match_kind(MatchKind::LeftmostFirst)
+                .build(refs.iter().copied())
+                .unwrap();
+            assert!(
+                !proved || reference.prefilter().is_none(),
+                "prefilter proof was unsound for {label}: {patterns:?}",
+            );
+            (proved, reference.prefilter().is_some())
+        }
+
+        let roots = [b'B', b'F', b'J', b'N'];
+        let mut cases = vec![
+            (
+                "duplicate",
+                (0..68).map(|_| b"duplicate".to_vec()).collect::<Vec<_>>(),
+            ),
+            (
+                "shared-start",
+                (0_u8..68).map(|id| vec![b'Q', id]).collect::<Vec<_>>(),
+            ),
+            (
+                "shared-rare",
+                (0_u8..68)
+                    .map(|id| vec![roots[usize::from(id) % roots.len()], b'\x1f', id])
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "empty",
+                (0_u8..68)
+                    .map(|id| if id == 37 { Vec::new() } else { vec![id, b'x'] })
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "non-ascii-starts",
+                (0_u8..68)
+                    .map(|id| vec![0x80 | (id & 7), id, id.wrapping_mul(17)])
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+        let mut long = (0_u8..68)
+            .map(|id| vec![roots[usize::from(id) % roots.len()], id])
+            .collect::<Vec<_>>();
+        long[19].resize(256, b'x');
+        cases.push(("long", long));
+
+        let mut proved_cases = 0_usize;
+        let mut retained_cases = 0_usize;
+        for (label, patterns) in cases {
+            let (proved, retained) = check(label, &patterns);
+            proved_cases += usize::from(proved);
+            retained_cases += usize::from(retained);
+        }
+        for seed in 0_u64..192 {
+            let mut state = seed.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let count = 65 + usize::try_from(next(&mut state) % 64).unwrap();
+            let domain = seed % 3;
+            let patterns = (0..count)
+                .map(|_| {
+                    let len = 1 + usize::try_from(next(&mut state) % 48).unwrap();
+                    (0..len)
+                        .map(|_| match domain {
+                            0 => next(&mut state) as u8,
+                            1 => b' ' + u8::try_from(next(&mut state) % 95).unwrap(),
+                            _ => 0x80 | (next(&mut state) as u8 & 0x7F),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let label = match domain {
+                0 => "seeded-arbitrary",
+                1 => "seeded-ascii",
+                _ => "seeded-non-ascii",
+            };
+            let (proved, retained) = check(label, &patterns);
+            proved_cases += usize::from(proved);
+            retained_cases += usize::from(retained);
+        }
+        assert!(proved_cases >= 128);
+        assert!(retained_cases >= 2);
     }
 
     #[test]

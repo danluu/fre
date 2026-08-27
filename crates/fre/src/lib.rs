@@ -6614,7 +6614,10 @@ fn publish_ripgrep_borrowed_small_flat_literal_set_ordinary(
             storage,
         )
     } else {
-        let literal_set = LiteralSetPlan::new(patterns, builder.limits.literal_set)?;
+        let literal_set = LiteralSetPlan::new_stable_leftmost_borrowed(
+            patterns,
+            builder.limits.literal_set,
+        )?;
         let storage = literal_set.build_accounting().persistent_bytes;
         (
             PortablePlan::LiteralSetDfa(PortableLiteralSetDfaPlan::with_ordinary_ascii_folded(
