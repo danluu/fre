@@ -12,16 +12,17 @@
 use super::*;
 
 // Persistent state is kept outside every scratch register used by the shared
-// scalar and ASIMD scanners. All five registers are AAPCS64 caller-saved; X18
+// scalar and ASIMD scanners. All six registers are AAPCS64 caller-saved; X18
 // remains untouched because platforms may reserve it.
 const REVERSE_CLASS_MAP: u8 = 10;
 pub(super) const REVERSE_FUEL: u8 = 13;
 const REVERSE_MINIMUM: u8 = 14;
 const REVERSE_NEXT_BASE: u8 = 15;
 const REVERSE_CURSOR: u8 = 16;
-// X7 is outside the reverse machine's persistent and scalar scratch sets. It
-// records the one-way replacement of projected ASIMD constants by the exact
-// relation bank across every reverse-candidate verification.
+// X7 is outside the reverse machine's persistent and scalar scratch sets. Its
+// mutually exclusive users record either the one-way replacement of projected
+// ASIMD constants by the exact relation bank or the bounded exact-only
+// follow-ups after a complete-pair false primary.
 pub(super) const REVERSE_RELATION_PHASE: u8 = 7;
 
 // Four-vector complete-pair scans carry a wider native body and more hot
@@ -30,6 +31,10 @@ pub(super) const REVERSE_RELATION_PHASE: u8 = 7;
 // the batch only once that setup is amortized. This is a runtime input-length
 // policy: it does not depend on the authenticated language or observed data.
 pub(super) const COMPLETE_PAIR_BATCH_MIN_WINDOW_BYTES_LSL12: u16 = 4;
+// Two bounded exact-only follow-ups amortize a proved dense false primary
+// without ever turning one observation into an unbounded input policy. A
+// sparse false primary therefore adds at most 128 bytes of exact scanning.
+pub(super) const COMPLETE_PAIR_FALSE_PRIMARY_FOLLOW_UP_BATCHES: u16 = 2;
 
 fn aarch64_movn_zero_x(destination: u8) -> Result<u32, ObjectError> {
     // MOVN Xd, #0 materializes the all-ones sentinel without consuming a
@@ -216,6 +221,10 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         .map(|_| assembler.label())
         .transpose()?;
     let complete_pair_persistent_batch_hit = complete_pair_registers
+        .filter(|receipt| receipt.batch_vectors == 4)
+        .map(|_| assembler.label())
+        .transpose()?;
+    let complete_pair_persistent_relation_batch = complete_pair_registers
         .filter(|receipt| receipt.batch_vectors == 4)
         .map(|_| assembler.label())
         .transpose()?;
@@ -573,6 +582,17 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         } else if let Some(relation) = complete_pair_vector {
             assembler.bind(batch_primary_hit)?;
             if use_asimd_batch {
+                if let Some(relation_batch) = complete_pair_persistent_relation_batch {
+                    // A primary-hit rejection may run a bounded number of
+                    // exact-only batches at following positions. The counter
+                    // is live only within that episode; ordinary primary
+                    // misses execute the unchanged hot loop.
+                    assembler.instruction(aarch64_movz_w(
+                        REVERSE_RELATION_PHASE,
+                        COMPLETE_PAIR_FALSE_PRIMARY_FOLLOW_UP_BATCHES,
+                    )?)?;
+                    assembler.bind(relation_batch)?;
+                }
                 let relation_candidates = if let Some(receipt) = complete_pair_registers {
                     aarch64_emit_complete_pair_relation_batch_candidates(
                         assembler,
@@ -607,7 +627,30 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
                     )?;
                 }
                 assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
-                assembler.branch(vector)?;
+                if let Some(relation_batch) = complete_pair_persistent_relation_batch {
+                    // Dense first-byte decoys alternate primary+exact and
+                    // exact-only batches. A sparse false primary can trigger
+                    // at most two extra exact batches before the primary
+                    // projection is rearmed. Recheck the full +64 bound
+                    // before every overlapping final load.
+                    assembler.branch_zero_w(REVERSE_RELATION_PHASE, vector)?;
+                    assembler.instruction(aarch64_sub_w_imm(
+                        REVERSE_RELATION_PHASE,
+                        REVERSE_RELATION_PHASE,
+                        1,
+                    )?)?;
+                    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+                    let batch_bytes = u16::from(maximum_scan_offset)
+                        .checked_add(AARCH64_BATCH_BYTES)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 complete-pair follow-up batch width",
+                        ))?;
+                    assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
+                    assembler.branch_cond(AARCH64_LO, vector)?;
+                    assembler.branch(relation_batch)?;
+                } else {
+                    assembler.branch(vector)?;
+                }
             } else {
                 assembler.branch(scalar)?;
             }
@@ -1020,6 +1063,7 @@ mod tests {
     #[test]
     fn seeded_reverse_persistent_registers_are_aapcs64_caller_saved() {
         for register in [
+            REVERSE_RELATION_PHASE,
             REVERSE_CLASS_MAP,
             REVERSE_FUEL,
             REVERSE_MINIMUM,

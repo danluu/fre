@@ -155365,6 +155365,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         const PAIR: &str = r"(?-u:(?:\xd4\xe1|\xd4\xeb|\xd5\xf0))";
         const RANGE_PAIR: &str = r"(?-u:(?:a[b-c]|d[e-f]))";
         const TRIPLE: &str = r"(?-u:(?:\xd4\x01\xe1|\xd4\x02\xeb|\xd5\x03\xf0))";
+        assert_eq!(
+            module_seeded_reverse_aarch64::COMPLETE_PAIR_FALSE_PRIMARY_FOLLOW_UP_BATCHES,
+            2,
+            "the emitted episode and linked boundary cases require two follow-ups",
+        );
         let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
         let aarch64 = Target::aarch64_macos().with_features(asimd).unwrap();
         let layout_for = |pattern: &str, output: OutputContract, target: Target| {
@@ -155385,6 +155390,26 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             )
             .unwrap()
             .1
+        };
+        let has_follow_up_episode = |code: &[u8]| {
+            let words = code
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let phase = module_seeded_reverse_aarch64::REVERSE_RELATION_PHASE;
+            let phase_step = aarch64_sub_w_imm(phase, phase, 1).unwrap();
+            words.contains(
+                &aarch64_movz_w(
+                    phase,
+                    module_seeded_reverse_aarch64::COMPLETE_PAIR_FALSE_PRIMARY_FOLLOW_UP_BATCHES,
+                )
+                .unwrap(),
+            )
+                && words.windows(3).any(|window| {
+                    window[0] & 0xff00_001f == (0x3400_0000 | u32::from(phase))
+                        && window[1] == phase_step
+                        && window[2] == aarch64_sub_x_reg(12, 3, 2).unwrap()
+                })
         };
 
         for output in [OutputContract::SelectedEnd, OutputContract::Span] {
@@ -155429,6 +155454,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .unwrap();
             assert!(!legacy.complete_pair_relation_persistent_banks);
             assert!(!legacy.complete_pair_relation_persistent_batch);
+            assert!(has_follow_up_episode(&emitted.code));
+            assert!(!has_follow_up_episode(&legacy.code));
             assert_ne!(emitted.code, legacy.code);
             assert_eq!(emitted.relocations, legacy.relocations);
             let mut incumbent = layout;
@@ -155476,6 +155503,15 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert!(exists.seeded_reverse.is_none_or(|reverse| {
             !reverse.complete_pair_relation_handoff_eligible
         }));
+        let exists_emission = lower_aarch64_dfa_for_operating_system_with_emission(
+            exists,
+            asimd,
+            OperatingSystem::Macos,
+            None,
+        )
+        .unwrap();
+        assert!(!exists_emission.complete_pair_relation_persistent_batch);
+        assert!(!has_follow_up_episode(&exists_emission.code));
 
         let range_pair = layout_for(RANGE_PAIR, OutputContract::Span, aarch64);
         let range_plan = range_pair
@@ -155494,6 +155530,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         .unwrap();
         assert!(range_emission.complete_pair_relation_persistent_banks);
         assert!(range_emission.complete_pair_relation_persistent_batch);
+        assert!(has_follow_up_episode(&range_emission.code));
 
         // Model the future-reachability seam where this authenticated handoff
         // control-flow shape carries an established frequency-gated batch.
@@ -160028,12 +160065,31 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .take(batch_threshold + 128)
                 .collect()
         };
-        cases.push((threshold_dense, 0, batch_threshold + 128));
+        cases.push((threshold_dense.clone(), 0, batch_threshold + 128));
+        // The first dense block is a proved false primary. These positions
+        // exercise the current batch's final lane, both exact-only follow-ups,
+        // and primary rearming after the bounded episode.
+        for start in [63_usize, 64, 65, 127, 128, 129, 191, 192] {
+            let mut haystack = threshold_dense.clone();
+            haystack[start..start + 2].copy_from_slice(&fixture);
+            cases.push((haystack, 0, batch_threshold + 128));
+        }
         let nonzero_start = 32_usize;
         let nonzero_end = nonzero_start + batch_threshold;
         let mut threshold_nonzero = vec![background; nonzero_end + 32];
         threshold_nonzero[nonzero_end - 2..nonzero_end].copy_from_slice(&fixture);
         cases.push((threshold_nonzero, nonzero_start, nonzero_end));
+        // With exactly 64 bytes left before the second follow-up, its +64
+        // overlapping load cannot run and the ordinary tail must find the
+        // match. One additional byte admits that second exact-only batch.
+        for extra in [0_usize, 1] {
+            let end = batch_threshold + extra;
+            let mut haystack = vec![background; end];
+            let primary_start = batch_threshold - 192 + primary_offset;
+            haystack[primary_start..primary_start + 64].fill(primary);
+            haystack[batch_threshold - 64..batch_threshold - 62].copy_from_slice(&fixture);
+            cases.push((haystack, 0, end));
+        }
 
         let directory = std::env::temp_dir().join(format!(
             "fre-aot-complete-pair-relation-{}-{fixture_index}",
