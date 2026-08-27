@@ -2979,6 +2979,7 @@ mod tests {
     static SEARCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DIRECT_SPAN_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DIRECT_SPAN_FILL_COUNTER_TEST_LOCK: Mutex<()> = Mutex::new(());
     static PREPARED_SPAN_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_EXACT_CAPACITY_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -5359,6 +5360,9 @@ mod tests {
 
     #[test]
     fn direct_iterator_crosses_native_fill_abi_once_per_refill() {
+        let _counter_guard = DIRECT_SPAN_FILL_COUNTER_TEST_LOCK
+            .lock()
+            .expect("direct Span-fill counter lock");
         DIRECT_SPAN_FILL_CALLS.store(0, Ordering::Relaxed);
         let haystack = vec![b'a'; NATIVE_SPAN_BUFFER_CAPACITY * 2 + 2];
         let mut matcher = native_matcher(one_byte_search, dense_direct_fill);
@@ -5375,6 +5379,9 @@ mod tests {
 
     #[test]
     fn direct_span_fill_boundary_fails_closed_before_or_after_one_raw_call() {
+        let _counter_guard = DIRECT_SPAN_FILL_COUNTER_TEST_LOCK
+            .lock()
+            .expect("direct Span-fill counter lock");
         DIRECT_SPAN_FILL_CALLS.store(0, Ordering::Relaxed);
         let mut state = NativeIterState::initial_at(0, 1).expect("valid initial state");
         let mut empty = [];
