@@ -37,7 +37,7 @@ use fre_kernels::{
 use crate::{
     BuildError, BuildReport, ByteMatch, CompatibilityProfile, Match, PlanKind, PortableBuilder,
     PortableCaptureNames, PortablePlan, PortableRegex, SearchAccounting, SearchError, SearchLimits,
-    SearchWindow,
+    SearchWindow, published_capture_names,
 };
 
 pub use fre_jit_aarch64::SearchBackendPolicy as QualifiedExactSearchBackendPolicy;
@@ -2317,7 +2317,7 @@ impl QualifiedExactSearchFacade {
     pub fn capture_names(&self) -> PortableCaptureNames<'_> {
         match &self.plan {
             QualifiedExactSearchFacadePlan::ExactLiteral(exact) => PortableCaptureNames {
-                names: exact.capture_names.iter(),
+                names: published_capture_names(&exact.capture_names).iter(),
             },
             QualifiedExactSearchFacadePlan::Portable(portable) => portable.capture_names(),
         }

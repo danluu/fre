@@ -148,15 +148,19 @@ fn capture_name_metadata_matches_pinned_bytes_across_every_portable_plan() {
         assert_eq!(actual_names.next(), None);
         assert_eq!(actual_names.next(), None);
 
-        let expected_storage = core::mem::size_of::<Option<Box<str>>>()
-            .checked_mul(expected.len())
-            .and_then(|slots| {
-                expected
-                    .iter()
-                    .flatten()
-                    .try_fold(slots, |total, name| total.checked_add(name.len()))
-            })
-            .expect("capture-name storage fixture fits usize");
+        let expected_storage = if expected == [None] {
+            0
+        } else {
+            core::mem::size_of::<Option<Box<str>>>()
+                .checked_mul(expected.len())
+                .and_then(|slots| {
+                    expected
+                        .iter()
+                        .flatten()
+                        .try_fold(slots, |total, name| total.checked_add(name.len()))
+                })
+                .expect("capture-name storage fixture fits usize")
+        };
         assert_eq!(
             fre.build_report().capture_name_storage_bytes,
             expected_storage,

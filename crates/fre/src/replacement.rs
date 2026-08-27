@@ -5,7 +5,7 @@ use crate::{
     AggregateCacheIdentity, AggregateExecutionDetails, AggregateExecutionSource,
     AggregateRunLimits, AggregateSpans, AggregateSpansRegex, Match, PortableFindIterError,
     PortableFindIterLimits, PortableFindIterRunLimits, PortableRegex, PortableSearchSession,
-    SearchError,
+    SearchError, published_capture_names,
 };
 
 /// A byte source accepted by the literal/no-expansion replacement facade.
@@ -755,8 +755,12 @@ impl PortableRegex {
                 actual: captures.len(),
             });
         }
-        let accounting =
-            capture_expansion_preflight(&self.capture_names, captures, replacement, limits)?;
+        let accounting = capture_expansion_preflight(
+            published_capture_names(&self.capture_names),
+            captures,
+            replacement,
+            limits,
+        )?;
 
         let mut output = Vec::new();
         output
@@ -768,7 +772,10 @@ impl PortableRegex {
             match piece {
                 CaptureTemplatePiece::Literal(bytes) => output.extend_from_slice(bytes),
                 CaptureTemplatePiece::Capture(reference) => {
-                    let index = capture_reference_index(&self.capture_names, reference);
+                    let index = capture_reference_index(
+                        published_capture_names(&self.capture_names),
+                        reference,
+                    );
                     if let Some(bytes) = index
                         .and_then(|index| captures.get(index))
                         .and_then(|capture| *capture)

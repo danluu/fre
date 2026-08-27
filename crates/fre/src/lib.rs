@@ -4955,6 +4955,17 @@ struct CaptureNameMetadata {
     storage_bytes: usize,
 }
 
+static IMPLICIT_CAPTURE_NAMES: [Option<Box<str>>; 1] = [None];
+
+#[inline(never)]
+fn published_capture_names(names: &[Option<Box<str>>]) -> &[Option<Box<str>>] {
+    if names.is_empty() {
+        &IMPLICIT_CAPTURE_NAMES
+    } else {
+        names
+    }
+}
+
 fn capture_slot_len(
     hir: &Hir,
     explicit_captures: usize,
@@ -5121,20 +5132,14 @@ fn capture_name_metadata(
     })
 }
 
-fn capture_free_name_metadata() -> Result<CaptureNameMetadata, BuildError> {
-    let mut names = Vec::new();
-    names
-        .try_reserve_exact(1)
-        .map_err(|_| BuildError::AllocationFailed {
-            structure: "capture-name slots",
-            additional: 1,
-        })?;
-    names.push(None);
-    Ok(CaptureNameMetadata {
-        names: names.into_boxed_slice(),
+fn capture_free_name_metadata() -> CaptureNameMetadata {
+    CaptureNameMetadata {
+        // Empty owns no allocation and is the private sentinel for the
+        // static implicit whole-match name published by the facade.
+        names: Box::default(),
         captures_len: 1,
-        storage_bytes: core::mem::size_of::<Option<Box<str>>>(),
-    })
+        storage_bytes: 0,
+    }
 }
 
 /// Per-search accounting with the selected plan kept explicit.
@@ -7864,7 +7869,7 @@ impl PortableBuilder {
             names: capture_names,
             captures_len,
             storage_bytes: capture_name_storage_bytes,
-        } = capture_free_name_metadata()?;
+        } = capture_free_name_metadata();
         let profile = CompatibilityProfile::RustBytes(self.profile.clone());
         let publication = RipgrepFlatLiteralPublication {
             source: context.source,
@@ -7957,7 +7962,7 @@ impl PortableBuilder {
             storage_bytes: capture_name_storage_bytes,
         } = match provenance {
             ParsedBuildProvenance::Canonical if explicit_captures == 0 => {
-                capture_free_name_metadata()?
+                capture_free_name_metadata()
             }
             ParsedBuildProvenance::Canonical => {
                 capture_name_metadata(&rust.hir, explicit_captures, syntax.hir_nodes)?
@@ -7968,7 +7973,7 @@ impl PortableBuilder {
                         "ripgrep capture-free receipt differs from HIR properties",
                     ));
                 }
-                capture_free_name_metadata()?
+                capture_free_name_metadata()
             }
         };
         let minimum_match_bytes = rust.hir.properties().minimum_len();
@@ -14285,7 +14290,7 @@ impl PortableRegex {
     #[must_use]
     pub fn capture_names(&self) -> PortableCaptureNames<'_> {
         PortableCaptureNames {
-            names: self.capture_names.iter(),
+            names: published_capture_names(&self.capture_names).iter(),
         }
     }
 
@@ -31217,10 +31222,7 @@ mod tests {
         assert_eq!(regex.captures_len(), 1);
         assert_eq!(regex.static_captures_len(), Some(1));
         assert_eq!(regex.capture_names().collect::<Vec<_>>(), vec![None]);
-        assert_eq!(
-            report.capture_name_storage_bytes,
-            core::mem::size_of::<Option<Box<str>>>()
-        );
+        assert_eq!(report.capture_name_storage_bytes, 0);
         // The authenticated flat handoff closes at 2,563 work while retaining
         // the same final words. Generic construction still uses the canonical
         // two-pass finite task machine, and a class-free HIR also skips the
@@ -31236,11 +31238,18 @@ mod tests {
         assert_eq!(raw.build_report(), regex.build_report());
         assert_eq!(raw.find(b"xxqzqzzqzqyy"), regex.find(b"xxqzqzzqzqyy"));
         assert_eq!(raw.find(b"xxxxxxxx"), regex.find(b"xxxxxxxx"));
+        let cloned = regex.clone();
+        assert_eq!(cloned.capture_names().collect::<Vec<_>>(), vec![None]);
+        assert_eq!(
+            cloned.build_report().charged_persistent_bytes,
+            report.charged_persistent_bytes,
+        );
         let exact = PortableBuilder::new("")
             .multi_line(true)
             .retained_find_iter(true)
             .limits(BuildLimits {
                 max_planner_work: report.planner_work,
+                max_persistent_bytes: report.charged_persistent_bytes,
                 ..BuildLimits::default()
             })
             .build_ripgrep_standard_literal_hir(&hir, usize::MAX)

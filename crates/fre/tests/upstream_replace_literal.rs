@@ -609,6 +609,14 @@ fn every_pinned_capture_replacement_template_expands_exactly() {
 }
 
 #[test]
+fn capture_free_template_expands_the_static_implicit_whole_match() {
+    assert_eq!(
+        assert_capture_template_matches_pinned("needle", b"xneedley", b"<$0>/${0}"),
+        1,
+    );
+}
+
+#[test]
 fn capture_template_grammar_matches_pinned_bytes_on_malformed_and_invalid_inputs() {
     let pattern = r"(?P<first>a)(?P<optional>b)?(?P<last>c)";
     let haystack = b"ac";

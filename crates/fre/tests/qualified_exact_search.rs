@@ -251,6 +251,8 @@ fn qualified_facade_session_value_projection_preserves_public_contracts() {
     let facade = PortableBuilder::new("0123456789abcdef")
         .build_qualified_exact_search(QUALIFIED_WORKLOAD)
         .expect("Candidate facade retains its exact portable owner");
+    assert_eq!(facade.capture_names().collect::<Vec<_>>(), vec![None]);
+    assert_eq!(facade.portable_build_report().capture_name_storage_bytes, 0);
     assert!(
         facade.portable_value_view().is_none(),
         "exact-literal facade must not expose a portable value view"

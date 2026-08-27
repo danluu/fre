@@ -45,17 +45,17 @@ fn capture_free_construction_skips_generic_capture_metadata() {
     assert_eq!(capture_free.captures_len(), 1);
     assert_eq!(capture_free.capture_names().collect::<Vec<_>>(), [None]);
     assert_eq!(capture_free.build_report().captures_len, 1);
-    assert_eq!(
-        capture_free.build_report().capture_name_storage_bytes,
-        core::mem::size_of::<Option<Box<str>>>()
-    );
+    assert_eq!(capture_free.build_report().capture_name_storage_bytes, 0);
     assert_eq!(captured.as_str().as_ptr(), captured_source);
     assert_eq!(captured.captures_len(), 2);
     assert_eq!(captured.capture_names().collect::<Vec<_>>(), [None, None]);
     assert!(
-        capture_free_stats.allocations.saturating_add(12) <= captured_stats.allocations,
+        capture_free_stats.allocations.saturating_add(13) <= captured_stats.allocations,
         "capture-free construction retained generic metadata allocations: capture_free={capture_free_stats:?} captured={captured_stats:?}"
     );
+    // The removed capture-name slot would remain owned by the returned regex,
+    // so it increases the allocation gap without changing this deallocation
+    // gap measured before either regex is dropped.
     assert!(
         capture_free_stats.deallocations.saturating_add(12) <= captured_stats.deallocations,
         "capture-free construction retained generic metadata deallocations: capture_free={capture_free_stats:?} captured={captured_stats:?}"

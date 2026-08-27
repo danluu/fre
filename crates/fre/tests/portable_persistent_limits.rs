@@ -232,7 +232,7 @@ fn folded_plan_persistent_refusal_falls_through_without_exceeding_the_total_limi
 }
 
 #[test]
-fn source_and_capture_names_are_not_hidden_from_the_total_limit() {
+fn source_and_owned_capture_names_are_not_hidden_from_the_total_limit() {
     let plain = PortableBuilder::new("Sherlock")
         .unicode(false)
         .build()
@@ -242,15 +242,33 @@ fn source_and_capture_names_are_not_hidden_from_the_total_limit() {
         .build()
         .expect("named exact literal");
 
-    assert!(plain.build_report().capture_name_storage_bytes > 0);
-    assert!(
-        named.build_report().capture_name_storage_bytes
-            > plain.build_report().capture_name_storage_bytes
-    );
+    assert_eq!(plain.build_report().capture_name_storage_bytes, 0);
+    assert!(named.build_report().capture_name_storage_bytes > 0);
     assert!(
         named.build_report().charged_persistent_bytes
             > plain.build_report().charged_persistent_bytes
     );
+
+    let plain_needed = plain.build_report().charged_persistent_bytes;
+    let plain_exact = PortableBuilder::new("Sherlock")
+        .unicode(false)
+        .max_persistent_bytes(plain_needed)
+        .build()
+        .expect("capture-free exact persistent boundary");
+    assert_eq!(
+        plain_exact.clone().build_report().charged_persistent_bytes,
+        plain_needed,
+    );
+    let plain_error = PortableBuilder::new("Sherlock")
+        .unicode(false)
+        .max_persistent_bytes(plain_needed - 1)
+        .build()
+        .expect_err("capture-free one-below persistent boundary");
+    assert!(matches!(
+        plain_error,
+        BuildError::PersistentBytesLimit { needed, limit }
+            if needed == plain_needed && limit + 1 == needed
+    ));
 
     let needed = named.build_report().charged_persistent_bytes;
     let error = PortableBuilder::new("(?P<detective>Sherlock)")
