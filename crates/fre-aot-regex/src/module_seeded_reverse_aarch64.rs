@@ -141,6 +141,19 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             "AArch64 seeded reverse complete-pair handoff receipt is inconsistent",
         ));
     }
+    if let Some(receipt) = reverse.complete_pair_relation_registers
+        && !aarch64_complete_pair_relation_register_receipt_is_valid(
+            receipt,
+            layout,
+            use_asimd,
+            use_asimd_batch,
+            use_exact_asimd_lane,
+        )
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete-pair relation register receipt is inconsistent",
+        ));
+    }
     let complete_pair_relation = if reverse.complete_pair_relation_handoff_eligible {
         Some(layout.prefix_relation.ok_or(ObjectError::InvalidModule(
             "AArch64 seeded reverse complete-pair relation is absent",
@@ -149,6 +162,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
         None
     };
     let complete_pair_vector = complete_pair_relation.and_then(|relation| relation.vector_plan);
+    let complete_pair_registers = reverse.complete_pair_relation_registers;
     if use_asimd_batch && !use_asimd {
         return Err(ObjectError::InvalidModule(
             "AArch64 seeded reverse selected an ASIMD batch on a scalar target",
@@ -220,6 +234,16 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
                             "AArch64 seeded reverse filter constants",
                         ))?;
                 }
+            } else if complete_pair_registers.is_some() {
+                aarch64_emit_start_filter_constants(
+                    assembler,
+                    filter,
+                    AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT,
+                )?;
+                let relation = complete_pair_vector.ok_or(ObjectError::InvalidModule(
+                    "AArch64 persistent complete-pair registers lost their vector plan",
+                ))?;
+                aarch64_emit_complete_pair_relation_constants(assembler, relation)?;
             } else {
                 aarch64_emit_start_filter_constants(
                     assembler,
@@ -432,7 +456,11 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
                 filter,
                 0,
                 24,
-                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                if complete_pair_registers.is_some() {
+                    AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT
+                } else {
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT
+                },
             )?;
             aarch64_emit_candidate_any(assembler, 24)?;
             assembler.branch_cond(
@@ -511,14 +539,20 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             }
 
             assembler.bind(single_primary_hit)?;
-            aarch64_emit_prefix_relation_constants(assembler, relation)?;
-            aarch64_emit_prefix_relation_vector_test(assembler, relation)?;
+            if let Some(receipt) = complete_pair_registers {
+                aarch64_emit_complete_pair_relation_vector_test(assembler, relation, receipt)?;
+            } else {
+                aarch64_emit_prefix_relation_constants(assembler, relation)?;
+                aarch64_emit_prefix_relation_vector_test(assembler, relation)?;
+            }
             assembler.branch_cond(AARCH64_NE, single_hit)?;
-            aarch64_emit_start_filter_constants(
-                assembler,
-                filter,
-                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
-            )?;
+            if complete_pair_registers.is_none() {
+                aarch64_emit_start_filter_constants(
+                    assembler,
+                    filter,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            }
             assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
             assembler.branch(vector)?;
         } else {
@@ -802,6 +836,7 @@ mod tests {
             proves_match,
             first_endpoint_proves_no_earlier_match: proves_match,
             complete_pair_relation_handoff_eligible: false,
+            complete_pair_relation_registers: None,
         };
         let layout = NativeDfaLayout {
             transitions: TransitionLayout::DirectByte,

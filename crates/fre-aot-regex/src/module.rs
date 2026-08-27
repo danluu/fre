@@ -1566,6 +1566,9 @@ struct NativeDfaEmission {
     scanner: Option<NativeScannerEmission>,
     suffix_scanner: Option<NativeScannerEmission>,
     conjunction: Option<NativeVectorConjunctionEmission>,
+    /// Target-final proof that the width-two lazy verifier kept its primary
+    /// and complete-relation constants live in disjoint ASIMD banks.
+    complete_pair_relation_persistent_banks: bool,
     direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
 }
 
@@ -28208,6 +28211,16 @@ enum NativeSuffixReverseSeed {
     RootState(u32),
 }
 
+/// Target-final register-liveness receipt for the width-two complete-relation
+/// handoff. The suffix primary and exact relation constants remain live in
+/// disjoint caller-saved banks, so a false primary hit can rearm the incumbent
+/// scanner without rematerializing either bank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64CompletePairRelationRegisterReceipt {
+    primary_constant_count: u8,
+    relation_constant_count: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeSeededReverseLayout {
     class_map_offset: u32,
@@ -28232,6 +28245,10 @@ struct NativeSeededReverseLayout {
     /// lazily with that exact relation before handing them to the ordinary
     /// authoritative forward DFA.
     complete_pair_relation_handoff_eligible: bool,
+    /// Target-final AArch64 register-liveness receipt. This is installed only
+    /// after the selected suffix scanner is known to be the single-vector
+    /// ASIMD route and is revalidated by the emitter before use.
+    complete_pair_relation_registers: Option<Aarch64CompletePairRelationRegisterReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30351,6 +30368,34 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
     receipt_policy: NativeExactFiniteExistsCompleteDfaReceiptPolicy,
     allow_complete_pair_relation_handoff: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_register_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        allow_exact_pair,
+        receipt_policy,
+        allow_complete_pair_relation_handoff,
+        true,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test-only final register policy is part of the exact ordinary-lowering seam"
+)]
+fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_register_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+    receipt_policy: NativeExactFiniteExistsCompleteDfaReceiptPolicy,
+    allow_complete_pair_relation_handoff: bool,
+    allow_persistent_pair_registers: bool,
+) -> Result<Option<NativeLowering>, ObjectError> {
     let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
         .min(max_native_data_bytes);
@@ -30459,14 +30504,17 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
                 lower_x86_64_dfa_with_entry_contract(layout, target.features, entry_contract)?
             }
         },
-        Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
-            layout,
-            target.features,
-            target.operating_system,
-            sve_filter_plan,
-            sve_suffix_kind,
-            entry_contract,
-        )?,
+        Architecture::Aarch64 => {
+            lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+                layout,
+                target.features,
+                target.operating_system,
+                sve_filter_plan,
+                sve_suffix_kind,
+                entry_contract,
+                allow_persistent_pair_registers,
+            )?
+        }
     };
     // Scalar exact-set emitters remain available for backend correctness and
     // cross-target inspection, but publishing a moving no-row product through
@@ -30559,6 +30607,13 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
         && layout.seeded_reverse.is_some_and(|reverse| {
             reverse.complete_pair_relation_handoff_eligible
         });
+    if emission.complete_pair_relation_persistent_banks
+        && !complete_pair_relation_handoff_lowered
+    {
+        return Err(ObjectError::InvalidModule(
+            "persistent complete-pair registers have no lowered handoff",
+        ));
+    }
     let anchored_prefix_filter_bytes = layout
         .prefix_filter
         .map_or(0, |filter| filter.guaranteed_bytes);
@@ -32997,6 +33052,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                     first_endpoint_proves_no_earlier_match: machine
                         .first_endpoint_proves_no_earlier_match,
                     complete_pair_relation_handoff_eligible: false,
+                    complete_pair_relation_registers: None,
                 }),
                 bytes,
             )
@@ -52464,6 +52520,7 @@ fn lower_x86_64_dfa_with_entry_contract(
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
+        complete_pair_relation_persistent_banks: false,
         direct_search_trusted_core: direct_search_trusted_core_offset.map(|code_offset| {
             NativeDirectSearchTrustedCore {
                 code_offset,
@@ -72589,6 +72646,20 @@ const AARCH64_EXACT_FILTER_SCRATCH: u8 = 28;
 const AARCH64_VECTOR_FILTER_FIRST_CONSTANT: u8 = 1;
 const AARCH64_STANDALONE_FILTER_FIRST_CONSTANT: u8 = 16;
 const AARCH64_STANDALONE_FILTER_CONSTANTS: usize = 8;
+// The target-final complete-pair route retains relation constants in V16..V21
+// and primary constants in V22..V23. Relation sources/scratch use V0..V6;
+// primary probes use V0, V5, V6, V24, and V28. Both share only transient
+// registers after the preceding candidate mask is dead.
+const AARCH64_COMPLETE_PAIR_RELATION_FIRST_CONSTANT: u8 = 16;
+const AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT: u8 = 22;
+const AARCH64_COMPLETE_PAIR_RELATION_FIRST_SOURCE: u8 = 0;
+const AARCH64_COMPLETE_PAIR_RELATION_SECOND_SOURCE: u8 = 1;
+const AARCH64_COMPLETE_PAIR_RELATION_NEGATION_SCRATCH: u8 = 2;
+const AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH: u8 = 3;
+const AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH: u8 = 4;
+const AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE: u8 = 5;
+const AARCH64_COMPLETE_PAIR_RELATION_SECOND_PREDICATE: u8 = 6;
+const AARCH64_COMPLETE_PAIR_RELATION_CANDIDATES: u8 = 24;
 // Optimizing+Exists exact-pair suffix retries do not retain the endpoint
 // minimum used by other output contracts. Keep their one-way relation phase
 // in caller-saved W13 across the bounded verifier.
@@ -72639,6 +72710,147 @@ fn aarch64_prefix_relation_constant_register(
         ));
     }
     Ok(register)
+}
+
+fn aarch64_complete_pair_relation_constant_register(
+    logical_first_register: u8,
+    index: usize,
+) -> Result<u8, ObjectError> {
+    let logical_index = usize::from(
+        logical_first_register
+            .checked_sub(1)
+            .ok_or(ObjectError::InvalidModule(
+                "ASIMD prefix-relation logical constant is zero",
+            ))?,
+    )
+    .checked_add(index)
+    .ok_or(ObjectError::ArithmeticOverflow(
+        "ASIMD prefix-relation constant register",
+    ))?;
+    if logical_index >= usize::from(MAX_AARCH64_PREFIX_RELATION_CONSTANTS) {
+        return Err(ObjectError::InvalidModule(
+            "ASIMD prefix-relation logical constant escaped its budget",
+        ));
+    }
+    let register = logical_index
+        .checked_add(usize::from(
+            AARCH64_COMPLETE_PAIR_RELATION_FIRST_CONSTANT,
+        ))
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "ASIMD prefix-relation constant register",
+        ))?;
+    if !aarch64_caller_saved_simd(register) {
+        return Err(ObjectError::InvalidModule(
+            "ASIMD prefix-relation constant escaped caller-saved registers",
+        ));
+    }
+    Ok(register)
+}
+
+fn aarch64_complete_pair_relation_registers_are_disjoint(
+    receipt: Aarch64CompletePairRelationRegisterReceipt,
+) -> bool {
+    if receipt.primary_constant_count == 0
+        || receipt.primary_constant_count > 2
+        || receipt.relation_constant_count > MAX_AARCH64_PREFIX_RELATION_CONSTANTS
+    {
+        return false;
+    }
+    let primary_clobbers = [0_u8, 5, 6, 7, 24, 28, 29, 30, 31];
+    let relation_clobbers = [0_u8, 1, 2, 3, 4, 5, 6, 7, 24, 29, 30, 31];
+    let relation_constants = AARCH64_COMPLETE_PAIR_RELATION_FIRST_CONSTANT
+        ..AARCH64_COMPLETE_PAIR_RELATION_FIRST_CONSTANT + receipt.relation_constant_count;
+    let primary_constants = AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT
+        ..AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT + receipt.primary_constant_count;
+    relation_constants.clone().all(|register| {
+        aarch64_caller_saved_simd(register) && !primary_clobbers.contains(&register)
+    }) && primary_constants.clone().all(|register| {
+        aarch64_caller_saved_simd(register)
+            && !relation_clobbers.contains(&register)
+            && !relation_constants.contains(&register)
+    })
+}
+
+fn aarch64_complete_pair_relation_register_receipt_is_valid(
+    receipt: Aarch64CompletePairRelationRegisterReceipt,
+    layout: NativeDfaLayout,
+    use_asimd_suffix: bool,
+    use_asimd_suffix_batch: bool,
+    use_exact_asimd_lane: bool,
+) -> bool {
+    if !use_asimd_suffix
+        || use_asimd_suffix_batch
+        || !use_exact_asimd_lane
+        || layout.mandatory_teddy.is_some()
+    {
+        return false;
+    }
+    let Some(reverse) = layout.seeded_reverse else {
+        return false;
+    };
+    let Some(suffix) = layout.suffix_filter else {
+        return false;
+    };
+    let Some(plan) = layout
+        .prefix_relation
+        .and_then(|relation| (!relation.context_assertions).then_some(relation.vector_plan))
+        .flatten()
+    else {
+        return false;
+    };
+    let primary_constants = suffix.filter.constant_count();
+    if !reverse.complete_pair_relation_handoff_eligible
+        || suffix.minimum_width != 2
+        || plan.rectangles().is_empty()
+        || usize::from(receipt.primary_constant_count) != primary_constants
+        || receipt.relation_constant_count != plan.constant_count
+        || !aarch64_complete_pair_relation_registers_are_disjoint(receipt)
+    {
+        return false;
+    }
+    true
+}
+
+fn install_aarch64_complete_pair_relation_register_receipt(
+    layout: &mut NativeDfaLayout,
+    use_asimd_suffix: bool,
+    use_asimd_suffix_batch: bool,
+    use_exact_asimd_lane: bool,
+    allow_persistent_registers: bool,
+) -> Result<(), ObjectError> {
+    let expected = allow_persistent_registers
+        .then_some(layout.seeded_reverse)
+        .flatten()
+        .filter(|reverse| reverse.complete_pair_relation_handoff_eligible)
+        .and_then(|_| {
+            let suffix = layout.suffix_filter?;
+            let relation = layout.prefix_relation?.vector_plan?;
+            let receipt = Aarch64CompletePairRelationRegisterReceipt {
+                primary_constant_count: u8::try_from(suffix.filter.constant_count()).ok()?,
+                relation_constant_count: relation.constant_count,
+            };
+            aarch64_complete_pair_relation_register_receipt_is_valid(
+                receipt,
+                *layout,
+                use_asimd_suffix,
+                use_asimd_suffix_batch,
+                use_exact_asimd_lane,
+            )
+            .then_some(receipt)
+        });
+    let Some(reverse) = layout.seeded_reverse.as_mut() else {
+        return Ok(());
+    };
+    if reverse.complete_pair_relation_registers.is_some()
+        && reverse.complete_pair_relation_registers != expected
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete-pair relation register receipt is inconsistent",
+        ));
+    }
+    reverse.complete_pair_relation_registers = expected;
+    Ok(())
 }
 
 fn aarch64_emit_first_lane_constants(
@@ -73816,6 +74028,52 @@ fn aarch64_emit_prefix_relation_constants(
     Ok(())
 }
 
+fn aarch64_emit_complete_pair_relation_constants(
+    assembler: &mut Aarch64Assembler,
+    plan: NativePrefixRelationVectorPlan,
+) -> Result<(), ObjectError> {
+    if plan.constant_count > MAX_AARCH64_PREFIX_RELATION_CONSTANTS {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 prefix-relation constant budget",
+        ));
+    }
+    for rectangle in plan.rectangles() {
+        for predicate in [rectangle.first, rectangle.second] {
+            if predicate.any {
+                continue;
+            }
+            for (index, range) in predicate.filter.ranges().iter().enumerate() {
+                if predicate.filter.is_exact() {
+                    let register = aarch64_complete_pair_relation_constant_register(
+                        predicate.first_constant,
+                        index,
+                    )?;
+                    assembler.instruction(aarch64_movi_16b(register, range.start)?)?;
+                } else {
+                    let logical_low = index.checked_mul(2).ok_or(
+                        ObjectError::ArithmeticOverflow("AArch64 prefix-relation range constant"),
+                    )?;
+                    let low = aarch64_complete_pair_relation_constant_register(
+                        predicate.first_constant,
+                        logical_low,
+                    )?;
+                    let high = aarch64_complete_pair_relation_constant_register(
+                        predicate.first_constant,
+                        logical_low
+                            .checked_add(1)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "AArch64 prefix-relation range constant",
+                            ))?,
+                    )?;
+                    assembler.instruction(aarch64_movi_16b(low, range.start)?)?;
+                    assembler.instruction(aarch64_movi_16b(high, range.end)?)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn aarch64_emit_prefix_relation_predicate(
     assembler: &mut Aarch64Assembler,
     predicate: NativePrefixRelationPredicate,
@@ -73867,6 +74125,100 @@ fn aarch64_emit_prefix_relation_predicate(
     Ok(())
 }
 
+fn aarch64_emit_complete_pair_relation_predicate(
+    assembler: &mut Aarch64Assembler,
+    predicate: NativePrefixRelationPredicate,
+    source: u8,
+    destination: u8,
+) -> Result<(), ObjectError> {
+    if predicate.any {
+        assembler.instruction(aarch64_cmeq_16b(destination, source, source)?)?;
+        return Ok(());
+    }
+    if predicate.filter.is_exact() {
+        let first = aarch64_complete_pair_relation_constant_register(
+            predicate.first_constant,
+            0,
+        )?;
+        assembler.instruction(aarch64_cmeq_16b(destination, source, first)?)?;
+        for index in 1..predicate.filter.ranges().len() {
+            let constant = aarch64_complete_pair_relation_constant_register(
+                predicate.first_constant,
+                index,
+            )?;
+            assembler.instruction(aarch64_cmeq_16b(
+                AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+                source,
+                constant,
+            )?)?;
+            assembler.instruction(aarch64_orr_16b(
+                destination,
+                destination,
+                AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+            )?)?;
+        }
+    } else {
+        for (index, _) in predicate.filter.ranges().iter().enumerate() {
+            let logical_low = index.checked_mul(2).ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 prefix-relation range constant",
+            ))?;
+            let low = aarch64_complete_pair_relation_constant_register(
+                predicate.first_constant,
+                logical_low,
+            )?;
+            let high = aarch64_complete_pair_relation_constant_register(
+                predicate.first_constant,
+                logical_low
+                    .checked_add(1)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "AArch64 prefix-relation range constant",
+                    ))?,
+            )?;
+            assembler.instruction(aarch64_cmhs_16b(
+                AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                source,
+                low,
+            )?)?;
+            assembler.instruction(aarch64_cmhs_16b(
+                AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+                high,
+                source,
+            )?)?;
+            assembler.instruction(aarch64_and_16b(
+                AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                AARCH64_COMPLETE_PAIR_RELATION_PREDICATE_SCRATCH,
+            )?)?;
+            if index == 0 {
+                assembler.instruction(aarch64_orr_16b(
+                    destination,
+                    AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                    AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                )?)?;
+            } else {
+                assembler.instruction(aarch64_orr_16b(
+                    destination,
+                    destination,
+                    AARCH64_COMPLETE_PAIR_RELATION_RANGE_SCRATCH,
+                )?)?;
+            }
+        }
+    }
+    if predicate.negated {
+        assembler.instruction(aarch64_cmeq_16b(
+            AARCH64_COMPLETE_PAIR_RELATION_NEGATION_SCRATCH,
+            source,
+            source,
+        )?)?;
+        assembler.instruction(aarch64_eor_16b(
+            destination,
+            destination,
+            AARCH64_COMPLETE_PAIR_RELATION_NEGATION_SCRATCH,
+        )?)?;
+    }
+    Ok(())
+}
+
 /// Produce one exact rectangle-union mask without reducing it. V17..V21 are
 /// caller-saved temporaries and V1..V6 are bounded constants; the
 /// ABI-preserved V8..V15 bank is never touched.
@@ -73897,6 +74249,55 @@ fn aarch64_emit_prefix_relation_mask(
     Ok(())
 }
 
+fn aarch64_emit_complete_pair_relation_mask(
+    assembler: &mut Aarch64Assembler,
+    plan: NativePrefixRelationVectorPlan,
+    first_source: u8,
+    second_source: u8,
+    destination: u8,
+) -> Result<(), ObjectError> {
+    if plan.rectangles().is_empty() {
+        return Err(ObjectError::InvalidModule(
+            "empty AArch64 prefix-relation vector plan",
+        ));
+    }
+    for (index, rectangle) in plan.rectangles().iter().copied().enumerate() {
+        aarch64_emit_complete_pair_relation_predicate(
+            assembler,
+            rectangle.first,
+            first_source,
+            AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+        )?;
+        if !rectangle.second.any {
+            aarch64_emit_complete_pair_relation_predicate(
+                assembler,
+                rectangle.second,
+                second_source,
+                AARCH64_COMPLETE_PAIR_RELATION_SECOND_PREDICATE,
+            )?;
+            assembler.instruction(aarch64_and_16b(
+                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+                AARCH64_COMPLETE_PAIR_RELATION_SECOND_PREDICATE,
+            )?)?;
+        }
+        if index == 0 {
+            assembler.instruction(aarch64_orr_16b(
+                destination,
+                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+            )?)?;
+        } else {
+            assembler.instruction(aarch64_orr_16b(
+                destination,
+                destination,
+                AARCH64_COMPLETE_PAIR_RELATION_FIRST_PREDICATE,
+            )?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Produce the exact 16-lane rectangle-union mask in V24 and leave condition
 /// flags ready for the shared hit edge.
 fn aarch64_emit_prefix_relation_vector_test(
@@ -73909,6 +74310,36 @@ fn aarch64_emit_prefix_relation_vector_test(
     assembler.instruction(aarch64_load_q(16, 12)?)?;
     aarch64_emit_prefix_relation_mask(assembler, plan, 0, 16, 24)?;
     aarch64_emit_candidate_any(assembler, 24)
+}
+
+fn aarch64_emit_complete_pair_relation_vector_test(
+    assembler: &mut Aarch64Assembler,
+    plan: NativePrefixRelationVectorPlan,
+    receipt: Aarch64CompletePairRelationRegisterReceipt,
+) -> Result<(), ObjectError> {
+    if receipt.relation_constant_count != plan.constant_count {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 complete-pair relation register receipt changed constants",
+        ));
+    }
+    aarch64_emit_start_filter_address(assembler, 0)?;
+    assembler.instruction(aarch64_load_q(
+        AARCH64_COMPLETE_PAIR_RELATION_FIRST_SOURCE,
+        12,
+    )?)?;
+    aarch64_emit_start_filter_address(assembler, 1)?;
+    assembler.instruction(aarch64_load_q(
+        AARCH64_COMPLETE_PAIR_RELATION_SECOND_SOURCE,
+        12,
+    )?)?;
+    aarch64_emit_complete_pair_relation_mask(
+        assembler,
+        plan,
+        AARCH64_COMPLETE_PAIR_RELATION_FIRST_SOURCE,
+        AARCH64_COMPLETE_PAIR_RELATION_SECOND_SOURCE,
+        AARCH64_COMPLETE_PAIR_RELATION_CANDIDATES,
+    )?;
+    aarch64_emit_candidate_any(assembler, AARCH64_COMPLETE_PAIR_RELATION_CANDIDATES)
 }
 
 /// Produce four exact adjacent relation masks in V24..V27. The first byte
@@ -76463,6 +76894,32 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     sve_suffix_kind: Option<Aarch64SveFilterKind>,
     entry_contract: NativeDfaEntryContract,
 ) -> Result<NativeDfaEmission, ObjectError> {
+    lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+        layout,
+        features,
+        operating_system,
+        sve_filter_plan,
+        sve_suffix_kind,
+        entry_contract,
+        true,
+    )
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
+)]
+fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+    mut layout: NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    sve_suffix_kind: Option<Aarch64SveFilterKind>,
+    entry_contract: NativeDfaEntryContract,
+    allow_persistent_pair_registers: bool,
+) -> Result<NativeDfaEmission, ObjectError> {
     if !native_default_exception_layout_is_valid(&layout) {
         return Err(ObjectError::InvalidModule(
             "AArch64 default-exception layout shape",
@@ -76719,6 +77176,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     // AArch64 retains SIMD block rejection and refines a hit scalarly. This
     // target cost policy applies to every graph-derived filter uniformly.
     let use_exact_asimd_lane = aarch64_use_exact_first_lane(operating_system);
+    install_aarch64_complete_pair_relation_register_receipt(
+        &mut layout,
+        use_asimd_suffix,
+        use_asimd_suffix_batch,
+        use_exact_asimd_lane,
+        allow_persistent_pair_registers,
+    )?;
     let vector_filter = if prefix_relation_vector.is_some() {
         None
     } else {
@@ -77994,6 +78458,9 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
+        complete_pair_relation_persistent_banks: layout.seeded_reverse.is_some_and(|reverse| {
+            reverse.complete_pair_relation_registers.is_some()
+        }),
         direct_search_trusted_core: direct_search_trusted_core_offset.map(|code_offset| {
             NativeDirectSearchTrustedCore {
                 code_offset,
@@ -154597,6 +155064,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             let layout = layout_for(PAIR, output, aarch64);
             let reverse = layout.seeded_reverse.expect("fixed-pair reverse sidecar");
             assert!(reverse.complete_pair_relation_handoff_eligible);
+            assert!(reverse.complete_pair_relation_registers.is_none());
             assert!(!layout.initial_pending);
             assert!(layout.start_scanner_preserves_pending);
             assert!(layout.prefix_relation.is_some_and(|relation| {
@@ -154611,14 +155079,28 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     && suffix.scalar_filter.is_none()
             }));
 
-            let emitted = lower_aarch64_dfa_for_operating_system(
+            let emitted = lower_aarch64_dfa_for_operating_system_with_emission(
                 layout,
                 asimd,
                 OperatingSystem::Macos,
                 None,
             )
-            .unwrap()
-            .0;
+            .unwrap();
+            assert!(emitted.complete_pair_relation_persistent_banks);
+            let legacy =
+                lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+                    layout,
+                    asimd,
+                    OperatingSystem::Macos,
+                    None,
+                    None,
+                    NativeDfaEntryContract::Public,
+                    false,
+                )
+                .unwrap();
+            assert!(!legacy.complete_pair_relation_persistent_banks);
+            assert!(emitted.code.len() < legacy.code.len());
+            assert_eq!(emitted.relocations, legacy.relocations);
             let mut incumbent = layout;
             let mut incumbent_reverse = reverse;
             incumbent_reverse.complete_pair_relation_handoff_eligible = false;
@@ -154631,13 +155113,13 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             )
             .unwrap()
             .0;
-            assert!(emitted.len() > incumbent.len());
+            assert!(emitted.code.len() > incumbent.len());
             let words = |code: &[u8]| {
                 code.chunks_exact(4)
                     .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
                     .collect::<Vec<_>>()
             };
-            let emitted = words(&emitted);
+            let emitted = words(&emitted.code);
             let incumbent = words(&incumbent);
             for instruction in [
                 aarch64_load_halfword_reg(8, 0, 2).unwrap(),
@@ -154673,6 +155155,123 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             ))
         ));
 
+        let mut forged_registers = layout_for(PAIR, OutputContract::Span, aarch64);
+        let forged_suffix = forged_registers.suffix_filter.unwrap();
+        assert!(!use_aarch64_filter_batch(forged_suffix.filter));
+        install_aarch64_complete_pair_relation_register_receipt(
+            &mut forged_registers,
+            true,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        let mut forged_reverse = forged_registers.seeded_reverse.unwrap();
+        let mut forged_receipt = forged_reverse
+            .complete_pair_relation_registers
+            .expect("single-vector pair receipt");
+        assert_eq!(forged_receipt.primary_constant_count, 2);
+        assert!(forged_receipt.relation_constant_count <= 6);
+        assert!(aarch64_complete_pair_relation_registers_are_disjoint(
+            forged_receipt
+        ));
+        assert_eq!(
+            aarch64_filter_constant_register(
+                AARCH64_COMPLETE_PAIR_PRIMARY_FIRST_CONSTANT,
+                0,
+            )
+            .unwrap(),
+            22,
+        );
+        assert_eq!(
+            aarch64_complete_pair_relation_constant_register(1, 0).unwrap(),
+            16,
+        );
+        forged_receipt.primary_constant_count -= 1;
+        forged_reverse.complete_pair_relation_registers = Some(forged_receipt);
+        forged_registers.seeded_reverse = Some(forged_reverse);
+        assert!(matches!(
+            lower_aarch64_dfa_for_operating_system(
+                forged_registers,
+                asimd,
+                OperatingSystem::Macos,
+                None,
+            ),
+            Err(ObjectError::InvalidModule(
+                "AArch64 complete-pair relation register receipt is inconsistent"
+            ))
+        ));
+
+        let mut batch_decline = layout_for(PAIR, OutputContract::Span, aarch64);
+        install_aarch64_complete_pair_relation_register_receipt(
+            &mut batch_decline,
+            true,
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(batch_decline.seeded_reverse.is_some_and(|reverse| {
+            reverse.complete_pair_relation_handoff_eligible
+                && reverse.complete_pair_relation_registers.is_none()
+        }));
+
+        let mut crowded_primary = layout_for(PAIR, OutputContract::Span, aarch64);
+        let mut crowded_suffix = crowded_primary.suffix_filter.unwrap();
+        let extra = usize::from(crowded_suffix.filter.range_count);
+        crowded_suffix.filter.ranges[extra] = NativeByteRange {
+            start: 0xff,
+            end: 0xff,
+        };
+        crowded_suffix.filter.range_count += 1;
+        crowded_suffix.filter.candidate_bytes += 1;
+        assert!(crowded_suffix.filter.constant_count() > 2);
+        crowded_primary.suffix_filter = Some(crowded_suffix);
+        let crowded_relation_constants = crowded_primary
+            .prefix_relation
+            .unwrap()
+            .vector_plan
+            .unwrap()
+            .constant_count;
+        assert!(!aarch64_complete_pair_relation_register_receipt_is_valid(
+            Aarch64CompletePairRelationRegisterReceipt {
+                primary_constant_count: u8::try_from(
+                    crowded_suffix.filter.constant_count(),
+                )
+                .unwrap(),
+                relation_constant_count: crowded_relation_constants,
+            },
+            crowded_primary,
+            true,
+            false,
+            true,
+        ));
+        let crowded_selected =
+            lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+                crowded_primary,
+                asimd,
+                OperatingSystem::Macos,
+                None,
+                None,
+                NativeDfaEntryContract::Public,
+                true,
+            )
+            .unwrap();
+        let crowded_incumbent =
+            lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+                crowded_primary,
+                asimd,
+                OperatingSystem::Macos,
+                None,
+                None,
+                NativeDfaEntryContract::Public,
+                false,
+            )
+            .unwrap();
+        assert!(!crowded_selected.complete_pair_relation_persistent_banks);
+        assert_eq!(crowded_selected.code, crowded_incumbent.code);
+        assert_eq!(crowded_selected.relocations, crowded_incumbent.relocations);
+
         let partial_compiled = compile_partial_loop(aarch64, OutputContract::Span);
         let partial = build_native_dfa_table_for_target_with_cost_model_data_limit_and_optional_policy(
             partial_compiled
@@ -154705,6 +155304,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             (
                 "width-three",
                 layout_for(TRIPLE, OutputContract::Span, aarch64),
+                aarch64,
+            ),
+            (
+                "utf8-width-two",
+                layout_for("(?:é|ñ)", OutputContract::Span, aarch64),
                 aarch64,
             ),
             ("partial", partial, aarch64),
@@ -154748,6 +155352,51 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         let selected_reverse = selected.module().has_synchronizing_accept_reverse();
         let selected_exact_pair = selected.module().has_exact_pair_suffix();
         let native_data_limit = SlowAotLimits::default().max_native_data_bytes;
+        let legacy_lowering =
+            lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_register_policy(
+                selected.program().native_dfa_view().unwrap(),
+                target,
+                NativeDfaEntryContract::Public,
+                native_data_limit,
+                selected_reverse,
+                selected_exact_pair,
+                NativeExactFiniteExistsCompleteDfaReceiptPolicy::None,
+                true,
+                false,
+            )
+            .unwrap()
+            .expect("legacy lazy complete-pair lowering");
+        assert!(legacy_lowering.complete_pair_relation_handoff_lowered);
+        assert_eq!(
+            selected.module().sections[PROGRAM_SECTION].data.as_ref(),
+            legacy_lowering.data.as_slice(),
+            "persistent registers must not alter native data"
+        );
+        let legacy = CompiledModule::lower_serialized_with_prelowered(
+            selected.program().serialize().unwrap(),
+            Some(legacy_lowering),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            target,
+        )
+        .unwrap();
+        assert!(legacy.has_complete_pair_relation_handoff());
+        assert!(
+            selected.module().sections[TEXT_SECTION].data.len()
+                < legacy.sections[TEXT_SECTION].data.len(),
+            "persistent registers must strictly shrink the selected text"
+        );
         let incumbent =
             CompiledModule::lower_ordinary_complete_dfa_with_suffix_and_relation_handoff_policy(
                 selected.program(),
@@ -154765,6 +155414,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             "the text-only verifier must not consume native-data budget"
         );
         let format = ObjectFormat::for_target(target);
+        let legacy_object = emit_object(&legacy, format, usize::MAX).unwrap();
+        assert!(
+            selected.object().len() <= legacy_object.len(),
+            "persistent registers must not grow the emitted object"
+        );
         let incumbent_object = emit_object(&incumbent, format, usize::MAX).unwrap();
         assert!(incumbent_object.len() < selected.object().len());
 
@@ -158886,6 +159540,18 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 }),
                 output != OutputContract::Exists,
                 "unexpected complete-pair receipt for {output:?}"
+            );
+            let target_emission = lower_aarch64_dfa_for_operating_system_with_emission(
+                layout,
+                features,
+                OperatingSystem::Macos,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                target_emission.complete_pair_relation_persistent_banks,
+                output != OutputContract::Exists,
+                "unexpected persistent-bank receipt for {output:?}"
             );
             let symbol = compiled.module().entry_symbol();
             writeln!(
