@@ -38,7 +38,7 @@ use first_candidate_build::FirstCandidateRegistryBuild;
 use lf_line_witness_build::MatchingLfLineWitnessRegistryBuild;
 use registry_key::manifest_profile_key;
 
-const ENABLE_MATCHING_LF_LINE_WITNESS: bool = false;
+const ENABLE_MATCHING_LF_LINE_WITNESS: bool = true;
 
 #[allow(
     clippy::too_many_lines,
