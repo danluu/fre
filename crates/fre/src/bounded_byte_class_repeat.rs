@@ -7,7 +7,8 @@
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
 use fre_kernels::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
-    DispatchPolicy, SimdDispatchContext, classify_byte_delta_16,
+    DispatchPolicy, SimdDispatchContext, classify_byte_delta_16, classify_byte_set1_16,
+    classify_byte_set2_16, classify_byte_set3_16,
 };
 use regex_syntax::hir::{Class, Hir, HirKind};
 
@@ -115,6 +116,9 @@ mod ordinary_count_mode_probe {
 
 #[derive(Clone, Copy)]
 enum MemberMaskMode<'a> {
+    One(u8),
+    Two([u8; 2]),
+    Three([u8; 3]),
     Range {
         origin: u8,
         maximum_delta: u8,
@@ -129,6 +133,11 @@ enum MemberMaskMode<'a> {
 impl<'a> MemberMaskMode<'a> {
     fn from_owner(owner: &'a Owner) -> Option<Self> {
         match owner.member_seek {
+            SetSeek::One(member) => Some(Self::One(member)),
+            SetSeek::Two(first, second) => Some(Self::Two([first, second])),
+            SetSeek::Three(first, second, third) => {
+                Some(Self::Three([first, second, third]))
+            }
             SetSeek::Range {
                 origin,
                 maximum_delta,
@@ -145,16 +154,16 @@ impl<'a> MemberMaskMode<'a> {
                     .expect("a classified member seek retains its classifier"),
                 inverted,
             }),
-            SetSeek::Constant(_)
-            | SetSeek::One(_)
-            | SetSeek::Two(_, _)
-            | SetSeek::Three(_, _, _) => None,
+            SetSeek::Constant(_) => None,
         }
     }
 
     #[inline]
     fn classify_16(self, block: &[u8; BYTE_SET_BLOCK_BYTES]) -> u16 {
         match self {
+            Self::One(member) => classify_byte_set1_16(member, block).member_mask(),
+            Self::Two(members) => classify_byte_set2_16(members, block).member_mask(),
+            Self::Three(members) => classify_byte_set3_16(members, block).member_mask(),
             Self::Range {
                 origin,
                 maximum_delta,
@@ -176,6 +185,9 @@ impl<'a> MemberMaskMode<'a> {
     #[inline]
     fn contains(self, byte: u8) -> bool {
         match self {
+            Self::One(member) => byte == member,
+            Self::Two(members) => members.contains(&byte),
+            Self::Three(members) => members.contains(&byte),
             Self::Range {
                 origin,
                 maximum_delta,
@@ -1405,7 +1417,10 @@ mod tests {
             }
         );
         assert!(plan.owner().classifier.is_none());
-        assert!(MemberMaskMode::from_owner(plan.owner()).is_none());
+        assert!(matches!(
+            MemberMaskMode::from_owner(plan.owner()),
+            Some(MemberMaskMode::One(b'a'))
+        ));
 
         let small_holey = build("(?-u:[ac]){2,5}");
         let PortablePlan::BoundedByteClassRepeat(plan) = &small_holey.plan else {
@@ -1424,7 +1439,10 @@ mod tests {
         assert!(!classifier.set().contains(b'a'));
         assert!(classifier.set().contains(b'b'));
         assert!(!classifier.set().contains(b'c'));
-        assert!(MemberMaskMode::from_owner(plan.owner()).is_none());
+        assert!(matches!(
+            MemberMaskMode::from_owner(plan.owner()),
+            Some(MemberMaskMode::Two([b'a', b'c']))
+        ));
 
         let small_holey_three = build("(?-u:[ace]){2,5}");
         let PortablePlan::BoundedByteClassRepeat(plan) = &small_holey_three.plan else {
@@ -1435,7 +1453,10 @@ mod tests {
             SetSeek::Three(b'a', b'c', b'e')
         );
         assert!(plan.owner().classifier.is_some());
-        assert!(MemberMaskMode::from_owner(plan.owner()).is_none());
+        assert!(matches!(
+            MemberMaskMode::from_owner(plan.owner()),
+            Some(MemberMaskMode::Three([b'a', b'c', b'e']))
+        ));
     }
 
     #[test]
@@ -1985,6 +2006,13 @@ mod tests {
     #[test]
     fn member_mask_run_finder_matches_accounted_across_block_boundaries() {
         let patterns = [
+            "a{2,5}",
+            "a{2,5}?",
+            "(?-u:[ac]){2,5}",
+            "(?-u:[ac]){2,5}?",
+            "(?-u:[ace]){3,7}",
+            "(?-u:[ace]){3,7}?",
+            "(?-u:[ac]){17,33}",
             "(?-u:[a-z]){17,33}",
             "(?-u:[a-z]){17,33}?",
             "(?-u:[a-z]){33,48}",
