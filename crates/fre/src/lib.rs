@@ -18938,6 +18938,27 @@ pub struct PortableOrdinarySession<'a> {
     plan: PortableOrdinarySessionPlan<'a>,
 }
 
+impl PortableOrdinarySession<'_> {
+    /// Whether this session is bound to a positive-width literal-set engine
+    /// whose selected-end count is total for every valid window.
+    ///
+    /// This is a narrow embedding receipt: it deliberately excludes other
+    /// ordinary plans even when their current count implementation may also
+    /// be total.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn supports_literal_set_selected_end_count(&self) -> bool {
+        matches!(
+            &self.plan,
+            PortableOrdinarySessionPlan::PackedLiteralSet { .. }
+                | PortableOrdinarySessionPlan::LiteralSetDfa { .. }
+                | PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa { .. }
+                | PortableOrdinarySessionPlan::LiteralSetCompact { .. }
+                | PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii { .. }
+        )
+    }
+}
+
 #[derive(Debug)]
 enum PortableOrdinaryLiteralSetEngine<'a> {
     Unbound,
