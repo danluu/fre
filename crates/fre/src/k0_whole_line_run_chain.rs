@@ -127,7 +127,6 @@ impl<'a> Engine<'a> {
         Self { plan, fallback }
     }
 
-    #[inline]
     pub(crate) fn is_match_at(
         &mut self,
         haystack: &[u8],
@@ -137,7 +136,6 @@ impl<'a> Engine<'a> {
             .map(|end| end.is_some())
     }
 
-    #[inline]
     pub(crate) fn first_acceptance_at(
         &mut self,
         haystack: &[u8],
@@ -156,7 +154,6 @@ impl<'a> Engine<'a> {
         }
     }
 
-    #[inline]
     pub(crate) fn find_at(
         &mut self,
         haystack: &[u8],
@@ -177,7 +174,6 @@ impl<'a> Engine<'a> {
         }
     }
 
-    #[inline]
     pub(crate) fn try_visit_spans_at<E>(
         &mut self,
         haystack: &[u8],
@@ -222,7 +218,6 @@ impl<'a> Engine<'a> {
         }
     }
 
-    #[inline]
     pub(crate) fn count_at(&mut self, haystack: &[u8], start: usize) -> Result<u64, K0SearchError> {
         match self.plan.route_at(haystack, start) {
             Route::CompleteMiss => Ok(0),
@@ -268,7 +263,6 @@ impl Plan {
         3
     }
 
-    #[inline]
     pub(crate) fn try_is_match_full(&self, haystack: &[u8]) -> Option<bool> {
         match self.route_at(haystack, 0) {
             Route::CompleteMiss => Some(false),
@@ -283,7 +277,6 @@ impl Plan {
         }
     }
 
-    #[inline]
     pub(crate) fn try_find_full(&self, haystack: &[u8]) -> Option<Option<(usize, usize)>> {
         match self.route_at(haystack, 0) {
             Route::CompleteMiss => Some(None),
@@ -328,7 +321,6 @@ impl Plan {
         }
     }
 
-    #[inline]
     fn route_at(&self, haystack: &[u8], start: usize) -> Route {
         let Some(mut search) = self.first_searchable_line_start(haystack, start) else {
             return Route::CompleteMiss;
