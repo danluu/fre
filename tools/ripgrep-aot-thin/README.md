@@ -129,6 +129,36 @@ FRE_RIPGREP_AOT_PATTERNS_FILE=testdata/public-first-candidate.tsv \
   cargo test -p fre-ripgrep-aot-thin
 ```
 
+## Matching-LF-line witness endpoint
+
+The same Optimizing/Exists build transaction considers a distinct stateless
+`MATCHING_LF_LINE_WITNESS_SPECS` registry. Its independent source pass admits
+only assertion-free exact finite byte languages with at least one member,
+where every member is nonempty and contains no LF. It records a raw-free
+language digest, member count, total bytes, and minimum/maximum width. Width-one
+languages are safe to prove but may be declined by the compiler.
+
+A row is published only when the compiler supplies the complete-DFA trusted
+core strategy and the module report agrees with the compile receipt, serialized
+program, ordinary entry, success-edge route counts, wrapper, endpoint symbol,
+native code, relocations, target, call-free property, and complete object. The
+generated registry contains no regex source or finite-language member bytes.
+
+Call `AotMatchingLfLineWitnessFactory::select` with the ordinary `(mode,
+output, pattern, case_insensitive)` tuple before obtaining a haystack.
+Unsupported routes and absent or structurally declined rows return `Ok(None)`;
+an ambiguous or stale present receipt is a raw-free terminal error.
+`find(&[u8])` returns `AotMatchingLfLineWitnessOutcome::ConfirmedMiss` or
+`Candidate { position }`. The miss alone is authoritative. A candidate is one
+byte in an LF-delimited line that may contain a match, so stock ripgrep must
+still decide the line and produce any spans or captures. Native status errors,
+the wrong sentinel shape, and positions outside the supplied haystack or on an
+LF delimiter are terminal after source access.
+
+The finite alternation in `testdata/public-first-candidate.tsv` is a public
+positive shape for this endpoint while remaining an intentional decline for
+the singleton-only endpoint.
+
 ## Opt-in Exact64 set prefilter
 
 The static multi-pattern registry is a separate additive opt-in. With the

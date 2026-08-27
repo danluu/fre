@@ -559,7 +559,10 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     // whose W8 cell exists only after a table load.
     if reverse.initial_reaches_start {
         if proven_exists {
-            assembler.branch(matched)?;
+            assembler.branch_lf_line_success(
+                matched,
+                NativeDirectSearchLfLineRoute::AcceptSeededReverseInsideMatchOffset,
+            )?;
         } else {
             assembler.instruction(aarch64_cmp_x(REVERSE_CURSOR, REVERSE_MINIMUM)?)?;
             assembler.branch_cond(AARCH64_HS, reverse_loop)?;
@@ -591,7 +594,10 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
 
     assembler.bind(record_start)?;
     if proven_exists {
-        assembler.branch(matched)?;
+        assembler.branch_lf_line_success(
+            matched,
+            NativeDirectSearchLfLineRoute::AcceptSeededReverseInsideMatchOffset,
+        )?;
     } else {
         assembler.instruction(aarch64_and_low_31(8, 8)?)?;
         assembler.instruction(aarch64_cmp_x(REVERSE_CURSOR, REVERSE_MINIMUM)?)?;

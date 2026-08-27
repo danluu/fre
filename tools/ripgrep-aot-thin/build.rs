@@ -19,11 +19,13 @@ mod build_target;
 mod exact64_set_build;
 mod first_candidate_build;
 mod first_candidate_receipt;
+mod lf_line_witness_build;
+mod lf_line_witness_receipt;
 mod registry_key;
 
 use build_proof::{
-    exact_crlf_free_finite_language, exact_nonempty_lf_free_singleton_literal,
-    ripgrep_grep_count_profile,
+    exact_crlf_free_finite_language, exact_nonempty_lf_free_finite_language_proof,
+    exact_nonempty_lf_free_singleton_literal, ripgrep_grep_count_profile,
 };
 use build_support::{
     BuildMode, BuildOutput, EXACT64_SETS_FILE_ENV, PATTERNS_FILE_ENV, VARIANTS_ENV, VariantPolicy,
@@ -32,6 +34,7 @@ use build_support::{
 use build_target::{CARGO_TARGET_FEATURE_ENV, FEATURES_ENV, selected_features};
 use exact64_set_build::generate as generate_exact64_sets;
 use first_candidate_build::FirstCandidateRegistryBuild;
+use lf_line_witness_build::MatchingLfLineWitnessRegistryBuild;
 use registry_key::manifest_profile_key;
 
 #[allow(
@@ -45,6 +48,8 @@ fn main() {
     println!("cargo:rerun-if-changed=exact64_set_build.rs");
     println!("cargo:rerun-if-changed=first_candidate_build.rs");
     println!("cargo:rerun-if-changed=first_candidate_receipt.rs");
+    println!("cargo:rerun-if-changed=lf_line_witness_build.rs");
+    println!("cargo:rerun-if-changed=lf_line_witness_receipt.rs");
     println!("cargo:rerun-if-changed=registry_key.rs");
     println!("cargo:rerun-if-env-changed={FEATURES_ENV}");
     println!("cargo:rerun-if-env-changed={CARGO_TARGET_FEATURE_ENV}");
@@ -121,6 +126,7 @@ fn main() {
     let mut grep_count_rows = String::new();
     let mut grep_count_admitted = 0_usize;
     let mut first_candidates = FirstCandidateRegistryBuild::new();
+    let mut matching_lf_line_witnesses = MatchingLfLineWitnessRegistryBuild::new();
     let mut objects = Vec::new();
 
     for pattern in &patterns {
@@ -156,6 +162,12 @@ fn main() {
                     && output == OutputContract::Exists)
                     .then(|| exact_nonempty_lf_free_singleton_literal(&pattern.source, &profile))
                     .flatten();
+                let independent_lf_line_witness_proof = (mode == CompileMode::Optimizing
+                    && output == OutputContract::Exists)
+                    .then(|| {
+                        exact_nonempty_lf_free_finite_language_proof(&pattern.source, &profile)
+                    })
+                    .flatten();
                 let request = CompileRequest::new(pattern.source.clone(), target)
                     .profile(profile)
                     .mode(mode)
@@ -178,6 +190,12 @@ fn main() {
                         target,
                         &compiled,
                         independent_first_candidate_literal.as_deref(),
+                    );
+                    matching_lf_line_witnesses.consider(
+                        pattern,
+                        target,
+                        &compiled,
+                        independent_lf_line_witness_proof,
                     );
                 }
                 let has_prepared_entry = compiled.module().prepared_entry_symbol().is_some();
@@ -517,6 +535,11 @@ fn main() {
         first_candidates.finish(target, public_first_candidate_fixture_selected),
     )
     .expect("write generated exact-singleton first-candidate registry");
+    fs::write(
+        out_dir.join("lf_line_witness_registry.rs"),
+        matching_lf_line_witnesses.finish(target, public_first_candidate_fixture_selected),
+    )
+    .expect("write generated matching-LF-line witness registry");
     let exact64_generated = generate_exact64_sets(
         &exact64_sets,
         target,

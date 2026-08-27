@@ -13,6 +13,7 @@
 #define FRE_AOT_REGEX_STATUS_PARTIAL_PREFLIGHT_ENTER 6u
 #define FRE_AOT_REGEX_STATUS_SUCCESS 0u
 #define FRE_AOT_REGEX_EXACT_SINGLETON_FIRST_CANDIDATE_MISS UINT64_MAX
+#define FRE_AOT_REGEX_MATCHING_LF_LINE_WITNESS_MISS UINT64_MAX
 #define FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES 32u
 #define FRE_AOT_REGEX_PARTIAL_ENTRY_BYPASS 0u
 #define FRE_AOT_REGEX_PARTIAL_ENTRY_ENTER 1u
@@ -152,6 +153,23 @@ typedef uint32_t (*FreAotRegexExactSingletonFirstCandidateV1)(
     const uint8_t *haystack_ptr,
     size_t haystack_len,
     uint64_t *inclusive_final_byte_out);
+
+/*
+ * Whole-haystack matching-LF-line witness endpoint. Status 0 publishes a byte
+ * offset on an LF-delimited line known to contain a match, or
+ * FRE_AOT_REGEX_MATCHING_LF_LINE_WITNESS_MISS. A hit is a candidate line
+ * witness, not an exact match boundary or inclusive final byte. Every nonzero
+ * status leaves matching_line_byte_out untouched.
+ *
+ * haystack_ptr is nonnull even when haystack_len is zero and remains readable
+ * for haystack_len bytes; haystack_len is in the signed address domain.
+ * matching_line_byte_out is nonnull, naturally aligned, writable for one
+ * uint64_t, and disjoint from the haystack extent for the complete call.
+ */
+typedef uint32_t (*FreAotRegexMatchingLfLineWitnessV1)(
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    uint64_t *matching_line_byte_out);
 
 /*
  * Full-haystack match reducers for an exclusively prepared Span program.

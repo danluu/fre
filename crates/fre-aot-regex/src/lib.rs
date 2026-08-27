@@ -131,6 +131,10 @@ pub use module::{
     EXACT_SINGLETON_FIRST_CANDIDATE_MISS, ExactSingletonFirstCandidateAbi,
     ExactSingletonFirstCandidateAotReport, ExactSingletonFirstCandidateCursorRegister,
     ExactSingletonFirstCandidateSemantics, ExactSingletonFirstCandidateStrategy,
+    MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION, MATCHING_LF_LINE_WITNESS_MISS,
+    MatchingLfLineWitnessAbi, MatchingLfLineWitnessAotReport,
+    MatchingLfLineWitnessCursorRegister, MatchingLfLineWitnessSemantics,
+    MatchingLfLineWitnessStrategy,
     ExactFiniteExistsByteSetAotReport, ExactFiniteSelectedEndDfaBaselineReport,
     ExactFiniteSelectedEndGrepCountAotReport, ExactFiniteSelectedEndTeddyAotIsa,
     ExactFiniteSelectedEndTeddyAotReport,
@@ -777,6 +781,8 @@ pub struct CompileReceipt {
     /// Additive authenticated exact-singleton earliest-candidate endpoint,
     /// when explicitly requested with the independent Exists batch.
     pub exact_singleton_first_candidate_aot: Option<ExactSingletonFirstCandidateAotReport>,
+    /// Additive authenticated complete-DFA matching-line witness endpoint.
+    pub matching_lf_line_witness_aot: Option<MatchingLfLineWitnessAotReport>,
     /// Direct exact finite-language Teddy `SelectedEnd` leaf, when selected.
     pub exact_finite_selected_end_teddy_aot: Option<ExactFiniteSelectedEndTeddyAotReport>,
     /// Authenticated target-neutral and native-data geometry for a selected
@@ -1158,6 +1164,9 @@ pub fn compile_with_exact_finite_selected_end_grep_count(
     compiled.receipt.exact_singleton_first_candidate_aot = module
         .direct_exact_singleton_first_candidate_aot_report()
         .copied();
+    compiled.receipt.matching_lf_line_witness_aot = module
+        .direct_matching_lf_line_witness_aot_report()
+        .copied();
     compiled.receipt.exact_finite_selected_end_teddy_aot =
         module.exact_finite_selected_end_teddy_aot_report().copied();
     compiled.receipt.ordered_finite_language_aot =
@@ -1249,6 +1258,66 @@ fn independent_exact_singleton_first_candidate_object_outcome(
     }
 }
 
+/// Preserve complete-DFA witness append failure provenance. Only a structural
+/// `Ok(None)` may retain the completed incumbent.
+fn independent_matching_lf_line_witness_append_outcome(
+    outcome: Result<Option<CompiledModule>, ObjectError>,
+) -> Result<Option<CompiledModule>, IndependentExistsBatchCompileError> {
+    outcome.map_err(|error| CompileError::from(error).into())
+}
+
+/// Once the witness module is complete, only final object-byte excess may
+/// retain the byte-identical preceding batch incumbent.
+fn independent_matching_lf_line_witness_object_outcome(
+    outcome: Result<Vec<u8>, ObjectError>,
+) -> Result<Option<Vec<u8>>, IndependentExistsBatchCompileError> {
+    match outcome {
+        Ok(object) => Ok(Some(object)),
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(CompileError::from(error).into()),
+    }
+}
+
+fn install_independent_exists_variant(
+    compiled: &mut CompiledRegex,
+    module: CompiledModule,
+    object: Vec<u8>,
+) {
+    compiled.receipt.passes = selected_passes(&compiled.program, &module).into_boxed_slice();
+    compiled.receipt.object_sha256 = Sha256::digest(&object).into();
+    compiled.receipt.slow_aot = module.slow_aot_report().cloned();
+    compiled.receipt.compiler_k0_aot = module.compiler_k0_aot_report().cloned();
+    compiled.receipt.exact_finite_exists_byte_set_aot =
+        module.exact_finite_exists_byte_set_aot_report().copied();
+    compiled.receipt.exact_single_literal_aot = module.exact_single_literal_aot_report().copied();
+    compiled.receipt.exact_singleton_first_candidate_aot = module
+        .direct_exact_singleton_first_candidate_aot_report()
+        .copied();
+    compiled.receipt.matching_lf_line_witness_aot = module
+        .direct_matching_lf_line_witness_aot_report()
+        .copied();
+    compiled.receipt.exact_finite_selected_end_teddy_aot = module
+        .exact_finite_selected_end_teddy_aot_report()
+        .copied();
+    compiled.receipt.ordered_finite_language_aot =
+        module.ordered_finite_language_aot_report().copied();
+    compiled.receipt.slow_context_aot = module.slow_context_aot_report().cloned();
+    compiled.receipt.runtime_helper_required = module.required_runtime_symbols().next().is_some();
+    compiled.receipt.code_bytes = module.code_bytes();
+    compiled.receipt.data_bytes = module
+        .sections()
+        .iter()
+        .filter(|section| section.kind == SectionKind::ReadOnlyData)
+        .map(|section| section.data.len())
+        .sum();
+    compiled.receipt.object_bytes = object.len();
+    compiled.module = module;
+    compiled.object = object.into_boxed_slice();
+}
+
 /// Compile an Exists program and request one independent-haystack batch
 /// entry for a self-contained direct object.
 ///
@@ -1260,15 +1329,21 @@ fn independent_exact_singleton_first_candidate_object_outcome(
 /// authenticated exact singleton whose core publishes a proved earliest
 /// candidate cursor, the compiler also appends a helper-free position entry.
 /// It returns the inclusive final byte of the earliest match or `u64::MAX` on
-/// miss through the `FreAotRegexExactSingletonFirstCandidateV1` ABI. The
-/// ordinary entry and its public ABI remain unchanged. Direct artifacts
-/// without either structural receipt retain the preceding exact artifact. If
-/// only the generic batch exceeds the requested final object-byte limit, the
-/// ordinary artifact is retained; if only the position endpoint exceeds it,
-/// the byte-identical generic batch is retained. Consumers must inspect
-/// [`CompiledModule::direct_exists_batch_symbol`] and
-/// [`CompiledModule::direct_exact_singleton_first_candidate_symbol`]. The
-/// canonical function types live in `fre-aot-regex-runtime` and its C header.
+/// miss through the `FreAotRegexExactSingletonFirstCandidateV1` ABI. A
+/// complete-DFA Exists artifact may instead receive a separately named
+/// `FreAotRegexMatchingLfLineWitnessV1` entry. Under an independent proof that
+/// every exact finite source member is nonempty and contains no LF, a hit from
+/// that entry is one byte on a matching LF-delimited line; it is deliberately
+/// not an exact boundary or inclusive final byte. The ordinary entry and its
+/// public ABI remain unchanged. Direct artifacts without an applicable
+/// structural receipt retain the preceding exact artifact. Only numeric
+/// `ObjectBytes` refusal during a completed endpoint's final object emission
+/// may retain that endpoint's byte-identical incumbent; allocator, backend,
+/// and authentication failures remain terminal. Consumers must inspect
+/// [`CompiledModule::direct_exists_batch_symbol`],
+/// [`CompiledModule::direct_exact_singleton_first_candidate_symbol`], and
+/// [`CompiledModule::direct_matching_lf_line_witness_symbol`]. The canonical
+/// function types live in `fre-aot-regex-runtime` and its C header.
 ///
 /// # Errors
 ///
@@ -1340,16 +1415,40 @@ pub fn compile_with_independent_exists_batch(
     // The generic batch is now a complete, byte-stable incumbent. Append the
     // exact-singleton position endpoint on a clone so final endpoint-only
     // ObjectBytes may retain this exact artifact.
-    let Some(module) = independent_exact_singleton_first_candidate_append_outcome(
+    let exact_singleton_module = independent_exact_singleton_first_candidate_append_outcome(
         compiled
             .module
             .clone()
             .append_direct_exact_singleton_first_candidate(OutputContract::Exists),
+    )?;
+    if let Some(module) = exact_singleton_module {
+        let Some(object) = independent_exact_singleton_first_candidate_object_outcome(
+            emit_object(
+                &module,
+                ObjectFormat::for_target(target),
+                max_object_bytes,
+            ),
+        )?
+        else {
+            return Ok(compiled);
+        };
+        install_independent_exists_variant(&mut compiled, module, object);
+    }
+
+    // A complete-DFA incumbent cannot also be the exact Two-Way singleton
+    // above. Append the independently named matching-line witness on a clone.
+    // Once its complete-DFA landmark is present, only final ObjectBytes may
+    // retain the exact preceding artifact after an endpoint failure.
+    let Some(module) = independent_matching_lf_line_witness_append_outcome(
+        compiled
+            .module
+            .clone()
+            .append_direct_matching_lf_line_witness(OutputContract::Exists),
     )?
     else {
         return Ok(compiled);
     };
-    let Some(object) = independent_exact_singleton_first_candidate_object_outcome(emit_object(
+    let Some(object) = independent_matching_lf_line_witness_object_outcome(emit_object(
         &module,
         ObjectFormat::for_target(target),
         max_object_bytes,
@@ -1357,36 +1456,7 @@ pub fn compile_with_independent_exists_batch(
     else {
         return Ok(compiled);
     };
-    compiled.receipt.passes = selected_passes(&compiled.program, &module).into_boxed_slice();
-    compiled.receipt.object_sha256 = Sha256::digest(&object).into();
-    compiled.receipt.slow_aot = module.slow_aot_report().cloned();
-    compiled.receipt.compiler_k0_aot = module.compiler_k0_aot_report().cloned();
-    compiled.receipt.exact_finite_exists_byte_set_aot = module
-        .exact_finite_exists_byte_set_aot_report()
-        .copied();
-    compiled.receipt.exact_single_literal_aot =
-        module.exact_single_literal_aot_report().copied();
-    compiled.receipt.exact_singleton_first_candidate_aot = module
-        .direct_exact_singleton_first_candidate_aot_report()
-        .copied();
-    compiled.receipt.exact_finite_selected_end_teddy_aot = module
-        .exact_finite_selected_end_teddy_aot_report()
-        .copied();
-    compiled.receipt.ordered_finite_language_aot = module
-        .ordered_finite_language_aot_report()
-        .copied();
-    compiled.receipt.slow_context_aot = module.slow_context_aot_report().cloned();
-    compiled.receipt.runtime_helper_required = module.required_runtime_symbols().next().is_some();
-    compiled.receipt.code_bytes = module.code_bytes();
-    compiled.receipt.data_bytes = module
-        .sections()
-        .iter()
-        .filter(|section| section.kind == SectionKind::ReadOnlyData)
-        .map(|section| section.data.len())
-        .sum();
-    compiled.receipt.object_bytes = object.len();
-    compiled.module = module;
-    compiled.object = object.into_boxed_slice();
+    install_independent_exists_variant(&mut compiled, module, object);
 
     Ok(compiled)
 }
@@ -3040,6 +3110,7 @@ fn compile_raw_prepared_ordered_nfa_v15_reported_with_surface(
         exact_finite_exists_byte_set_aot: None,
         exact_single_literal_aot: None,
         exact_singleton_first_candidate_aot: None,
+        matching_lf_line_witness_aot: None,
         exact_finite_selected_end_teddy_aot: None,
         ordered_finite_language_aot: None,
         slow_context_aot: None,
@@ -4355,6 +4426,9 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
         exact_single_literal_aot: module.exact_single_literal_aot_report().copied(),
         exact_singleton_first_candidate_aot: module
             .direct_exact_singleton_first_candidate_aot_report()
+            .copied(),
+        matching_lf_line_witness_aot: module
+            .direct_matching_lf_line_witness_aot_report()
             .copied(),
         exact_finite_selected_end_teddy_aot: module
             .exact_finite_selected_end_teddy_aot_report()

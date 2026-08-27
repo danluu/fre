@@ -5,6 +5,20 @@ use fre_lower::{
     analyze_facts,
 };
 use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
+use sha2::{Digest, Sha256};
+
+const MATCHING_LF_LINE_WITNESS_LANGUAGE_IDENTITY_DOMAIN: &[u8] =
+    b"FRE-RIPGREP-AOT-THIN-MATCHING-LF-LINE-WITNESS-LANGUAGE\0\x01";
+
+/// Raw-free summary of an independently proved exact finite byte language.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MatchingLfLineWitnessSourceProof {
+    pub(crate) source_count: usize,
+    pub(crate) source_bytes: usize,
+    pub(crate) minimum_width: usize,
+    pub(crate) maximum_width: usize,
+    pub(crate) language_sha256: [u8; 32],
+}
 
 /// The ordinary byte-regex profile used by ripgrep's LF-delimited line
 /// matcher. Multiline controls `^`/`$`; dot still does not consume LF.
@@ -81,6 +95,76 @@ pub(crate) fn exact_nonempty_lf_free_singleton_literal(
 pub(crate) fn exact_nonempty_lf_free_singleton(pattern: &str, profile: &RustProfile) -> bool {
     exact_nonempty_lf_free_singleton_literal(pattern, profile).is_some()
 }
+
+/// Independently prove the complete source condition required by the
+/// matching-LF-line witness endpoint.
+///
+/// The proof is intentionally independent of the optional compiler report:
+/// it authenticates this facts pass, requires an assertion-free exact finite
+/// byte language, and checks every member rather than relying on width alone.
+/// The returned digest binds the deterministic finite-language enumeration
+/// without retaining any raw source or member bytes in the generated registry.
+pub(crate) fn exact_nonempty_lf_free_finite_language_proof(
+    pattern: &str,
+    profile: &RustProfile,
+) -> Option<MatchingLfLineWitnessSourceProof> {
+    let operation = FactOperation::capture_erased(FactOutput::Exists)
+        .with_optional_proofs(FactOptionalProofs::FiniteLanguage);
+    let parsed = fre_syntax::parse(ParseRequest::rust(
+        pattern,
+        CompatibilityProfile::RustBytes(profile.clone()),
+    ))
+    .ok()?;
+    let CanonicalPattern::Rust(parsed) = parsed.pattern else {
+        return None;
+    };
+    let facts = analyze_facts(&parsed, operation, FactLimits::default()).ok()?;
+    if !facts.identity().authenticates_current()
+        || facts.operation() != operation
+        || !matches!(
+            facts.width(),
+            CheckedWidth::NonEmpty { minimum, .. } if minimum != 0
+        )
+        || !facts
+            .assertions()
+            .possible()
+            .as_proven()
+            .is_some_and(Vec::is_empty)
+    {
+        return None;
+    }
+    let FactProof::Proven(language) = facts.finite_language() else {
+        return None;
+    };
+    if language.is_empty() {
+        return None;
+    }
+
+    let mut source_bytes = 0_usize;
+    let mut minimum_width = usize::MAX;
+    let mut maximum_width = 0_usize;
+    let mut digest = Sha256::new();
+    digest.update(MATCHING_LF_LINE_WITNESS_LANGUAGE_IDENTITY_DOMAIN);
+    digest.update(u64::try_from(language.len()).ok()?.to_le_bytes());
+    for literal in language.strings() {
+        if literal.is_empty() || literal.contains(&b'\n') {
+            return None;
+        }
+        source_bytes = source_bytes.checked_add(literal.len())?;
+        minimum_width = minimum_width.min(literal.len());
+        maximum_width = maximum_width.max(literal.len());
+        digest.update(u64::try_from(literal.len()).ok()?.to_le_bytes());
+        digest.update(literal);
+    }
+    Some(MatchingLfLineWitnessSourceProof {
+        source_count: language.len(),
+        source_bytes,
+        minimum_width,
+        maximum_width,
+        language_sha256: digest.finalize().into(),
+    })
+}
+
 /// Independently prove the source language required by the native line-jump
 /// `GrepCount` compiler. Any parse, construction, identity, or proof refusal is
 /// a closed structural decline.
@@ -232,5 +316,37 @@ mod tests {
             exact_nonempty_lf_free_singleton_literal("a|b", &profile),
             None
         );
+    }
+
+    #[test]
+    fn matching_lf_line_proof_accepts_exact_finite_lf_free_languages() {
+        let profile = RustProfile::default();
+        let singleton = exact_nonempty_lf_free_finite_language_proof("a", &profile)
+            .expect("width-one language is independently eligible");
+        assert_eq!(singleton.source_count, 1);
+        assert_eq!(singleton.source_bytes, 1);
+        assert_eq!(singleton.minimum_width, 1);
+        assert_eq!(singleton.maximum_width, 1);
+        assert_ne!(singleton.language_sha256, [0; 32]);
+
+        let finite =
+            exact_nonempty_lf_free_finite_language_proof(r"(?:alpha|beta\r|(?:xy){2})", &profile)
+                .expect("finite LF-free language");
+        assert_eq!(finite.source_count, 3);
+        assert_eq!(finite.source_bytes, 14);
+        assert_eq!(finite.minimum_width, 4);
+        assert_eq!(finite.maximum_width, 5);
+        assert_ne!(finite.language_sha256, singleton.language_sha256);
+    }
+
+    #[test]
+    fn matching_lf_line_proof_fails_closed_for_nonexact_or_unsafe_sources() {
+        let profile = RustProfile::default();
+        for pattern in ["", "(?:a)?", "a+", "^a", r"a\nb", r"(?:safe|line\nbreak)"] {
+            assert!(
+                exact_nonempty_lf_free_finite_language_proof(pattern, &profile).is_none(),
+                "ineligible source admitted: {pattern:?}"
+            );
+        }
     }
 }

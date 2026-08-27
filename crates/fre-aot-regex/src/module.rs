@@ -558,6 +558,70 @@ pub struct ExactSingletonFirstCandidateAotReport {
     pub runtime_call_count: u8,
 }
 
+/// Schema version for [`MatchingLfLineWitnessAotReport`].
+pub const MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION: u32 = 1;
+
+/// Miss value published by the matching-LF-line witness endpoint.
+pub const MATCHING_LF_LINE_WITNESS_MISS: u64 = u64::MAX;
+
+/// Search result represented by a matching-LF-line witness endpoint.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MatchingLfLineWitnessSemantics {
+    /// One byte known to belong to the LF-delimited line containing an
+    /// accepted match found by the authenticated complete DFA.
+    MatchingLfLineByteV1,
+}
+
+/// Callable contract authenticated for a matching-LF-line witness endpoint.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MatchingLfLineWitnessAbi {
+    /// `(haystack, length, value_out) -> status`, where status zero publishes
+    /// either a byte offset in a matching LF-delimited line or the canonical
+    /// miss sentinel.
+    HaystackLenU64OutStatusV1,
+}
+
+/// Physical register carrying the authenticated complete-DFA success cursor.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MatchingLfLineWitnessCursorRegister {
+    X86Rdx,
+    Aarch64X2,
+}
+
+/// Authentication receipt for the additive exact-finite whole-buffer
+/// matching-line witness entry.
+///
+/// The endpoint is safe only together with an independent proof that the
+/// source denotes a nonempty, assertion-free exact finite byte language and
+/// that every language member is nonempty and contains no LF. The object
+/// digest remains in [`crate::CompileReceipt`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MatchingLfLineWitnessAotReport {
+    pub schema_version: u32,
+    pub semantics: MatchingLfLineWitnessSemantics,
+    pub abi: MatchingLfLineWitnessAbi,
+    pub miss_sentinel: u64,
+    pub target: Target,
+    pub program_bytes: usize,
+    pub program_sha256: [u8; 32],
+    pub cursor_register: MatchingLfLineWitnessCursorRegister,
+    pub success_edge_count: u8,
+    pub inside_match_edge_count: u8,
+    pub exclusive_end_edge_count: u8,
+    pub success_edges_sha256: [u8; 32],
+    pub trusted_core_offset: usize,
+    pub trusted_core_sha256: [u8; 32],
+    pub ordinary_entry_symbol_sha256: [u8; 32],
+    pub ordinary_entry_code_sha256: [u8; 32],
+    pub wrapper_entry_offset: usize,
+    pub wrapper_bytes: usize,
+    pub wrapper_sha256: [u8; 32],
+    pub endpoint_symbol_sha256: [u8; 32],
+    pub native_code_sha256: [u8; 32],
+    pub relocations_sha256: [u8; 32],
+    pub runtime_call_count: u8,
+}
+
 /// Actual instruction family emitted by the direct exact-finite
 /// `SelectedEnd` Teddy leaf. Stronger targets may reuse an audited narrower
 /// sequence, so this is distinct from the authorizing target tier.
@@ -1476,6 +1540,8 @@ struct NativeDirectSearchTrustedCore {
     prologue: NativeDirectSearchTrustedCorePrologue,
     landmark: NativeDirectSearchTrustedCoreLandmark,
     success_cursor: Option<NativeDirectSearchSuccessCursor>,
+    matching_lf_line_cursor: Option<NativeDirectSearchLfLineCursor>,
+    matching_lf_line_success_edges_sha256: Option<[u8; 32]>,
 }
 
 /// Compiler-private physical proof consumed before an endpoint may observe a
@@ -1486,6 +1552,103 @@ struct NativeDirectSearchSuccessCursor {
     register: ExactSingletonFirstCandidateCursorRegister,
     matched_offset: usize,
     edge_offsets: [usize; 2],
+    edge_count: u8,
+}
+
+const NATIVE_DIRECT_SEARCH_LF_LINE_MAX_SUCCESS_EDGES: usize = 16;
+
+/// Semantic family of one complete-DFA edge entering the shared matched
+/// terminal. The physical cursor has two different meanings across these
+/// routes, but both can be normalized to a byte in the matching LF domain.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NativeDirectSearchLfLineRoute {
+    ExactPrefixInsideMatchOffset,
+    AcceptSeededReverseInsideMatchOffset,
+    OrdinaryDfaExclusiveEndOffset,
+    BoundedRetryExclusiveEndOffset,
+    /// A complete DFA for a nullable language may accept before consuming a
+    /// byte. Exact nonempty endpoint admission rejects this route.
+    NullableInitialOffset,
+}
+
+impl NativeDirectSearchLfLineRoute {
+    const fn inside_match(self) -> bool {
+        matches!(
+            self,
+            Self::ExactPrefixInsideMatchOffset | Self::AcceptSeededReverseInsideMatchOffset
+        )
+    }
+
+    const fn exclusive_end(self) -> bool {
+        matches!(
+            self,
+            Self::OrdinaryDfaExclusiveEndOffset | Self::BoundedRetryExclusiveEndOffset
+        )
+    }
+
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::ExactPrefixInsideMatchOffset => 1,
+            Self::AcceptSeededReverseInsideMatchOffset => 2,
+            Self::OrdinaryDfaExclusiveEndOffset => 3,
+            Self::BoundedRetryExclusiveEndOffset => 4,
+            Self::NullableInitialOffset => 5,
+        }
+    }
+}
+
+fn combine_native_lf_line_routes(
+    left: Option<NativeDirectSearchLfLineRoute>,
+    right: Option<NativeDirectSearchLfLineRoute>,
+) -> Result<Option<NativeDirectSearchLfLineRoute>, ObjectError> {
+    match (left, right) {
+        (None, route) | (route, None) => Ok(route),
+        (Some(left), Some(right)) if left == right => Ok(Some(left)),
+        (Some(_), Some(_)) => Err(ObjectError::InvalidModule(
+            "LF-line success routes disagree across a CFG rewrite",
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NativeDirectSearchSuccessEdgeControl {
+    Taken,
+    Fallthrough,
+}
+
+impl NativeDirectSearchSuccessEdgeControl {
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::Taken => 1,
+            Self::Fallthrough => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDirectSearchLfLineSuccessEdge {
+    instruction_offset: usize,
+    instruction_bytes: u8,
+    control: NativeDirectSearchSuccessEdgeControl,
+    route: NativeDirectSearchLfLineRoute,
+}
+
+const EMPTY_NATIVE_DIRECT_SEARCH_LF_LINE_SUCCESS_EDGE: NativeDirectSearchLfLineSuccessEdge =
+    NativeDirectSearchLfLineSuccessEdge {
+        instruction_offset: 0,
+        instruction_bytes: 0,
+        control: NativeDirectSearchSuccessEdgeControl::Taken,
+        route: NativeDirectSearchLfLineRoute::NullableInitialOffset,
+    };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDirectSearchLfLineCursor {
+    register: MatchingLfLineWitnessCursorRegister,
+    matched_offset: usize,
+    edges: [
+        NativeDirectSearchLfLineSuccessEdge;
+        NATIVE_DIRECT_SEARCH_LF_LINE_MAX_SUCCESS_EDGES
+    ],
     edge_count: u8,
 }
 
@@ -1937,6 +2100,221 @@ fn exact_singleton_first_candidate_success_edges_digest(
     Ok(digest.finalize().into())
 }
 
+const MATCHING_LF_LINE_WITNESS_SUCCESS_EDGES_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/matching-lf-line-witness-success-edges-v1\0";
+
+fn matching_lf_line_witness_success_edges_digest(
+    architecture: Architecture,
+    text: &[u8],
+    proof: NativeDirectSearchLfLineCursor,
+) -> Result<[u8; 32], ObjectError> {
+    let edge_count = usize::from(proof.edge_count);
+    let expected_register = match architecture {
+        Architecture::X86_64 => MatchingLfLineWitnessCursorRegister::X86Rdx,
+        Architecture::Aarch64 => MatchingLfLineWitnessCursorRegister::Aarch64X2,
+    };
+    if !(1..=proof.edges.len()).contains(&edge_count)
+        || proof.register != expected_register
+        || proof.edges[..edge_count].windows(2).any(|pair| {
+            let key = |edge: NativeDirectSearchLfLineSuccessEdge| {
+                (
+                    edge.instruction_offset,
+                    edge.control.identity_tag(),
+                    edge.route.identity_tag(),
+                )
+            };
+            key(pair[0]) >= key(pair[1])
+        })
+    {
+        return Err(ObjectError::InvalidModule(
+            "matching-LF-line cursor proof is malformed",
+        ));
+    }
+
+    let add_signed = |base: usize, delta: i64| -> Result<usize, ObjectError> {
+        let base = i64::try_from(base)
+            .map_err(|_| ObjectError::ArithmeticOverflow("LF-line branch base"))?;
+        usize::try_from(
+            base.checked_add(delta)
+                .ok_or(ObjectError::ArithmeticOverflow("LF-line branch target"))?,
+        )
+        .map_err(|_| ObjectError::InvalidModule("LF-line branch target is negative"))
+    };
+    let mut digest = Sha256::new();
+    digest.update(MATCHING_LF_LINE_WITNESS_SUCCESS_EDGES_IDENTITY_DOMAIN);
+    digest.update([match proof.register {
+        MatchingLfLineWitnessCursorRegister::X86Rdx => 1,
+        MatchingLfLineWitnessCursorRegister::Aarch64X2 => 2,
+    }]);
+    digest.update([proof.edge_count]);
+    digest.update(
+        u64::try_from(proof.matched_offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("LF-line matched offset"))?
+            .to_le_bytes(),
+    );
+    for &edge in &proof.edges[..edge_count] {
+        let instruction_bytes = usize::from(edge.instruction_bytes);
+        let end = edge
+            .instruction_offset
+            .checked_add(instruction_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "LF-line success instruction extent",
+            ))?;
+        let instruction = text
+            .get(edge.instruction_offset..end)
+            .ok_or(ObjectError::InvalidModule(
+                "LF-line success instruction is outside text",
+            ))?;
+        match (architecture, edge.control) {
+            (Architecture::X86_64, NativeDirectSearchSuccessEdgeControl::Taken) => {
+                let (after, delta) = match instruction {
+                    [(0xeb | 0x70..=0x7f), displacement] => {
+                        let after = edge.instruction_offset.checked_add(2).ok_or(
+                            ObjectError::ArithmeticOverflow("x86 LF-line short branch base"),
+                        )?;
+                        (
+                            after,
+                            i64::from(i8::from_le_bytes([*displacement])),
+                        )
+                    }
+                    [0xe9, displacement @ ..] if displacement.len() == 4 => {
+                        let displacement = i32::from_le_bytes(
+                            displacement.try_into().map_err(|_| {
+                                ObjectError::InvalidModule(
+                                    "x86 LF-line branch displacement",
+                                )
+                            })?,
+                        );
+                        (
+                            edge.instruction_offset.checked_add(5).ok_or(
+                                ObjectError::ArithmeticOverflow("x86 LF-line branch base"),
+                            )?,
+                            i64::from(displacement),
+                        )
+                    }
+                    [0x0f, 0x80..=0x8f, displacement @ ..]
+                        if displacement.len() == 4 =>
+                    {
+                        let displacement = i32::from_le_bytes(
+                            displacement.try_into().map_err(|_| {
+                                ObjectError::InvalidModule(
+                                    "x86 LF-line conditional displacement",
+                                )
+                            })?,
+                        );
+                        (
+                            edge.instruction_offset.checked_add(6).ok_or(
+                                ObjectError::ArithmeticOverflow(
+                                    "x86 LF-line conditional base",
+                                ),
+                            )?,
+                            i64::from(displacement),
+                        )
+                    }
+                    _ => {
+                        return Err(ObjectError::InvalidModule(
+                            "x86 LF-line taken edge has the wrong opcode",
+                        ));
+                    }
+                };
+                if add_signed(after, delta)? != proof.matched_offset {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 LF-line edge does not target matched",
+                    ));
+                }
+            }
+            (Architecture::X86_64, NativeDirectSearchSuccessEdgeControl::Fallthrough) => {
+                if instruction.is_empty()
+                    || instruction.len() > 15
+                    || end != proof.matched_offset
+                    || matches!(instruction, [0xc3] | [0xeb, _] | [0xe9, ..])
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 LF-line fallthrough edge is malformed",
+                    ));
+                }
+            }
+            (Architecture::Aarch64, NativeDirectSearchSuccessEdgeControl::Taken) => {
+                let encoded = instruction
+                    .try_into()
+                    .ok()
+                    .map(u32::from_le_bytes)
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 LF-line edge is not one instruction",
+                    ))?;
+                let (immediate, bits) = if encoded & 0xfc00_0000 == 0x1400_0000 {
+                    (encoded & 0x03ff_ffff, 26_u8)
+                } else if encoded & 0xff00_0010 == 0x5400_0000 {
+                    ((encoded >> 5) & 0x7_ffff, 19)
+                } else if encoded & 0x7e00_0000 == 0x3400_0000 {
+                    ((encoded >> 5) & 0x7_ffff, 19)
+                } else if encoded & 0x7e00_0000 == 0x3600_0000 {
+                    ((encoded >> 5) & 0x3fff, 14)
+                } else {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 LF-line taken edge has the wrong opcode",
+                    ));
+                };
+                let shift = 64_u32.checked_sub(u32::from(bits)).ok_or(
+                    ObjectError::InvalidModule("AArch64 LF-line immediate width"),
+                )?;
+                let signed_words = ((u64::from(immediate) << shift) as i64) >> shift;
+                let delta = signed_words.checked_mul(4).ok_or(
+                    ObjectError::ArithmeticOverflow("AArch64 LF-line branch displacement"),
+                )?;
+                if add_signed(edge.instruction_offset, delta)? != proof.matched_offset {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 LF-line edge does not target matched",
+                    ));
+                }
+            }
+            (Architecture::Aarch64, NativeDirectSearchSuccessEdgeControl::Fallthrough) => {
+                let encoded = instruction
+                    .try_into()
+                    .ok()
+                    .map(u32::from_le_bytes)
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 LF-line edge is not one instruction",
+                    ))?;
+                if end != proof.matched_offset
+                    || encoded & 0xfc00_0000 == 0x1400_0000
+                    || encoded & 0xffff_fc1f == 0xd61f_0000
+                    || encoded & 0xffff_fc1f == 0xd65f_0000
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 LF-line fallthrough edge is malformed",
+                    ));
+                }
+            }
+        }
+        digest.update(
+            u64::try_from(edge.instruction_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("LF-line edge offset"))?
+                .to_le_bytes(),
+        );
+        digest.update([edge.instruction_bytes]);
+        digest.update([edge.control.identity_tag(), edge.route.identity_tag()]);
+        digest.update(instruction);
+    }
+    let x86_matched_terminal = [0xb8, 1, 0, 0, 0];
+    let aarch64_matched_terminal = aarch64_movz_w(0, 1)?.to_le_bytes();
+    let matched_terminal = match architecture {
+        Architecture::X86_64 => x86_matched_terminal.as_slice(),
+        Architecture::Aarch64 => aarch64_matched_terminal.as_slice(),
+    };
+    if text.get(
+        proof.matched_offset
+            ..proof.matched_offset.saturating_add(matched_terminal.len()),
+    ) != Some(matched_terminal)
+    {
+        return Err(ObjectError::InvalidModule(
+            "matching-LF-line matched terminal is malformed",
+        ));
+    }
+    digest.update(matched_terminal);
+    Ok(digest.finalize().into())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1982,8 +2360,60 @@ fn authenticate_native_direct_search_trusted_core(
                     "complete DFA trusted core unexpectedly publishes a cursor",
                 ));
             }
+            match (
+                expected_output,
+                core.matching_lf_line_cursor,
+                core.matching_lf_line_success_edges_sha256,
+            ) {
+                (OutputContract::Exists, Some(cursor), Some(authenticated_digest)) => {
+                    if cursor.matched_offset <= core.code_offset
+                        || cursor.matched_offset >= entry_end
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "matching-LF-line terminal is outside its trusted core",
+                        ));
+                    }
+                    let actual_digest = matching_lf_line_witness_success_edges_digest(
+                        architecture,
+                        text,
+                        cursor,
+                    )?;
+                    if actual_digest != authenticated_digest {
+                        return Err(ObjectError::InvalidModule(
+                            "matching-LF-line cursor receipt is inconsistent",
+                        ));
+                    }
+                    for edge in &cursor.edges[..usize::from(cursor.edge_count)] {
+                        if edge.instruction_offset < core.code_offset
+                            || edge.instruction_offset >= cursor.matched_offset
+                        {
+                            return Err(ObjectError::InvalidModule(
+                                "matching-LF-line edge is outside its trusted core",
+                            ));
+                        }
+                    }
+                }
+                (OutputContract::Exists, _, _) => {
+                    return Err(ObjectError::InvalidModule(
+                        "complete Exists DFA has no matching-LF-line cursor proof",
+                    ));
+                }
+                (_, None, None) => {}
+                (_, _, _) => {
+                    return Err(ObjectError::InvalidModule(
+                        "non-Exists DFA unexpectedly publishes an LF-line cursor",
+                    ));
+                }
+            }
         }
         NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 { .. } => {
+            if core.matching_lf_line_cursor.is_some()
+                || core.matching_lf_line_success_edges_sha256.is_some()
+            {
+                return Err(ObjectError::InvalidModule(
+                    "Two-Way trusted core unexpectedly publishes an LF-line cursor",
+                ));
+            }
             let cursor = core.success_cursor.ok_or(ObjectError::InvalidModule(
                 "exact-singleton trusted core has no success cursor proof",
             ))?;
@@ -2858,6 +3288,14 @@ pub enum ExactSingletonFirstCandidateStrategy {
     NativeTwoWayTrustedCoreV1,
 }
 
+/// Implementation selected behind a matching-LF-line witness symbol.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MatchingLfLineWitnessStrategy {
+    /// One validated whole-buffer call enters the authenticated complete-DFA
+    /// core and normalizes its success cursor to a byte in the matching line.
+    NativeCompleteDfaTrustedCoreV1,
+}
+
 /// Prepared-handle capability bit required by an object whose aggregate/fill
 /// benchmark path is published through the native Ordered-TNFA iterator.
 /// This value is intentionally identical to runtime V3's capability bit but
@@ -2990,10 +3428,35 @@ pub(crate) enum PreparedOrderedNfaV15Surface {
     RowSearchOnly,
 }
 
+/// Semantic program identity captured before target-specific lowering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SerializedProgramIdentity {
+    bytes: usize,
+    sha256: [u8; 32],
+}
+
+/// Construction-time authentication of the native surfaces consumed by a
+/// direct-search trusted core. Additive wrappers may extend text and symbols,
+/// but they must not silently bless changed table bytes or relocations under
+/// the ordinary entry's original native-module identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDirectSearchModuleSurfaceSeal {
+    target: Target,
+    serialized_program_identity: SerializedProgramIdentity,
+    native_module_identity: [u8; 32],
+    native_data_bytes: usize,
+    native_data_sha256: [u8; 32],
+    relocations_sha256: [u8; 32],
+}
+
 /// Object-format-neutral native module.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledModule {
     target: Target,
+    /// Semantic identity retained before native lowering replaces the program
+    /// section with target-specific tables. Non-regex aggregate modules have
+    /// no serialized-program identity.
+    serialized_program_identity: Option<SerializedProgramIdentity>,
     sections: Box<[ModuleSection]>,
     symbols: Box<[ModuleSymbol]>,
     relocations: Box<[ModuleRelocation]>,
@@ -3004,7 +3467,9 @@ pub struct CompiledModule {
     direct_exists_batch_symbol_index: Option<usize>,
     direct_exact_singleton_first_candidate:
         Option<(usize, ExactSingletonFirstCandidateAotReport)>,
+    direct_matching_lf_line_witness: Option<(usize, MatchingLfLineWitnessAotReport)>,
     native_direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
+    native_direct_search_module_surface_seal: Option<NativeDirectSearchModuleSurfaceSeal>,
     native_complete_span_reduce_source: Option<Box<NativeCompleteSpanReduceSource>>,
     native_complete_span_reduce_core: Option<NativeCompleteSpanReduceCore>,
     prepared_count_symbol_index: Option<usize>,
@@ -3202,6 +3667,10 @@ const DIRECT_EXACT_SINGLETON_FIRST_CANDIDATE_SYMBOL_PREFIX: &str =
     "fre_aot_regex_exact_singleton_first_candidate_v1_";
 const DIRECT_EXACT_SINGLETON_FIRST_CANDIDATE_IDENTITY_DOMAIN: &[u8] =
     b"fre-aot-regex/exact-singleton-first-candidate-v1\0";
+const DIRECT_MATCHING_LF_LINE_WITNESS_SYMBOL_PREFIX: &str =
+    "fre_aot_regex_matching_lf_line_witness_v1_";
+const DIRECT_MATCHING_LF_LINE_WITNESS_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/matching-lf-line-witness-v1\0";
 const PREPARED_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_count_exclusive_v1_";
 const PREPARED_SPAN_SUM_SYMBOL_PREFIX: &str = "fre_aot_regex_span_sum_exclusive_v1_";
 const PREPARED_GREP_COUNT_SYMBOL_PREFIX: &str = "fre_aot_regex_grep_count_exclusive_v1_";
@@ -6806,9 +7275,15 @@ impl CompiledModule {
                 "slow contextual provenance has no selected native lowering",
             ));
         }
-        let serialized_program_size = program_bytes.len();
-        let program_digest = Sha256::digest(&program_bytes);
-        let program_name = identity_symbol(PROGRAM_SYMBOL_PREFIX, program_digest.as_slice())?;
+        let serialized_program_identity = SerializedProgramIdentity {
+            bytes: program_bytes.len(),
+            sha256: Sha256::digest(&program_bytes).into(),
+        };
+        let serialized_program_size = serialized_program_identity.bytes;
+        let program_name = identity_symbol(
+            PROGRAM_SYMBOL_PREFIX,
+            &serialized_program_identity.sha256,
+        )?;
         if prelowered_prepared_layout.is_some() && prelowered.is_none() {
             return Err(ObjectError::InvalidModule(
                 "prelowered prepared layout has no selected native lowering",
@@ -7120,6 +7595,24 @@ impl CompiledModule {
         let runtime_program_name = (lowering.needs_runtime || ordered_nfa_row_search_only)
             .then(|| identity_symbol(RUNTIME_PROGRAM_SYMBOL_PREFIX, &native_digest))
             .transpose()?;
+        let native_direct_search_module_surface_seal =
+            if lowering.direct_search_trusted_core.is_some() {
+                Some(NativeDirectSearchModuleSurfaceSeal {
+                    target,
+                    serialized_program_identity,
+                    native_module_identity: native_digest,
+                    native_data_bytes: lowering.data.len(),
+                    native_data_sha256: Sha256::digest(&lowering.data).into(),
+                    relocations_sha256: exact_finite_selected_end_relocation_digest(
+                        &lowering.relocations,
+                    )
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "native direct-search relocation seal",
+                    ))?,
+                })
+            } else {
+                None
+            };
 
         let code_size = u64::try_from(lowering.code.len())
             .map_err(|_| ObjectError::ArithmeticOverflow("module code size"))?;
@@ -7986,6 +8479,7 @@ impl CompiledModule {
 
         Ok(Self {
             target,
+            serialized_program_identity: Some(serialized_program_identity),
             sections,
             symbols: symbols.into_boxed_slice(),
             relocations: lowering.relocations.into_boxed_slice(),
@@ -7999,7 +8493,9 @@ impl CompiledModule {
             prepared_exists_batch_symbol_index,
             direct_exists_batch_symbol_index: None,
             direct_exact_singleton_first_candidate: None,
+            direct_matching_lf_line_witness: None,
             native_direct_search_trusted_core: lowering.direct_search_trusted_core,
+            native_direct_search_module_surface_seal,
             native_complete_span_reduce_source: lowering.complete_span_reduce_source,
             native_complete_span_reduce_core: None,
             prepared_count_symbol_index: None,
@@ -8594,6 +9090,42 @@ impl CompiledModule {
         &self,
     ) -> Option<&ExactSingletonFirstCandidateAotReport> {
         match &self.direct_exact_singleton_first_candidate {
+            Some((_, report)) => Some(report),
+            None => None,
+        }
+    }
+
+    /// Return the additive whole-buffer matching-LF-line witness entry.
+    ///
+    /// A hit is a candidate byte on the matching LF-delimited line, not an
+    /// exact match boundary. Safe use additionally requires an independent
+    /// proof that every member of the exact finite source language is
+    /// nonempty and contains no LF.
+    #[must_use]
+    pub fn direct_matching_lf_line_witness_symbol(&self) -> Option<&str> {
+        self.direct_matching_lf_line_witness
+            .and_then(|(index, _)| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return how the matching-LF-line witness symbol executes.
+    #[must_use]
+    pub const fn direct_matching_lf_line_witness_strategy(
+        &self,
+    ) -> Option<MatchingLfLineWitnessStrategy> {
+        if self.direct_matching_lf_line_witness.is_some() {
+            Some(MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1)
+        } else {
+            None
+        }
+    }
+
+    /// Return the authentication receipt for the matching-LF-line witness.
+    #[must_use]
+    pub const fn direct_matching_lf_line_witness_aot_report(
+        &self,
+    ) -> Option<&MatchingLfLineWitnessAotReport> {
+        match &self.direct_matching_lf_line_witness {
             Some((_, report)) => Some(report),
             None => None,
         }
@@ -9982,6 +10514,340 @@ impl CompiledModule {
                 literal_sha256: program_sha256,
                 cursor_register: success_cursor.register,
                 success_edge_count: success_cursor.edge_count,
+                success_edges_sha256,
+                trusted_core_offset: trusted_core.code_offset,
+                trusted_core_sha256,
+                ordinary_entry_symbol_sha256,
+                ordinary_entry_code_sha256,
+                wrapper_entry_offset: code_offset,
+                wrapper_bytes: wrapper.code.len(),
+                wrapper_sha256,
+                endpoint_symbol_sha256,
+                native_code_sha256,
+                relocations_sha256,
+                runtime_call_count: 0,
+            },
+        ));
+        Ok(Some(self))
+    }
+
+    /// Append a whole-buffer matching-LF-line witness endpoint to an already
+    /// completed direct Exists-batch module. Non-complete-DFA cores decline;
+    /// every inconsistency after the complete-DFA landmark is observed is
+    /// terminal so callers cannot silently publish a less-authenticated route.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "core-edge authentication, wrapper identity, and publication are one failure-atomic transaction"
+    )]
+    pub(crate) fn append_direct_matching_lf_line_witness(
+        mut self,
+        output: OutputContract,
+    ) -> Result<Option<Self>, ObjectError> {
+        if output != OutputContract::Exists
+            || self.prepared_entry_symbol_index.is_some()
+            || self.runtime_symbol_index.is_some()
+        {
+            return Ok(None);
+        }
+        if self.direct_matching_lf_line_witness.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "matching-LF-line witness endpoint was appended more than once",
+            ));
+        }
+        if self.direct_exists_batch_symbol_index.is_none() {
+            return Err(ObjectError::InvalidModule(
+                "matching-LF-line witness has no direct batch incumbent",
+            ));
+        }
+        let Some(trusted_core) = self.native_direct_search_trusted_core else {
+            return Ok(None);
+        };
+        if trusted_core.landmark != NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1 {
+            return Ok(None);
+        }
+        let cursor = trusted_core.matching_lf_line_cursor.ok_or(
+            ObjectError::InvalidModule("matching-LF-line core has no cursor proof"),
+        )?;
+        let edge_count = usize::from(cursor.edge_count);
+        let mut inside_match_edge_count = 0_u8;
+        let mut exclusive_end_edge_count = 0_u8;
+        for edge in cursor.edges.get(..edge_count).ok_or(
+            ObjectError::InvalidModule("matching-LF-line edge count is invalid"),
+        )? {
+            if edge.route.inside_match() {
+                inside_match_edge_count = inside_match_edge_count.checked_add(1).ok_or(
+                    ObjectError::ArithmeticOverflow("matching-LF-line inside edge count"),
+                )?;
+            } else if edge.route.exclusive_end() {
+                exclusive_end_edge_count = exclusive_end_edge_count.checked_add(1).ok_or(
+                    ObjectError::ArithmeticOverflow("matching-LF-line end edge count"),
+                )?;
+            } else {
+                return Err(ObjectError::InvalidModule(
+                    "matching-LF-line endpoint cannot admit nullable success",
+                ));
+            }
+        }
+
+        let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("matching-LF-line entry index is invalid"),
+        )?;
+        let entry_start = usize::try_from(entry.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("matching-LF-line entry offset")
+        })?;
+        let entry_size = usize::try_from(entry.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("matching-LF-line entry size")
+        })?;
+        let entry_end = entry_start.checked_add(entry_size).ok_or(
+            ObjectError::ArithmeticOverflow("matching-LF-line entry extent"),
+        )?;
+        let text_len = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "matching-LF-line module has no text",
+            ))?
+            .data
+            .len();
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "matching-LF-line target is not a complete text function",
+            ));
+        }
+        let program = self.sections.get(PROGRAM_SECTION).ok_or(
+            ObjectError::InvalidModule("matching-LF-line module has no program"),
+        )?;
+        let program_symbol = self.symbols.get(PROGRAM_SYMBOL).ok_or(
+            ObjectError::InvalidModule("matching-LF-line program symbol is absent"),
+        )?;
+        let program_symbol_bytes = usize::try_from(program_symbol.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("matching-LF-line program symbol size")
+        })?;
+        let serialized_program_identity = self.serialized_program_identity.ok_or(
+            ObjectError::InvalidModule(
+                "matching-LF-line serialized program identity is absent",
+            ),
+        )?;
+        let expected_program_symbol_name = identity_symbol(
+            PROGRAM_SYMBOL_PREFIX,
+            &serialized_program_identity.sha256,
+        )?;
+        if program.name != ".rodata.fre.regex"
+            || program.kind != SectionKind::ReadOnlyData
+            || program.alignment != 16
+            || program.data.is_empty()
+            || serialized_program_identity.bytes < crate::PROGRAM_HEADER_LEN
+            || program_symbol.name != expected_program_symbol_name
+            || program_symbol.binding != SymbolBinding::Local
+            || program_symbol.kind != SymbolKind::Object
+            || program_symbol.section != Some(PROGRAM_SECTION)
+            || program_symbol.offset != 0
+            || program_symbol_bytes != program.data.len()
+        {
+            return Err(ObjectError::InvalidModule(
+                "matching-LF-line program surface is inconsistent",
+            ));
+        }
+        let native_surface_seal = self
+            .native_direct_search_module_surface_seal
+            .ok_or(ObjectError::InvalidModule(
+                "matching-LF-line native module surface seal is absent",
+            ))?;
+        let expected_entry_name = identity_symbol(
+            ENTRY_SYMBOL_PREFIX,
+            &native_surface_seal.native_module_identity,
+        )?;
+        let native_data_bytes = program.data.len();
+        let native_data_sha256: [u8; 32] = Sha256::digest(program.data.as_ref()).into();
+        let relocations_sha256 = exact_finite_selected_end_relocation_digest(&self.relocations)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "matching-LF-line relocation receipt",
+            ))?;
+        if native_surface_seal.target != self.target
+            || native_surface_seal.serialized_program_identity != serialized_program_identity
+            || entry.name != expected_entry_name
+            || native_surface_seal.native_data_bytes != native_data_bytes
+            || native_surface_seal.native_data_sha256 != native_data_sha256
+            || native_surface_seal.relocations_sha256 != relocations_sha256
+        {
+            return Err(ObjectError::InvalidModule(
+                "matching-LF-line native module surface is inconsistent",
+            ));
+        }
+        authenticate_native_direct_search_trusted_program_surface(
+            program,
+            &self.symbols,
+            trusted_core,
+        )?;
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &self.sections[TEXT_SECTION].data,
+            entry_start,
+            entry_end,
+            program.data.as_ref(),
+            &self.relocations,
+            trusted_core,
+            OutputContract::Exists,
+        )?;
+        let success_edges_sha256 = matching_lf_line_witness_success_edges_digest(
+            self.target.architecture,
+            &self.sections[TEXT_SECTION].data,
+            cursor,
+        )?;
+        let program_bytes = serialized_program_identity.bytes;
+        let program_sha256 = serialized_program_identity.sha256;
+        let ordinary_entry_symbol_sha256: [u8; 32] = Sha256::digest(entry.name.as_bytes()).into();
+        let wrapper = match self.target.architecture {
+            Architecture::X86_64 => {
+                lower_x86_64_matching_lf_line_witness(trusted_core.prologue)?
+            }
+            Architecture::Aarch64 => {
+                lower_aarch64_matching_lf_line_witness(trusted_core.prologue)?
+            }
+        };
+        let alignment_mask = match self.target.architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let code_offset = text_len.checked_add(alignment_mask).ok_or(
+            ObjectError::ArithmeticOverflow("matching-LF-line endpoint alignment"),
+        )? & !alignment_mask;
+        let final_text_len = code_offset.checked_add(wrapper.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("matching-LF-line endpoint extent"),
+        )?;
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("matching-LF-line witness text"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(code_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < code_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &wrapper.code)?;
+        let call_offset = code_offset.checked_add(wrapper.search_call_offset).ok_or(
+            ObjectError::ArithmeticOverflow("matching-LF-line local call"),
+        )?;
+        let trampoline_offset = code_offset.checked_add(wrapper.trampoline_offset).ok_or(
+            ObjectError::ArithmeticOverflow("matching-LF-line trampoline"),
+        )?;
+        let core_jump_offset = code_offset.checked_add(wrapper.core_jump_offset).ok_or(
+            ObjectError::ArithmeticOverflow("matching-LF-line core jump"),
+        )?;
+        match self.target.architecture {
+            Architecture::X86_64 => {
+                patch_x86_64_local_call(&mut text, call_offset, trampoline_offset)?;
+                patch_x86_64_local_jump(&mut text, core_jump_offset, trusted_core.code_offset)?;
+            }
+            Architecture::Aarch64 => {
+                patch_aarch64_local_call(&mut text, call_offset, trampoline_offset)?;
+                patch_aarch64_local_branch(&mut text, core_jump_offset, trusted_core.code_offset)?;
+            }
+        }
+
+        let ordinary_entry_code_sha256: [u8; 32] = Sha256::digest(
+            text.get(entry_start..entry_end).ok_or(ObjectError::InvalidModule(
+                "matching-LF-line ordinary entry moved outside final text",
+            ))?,
+        )
+        .into();
+        if ordinary_entry_code_sha256 != trusted_core.entry_code_sha256 {
+            return Err(ObjectError::InvalidModule(
+                "matching-LF-line ordinary entry identity changed",
+            ));
+        }
+        let trusted_core_sha256: [u8; 32] = Sha256::digest(
+            text.get(trusted_core.code_offset..entry_end).ok_or(
+                ObjectError::InvalidModule("matching-LF-line core is outside entry"),
+            )?,
+        )
+        .into();
+        let wrapper_bytes = text.get(code_offset..final_text_len).ok_or(
+            ObjectError::InvalidModule("matching-LF-line wrapper is outside final text"),
+        )?;
+        let wrapper_sha256: [u8; 32] = Sha256::digest(wrapper_bytes).into();
+        let mut identity = Sha256::new();
+        identity.update(DIRECT_MATCHING_LF_LINE_WITNESS_IDENTITY_DOMAIN);
+        identity.update([match self.target.architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        }]);
+        identity.update([match self.target.operating_system {
+            OperatingSystem::Linux => 1,
+            OperatingSystem::Macos => 2,
+        }]);
+        identity.update(self.target.features.bits().to_le_bytes());
+        identity.update([trusted_core.prologue.identity_tag()]);
+        identity.update(program_sha256);
+        identity.update(
+            u64::try_from(program_bytes)
+                .map_err(|_| ObjectError::ArithmeticOverflow("matching-LF-line program identity"))?
+                .to_le_bytes(),
+        );
+        identity.update(native_data_sha256);
+        identity.update(
+            u64::try_from(native_data_bytes)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("matching-LF-line native data identity")
+                })?
+                .to_le_bytes(),
+        );
+        identity.update(ordinary_entry_symbol_sha256);
+        identity.update(ordinary_entry_code_sha256);
+        identity.update(trusted_core_sha256);
+        identity.update(success_edges_sha256);
+        identity.update(wrapper_sha256);
+        identity.update(relocations_sha256);
+        let identity: [u8; 32] = identity.finalize().into();
+        let endpoint_name = identity_symbol(
+            DIRECT_MATCHING_LF_LINE_WITNESS_SYMBOL_PREFIX,
+            &identity,
+        )?;
+        let endpoint_symbol_sha256: [u8; 32] = Sha256::digest(endpoint_name.as_bytes()).into();
+        let native_code_sha256: [u8; 32] = Sha256::digest(&text).into();
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        symbols
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("matching-LF-line witness symbol"))?;
+        let symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: endpoint_name,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: u64::try_from(code_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("matching-LF-line endpoint offset")
+            })?,
+            size: u64::try_from(wrapper.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("matching-LF-line endpoint size")
+            })?,
+        });
+        self.symbols = symbols.into_boxed_slice();
+        self.direct_matching_lf_line_witness = Some((
+            symbol_index,
+            MatchingLfLineWitnessAotReport {
+                schema_version: MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION,
+                semantics: MatchingLfLineWitnessSemantics::MatchingLfLineByteV1,
+                abi: MatchingLfLineWitnessAbi::HaystackLenU64OutStatusV1,
+                miss_sentinel: MATCHING_LF_LINE_WITNESS_MISS,
+                target: self.target,
+                program_bytes,
+                program_sha256,
+                cursor_register: cursor.register,
+                success_edge_count: cursor.edge_count,
+                inside_match_edge_count,
+                exclusive_end_edge_count,
                 success_edges_sha256,
                 trusted_core_offset: trusted_core.code_offset,
                 trusted_core_sha256,
@@ -14929,6 +15795,13 @@ struct NativeDirectExistsBatchWrapper {
 }
 
 struct NativeExactSingletonFirstCandidateWrapper {
+    code: Vec<u8>,
+    search_call_offset: usize,
+    trampoline_offset: usize,
+    core_jump_offset: usize,
+}
+
+struct NativeMatchingLfLineWitnessWrapper {
     code: Vec<u8>,
     search_call_offset: usize,
     trampoline_offset: usize,
@@ -33934,6 +34807,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
     ];
     Ok(CompiledModule {
         target,
+        serialized_program_identity: None,
         sections: vec![
             ModuleSection {
                 name: ".text",
@@ -33955,9 +34829,11 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+        direct_exists_batch_symbol_index: None,
+        direct_exact_singleton_first_candidate: None,
+        direct_matching_lf_line_witness: None,
+        native_direct_search_trusted_core: None,
+        native_direct_search_module_surface_seal: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -34274,6 +35150,7 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
     ];
     Ok(CompiledModule {
         target,
+        serialized_program_identity: None,
         sections: vec![
             ModuleSection {
                 name: ".text",
@@ -34295,9 +35172,11 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+        direct_exists_batch_symbol_index: None,
+        direct_exact_singleton_first_candidate: None,
+        direct_matching_lf_line_witness: None,
+        native_direct_search_trusted_core: None,
+        native_direct_search_module_surface_seal: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -34796,6 +35675,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
     }
     Ok(CompiledModule {
         target,
+        serialized_program_identity: None,
         sections: vec![
             ModuleSection {
                 name: ".text",
@@ -34817,9 +35697,11 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+        direct_exists_batch_symbol_index: None,
+        direct_exact_singleton_first_candidate: None,
+        direct_matching_lf_line_witness: None,
+        native_direct_search_trusted_core: None,
+        native_direct_search_module_surface_seal: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -34958,6 +35840,7 @@ fn native_regex_redux_module(
     }
     Ok(CompiledModule {
         target,
+        serialized_program_identity: None,
         sections: vec![
             ModuleSection {
                 name: ".text",
@@ -34979,9 +35862,11 @@ fn native_regex_redux_module(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+        direct_exists_batch_symbol_index: None,
+        direct_exact_singleton_first_candidate: None,
+        direct_matching_lf_line_witness: None,
+        native_direct_search_trusted_core: None,
+        native_direct_search_module_surface_seal: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -35313,6 +36198,7 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
 
     let module = CompiledModule {
         target,
+        serialized_program_identity: None,
         sections: vec![
             ModuleSection {
                 name: ".text",
@@ -35334,9 +36220,11 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+        direct_exists_batch_symbol_index: None,
+        direct_exact_singleton_first_candidate: None,
+        direct_matching_lf_line_witness: None,
+        native_direct_search_trusted_core: None,
+        native_direct_search_module_surface_seal: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -35429,6 +36317,7 @@ fn native_weighted_capture_module(
     }
     Ok(CompiledModule {
         target,
+        serialized_program_identity: None,
         sections: vec![
             ModuleSection {
                 name: ".text",
@@ -35450,9 +36339,11 @@ fn native_weighted_capture_module(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+        direct_exists_batch_symbol_index: None,
+        direct_exact_singleton_first_candidate: None,
+        direct_matching_lf_line_witness: None,
+        native_direct_search_trusted_core: None,
+        native_direct_search_module_surface_seal: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -35884,6 +36775,7 @@ fn native_rebar_multi_grep_module_v1(
     }
     Ok(CompiledModule {
         target,
+        serialized_program_identity: None,
         sections: vec![
             ModuleSection {
                 name: ".text",
@@ -35909,9 +36801,11 @@ fn native_rebar_multi_grep_module_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+        direct_exists_batch_symbol_index: None,
+        direct_exact_singleton_first_candidate: None,
+        direct_matching_lf_line_witness: None,
+        native_direct_search_trusted_core: None,
+        native_direct_search_module_surface_seal: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -36133,6 +37027,7 @@ fn native_rebar_row_scalar_module_v1(
     }
     Ok(CompiledModule {
         target,
+        serialized_program_identity: None,
         sections: vec![
             ModuleSection {
                 name: ".text",
@@ -36158,9 +37053,11 @@ fn native_rebar_row_scalar_module_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+        direct_exists_batch_symbol_index: None,
+        direct_exact_singleton_first_candidate: None,
+        direct_matching_lf_line_witness: None,
+        native_direct_search_trusted_core: None,
+        native_direct_search_module_surface_seal: None,
         native_complete_span_reduce_source: None,
         native_complete_span_reduce_core: None,
         prepared_count_symbol_index: None,
@@ -36356,11 +37253,14 @@ struct X86Fixup {
     label: X86Label,
     short_opcode: Option<u8>,
     long_bytes: usize,
+    lf_line_taken_route: Option<NativeDirectSearchLfLineRoute>,
+    lf_line_fallthrough_route: Option<NativeDirectSearchLfLineRoute>,
 }
 
 struct X86Finished {
     code: Vec<u8>,
     label_offsets: Vec<Option<usize>>,
+    matching_lf_line_cursor: Option<NativeDirectSearchLfLineCursor>,
 }
 
 impl X86Finished {
@@ -36378,6 +37278,7 @@ struct X86Assembler {
     labels: Vec<Option<usize>>,
     fixups: Vec<X86Fixup>,
     instruction_offsets: Vec<usize>,
+    track_lf_line_success: bool,
 }
 
 struct NativeCaptureMaterializerLowering {
@@ -40018,7 +40919,12 @@ impl X86Assembler {
             labels: Vec::new(),
             fixups: Vec::new(),
             instruction_offsets: Vec::new(),
+            track_lf_line_success: false,
         }
+    }
+
+    fn track_lf_line_success_edges(&mut self) {
+        self.track_lf_line_success = true;
     }
 
     fn label(&mut self) -> Result<X86Label, ObjectError> {
@@ -40080,7 +40986,31 @@ impl X86Assembler {
                 .len()
                 .checked_add(4)
                 .ok_or(ObjectError::ArithmeticOverflow("x86 branch size"))?,
+            lf_line_taken_route: None,
+            lf_line_fallthrough_route: None,
         });
+        Ok(())
+    }
+
+    fn branch_lf_line_success(
+        &mut self,
+        opcode: &[u8],
+        label: X86Label,
+        route: NativeDirectSearchLfLineRoute,
+    ) -> Result<(), ObjectError> {
+        self.branch(opcode, label)?;
+        if !self.track_lf_line_success {
+            return Ok(());
+        }
+        let fixup = self
+            .fixups
+            .last_mut()
+            .ok_or(ObjectError::InvalidModule("x86 LF-line success branch is absent"))?;
+        if fixup.lf_line_taken_route.replace(route).is_some() {
+            return Err(ObjectError::InvalidModule(
+                "x86 LF-line success branch was tagged twice",
+            ));
+        }
         Ok(())
     }
 
@@ -40193,9 +41123,22 @@ impl X86Assembler {
                     ));
                 }
                 *opcode ^= 1;
+                if conditional.lf_line_fallthrough_route.is_some()
+                    || jump.lf_line_fallthrough_route.is_some()
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 LF-line route reached a non-canonical inversion",
+                    ));
+                }
                 self.fixups[conditional_index].short_opcode =
                     conditional.short_opcode.map(|v| v ^ 1);
                 self.fixups[conditional_index].label = jump.label;
+                self.fixups[conditional_index].lf_line_taken_route =
+                    jump.lf_line_taken_route;
+                self.fixups[conditional_index].lf_line_fallthrough_route =
+                    conditional.lf_line_taken_route;
+                self.fixups[jump_index].lf_line_taken_route = None;
+                self.fixups[jump_index].lf_line_fallthrough_route = None;
                 removed[jump_index] = true;
                 changed = true;
             }
@@ -40206,8 +41149,8 @@ impl X86Assembler {
     }
 
     fn thread_branch_targets(&mut self, removed: &[bool]) -> Result<(), ObjectError> {
-        let mut labels = Vec::new();
-        labels
+        let mut labels_and_routes = Vec::new();
+        labels_and_routes
             .try_reserve_exact(self.fixups.len())
             .map_err(|_| ObjectError::Allocation("x86 threading"))?;
         let mut shortened = Vec::new();
@@ -40222,6 +41165,7 @@ impl X86Assembler {
             let mut resolved = None;
             let mut retained_cycle_label = None;
             let mut direct_target_removed = false;
+            let mut threaded_route = None;
 
             // There can be at most one direct branch at an instruction
             // boundary and at most `fixups.len()` distinct trampoline
@@ -40238,18 +41182,27 @@ impl X86Assembler {
                     .fixups
                     .binary_search_by_key(&target, |candidate| candidate.instruction)
                 else {
-                    resolved = Some(label);
+                    resolved = Some((label, threaded_route));
                     break;
                 };
                 let trampoline = self.fixups[index];
                 if trampoline.short_opcode != Some(0xeb) {
-                    resolved = Some(label);
+                    resolved = Some((label, threaded_route));
                     break;
                 }
+                if trampoline.lf_line_fallthrough_route.is_some() {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 unconditional trampoline has an LF-line fallthrough route",
+                    ));
+                }
+                threaded_route = combine_native_lf_line_routes(
+                    threaded_route,
+                    trampoline.lf_line_taken_route,
+                )?;
                 if removed[index] {
                     direct_target_removed |= label == original;
                 } else {
-                    retained_cycle_label = Some(label);
+                    retained_cycle_label = Some((label, threaded_route));
                 }
                 label = trampoline.label;
             }
@@ -40259,13 +41212,13 @@ impl X86Assembler {
             // edge can use rel8 before any other shortening; later monotone
             // compaction can only bring the destination closer. This avoids
             // trading a nearby trampoline for a larger source branch.
-            let label = if let Some(label) = resolved {
-                label
+            let (label, route) = if let Some(resolved) = resolved {
+                resolved
             } else if direct_target_removed {
                 retained_cycle_label
                     .ok_or(ObjectError::InvalidModule("x86 removed trampoline cycle"))?
             } else {
-                original
+                (original, None)
             };
             let raw_target =
                 self.labels[label].ok_or(ObjectError::InvalidModule("unbound x86 branch label"))?;
@@ -40299,19 +41252,23 @@ impl X86Assembler {
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "x86 threaded branch displacement",
                 ))?;
-            labels.push(
+            labels_and_routes.push(
                 if !removed[index]
                     && (direct_target_removed
                         || fixup.short_opcode.is_some() && i8::try_from(delta).is_ok())
                 {
-                    label
+                    (
+                        label,
+                        combine_native_lf_line_routes(fixup.lf_line_taken_route, route)?,
+                    )
                 } else {
-                    original
+                    (original, fixup.lf_line_taken_route)
                 },
             );
         }
-        for (fixup, label) in self.fixups.iter_mut().zip(labels) {
+        for (fixup, (label, route)) in self.fixups.iter_mut().zip(labels_and_routes) {
             fixup.label = label;
+            fixup.lf_line_taken_route = route;
         }
         Ok(())
     }
@@ -40409,7 +41366,233 @@ impl X86Assembler {
         Ok(())
     }
 
-    fn finish_with_label_offsets(mut self) -> Result<X86Finished, ObjectError> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "final code, CFG rewrites, labels, and route metadata form one authentication boundary"
+    )]
+    fn finish_lf_line_cursor(
+        &self,
+        code: &[u8],
+        label_offsets: &[Option<usize>],
+        removed: &[bool],
+        shortened: &[bool],
+        removed_fallthrough: &[Option<NativeDirectSearchLfLineRoute>],
+        matched: X86Label,
+        register: MatchingLfLineWitnessCursorRegister,
+    ) -> Result<NativeDirectSearchLfLineCursor, ObjectError> {
+        if register != MatchingLfLineWitnessCursorRegister::X86Rdx
+            || removed.len() != self.fixups.len()
+            || shortened.len() != self.fixups.len()
+            || removed_fallthrough.len() != self.fixups.len()
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 LF-line final-assembler inputs are inconsistent",
+            ));
+        }
+        let matched_offset = label_offsets
+            .get(matched)
+            .copied()
+            .flatten()
+            .ok_or(ObjectError::InvalidModule(
+                "x86 LF-line matched label is unbound",
+            ))?;
+        let mut edges = [EMPTY_NATIVE_DIRECT_SEARCH_LF_LINE_SUCCESS_EDGE;
+            NATIVE_DIRECT_SEARCH_LF_LINE_MAX_SUCCESS_EDGES];
+        let mut edge_count = 0_usize;
+        let mut lexical_fallthrough_route = None;
+        let mut push_edge = |edge: NativeDirectSearchLfLineSuccessEdge| {
+            let slot = edges.get_mut(edge_count).ok_or(ObjectError::InvalidModule(
+                "x86 LF-line success-edge capacity is insufficient",
+            ))?;
+            *slot = edge;
+            edge_count = edge_count
+                .checked_add(1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 LF-line success-edge count",
+                ))?;
+            Ok::<(), ObjectError>(())
+        };
+
+        for (index, fixup) in self.fixups.iter().enumerate() {
+            if removed[index] {
+                if let Some(route) = removed_fallthrough[index] {
+                    let boundary = self.remap_offset(fixup.instruction, removed, shortened)?;
+                    if boundary != matched_offset {
+                        return Err(ObjectError::InvalidModule(
+                            "x86 removed LF-line edge does not fall through to matched",
+                        ));
+                    }
+                    lexical_fallthrough_route = combine_native_lf_line_routes(
+                        lexical_fallthrough_route,
+                        Some(route),
+                    )?;
+                }
+                continue;
+            }
+            let instruction = self.remap_offset(fixup.instruction, removed, shortened)?;
+            let instruction_bytes = if shortened[index] { 2 } else { fixup.long_bytes };
+            let instruction_bytes_u8 = u8::try_from(instruction_bytes).map_err(|_| {
+                ObjectError::ArithmeticOverflow("x86 LF-line instruction width")
+            })?;
+            let target = label_offsets
+                .get(fixup.label)
+                .copied()
+                .flatten()
+                .ok_or(ObjectError::InvalidModule(
+                    "x86 LF-line branch target is unbound",
+                ))?;
+            if target == matched_offset {
+                let route = fixup.lf_line_taken_route.ok_or(
+                    ObjectError::InvalidModule(
+                        "x86 matched terminal has an untagged incoming branch",
+                    ),
+                )?;
+                push_edge(NativeDirectSearchLfLineSuccessEdge {
+                    instruction_offset: instruction,
+                    instruction_bytes: instruction_bytes_u8,
+                    control: NativeDirectSearchSuccessEdgeControl::Taken,
+                    route,
+                })?;
+            } else if fixup.lf_line_taken_route.is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "x86 LF-line taken route does not enter matched",
+                ));
+            }
+
+            let fallthrough = instruction.checked_add(instruction_bytes).ok_or(
+                ObjectError::ArithmeticOverflow("x86 LF-line branch fallthrough"),
+            )?;
+            let is_unconditional = fixup.short_opcode == Some(0xeb);
+            if !is_unconditional && fallthrough == matched_offset {
+                let route = fixup.lf_line_fallthrough_route.ok_or(
+                    ObjectError::InvalidModule(
+                        "x86 matched terminal has an untagged conditional fallthrough",
+                    ),
+                )?;
+                push_edge(NativeDirectSearchLfLineSuccessEdge {
+                    instruction_offset: instruction,
+                    instruction_bytes: instruction_bytes_u8,
+                    control: NativeDirectSearchSuccessEdgeControl::Fallthrough,
+                    route,
+                })?;
+            } else if fixup.lf_line_fallthrough_route.is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "x86 LF-line fallthrough route does not enter matched",
+                ));
+            }
+        }
+
+        let mut predecessor = None;
+        for (index, &raw_offset) in self.instruction_offsets.iter().enumerate() {
+            if index + 1 == self.instruction_offsets.len() {
+                break;
+            }
+            if self
+                .fixups
+                .binary_search_by_key(&raw_offset, |fixup| fixup.instruction)
+                .is_ok_and(|fixup| removed[fixup])
+            {
+                continue;
+            }
+            let offset = self.remap_offset(raw_offset, removed, shortened)?;
+            if offset < matched_offset && predecessor.is_none_or(|current| offset > current) {
+                predecessor = Some(offset);
+            }
+        }
+        let predecessor = predecessor.ok_or(ObjectError::InvalidModule(
+            "x86 LF-line matched terminal has no predecessor",
+        ))?;
+        let predecessor_fixup = self.fixups.iter().enumerate().find_map(|(index, fixup)| {
+            (!removed[index]
+                && self
+                    .remap_offset(fixup.instruction, removed, shortened)
+                    .is_ok_and(|offset| offset == predecessor))
+            .then_some(fixup)
+        });
+        if let Some(fixup) = predecessor_fixup {
+            if fixup.short_opcode == Some(0xeb) {
+                if lexical_fallthrough_route.is_some() {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 removed LF-line edge is hidden by a final jump",
+                    ));
+                }
+            } else if lexical_fallthrough_route.is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "x86 LF-line fallthrough was authenticated twice",
+                ));
+            }
+        } else {
+            let predecessor_bytes = code.get(predecessor..matched_offset).ok_or(
+                ObjectError::InvalidModule("x86 LF-line predecessor is outside code"),
+            )?;
+            let terminates = predecessor_bytes == [0xc3];
+            match (terminates, lexical_fallthrough_route) {
+                (true, None) => {}
+                (true, Some(_)) => {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 LF-line fallthrough crosses a return",
+                    ));
+                }
+                (false, Some(route)) => {
+                    push_edge(NativeDirectSearchLfLineSuccessEdge {
+                        instruction_offset: predecessor,
+                        instruction_bytes: u8::try_from(predecessor_bytes.len()).map_err(|_| {
+                            ObjectError::ArithmeticOverflow(
+                                "x86 LF-line fallthrough predecessor width",
+                            )
+                        })?,
+                        control: NativeDirectSearchSuccessEdgeControl::Fallthrough,
+                        route,
+                    })?;
+                }
+                (false, None) => {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 matched terminal has an untagged lexical fallthrough",
+                    ));
+                }
+            }
+        }
+
+        if edge_count == 0 {
+            return Err(ObjectError::InvalidModule(
+                "x86 LF-line matched terminal has no incoming success edge",
+            ));
+        }
+        edges[..edge_count].sort_by_key(|edge| {
+            (
+                edge.instruction_offset,
+                edge.control.identity_tag(),
+                edge.route.identity_tag(),
+            )
+        });
+        Ok(NativeDirectSearchLfLineCursor {
+            register,
+            matched_offset,
+            edges,
+            edge_count: u8::try_from(edge_count).map_err(|_| {
+                ObjectError::ArithmeticOverflow("x86 LF-line success-edge count")
+            })?,
+        })
+    }
+
+    fn finish_with_label_offsets(self) -> Result<X86Finished, ObjectError> {
+        self.finish_with_label_offsets_impl(None)
+    }
+
+    fn finish_with_label_offsets_and_lf_line_cursor(
+        self,
+        matched: X86Label,
+    ) -> Result<X86Finished, ObjectError> {
+        self.finish_with_label_offsets_impl(Some((
+            matched,
+            MatchingLfLineWitnessCursorRegister::X86Rdx,
+        )))
+    }
+
+    fn finish_with_label_offsets_impl(
+        mut self,
+        tracked_lf_line: Option<(X86Label, MatchingLfLineWitnessCursorRegister)>,
+    ) -> Result<X86Finished, ObjectError> {
         self.instruction_offsets.try_reserve(1).map_err(|_| {
             ObjectError::Allocation("x86 instruction sentinel")
         })?;
@@ -40438,6 +41621,13 @@ impl X86Assembler {
         self.invert_branch_fallthroughs(&mut removed)?;
         self.thread_branch_targets(&removed)?;
         self.remove_unreachable_branches(&mut removed)?;
+        let mut removed_lf_line_fallthrough = Vec::new();
+        if tracked_lf_line.is_some() {
+            removed_lf_line_fallthrough
+                .try_reserve_exact(self.fixups.len())
+                .map_err(|_| ObjectError::Allocation("x86 LF-line fallthrough map"))?;
+            removed_lf_line_fallthrough.resize(self.fixups.len(), None);
+        }
         let mut shortened = Vec::new();
         shortened
             .try_reserve_exact(self.fixups.len())
@@ -40469,6 +41659,12 @@ impl X86Assembler {
                         "x86 hypothetical dead branch target",
                     ))?;
                 if target == instruction {
+                    if tracked_lf_line.is_some() {
+                        removed_lf_line_fallthrough[index] = combine_native_lf_line_routes(
+                            fixup.lf_line_taken_route,
+                            fixup.lf_line_fallthrough_route,
+                        )?;
+                    }
                     removed[index] = true;
                     changed = true;
                 }
@@ -40638,9 +41834,23 @@ impl X86Assembler {
                     .copy_from_slice(&delta.to_le_bytes());
             }
         }
+        let matching_lf_line_cursor = tracked_lf_line
+            .map(|(matched, register)| {
+                self.finish_lf_line_cursor(
+                    &code,
+                    &label_offsets,
+                    &removed,
+                    &shortened,
+                    &removed_lf_line_fallthrough,
+                    matched,
+                    register,
+                )
+            })
+            .transpose()?;
         Ok(X86Finished {
             code,
             label_offsets,
+            matching_lf_line_cursor,
         })
     }
 
@@ -44095,7 +45305,15 @@ fn x86_emit_exact_prefix_match(
             assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?; // result.end = end
         }
     }
-    assembler.branch(&[0xe9], matched)?;
+    if output == OutputContract::Exists {
+        assembler.branch_lf_line_success(
+            &[0xe9],
+            matched,
+            NativeDirectSearchLfLineRoute::ExactPrefixInsideMatchOffset,
+        )?;
+    } else {
+        assembler.branch(&[0xe9], matched)?;
+    }
     Ok(())
 }
 
@@ -46077,7 +47295,11 @@ fn x86_emit_seeded_reverse_prepass(
     // whose EAX cell exists only after a table load.
     if reverse.initial_reaches_start {
         if reverse.proves_match && layout.output == OutputContract::Exists {
-            assembler.branch(&[0xe9], matched)?;
+            assembler.branch_lf_line_success(
+                &[0xe9],
+                matched,
+                NativeDirectSearchLfLineRoute::AcceptSeededReverseInsideMatchOffset,
+            )?;
         } else {
             assembler.instruction(&[0x4d, 0x39, 0xef])?; // cursor >= minimum
             assembler.branch(&[0x0f, 0x83], reverse_loop)?;
@@ -46106,7 +47328,11 @@ fn x86_emit_seeded_reverse_prepass(
 
     assembler.bind(record_start)?;
     if reverse.proves_match && layout.output == OutputContract::Exists {
-        assembler.branch(&[0xe9], matched)?;
+        assembler.branch_lf_line_success(
+            &[0xe9],
+            matched,
+            NativeDirectSearchLfLineRoute::AcceptSeededReverseInsideMatchOffset,
+        )?;
     } else {
         // This sidecar is independently wide. Clear its sole metadata bit on
         // the cold accepting edge so the live rejoin carries a raw byte token.
@@ -47805,6 +49031,11 @@ fn lower_x86_64_dfa_with_entry_contract(
     }
     let has_direct_search_trusted_core = entry_contract == NativeDfaEntryContract::Public
         && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
+    let track_matching_lf_line =
+        has_direct_search_trusted_core && layout.output == OutputContract::Exists;
+    if track_matching_lf_line {
+        assembler.track_lf_line_success_edges();
+    }
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         x86_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
     }
@@ -47888,7 +49119,11 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     if layout.initial_pending {
         if layout.output == OutputContract::Exists {
-            assembler.branch(&[0xe9], matched)?;
+            assembler.branch_lf_line_success(
+                &[0xe9],
+                matched,
+                NativeDirectSearchLfLineRoute::NullableInitialOffset,
+            )?;
         } else {
             assembler.instruction(&[0x49, 0x89, 0xd3])?;
             if layout.initial_terminal {
@@ -48442,7 +49677,11 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     assembler.bind(accept)?;
     if layout.output == OutputContract::Exists {
-        assembler.branch(&[0xe9], matched)?;
+        assembler.branch_lf_line_success(
+            &[0xe9],
+            matched,
+            NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset,
+        )?;
     } else {
         assembler.instruction(&[0x49, 0x89, 0xd3])?;
         // Normalize only the cold accepting edge. This makes an accepted-live
@@ -48725,7 +49964,11 @@ fn lower_x86_64_dfa_with_entry_contract(
         None
     };
 
-    let mut finished = assembler.finish_with_label_offsets()?;
+    let mut finished = if track_matching_lf_line {
+        assembler.finish_with_label_offsets_and_lf_line_cursor(matched)?
+    } else {
+        assembler.finish_with_label_offsets()?
+    };
     let table_displacement = finished.label_offset(table_displacement_label)?;
     let direct_search_trusted_core_offset = if has_direct_search_trusted_core {
         let code_offset = table_displacement
@@ -48772,7 +50015,13 @@ fn lower_x86_64_dfa_with_entry_contract(
         push_bytes(&mut finished.code, &padding)?;
     }
 
+    let matching_lf_line_cursor = finished.matching_lf_line_cursor;
     let code = finished.code;
+    let matching_lf_line_success_edges_sha256 = matching_lf_line_cursor
+        .map(|cursor| {
+            matching_lf_line_witness_success_edges_digest(Architecture::X86_64, &code, cursor)
+        })
+        .transpose()?;
     let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
     let relocations = vec![ModuleRelocation {
             section: TEXT_SECTION,
@@ -48844,6 +50093,8 @@ fn lower_x86_64_dfa_with_entry_contract(
                 },
                 landmark: NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
                 success_cursor: None,
+                matching_lf_line_cursor,
+                matching_lf_line_success_edges_sha256,
             }
         }),
     })
@@ -56092,6 +57343,222 @@ fn lower_aarch64_exact_singleton_first_candidate(
         ));
     }
     Ok(NativeExactSingletonFirstCandidateWrapper {
+        code,
+        search_call_offset: offsets[0],
+        trampoline_offset,
+        core_jump_offset,
+    })
+}
+
+fn lower_x86_64_matching_lf_line_witness(
+    prologue: NativeDirectSearchTrustedCorePrologue,
+) -> Result<NativeMatchingLfLineWitnessWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 40;
+    let NativeDirectSearchTrustedCorePrologue::X86_64 {
+        save_rbx,
+        save_r12_r13,
+        save_r14_r15,
+    } = prologue
+    else {
+        return Err(ObjectError::InvalidModule(
+            "x86 matching-LF-line wrapper has a non-x86 trusted core",
+        ));
+    };
+    let mut assembler = X86Assembler::new();
+    let miss = assembler.label()?;
+    let subtract = assembler.label()?;
+    let publish = assembler.label()?;
+    let frame_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+    let trampoline = assembler.label()?;
+
+    assembler.instruction(&[0x48, 0x85, 0xd2])?; // value_out
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0xf6, 0xc2, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // signed address-domain length
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // haystack
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x08, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x31, 0xd2])?; // start = 0
+    assembler.instruction(&[0x48, 0x89, 0xf1])?; // end = length
+    assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // result pair
+    assembler.instruction(&[0xe8])?;
+    let search_call = assembler.label()?;
+    assembler.bind(search_call)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], miss)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?;
+    assembler.branch(&[0x0f, 0x85], frame_invalid)?;
+
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x18])?; // length
+    assembler.instruction(&[0x4c, 0x39, 0xca])?; // cursor <= length
+    assembler.branch(&[0x0f, 0x87], frame_invalid)?;
+    assembler.branch(&[0x0f, 0x84], subtract)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x10])?; // haystack
+    assembler.instruction(&[0x41, 0x80, 0x3c, 0x11, b'\n'])?;
+    assembler.branch(&[0x0f, 0x84], subtract)?;
+    assembler.branch(&[0xe9], publish)?;
+
+    assembler.bind(subtract)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], frame_invalid)?;
+    assembler.instruction(&[0x48, 0xff, 0xca])?;
+    assembler.bind(publish)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x20])?;
+    assembler.instruction(&[0x49, 0x89, 0x13])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+
+    assembler.bind(miss)?;
+    assembler.instruction(&[0x49, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x20])?;
+    assembler.instruction(&[0x4d, 0x89, 0x13])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], returned)?;
+    assembler.bind(frame_invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.bind(returned)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(trampoline)?;
+    if save_rbx {
+        assembler.instruction(&[0x53])?;
+    }
+    if save_r12_r13 {
+        assembler.instruction(&[0x41, 0x54])?;
+        assembler.instruction(&[0x41, 0x55])?;
+    }
+    if save_r14_r15 {
+        assembler.instruction(&[0x41, 0x56])?;
+        assembler.instruction(&[0x41, 0x57])?;
+    }
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0xe9])?;
+    let core_jump = assembler.label()?;
+    assembler.bind(core_jump)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    Ok(NativeMatchingLfLineWitnessWrapper {
+        search_call_offset: finished.label_offset(search_call)?,
+        trampoline_offset: finished.label_offset(trampoline)?,
+        core_jump_offset: finished.label_offset(core_jump)?,
+        code: finished.code,
+    })
+}
+
+fn lower_aarch64_matching_lf_line_witness(
+    prologue: NativeDirectSearchTrustedCorePrologue,
+) -> Result<NativeMatchingLfLineWitnessWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 64;
+    if prologue != NativeDirectSearchTrustedCorePrologue::Aarch64 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 matching-LF-line wrapper has a non-AArch64 trusted core",
+        ));
+    }
+    let mut assembler = Aarch64Assembler::new();
+    let miss = assembler.label()?;
+    let subtract = assembler.label()?;
+    let publish = assembler.label()?;
+    let frame_invalid = assembler.label()?;
+    let returned = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.branch_zero_x(2, invalid)?;
+    assembler.instruction(aarch64_and_low_x(3, 2, 3)?)?;
+    assembler.branch_nonzero_x(3, invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.branch_zero_x(0, invalid)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(21, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_mov_x(19, 0)?)?;
+    assembler.instruction(aarch64_mov_x(20, 1)?)?;
+    assembler.instruction(aarch64_mov_x(21, 2)?)?;
+    assembler.instruction(aarch64_store_x(31, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 31, 8)?)?;
+    assembler.instruction(aarch64_movz_x(2, 0, 0)?)?;
+    assembler.instruction(aarch64_mov_x(3, 20)?)?;
+    assembler.instruction(aarch64_add_x_imm(4, 31, 0)?)?;
+    let search_call = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, miss)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_NE, frame_invalid)?;
+
+    assembler.instruction(aarch64_cmp_x(2, 20)?)?;
+    assembler.branch_cond(AARCH64_HI, frame_invalid)?;
+    assembler.branch_cond(AARCH64_EQ, subtract)?;
+    assembler.instruction(aarch64_load_byte_reg(9, 19, 2)?)?;
+    assembler.instruction(aarch64_cmp_w_imm(9, u16::from(b'\n'))?)?;
+    assembler.branch_cond(AARCH64_EQ, subtract)?;
+    assembler.branch(publish)?;
+
+    assembler.bind(subtract)?;
+    assembler.branch_zero_x(2, frame_invalid)?;
+    assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
+    assembler.bind(publish)?;
+    assembler.instruction(aarch64_store_x(2, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+
+    assembler.bind(miss)?;
+    aarch64_load_u64_constant(&mut assembler, 9, u64::MAX)?;
+    assembler.instruction(aarch64_store_x(9, 21, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(returned)?;
+    assembler.bind(frame_invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.bind(returned)?;
+    assembler.instruction(aarch64_load_pair_x(19, 20, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(21, 30, 31, 32)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let trampoline_offset = assembler.code.len();
+    assembler.instruction(0xf100_001f)?; // cmp x0, #0
+    let core_jump = assembler.instruction(0x1400_0000)?;
+    if core_jump != trampoline_offset.saturating_add(4) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 matching-LF-line trampoline is not cmp-and-branch",
+        ));
+    }
+    let mut offsets = [search_call];
+    let code = assembler.finish_with_offsets(&mut offsets)?;
+    let core_jump_offset = code.len().checked_sub(4).ok_or(ObjectError::InvalidModule(
+        "AArch64 matching-LF-line trampoline is absent",
+    ))?;
+    let trampoline_offset = core_jump_offset.checked_sub(4).ok_or(
+        ObjectError::InvalidModule("AArch64 matching-LF-line trampoline cmp is absent"),
+    )?;
+    if code.get(trampoline_offset..core_jump_offset)
+        != Some(0xf100_001f_u32.to_le_bytes().as_slice())
+        || code.get(core_jump_offset..) != Some(0x1400_0000_u32.to_le_bytes().as_slice())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 matching-LF-line trampoline was rewritten",
+        ));
+    }
+    Ok(NativeMatchingLfLineWitnessWrapper {
         code,
         search_call_offset: offsets[0],
         trampoline_offset,
@@ -63973,6 +65440,8 @@ struct Aarch64Fixup {
     instruction: usize,
     label: Aarch64Label,
     kind: Aarch64FixupKind,
+    lf_line_taken_route: Option<NativeDirectSearchLfLineRoute>,
+    lf_line_fallthrough_route: Option<NativeDirectSearchLfLineRoute>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63980,6 +65449,7 @@ struct Aarch64Assembler {
     code: Vec<u8>,
     labels: Vec<Option<usize>>,
     fixups: Vec<Aarch64Fixup>,
+    track_lf_line_success: bool,
 }
 
 struct Aarch64OptimizedAssembly {
@@ -63987,6 +65457,7 @@ struct Aarch64OptimizedAssembly {
     labels: Vec<Option<usize>>,
     fixups: Vec<Aarch64Fixup>,
     relocation_offsets: Vec<usize>,
+    matching_lf_line_lexical_route: Option<NativeDirectSearchLfLineRoute>,
 }
 
 impl Aarch64Assembler {
@@ -63995,7 +65466,12 @@ impl Aarch64Assembler {
             code: Vec::with_capacity(256),
             labels: Vec::new(),
             fixups: Vec::new(),
+            track_lf_line_success: false,
         }
+    }
+
+    fn track_lf_line_success_edges(&mut self) {
+        self.track_lf_line_success = true;
     }
 
     fn label(&mut self) -> Result<Aarch64Label, ObjectError> {
@@ -64027,6 +65503,26 @@ impl Aarch64Assembler {
 
     fn branch(&mut self, label: Aarch64Label) -> Result<(), ObjectError> {
         self.branch_placeholder(0x1400_0000, label, Aarch64FixupKind::Branch26)
+    }
+
+    fn branch_lf_line_success(
+        &mut self,
+        label: Aarch64Label,
+        route: NativeDirectSearchLfLineRoute,
+    ) -> Result<(), ObjectError> {
+        self.branch(label)?;
+        if !self.track_lf_line_success {
+            return Ok(());
+        }
+        let fixup = self.fixups.last_mut().ok_or(ObjectError::InvalidModule(
+            "AArch64 LF-line success branch is absent",
+        ))?;
+        if fixup.lf_line_taken_route.replace(route).is_some() {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 LF-line success branch was tagged twice",
+            ));
+        }
+        Ok(())
     }
 
     fn call(&mut self, label: Aarch64Label) -> Result<(), ObjectError> {
@@ -64149,35 +65645,57 @@ impl Aarch64Assembler {
             instruction: offset,
             label,
             kind,
+            lf_line_taken_route: None,
+            lf_line_fallthrough_route: None,
         });
         Ok(())
     }
 
-    fn threaded_label(
+    fn threaded_label_and_lf_line_route(
         &self,
         label: Aarch64Label,
         unconditional_targets: &[Option<Aarch64Label>],
-    ) -> Aarch64Label {
+        fixup_indices: &[Option<usize>],
+    ) -> Result<(Aarch64Label, Option<NativeDirectSearchLfLineRoute>), ObjectError> {
         let original = label;
         let mut current = label;
         let mut traversed = 0_usize;
+        let mut route = None;
         loop {
             let Some(target) = self.labels.get(current).copied().flatten() else {
-                return original;
+                return Ok((original, None));
             };
             let instruction = target / 4;
             let Some(next) = unconditional_targets.get(instruction).copied().flatten() else {
-                return current;
+                return Ok((current, route));
             };
+            let fixup_index = fixup_indices
+                .get(instruction)
+                .copied()
+                .flatten()
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 unconditional target has no fixup",
+                ))?;
+            let fixup = self.fixups.get(fixup_index).copied().ok_or(
+                ObjectError::InvalidModule("AArch64 unconditional fixup index"),
+            )?;
+            if fixup.kind != Aarch64FixupKind::Branch26
+                || fixup.lf_line_fallthrough_route.is_some()
+            {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 LF-line trampoline is not canonical",
+                ));
+            }
+            route = combine_native_lf_line_routes(route, fixup.lf_line_taken_route)?;
             let Some(next_traversed) = traversed.checked_add(1) else {
-                return original;
+                return Ok((original, None));
             };
             traversed = next_traversed;
             if traversed > self.labels.len() {
                 // A cycle of unconditional branches is a valid (non-returning)
                 // CFG. Preserve its original edge instead of attempting to
                 // choose an arbitrary representative.
-                return original;
+                return Ok((original, None));
             }
             current = next;
         }
@@ -64301,6 +65819,7 @@ impl Aarch64Assembler {
         relocation_anchors: &[bool],
         removed: &mut [bool],
         remove_this_round: &mut [bool],
+        removed_lf_line_fallthrough: &mut [Option<NativeDirectSearchLfLineRoute>],
     ) -> Result<(), ObjectError> {
         let instruction_count = removed.len();
         loop {
@@ -64346,6 +65865,18 @@ impl Aarch64Assembler {
                             ))?;
                 }
                 if target_instruction == fallthrough {
+                    if !removed_lf_line_fallthrough.is_empty() {
+                        let route = combine_native_lf_line_routes(
+                            fixup.lf_line_taken_route,
+                            fixup.lf_line_fallthrough_route,
+                        )?;
+                        let slot = removed_lf_line_fallthrough.get_mut(source).ok_or(
+                            ObjectError::InvalidModule(
+                                "AArch64 LF-line fallthrough outside native code",
+                            ),
+                        )?;
+                        *slot = combine_native_lf_line_routes(*slot, route)?;
+                    }
                     let remove =
                         remove_this_round
                             .get_mut(source)
@@ -64372,6 +65903,14 @@ impl Aarch64Assembler {
     fn control_flow_optimized(
         &self,
         relocation_offsets: &[usize],
+    ) -> Result<Aarch64OptimizedAssembly, ObjectError> {
+        self.control_flow_optimized_impl(relocation_offsets, None)
+    }
+
+    fn control_flow_optimized_impl(
+        &self,
+        relocation_offsets: &[usize],
+        tracked_lf_line: Option<Aarch64Label>,
     ) -> Result<Aarch64OptimizedAssembly, ObjectError> {
         if !self.code.len().is_multiple_of(4) {
             return Err(ObjectError::InvalidModule(
@@ -64487,6 +66026,13 @@ impl Aarch64Assembler {
                 ObjectError::Allocation("AArch64 branch relaxation")
             })?;
         remove_this_round.resize(instruction_count, false);
+        let mut removed_lf_line_fallthrough = Vec::new();
+        if tracked_lf_line.is_some() {
+            removed_lf_line_fallthrough
+                .try_reserve_exact(instruction_count)
+                .map_err(|_| ObjectError::Allocation("AArch64 LF-line fallthrough map"))?;
+            removed_lf_line_fallthrough.resize(instruction_count, None);
+        }
 
         // Preserve direct fallthrough information in the first phase: if its
         // next instruction is itself a trampoline, threading first would turn
@@ -64500,7 +66046,11 @@ impl Aarch64Assembler {
                     if relocation_anchors.get(source).copied().unwrap_or(true) {
                         continue;
                     }
-                    let threaded = self.threaded_label(fixup.label, &unconditional_targets);
+                    let (threaded, route) = self.threaded_label_and_lf_line_route(
+                        fixup.label,
+                        &unconditional_targets,
+                        &fixup_indices,
+                    )?;
                     let target = self
                         .labels
                         .get(threaded)
@@ -64511,6 +66061,10 @@ impl Aarch64Assembler {
                     let (bits, _, _) = Self::fixup_encoding(fixup.kind);
                     if Self::fixup_words_fit(words, bits)? {
                         fixup.label = threaded;
+                        fixup.lf_line_taken_route = combine_native_lf_line_routes(
+                            fixup.lf_line_taken_route,
+                            route,
+                        )?;
                     }
                 }
             }
@@ -64521,6 +66075,7 @@ impl Aarch64Assembler {
                 &relocation_anchors,
                 &mut removed,
                 &mut remove_this_round,
+                &mut removed_lf_line_fallthrough,
             )?;
         }
 
@@ -64558,6 +66113,7 @@ impl Aarch64Assembler {
                 &relocation_anchors,
                 &mut removed,
                 &mut remove_this_round,
+                &mut removed_lf_line_fallthrough,
             )?;
 
             removed_prefix.clear();
@@ -64751,7 +66307,20 @@ impl Aarch64Assembler {
                     continue;
                 }
 
+                if conditional.lf_line_fallthrough_route.is_some()
+                    || false_branch.lf_line_fallthrough_route.is_some()
+                {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 LF-line route reached a non-canonical inversion",
+                    ));
+                }
                 fixups[conditional_index].label = false_branch.label;
+                fixups[conditional_index].lf_line_taken_route =
+                    false_branch.lf_line_taken_route;
+                fixups[conditional_index].lf_line_fallthrough_route =
+                    conditional.lf_line_taken_route;
+                fixups[false_fixup_index].lf_line_taken_route = None;
+                fixups[false_fixup_index].lf_line_fallthrough_route = None;
                 let mask = inversion_masks
                     .get_mut(source)
                     .ok_or(ObjectError::InvalidModule(
@@ -64940,6 +66509,36 @@ impl Aarch64Assembler {
         for &label in &self.labels {
             labels.push(label.map(&remap).transpose()?);
         }
+        let matching_lf_line_lexical_route = tracked_lf_line
+            .map(|matched| {
+                let matched_offset = labels
+                    .get(matched)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 LF-line matched label is unbound",
+                    ))?;
+                let mut route = None;
+                for (instruction, &candidate) in
+                    removed_lf_line_fallthrough.iter().enumerate()
+                {
+                    let Some(candidate) = candidate else {
+                        continue;
+                    };
+                    let raw_offset = instruction.checked_mul(4).ok_or(
+                        ObjectError::ArithmeticOverflow("AArch64 LF-line fallthrough offset"),
+                    )?;
+                    if remap(raw_offset)? != matched_offset {
+                        return Err(ObjectError::InvalidModule(
+                            "AArch64 removed LF-line edge does not fall through to matched",
+                        ));
+                    }
+                    route = combine_native_lf_line_routes(route, Some(candidate))?;
+                }
+                Ok::<_, ObjectError>(route)
+            })
+            .transpose()?
+            .flatten();
 
         let mut compacted_fixups = Vec::new();
         compacted_fixups
@@ -64974,6 +66573,273 @@ impl Aarch64Assembler {
             labels,
             fixups: compacted_fixups,
             relocation_offsets: compacted_relocations,
+            matching_lf_line_lexical_route,
+        })
+    }
+
+    fn lf_line_reachable_instructions(&self) -> Result<Vec<bool>, ObjectError> {
+        if !self.code.len().is_multiple_of(4) {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 LF-line code is not instruction aligned",
+            ));
+        }
+        let instruction_count = self.code.len() / 4;
+        if instruction_count == 0 {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 LF-line code is empty",
+            ));
+        }
+
+        let mut reachable = Vec::new();
+        reachable
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| ObjectError::Allocation("AArch64 LF-line reachability"))?;
+        reachable.resize(instruction_count, false);
+        let mut worklist = Vec::new();
+        worklist
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| ObjectError::Allocation("AArch64 LF-line reachability"))?;
+        reachable[0] = true;
+        worklist.push(0_usize);
+
+        while let Some(instruction) = worklist.pop() {
+            let offset = instruction.checked_mul(4).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 LF-line instruction offset"),
+            )?;
+            let next = instruction.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 LF-line reachability successor"),
+            )?;
+            let enqueue = |successor: usize,
+                           reachable: &mut [bool],
+                           worklist: &mut Vec<usize>| {
+                if successor < instruction_count && !reachable[successor] {
+                    reachable[successor] = true;
+                    worklist.push(successor);
+                }
+            };
+
+            if let Ok(fixup_index) = self
+                .fixups
+                .binary_search_by_key(&offset, |fixup| fixup.instruction)
+            {
+                let fixup = self.fixups[fixup_index];
+                let target = self
+                    .labels
+                    .get(fixup.label)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 LF-line branch target is unbound",
+                    ))?;
+                if !target.is_multiple_of(4) || target > self.code.len() {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 LF-line branch target is not an instruction boundary",
+                    ));
+                }
+                enqueue(target / 4, &mut reachable, &mut worklist);
+                if fixup.kind != Aarch64FixupKind::Branch26 {
+                    enqueue(next, &mut reachable, &mut worklist);
+                }
+                continue;
+            }
+
+            let end = offset.checked_add(4).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 LF-line instruction extent"),
+            )?;
+            let encoded = self
+                .code
+                .get(offset..end)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes)
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 LF-line instruction is outside code",
+                ))?;
+            let terminates = encoded & 0xfc00_0000 == 0x1400_0000
+                || encoded & 0xffff_fc1f == 0xd61f_0000
+                || encoded & 0xffff_fc1f == 0xd65f_0000;
+            if !terminates {
+                enqueue(next, &mut reachable, &mut worklist);
+            }
+        }
+        Ok(reachable)
+    }
+
+    fn finish_lf_line_cursor(
+        &self,
+        matched_offset: usize,
+        lexical_fallthrough_route: Option<NativeDirectSearchLfLineRoute>,
+    ) -> Result<NativeDirectSearchLfLineCursor, ObjectError> {
+        if self.code.get(matched_offset..matched_offset.saturating_add(4))
+            != Some(aarch64_movz_w(0, 1)?.to_le_bytes().as_slice())
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 LF-line matched terminal is not canonical",
+            ));
+        }
+        let reachable = self.lf_line_reachable_instructions()?;
+        let matched_instruction = matched_offset / 4;
+        if !matched_offset.is_multiple_of(4)
+            || !reachable
+                .get(matched_instruction)
+                .copied()
+                .unwrap_or(false)
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 LF-line matched terminal is unreachable",
+            ));
+        }
+        let mut edges = [EMPTY_NATIVE_DIRECT_SEARCH_LF_LINE_SUCCESS_EDGE;
+            NATIVE_DIRECT_SEARCH_LF_LINE_MAX_SUCCESS_EDGES];
+        let mut edge_count = 0_usize;
+        let mut push_edge = |edge: NativeDirectSearchLfLineSuccessEdge| {
+            let slot = edges.get_mut(edge_count).ok_or(ObjectError::InvalidModule(
+                "AArch64 LF-line success-edge capacity is insufficient",
+            ))?;
+            *slot = edge;
+            edge_count = edge_count.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 LF-line success-edge count"),
+            )?;
+            Ok::<(), ObjectError>(())
+        };
+
+        for fixup in &self.fixups {
+            if !reachable
+                .get(fixup.instruction / 4)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let target = self
+                .labels
+                .get(fixup.label)
+                .copied()
+                .flatten()
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 LF-line branch target is unbound",
+                ))?;
+            if target == matched_offset {
+                let route = fixup.lf_line_taken_route.ok_or(
+                    ObjectError::InvalidModule(
+                        "AArch64 matched terminal has an untagged incoming branch",
+                    ),
+                )?;
+                push_edge(NativeDirectSearchLfLineSuccessEdge {
+                    instruction_offset: fixup.instruction,
+                    instruction_bytes: 4,
+                    control: NativeDirectSearchSuccessEdgeControl::Taken,
+                    route,
+                })?;
+            } else if fixup.lf_line_taken_route.is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 LF-line taken route does not enter matched",
+                ));
+            }
+
+            let fallthrough = fixup.instruction.checked_add(4).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 LF-line branch fallthrough"),
+            )?;
+            if fixup.kind != Aarch64FixupKind::Branch26 && fallthrough == matched_offset {
+                let route = fixup.lf_line_fallthrough_route.ok_or(
+                    ObjectError::InvalidModule(
+                        "AArch64 matched terminal has an untagged conditional fallthrough",
+                    ),
+                )?;
+                push_edge(NativeDirectSearchLfLineSuccessEdge {
+                    instruction_offset: fixup.instruction,
+                    instruction_bytes: 4,
+                    control: NativeDirectSearchSuccessEdgeControl::Fallthrough,
+                    route,
+                })?;
+            } else if fixup.lf_line_fallthrough_route.is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 LF-line fallthrough route does not enter matched",
+                ));
+            }
+        }
+
+        let predecessor = matched_offset.checked_sub(4).ok_or(
+            ObjectError::InvalidModule("AArch64 LF-line matched terminal has no predecessor"),
+        )?;
+        if !reachable
+            .get(predecessor / 4)
+            .copied()
+            .unwrap_or(false)
+        {
+            // A retained dead instruction immediately before `matched` has no
+            // physical success edge. It remains byte-for-byte in the ordinary
+            // core, but neither it nor a dead removed fallthrough contributes
+            // to the authenticated reachable edge set.
+        } else if let Some(fixup) = self
+            .fixups
+            .iter()
+            .find(|fixup| fixup.instruction == predecessor)
+        {
+            if fixup.kind == Aarch64FixupKind::Branch26 {
+                if lexical_fallthrough_route.is_some() {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 removed LF-line edge is hidden by a final branch",
+                    ));
+                }
+            } else if lexical_fallthrough_route.is_some() {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 LF-line fallthrough was authenticated twice",
+                ));
+            }
+        } else {
+            let predecessor_word = self
+                .code
+                .get(predecessor..matched_offset)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes)
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 LF-line predecessor is outside code",
+                ))?;
+            let terminates = predecessor_word & 0x7c00_0000 == 0x1400_0000
+                || predecessor_word & 0xffff_fc1f == 0xd61f_0000
+                || predecessor_word & 0xffff_fc1f == 0xd65f_0000;
+            match (terminates, lexical_fallthrough_route) {
+                (true, None) => {}
+                (true, Some(_)) => {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 LF-line fallthrough crosses a terminator",
+                    ));
+                }
+                (false, Some(route)) => {
+                    push_edge(NativeDirectSearchLfLineSuccessEdge {
+                        instruction_offset: predecessor,
+                        instruction_bytes: 4,
+                        control: NativeDirectSearchSuccessEdgeControl::Fallthrough,
+                        route,
+                    })?;
+                }
+                (false, None) => {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 matched terminal has an untagged lexical fallthrough",
+                    ));
+                }
+            }
+        }
+
+        if edge_count == 0 {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 LF-line matched terminal has no incoming success edge",
+            ));
+        }
+        edges[..edge_count].sort_by_key(|edge| {
+            (
+                edge.instruction_offset,
+                edge.control.identity_tag(),
+                edge.route.identity_tag(),
+            )
+        });
+        Ok(NativeDirectSearchLfLineCursor {
+            register: MatchingLfLineWitnessCursorRegister::Aarch64X2,
+            matched_offset,
+            edges,
+            edge_count: u8::try_from(edge_count).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 LF-line success-edge count")
+            })?,
         })
     }
 
@@ -64991,11 +66857,48 @@ impl Aarch64Assembler {
     }
 
     fn finish_with_offsets_and_label(
-        mut self,
+        self,
         relocation_offsets: &mut [usize],
         tracked_label: Option<Aarch64Label>,
     ) -> Result<(Vec<u8>, Option<usize>), ObjectError> {
-        let optimized = self.control_flow_optimized(relocation_offsets)?;
+        let (code, tracked_offset, _) = self.finish_with_offsets_impl(
+            relocation_offsets,
+            tracked_label,
+            None,
+        )?;
+        Ok((code, tracked_offset))
+    }
+
+    fn finish_with_offsets_and_lf_line_cursor(
+        self,
+        relocation_offsets: &mut [usize],
+        matched: Aarch64Label,
+    ) -> Result<(Vec<u8>, NativeDirectSearchLfLineCursor), ObjectError> {
+        let (code, _, cursor) =
+            self.finish_with_offsets_impl(relocation_offsets, None, Some(matched))?;
+        Ok((
+            code,
+            cursor.ok_or(ObjectError::InvalidModule(
+                "AArch64 LF-line cursor proof is absent",
+            ))?,
+        ))
+    }
+
+    fn finish_with_offsets_impl(
+        mut self,
+        relocation_offsets: &mut [usize],
+        tracked_label: Option<Aarch64Label>,
+        tracked_lf_line: Option<Aarch64Label>,
+    ) -> Result<
+        (
+            Vec<u8>,
+            Option<usize>,
+            Option<NativeDirectSearchLfLineCursor>,
+        ),
+        ObjectError,
+    > {
+        let optimized =
+            self.control_flow_optimized_impl(relocation_offsets, tracked_lf_line)?;
         let tracked_offset = tracked_label
             .map(|label| {
                 optimized
@@ -65008,6 +66911,7 @@ impl Aarch64Assembler {
                     ))
             })
             .transpose()?;
+        let matching_lf_line_lexical_route = optimized.matching_lf_line_lexical_route;
         self.code = optimized.code;
         self.labels = optimized.labels;
         self.fixups = optimized.fixups;
@@ -65047,7 +66951,20 @@ impl Aarch64Assembler {
             self.code[fixup.instruction..end].copy_from_slice(&patched.to_le_bytes());
         }
         relocation_offsets.copy_from_slice(&optimized.relocation_offsets);
-        Ok((self.code, tracked_offset))
+        let matching_lf_line_cursor = tracked_lf_line
+            .map(|matched| {
+                let matched_offset = self
+                    .labels
+                    .get(matched)
+                    .copied()
+                    .flatten()
+                    .ok_or(ObjectError::InvalidModule(
+                        "AArch64 LF-line matched label is unbound",
+                    ))?;
+                self.finish_lf_line_cursor(matched_offset, matching_lf_line_lexical_route)
+            })
+            .transpose()?;
+        Ok((self.code, tracked_offset, matching_lf_line_cursor))
     }
 }
 
@@ -66171,7 +68088,14 @@ fn aarch64_emit_exact_prefix_match(
             assembler.instruction(aarch64_store_x(6, 4, 8)?)?;
         }
     }
-    assembler.branch(matched)?;
+    if output == OutputContract::Exists {
+        assembler.branch_lf_line_success(
+            matched,
+            NativeDirectSearchLfLineRoute::ExactPrefixInsideMatchOffset,
+        )?;
+    } else {
+        assembler.branch(matched)?;
+    }
     Ok(())
 }
 
@@ -72265,6 +74189,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     }
     let has_direct_search_trusted_core = entry_contract == NativeDfaEntryContract::Public
         && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
+    let track_matching_lf_line =
+        has_direct_search_trusted_core && layout.output == OutputContract::Exists;
+    if track_matching_lf_line {
+        assembler.track_lf_line_success_edges();
+    }
     if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
         aarch64_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
     }
@@ -72566,7 +74495,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
 
     if layout.initial_pending {
         if layout.output == OutputContract::Exists {
-            assembler.branch(matched)?;
+            assembler.branch_lf_line_success(
+                matched,
+                NativeDirectSearchLfLineRoute::NullableInitialOffset,
+            )?;
         } else {
             assembler.instruction(aarch64_mov_x(7, 2)?)?;
             if layout.initial_terminal {
@@ -73264,7 +75196,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
 
     assembler.bind(accept)?;
     if layout.output == OutputContract::Exists {
-        assembler.branch(matched)?;
+        assembler.branch_lf_line_success(
+            matched,
+            NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset,
+        )?;
     } else {
         assembler.instruction(aarch64_mov_x(7, 2)?)?;
         // Clear only the layout-specific accept bit on this cold edge. Any
@@ -73528,7 +75463,21 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     assembler.instruction(0xd65f_03c0)?;
 
     let mut relocation_offsets = [table_page, table_page_offset];
-    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    let (code, matching_lf_line_cursor) = if track_matching_lf_line {
+        let (code, cursor) = assembler
+            .finish_with_offsets_and_lf_line_cursor(&mut relocation_offsets, matched)?;
+        (code, Some(cursor))
+    } else {
+        (
+            assembler.finish_with_offsets(&mut relocation_offsets)?,
+            None,
+        )
+    };
+    let matching_lf_line_success_edges_sha256 = matching_lf_line_cursor
+        .map(|cursor| {
+            matching_lf_line_witness_success_edges_digest(Architecture::Aarch64, &code, cursor)
+        })
+        .transpose()?;
     let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
     let direct_search_trusted_core_offset = if has_direct_search_trusted_core {
         let code_offset = relocation_offsets[0]
@@ -73634,6 +75583,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 prologue: NativeDirectSearchTrustedCorePrologue::Aarch64,
                 landmark: NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
                 success_cursor: None,
+                matching_lf_line_cursor,
+                matching_lf_line_success_edges_sha256,
             }
         }),
     })
@@ -83421,6 +85372,325 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn matching_lf_line_witness_append_is_core_preserving_and_tamper_evident() {
+        let pattern = "x".repeat(
+            module_single_literal_two_way::MIN_TWO_WAY_LITERAL_BYTES
+                .checked_sub(1)
+                .unwrap(),
+        );
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let ordinary = compile(
+                CompileRequest::new(&pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .expect("compile complete-DFA witness fixture");
+            let ordinary_core = ordinary
+                .module()
+                .native_direct_search_trusted_core
+                .expect("complete-DFA trusted core");
+            assert_eq!(
+                ordinary_core.landmark,
+                NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
+            );
+            let cursor = ordinary_core
+                .matching_lf_line_cursor
+                .expect("final-assembler cursor proof");
+            let authenticated_edges = ordinary_core
+                .matching_lf_line_success_edges_sha256
+                .expect("sealed final-assembler cursor proof");
+            assert_eq!(
+                authenticated_edges,
+                matching_lf_line_witness_success_edges_digest(
+                    target.architecture,
+                    ordinary.module().sections[TEXT_SECTION].bytes(),
+                    cursor,
+                )
+                .expect("reauthenticate final physical edges"),
+            );
+
+            let batch = ordinary
+                .module()
+                .clone()
+                .append_direct_exists_batch(OutputContract::Exists)
+                .expect("append generic batch")
+                .expect("generic batch eligibility");
+            let entry = &batch.symbols[batch.entry_symbol_index];
+            let entry_start = usize::try_from(entry.offset).unwrap();
+            let entry_end = entry_start
+                .checked_add(usize::try_from(entry.size).unwrap())
+                .unwrap();
+            let batch_text = batch.sections[TEXT_SECTION].bytes().to_vec();
+            let ordinary_entry = batch_text[entry_start..entry_end].to_vec();
+
+            let endpoint = batch
+                .clone()
+                .append_direct_matching_lf_line_witness(OutputContract::Exists)
+                .expect("append matching-line witness")
+                .expect("complete-DFA witness eligibility");
+            let endpoint_text = endpoint.sections[TEXT_SECTION].bytes();
+            assert_eq!(&endpoint_text[..batch_text.len()], batch_text.as_slice());
+            assert_eq!(&endpoint_text[entry_start..entry_end], ordinary_entry.as_slice());
+            let report = endpoint
+                .direct_matching_lf_line_witness_aot_report()
+                .copied()
+                .expect("matching-line witness receipt");
+            assert_eq!(
+                endpoint.direct_matching_lf_line_witness_strategy(),
+                Some(MatchingLfLineWitnessStrategy::NativeCompleteDfaTrustedCoreV1),
+            );
+            assert!(endpoint
+                .direct_matching_lf_line_witness_symbol()
+                .is_some());
+            assert_eq!(report.schema_version, MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION);
+            assert_eq!(
+                report.semantics,
+                MatchingLfLineWitnessSemantics::MatchingLfLineByteV1,
+            );
+            assert_eq!(
+                report.abi,
+                MatchingLfLineWitnessAbi::HaystackLenU64OutStatusV1,
+            );
+            assert_eq!(report.miss_sentinel, MATCHING_LF_LINE_WITNESS_MISS);
+            assert_eq!(report.target, target);
+            let serialized_program = ordinary
+                .program()
+                .serialize()
+                .expect("serialize matching-line semantic program");
+            let serialized_program_sha256: [u8; 32] =
+                Sha256::digest(&serialized_program).into();
+            assert_eq!(report.program_bytes, serialized_program.len());
+            assert_eq!(report.program_sha256, serialized_program_sha256);
+            let native_data = batch.sections[PROGRAM_SECTION].bytes();
+            assert_ne!(
+                (report.program_bytes, report.program_sha256),
+                (
+                    native_data.len(),
+                    <[u8; 32]>::from(Sha256::digest(native_data)),
+                ),
+                "semantic program identity collapsed into native DFA data",
+            );
+            assert_eq!(report.cursor_register, cursor.register);
+            assert_eq!(report.success_edge_count, cursor.edge_count);
+            assert_eq!(
+                report
+                    .inside_match_edge_count
+                    .checked_add(report.exclusive_end_edge_count),
+                Some(report.success_edge_count),
+            );
+            assert_eq!(report.success_edges_sha256, authenticated_edges);
+            assert_eq!(report.ordinary_entry_code_sha256, ordinary_core.entry_code_sha256);
+            assert_eq!(report.runtime_call_count, 0);
+            assert_eq!(
+                report.native_code_sha256,
+                <[u8; 32]>::from(Sha256::digest(endpoint_text)),
+            );
+            assert_eq!(
+                report.wrapper_sha256,
+                <[u8; 32]>::from(Sha256::digest(
+                    &endpoint_text[report.wrapper_entry_offset
+                        ..report.wrapper_entry_offset + report.wrapper_bytes],
+                )),
+            );
+
+            let mut forged = batch.clone();
+            let mut forged_core = forged.native_direct_search_trusted_core.unwrap();
+            let mut forged_cursor = forged_core.matching_lf_line_cursor.unwrap();
+            forged_cursor.edges[0].route =
+                if forged_cursor.edges[0].route
+                    == NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset
+                {
+                    NativeDirectSearchLfLineRoute::ExactPrefixInsideMatchOffset
+                } else {
+                    NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset
+                };
+            forged_core.matching_lf_line_cursor = Some(forged_cursor);
+            forged.native_direct_search_trusted_core = Some(forged_core);
+            assert!(matches!(
+                forged.append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "matching-LF-line cursor receipt is inconsistent"
+                ))
+            ));
+
+            let mut unsealed = batch.clone();
+            let mut unsealed_core = unsealed.native_direct_search_trusted_core.unwrap();
+            unsealed_core.matching_lf_line_success_edges_sha256 = None;
+            unsealed.native_direct_search_trusted_core = Some(unsealed_core);
+            assert!(matches!(
+                unsealed.append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "complete Exists DFA has no matching-LF-line cursor proof"
+                ))
+            ));
+
+            let mut wrong_program_identity = batch.clone();
+            wrong_program_identity
+                .serialized_program_identity
+                .as_mut()
+                .expect("serialized program identity")
+                .sha256[0] ^= 1;
+            assert!(matches!(
+                wrong_program_identity
+                    .append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "matching-LF-line program surface is inconsistent"
+                ))
+            ));
+
+            let mut wrong_program_bytes = batch.clone();
+            let wrong_program_bytes_identity = wrong_program_bytes
+                .serialized_program_identity
+                .as_mut()
+                .expect("serialized program identity");
+            wrong_program_bytes_identity.bytes = wrong_program_bytes_identity
+                .bytes
+                .checked_add(1)
+                .expect("serialized program byte-count tamper");
+            assert!(matches!(
+                wrong_program_bytes
+                    .append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "matching-LF-line native module surface is inconsistent"
+                ))
+            ));
+
+            let mut wrong_target = batch.clone();
+            wrong_target.target.operating_system = match target.operating_system {
+                OperatingSystem::Linux => OperatingSystem::Macos,
+                OperatingSystem::Macos => OperatingSystem::Linux,
+            };
+            assert!(matches!(
+                wrong_target.append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "matching-LF-line native module surface is inconsistent"
+                ))
+            ));
+
+            let mut wrong_native_data = batch.clone();
+            *wrong_native_data.sections[PROGRAM_SECTION]
+                .data
+                .first_mut()
+                .expect("complete-DFA native data") ^= 1;
+            assert!(matches!(
+                wrong_native_data
+                    .append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "matching-LF-line native module surface is inconsistent"
+                ))
+            ));
+
+            let mut wrong_relocations = batch.clone();
+            wrong_relocations
+                .relocations
+                .first_mut()
+                .expect("complete-DFA native relocation")
+                .addend ^= 1;
+            assert!(matches!(
+                wrong_relocations
+                    .append_direct_matching_lf_line_witness(OutputContract::Exists),
+                Err(ObjectError::InvalidModule(
+                    "matching-LF-line native module surface is inconsistent"
+                ))
+            ));
+        }
+
+        let nullable = compile(
+            CompileRequest::new("x*", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile nullable complete DFA");
+        let nullable_batch = nullable
+            .module()
+            .clone()
+            .append_direct_exists_batch(OutputContract::Exists)
+            .expect("append nullable generic batch")
+            .expect("nullable generic batch eligibility");
+        assert!(matches!(
+            nullable_batch.append_direct_matching_lf_line_witness(OutputContract::Exists),
+            Err(ObjectError::InvalidModule(
+                "matching-LF-line endpoint cannot admit nullable success"
+            ))
+        ));
+
+        let width_one = crate::compile_with_independent_exists_batch(
+            CompileRequest::new("x", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .expect("width-one witness may decline");
+        assert!(width_one
+            .module()
+            .direct_matching_lf_line_witness_symbol()
+            .is_none());
+    }
+
+    #[test]
+    fn matching_lf_line_witness_wrappers_encode_the_exact_boundary_normalization() {
+        let x86 = lower_x86_64_matching_lf_line_witness(
+            NativeDirectSearchTrustedCorePrologue::X86_64 {
+                save_rbx: false,
+                save_r12_r13: false,
+                save_r14_r15: false,
+            },
+        )
+        .expect("lower x86 matching-line wrapper");
+        let x86_offset = |needle: &[u8]| {
+            x86.code
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("x86 matching-line normalization instruction")
+        };
+        let compare_cursor_to_len = x86_offset(&[0x4c, 0x39, 0xca]);
+        let inspect_cursor_byte = x86_offset(&[
+            0x4c, 0x8b, 0x4c, 0x24, 0x10, // reload haystack
+            0x41, 0x80, 0x3c, 0x11, b'\n',
+        ]);
+        let reject_zero_subtract = x86
+            .code
+            .windows(3)
+            .rposition(|window| window == [0x48, 0x85, 0xd2])
+            .expect("x86 zero-subtract rejection");
+        let subtract_one = x86_offset(&[0x48, 0xff, 0xca]);
+        let publish = x86_offset(&[0x49, 0x89, 0x13]);
+        assert!(compare_cursor_to_len < inspect_cursor_byte);
+        assert!(inspect_cursor_byte < reject_zero_subtract);
+        assert!(reject_zero_subtract < subtract_one);
+        assert!(subtract_one < publish);
+
+        let aarch64 = lower_aarch64_matching_lf_line_witness(
+            NativeDirectSearchTrustedCorePrologue::Aarch64,
+        )
+        .expect("lower AArch64 matching-line wrapper");
+        let words = aarch64
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let word_offset = |needle: u32| {
+            words
+                .iter()
+                .position(|&word| word == needle)
+                .expect("AArch64 matching-line normalization instruction")
+        };
+        let compare_cursor_to_len = word_offset(aarch64_cmp_x(2, 20).unwrap());
+        let inspect_cursor_byte = word_offset(aarch64_load_byte_reg(9, 19, 2).unwrap());
+        let compare_lf = word_offset(aarch64_cmp_w_imm(9, u16::from(b'\n')).unwrap());
+        let subtract_one = word_offset(aarch64_sub_x_imm(2, 2, 1).unwrap());
+        let publish = word_offset(aarch64_store_x(2, 21, 0).unwrap());
+        assert!(compare_cursor_to_len < inspect_cursor_byte);
+        assert!(inspect_cursor_byte < compare_lf);
+        assert!(compare_lf < subtract_one);
+        assert!(subtract_one < publish);
     }
 
     #[test]
@@ -129187,6 +131457,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL_NAME.to_owned();
             let module = CompiledModule {
                 target,
+                serialized_program_identity: None,
                 sections: vec![
                     ModuleSection {
                         name: ".text",
@@ -129212,9 +131483,11 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_entry_symbol_index: Some(PREPARED_ENTRY_SYMBOL),
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
-            direct_exists_batch_symbol_index: None,
-            direct_exact_singleton_first_candidate: None,
-            native_direct_search_trusted_core: None,
+                direct_exists_batch_symbol_index: None,
+                direct_exact_singleton_first_candidate: None,
+                direct_matching_lf_line_witness: None,
+                native_direct_search_trusted_core: None,
+                native_direct_search_module_surface_seal: None,
                 native_complete_span_reduce_source: None,
                 native_complete_span_reduce_core: None,
                 prepared_count_symbol_index: None,
@@ -129527,6 +131800,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
         };
         let module = CompiledModule {
             target,
+            serialized_program_identity: None,
             sections: vec![
                 ModuleSection {
                     name: ".text",
@@ -129554,7 +131828,9 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_exists_batch_symbol_index: None,
             direct_exists_batch_symbol_index: None,
             direct_exact_singleton_first_candidate: None,
+            direct_matching_lf_line_witness: None,
             native_direct_search_trusted_core: None,
+            native_direct_search_module_surface_seal: None,
             native_complete_span_reduce_source: None,
             native_complete_span_reduce_core: None,
             prepared_count_symbol_index: None,
@@ -137118,6 +139394,202 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .unwrap();
             assert_eq!(actual, expected, "x86 table changed for {features:?}");
         }
+    }
+
+    #[test]
+    fn matching_lf_line_final_assemblers_preserve_route_tags_through_cfg_rewrites() {
+        let mut x86 = X86Assembler::new();
+        x86.track_lf_line_success_edges();
+        let matched = x86.label().unwrap();
+        let failed = x86.label().unwrap();
+        x86.branch_lf_line_success(
+            &[0x0f, 0x84],
+            matched,
+            NativeDirectSearchLfLineRoute::ExactPrefixInsideMatchOffset,
+        )
+        .unwrap();
+        x86.branch(&[0xe9], failed).unwrap();
+        x86.bind(matched).unwrap();
+        x86.instruction(&[0xb8, 1, 0, 0, 0]).unwrap();
+        x86.instruction(&[0xc3]).unwrap();
+        x86.bind(failed).unwrap();
+        x86.instruction(&[0x31, 0xc0]).unwrap();
+        x86.instruction(&[0xc3]).unwrap();
+        let finished = x86
+            .finish_with_label_offsets_and_lf_line_cursor(matched)
+            .unwrap();
+        let proof = finished.matching_lf_line_cursor.unwrap();
+        assert_eq!(proof.edge_count, 1);
+        assert_eq!(
+            proof.edges[0].control,
+            NativeDirectSearchSuccessEdgeControl::Fallthrough,
+        );
+        assert_eq!(
+            proof.edges[0].route,
+            NativeDirectSearchLfLineRoute::ExactPrefixInsideMatchOffset,
+        );
+        matching_lf_line_witness_success_edges_digest(
+            Architecture::X86_64,
+            &finished.code,
+            proof,
+        )
+        .unwrap();
+
+        let mut x86 = X86Assembler::new();
+        x86.track_lf_line_success_edges();
+        let trampoline = x86.label().unwrap();
+        let matched = x86.label().unwrap();
+        x86.branch_lf_line_success(
+            &[0x0f, 0x85],
+            trampoline,
+            NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset,
+        )
+        .unwrap();
+        x86.instruction(&[0xc3]).unwrap();
+        x86.bind(trampoline).unwrap();
+        x86.branch_lf_line_success(
+            &[0xe9],
+            matched,
+            NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset,
+        )
+        .unwrap();
+        x86.bind(matched).unwrap();
+        x86.instruction(&[0xb8, 1, 0, 0, 0]).unwrap();
+        x86.instruction(&[0xc3]).unwrap();
+        let finished = x86
+            .finish_with_label_offsets_and_lf_line_cursor(matched)
+            .unwrap();
+        let proof = finished.matching_lf_line_cursor.unwrap();
+        assert_eq!(proof.edge_count, 1);
+        assert_eq!(
+            proof.edges[0].route,
+            NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset,
+        );
+        matching_lf_line_witness_success_edges_digest(
+            Architecture::X86_64,
+            &finished.code,
+            proof,
+        )
+        .unwrap();
+
+        let mut aarch64 = Aarch64Assembler::new();
+        aarch64.track_lf_line_success_edges();
+        let true_target = aarch64.label().unwrap();
+        let matched = aarch64.label().unwrap();
+        aarch64.branch_cond(AARCH64_EQ, true_target).unwrap();
+        aarch64
+            .branch_lf_line_success(
+                matched,
+                NativeDirectSearchLfLineRoute::BoundedRetryExclusiveEndOffset,
+            )
+            .unwrap();
+        aarch64.bind(true_target).unwrap();
+        aarch64.instruction(aarch64_movz_w(0, 0).unwrap()).unwrap();
+        aarch64.instruction(0xd65f_03c0).unwrap();
+        aarch64.bind(matched).unwrap();
+        aarch64.instruction(aarch64_movz_w(0, 1).unwrap()).unwrap();
+        aarch64.instruction(0xd65f_03c0).unwrap();
+        let (code, proof) = aarch64
+            .finish_with_offsets_and_lf_line_cursor(&mut [], matched)
+            .unwrap();
+        assert_eq!(proof.edge_count, 1);
+        assert_eq!(
+            proof.edges[0].control,
+            NativeDirectSearchSuccessEdgeControl::Taken,
+        );
+        assert_eq!(
+            proof.edges[0].route,
+            NativeDirectSearchLfLineRoute::BoundedRetryExclusiveEndOffset,
+        );
+        matching_lf_line_witness_success_edges_digest(Architecture::Aarch64, &code, proof)
+            .unwrap();
+
+        let mut aarch64 = Aarch64Assembler::new();
+        aarch64.track_lf_line_success_edges();
+        let trampoline = aarch64.label().unwrap();
+        let matched = aarch64.label().unwrap();
+        aarch64.instruction(0xd503_201f).unwrap();
+        aarch64
+            .branch_lf_line_success(
+                trampoline,
+                NativeDirectSearchLfLineRoute::AcceptSeededReverseInsideMatchOffset,
+            )
+            .unwrap();
+        aarch64.bind(trampoline).unwrap();
+        aarch64
+            .branch_lf_line_success(
+                matched,
+                NativeDirectSearchLfLineRoute::AcceptSeededReverseInsideMatchOffset,
+            )
+            .unwrap();
+        aarch64.bind(matched).unwrap();
+        aarch64.instruction(aarch64_movz_w(0, 1).unwrap()).unwrap();
+        aarch64.instruction(0xd65f_03c0).unwrap();
+        let (code, proof) = aarch64
+            .finish_with_offsets_and_lf_line_cursor(&mut [], matched)
+            .unwrap();
+        assert_eq!(proof.edge_count, 1);
+        assert_eq!(
+            proof.edges[0].control,
+            NativeDirectSearchSuccessEdgeControl::Fallthrough,
+        );
+        assert_eq!(
+            proof.edges[0].route,
+            NativeDirectSearchLfLineRoute::AcceptSeededReverseInsideMatchOffset,
+        );
+        matching_lf_line_witness_success_edges_digest(Architecture::Aarch64, &code, proof)
+            .unwrap();
+    }
+
+    #[test]
+    fn matching_lf_line_final_assemblers_reject_untagged_physical_success_edges() {
+        let mut x86 = X86Assembler::new();
+        x86.track_lf_line_success_edges();
+        let matched = x86.label().unwrap();
+        x86.branch(&[0xe9], matched).unwrap();
+        x86.bind(matched).unwrap();
+        x86.instruction(&[0xb8, 1, 0, 0, 0]).unwrap();
+        assert!(matches!(
+            x86.finish_with_label_offsets_and_lf_line_cursor(matched),
+            Err(ObjectError::InvalidModule(_))
+        ));
+
+        let mut aarch64 = Aarch64Assembler::new();
+        aarch64.track_lf_line_success_edges();
+        let matched = aarch64.label().unwrap();
+        aarch64.branch(matched).unwrap();
+        aarch64.bind(matched).unwrap();
+        aarch64.instruction(aarch64_movz_w(0, 1).unwrap()).unwrap();
+        assert!(matches!(
+            aarch64.finish_with_offsets_and_lf_line_cursor(&mut [], matched),
+            Err(ObjectError::InvalidModule(_))
+        ));
+
+        let mut aarch64 = Aarch64Assembler::new();
+        aarch64.track_lf_line_success_edges();
+        let live = aarch64.label().unwrap();
+        let matched = aarch64.label().unwrap();
+        aarch64.branch(live).unwrap();
+        aarch64.branch(matched).unwrap(); // retained but unreachable
+        aarch64.bind(live).unwrap();
+        aarch64.instruction(0xd503_201f).unwrap();
+        aarch64
+            .branch_lf_line_success(
+                matched,
+                NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset,
+            )
+            .unwrap();
+        aarch64.bind(matched).unwrap();
+        aarch64.instruction(aarch64_movz_w(0, 1).unwrap()).unwrap();
+        aarch64.instruction(0xd65f_03c0).unwrap();
+        let (_, proof) = aarch64
+            .finish_with_offsets_and_lf_line_cursor(&mut [], matched)
+            .expect("unreachable untagged physical edge is not a success edge");
+        assert_eq!(proof.edge_count, 1);
+        assert_eq!(
+            proof.edges[0].route,
+            NativeDirectSearchLfLineRoute::OrdinaryDfaExclusiveEndOffset,
+        );
     }
 
     #[test]

@@ -176,6 +176,8 @@ pub const STATUS_NATIVE_PARTICIPATION_UNAVAILABLE: u32 = 10;
 pub const STATUS_SUCCESS: u32 = 0;
 /// Miss sentinel published by an exact-singleton first-candidate endpoint.
 pub const EXACT_SINGLETON_FIRST_CANDIDATE_MISS: u64 = u64::MAX;
+/// Miss sentinel published by a matching-LF-line witness endpoint.
+pub const MATCHING_LF_LINE_WITNESS_MISS: u64 = u64::MAX;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
 pub const ARTIFACT_IDENTITY_BYTES: usize = 32;
 /// The prepared native retained-row entry should use the ordinary executor.
@@ -787,6 +789,18 @@ pub type FreAotRegexIndependentExistsBatchV1 = unsafe extern "C" fn(
 /// of the earliest full match or [`EXACT_SINGLETON_FIRST_CANDIDATE_MISS`].
 /// Every nonzero status leaves `inclusive_final_byte_out` untouched.
 pub type FreAotRegexExactSingletonFirstCandidateV1 =
+    unsafe extern "C" fn(*const u8, usize, *mut u64) -> u32;
+
+/// Compiler-produced whole-haystack matching-LF-line witness entry.
+///
+/// Status [`STATUS_SUCCESS`] publishes either a byte offset on an LF-delimited
+/// line known to contain a match or [`MATCHING_LF_LINE_WITNESS_MISS`]. A hit is
+/// a candidate line witness, not an exact match boundary or inclusive final
+/// byte. Every nonzero status leaves `matching_line_byte_out` untouched. The
+/// haystack pointer is nonnull and readable for its signed-address-domain
+/// length, including a nonnull zero-length pointer. The output is nonnull,
+/// naturally aligned, writable for one `u64`, and disjoint from the haystack.
+pub type FreAotRegexMatchingLfLineWitnessV1 =
     unsafe extern "C" fn(*const u8, usize, *mut u64) -> u32;
 
 /// Compiler-produced full-haystack Count entry for one exclusively prepared
@@ -10639,6 +10653,10 @@ mod tests {
         assert!(C_API_V1_HEADER.contains(
             "FRE_AOT_REGEX_EXACT_SINGLETON_FIRST_CANDIDATE_MISS UINT64_MAX"
         ));
+        assert!(C_API_V1_HEADER.contains("FreAotRegexMatchingLfLineWitnessV1"));
+        assert!(
+            C_API_V1_HEADER.contains("FRE_AOT_REGEX_MATCHING_LF_LINE_WITNESS_MISS UINT64_MAX")
+        );
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveCountV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanSumV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveGrepCountV1"));
@@ -10693,6 +10711,10 @@ mod tests {
         );
         assert_eq!(
             size_of::<FreAotRegexExactSingletonFirstCandidateV1>(),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            size_of::<FreAotRegexMatchingLfLineWitnessV1>(),
             size_of::<usize>()
         );
         assert_eq!(size_of::<FreAotRegexExclusiveCountV1>(), size_of::<usize>());

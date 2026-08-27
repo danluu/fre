@@ -22,6 +22,8 @@ use crate::{
     independent_exists_batch_append_outcome, independent_exists_batch_object_outcome,
     independent_exact_singleton_first_candidate_append_outcome,
     independent_exact_singleton_first_candidate_object_outcome,
+    independent_matching_lf_line_witness_append_outcome,
+    independent_matching_lf_line_witness_object_outcome,
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
@@ -619,6 +621,50 @@ fn independent_exists_batch_allocator_failure_is_terminal_at_both_optional_seams
         }
     ))
     .expect("final endpoint-only ObjectBytes cap retains the batch incumbent")
+    .is_none());
+
+    const LF_WITNESS_APPEND_SITE: &str =
+        "injected matching-LF-line witness append allocation";
+    const LF_WITNESS_OBJECT_SITE: &str =
+        "injected matching-LF-line witness object allocation";
+    assert!(matches!(
+        independent_matching_lf_line_witness_append_outcome(Err(
+            ObjectError::Allocation(LF_WITNESS_APPEND_SITE)
+        )),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(LF_WITNESS_APPEND_SITE))
+        ))
+    ));
+    assert!(matches!(
+        independent_matching_lf_line_witness_append_outcome(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 63,
+            required: 64,
+        })),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit: 63,
+                required: 64,
+            })
+        ))
+    ));
+    assert!(matches!(
+        independent_matching_lf_line_witness_object_outcome(Err(
+            ObjectError::Allocation(LF_WITNESS_OBJECT_SITE)
+        )),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(LF_WITNESS_OBJECT_SITE))
+        ))
+    ));
+    assert!(independent_matching_lf_line_witness_object_outcome(Err(
+        ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 63,
+            required: 64,
+        }
+    ))
+    .expect("only final witness ObjectBytes may retain the exact batch incumbent")
     .is_none());
 }
 

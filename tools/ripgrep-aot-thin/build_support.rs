@@ -11,6 +11,7 @@ pub(crate) const EXACT64_SETS_FILE_ENV: &str = "FRE_RIPGREP_AOT_EXACT64_SETS_FIL
 pub(crate) const EXACT64_SET_PROFILE_V1: &str = "rust-regex-lf-bytes-v1";
 const GENERATED_REGISTRY: &str = "registry.rs";
 const GENERATED_FIRST_CANDIDATE_REGISTRY: &str = "first_candidate_registry.rs";
+const GENERATED_LF_LINE_WITNESS_REGISTRY: &str = "lf_line_witness_registry.rs";
 const GENERATED_EXACT64_SET_REGISTRY: &str = "exact64_set_registry.rs";
 const GENERATED_ARCHIVE: &str = "libfre_ripgrep_aot_objects.a";
 const GENERATED_ARTIFACT_SUFFIXES: &[&str] = &[
@@ -185,6 +186,7 @@ fn is_generated_artifact(path: &Path) -> bool {
     };
     name == GENERATED_REGISTRY
         || name == GENERATED_FIRST_CANDIDATE_REGISTRY
+        || name == GENERATED_LF_LINE_WITNESS_REGISTRY
         || name == GENERATED_EXACT64_SET_REGISTRY
         || name == GENERATED_ARCHIVE
         || GENERATED_ARTIFACT_SUFFIXES.iter().any(|suffix| {
@@ -554,6 +556,7 @@ mod tests {
         for name in [
             GENERATED_REGISTRY,
             GENERATED_FIRST_CANDIDATE_REGISTRY,
+            GENERATED_LF_LINE_WITNESS_REGISTRY,
             GENERATED_EXACT64_SET_REGISTRY,
             GENERATED_ARCHIVE,
             "old_fast_exists.o",
@@ -578,6 +581,7 @@ mod tests {
         for removed in [
             GENERATED_REGISTRY,
             GENERATED_FIRST_CANDIDATE_REGISTRY,
+            GENERATED_LF_LINE_WITNESS_REGISTRY,
             GENERATED_EXACT64_SET_REGISTRY,
             GENERATED_ARCHIVE,
             "old_fast_exists.o",

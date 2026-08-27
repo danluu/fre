@@ -7,7 +7,8 @@ use std::mem::MaybeUninit;
 
 use fre_aot_regex::{
     EXACT_SINGLETON_FIRST_CANDIDATE_AOT_SCHEMA_VERSION, EXACT_SINGLETON_FIRST_CANDIDATE_MISS,
-    MatchResult, REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
+    MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION, MATCHING_LF_LINE_WITNESS_MISS, MatchResult,
+    REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_ABI_VERSION,
     REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_LINE_TERMINATOR,
     REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_NO_MATCH,
     REGEX_SET_EXACT64_FIRST_ANY_AOT_V1_POSITION_FINAL_BYTE,
@@ -19,9 +20,9 @@ use fre_aot_regex_runtime::{
     FreAotRegexExactSingletonFirstCandidateV1, FreAotRegexExclusiveExistsBatchV1,
     FreAotRegexExclusiveGrepCountV1, FreAotRegexExclusiveHandleV1, FreAotRegexExclusiveSpanFillV1,
     FreAotRegexHaystackV1, FreAotRegexIndependentExistsBatchV1, FreAotRegexIterStateV1,
-    FreAotRegexResultV1, ITER_FINISHED, ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY,
-    PreparedAotMatches, PreparedAotRegex, fre_aot_regex_runtime_destroy_exclusive_v1,
-    fre_aot_regex_runtime_prepare_exclusive_v1,
+    FreAotRegexMatchingLfLineWitnessV1, FreAotRegexResultV1, ITER_FINISHED, ITER_HAS_LAST,
+    ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY, PreparedAotMatches, PreparedAotRegex,
+    fre_aot_regex_runtime_destroy_exclusive_v1, fre_aot_regex_runtime_prepare_exclusive_v1,
 };
 use sha2::{Digest, Sha256};
 
@@ -31,7 +32,11 @@ mod registry_key;
 #[path = "../first_candidate_receipt.rs"]
 mod first_candidate_receipt;
 
+#[path = "../lf_line_witness_receipt.rs"]
+mod lf_line_witness_receipt;
+
 use first_candidate_receipt::FirstCandidateReceiptIdentityInputV1;
+use lf_line_witness_receipt::MatchingLfLineWitnessReceiptIdentityInputV1;
 use registry_key::{exact64_set_registry_key, manifest_profile_key};
 
 /// Explicit general-AOT compilation policy.
@@ -534,6 +539,262 @@ pub struct AotExactSingletonFirstCandidateFactory {
     spec: &'static ExactSingletonFirstCandidateSpec,
 }
 
+type NativeMatchingLfLineWitness = FreAotRegexMatchingLfLineWitnessV1;
+
+const LF_LINE_WITNESS_STRATEGY_NATIVE_COMPLETE_DFA_TRUSTED_CORE_V1: u8 = 1;
+const LF_LINE_WITNESS_SEMANTICS_MATCHING_LF_LINE_BYTE_V1: u8 = 1;
+const LF_LINE_WITNESS_ABI_HAYSTACK_LEN_U64_OUT_STATUS_V1: u8 = 1;
+const LF_LINE_WITNESS_CURSOR_X86_RDX: u8 = 1;
+const LF_LINE_WITNESS_CURSOR_AARCH64_X2: u8 = 2;
+const LF_LINE_WITNESS_TARGET_AARCH64: u8 = 1;
+const LF_LINE_WITNESS_TARGET_X86_64: u8 = 2;
+const LF_LINE_WITNESS_TARGET_LINUX: u8 = 1;
+const LF_LINE_WITNESS_TARGET_MACOS: u8 = 2;
+
+const fn lf_line_witness_runtime_target_architecture() -> u8 {
+    if cfg!(target_arch = "aarch64") {
+        LF_LINE_WITNESS_TARGET_AARCH64
+    } else if cfg!(target_arch = "x86_64") {
+        LF_LINE_WITNESS_TARGET_X86_64
+    } else {
+        0
+    }
+}
+
+const fn lf_line_witness_runtime_target_os() -> u8 {
+    if cfg!(target_os = "linux") {
+        LF_LINE_WITNESS_TARGET_LINUX
+    } else if cfg!(target_os = "macos") {
+        LF_LINE_WITNESS_TARGET_MACOS
+    } else {
+        0
+    }
+}
+
+/// Raw-free build receipt for one stateless matching-LF-line witness endpoint
+/// linked from an ordinary Optimizing/Exists object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AotMatchingLfLineWitnessReceiptV1 {
+    manifest_profile_key: [u8; 32],
+    case_insensitive: bool,
+    source_count: usize,
+    source_bytes: usize,
+    minimum_width: usize,
+    maximum_width: usize,
+    source_language_sha256: [u8; 32],
+    schema_version: u32,
+    strategy: u8,
+    semantics: u8,
+    abi: u8,
+    miss_sentinel: u64,
+    target_architecture: u8,
+    target_operating_system: u8,
+    target_features: u64,
+    program_bytes: usize,
+    program_sha256: [u8; 32],
+    cursor_register: u8,
+    success_edge_count: u8,
+    inside_match_edge_count: u8,
+    exclusive_end_edge_count: u8,
+    success_edges_sha256: [u8; 32],
+    trusted_core_offset: usize,
+    trusted_core_sha256: [u8; 32],
+    ordinary_entry_symbol_sha256: [u8; 32],
+    ordinary_entry_code_sha256: [u8; 32],
+    wrapper_entry_offset: usize,
+    wrapper_bytes: usize,
+    wrapper_sha256: [u8; 32],
+    endpoint_symbol_sha256: [u8; 32],
+    native_code_sha256: [u8; 32],
+    relocations_sha256: [u8; 32],
+    object_sha256: [u8; 32],
+    runtime_call_count: u8,
+    receipt_identity_sha256: [u8; 32],
+}
+
+impl AotMatchingLfLineWitnessReceiptV1 {
+    /// Domain-separated identity of the raw manifest source and case profile.
+    #[must_use]
+    pub const fn manifest_profile_key(self) -> [u8; 32] {
+        self.manifest_profile_key
+    }
+
+    /// Number of members in the independently proved finite language.
+    #[must_use]
+    pub const fn source_count(self) -> usize {
+        self.source_count
+    }
+
+    /// Total bytes across the independently proved finite language.
+    #[must_use]
+    pub const fn source_bytes(self) -> usize {
+        self.source_bytes
+    }
+
+    /// Minimum independently proved member width.
+    #[must_use]
+    pub const fn minimum_width(self) -> usize {
+        self.minimum_width
+    }
+
+    /// Maximum independently proved member width.
+    #[must_use]
+    pub const fn maximum_width(self) -> usize {
+        self.maximum_width
+    }
+
+    /// Raw-free identity of the independently proved finite language.
+    #[must_use]
+    pub const fn source_language_sha256(self) -> [u8; 32] {
+        self.source_language_sha256
+    }
+
+    /// Complete linked object identity authenticated by the compiler receipt.
+    #[must_use]
+    pub const fn object_sha256(self) -> [u8; 32] {
+        self.object_sha256
+    }
+
+    /// Exact target feature mask authenticated by the compiler and build.
+    #[must_use]
+    pub const fn target_features(self) -> u64 {
+        self.target_features
+    }
+
+    fn identity_input(self) -> MatchingLfLineWitnessReceiptIdentityInputV1 {
+        MatchingLfLineWitnessReceiptIdentityInputV1 {
+            manifest_profile_key: self.manifest_profile_key,
+            case_insensitive: self.case_insensitive,
+            source_count: self.source_count,
+            source_bytes: self.source_bytes,
+            minimum_width: self.minimum_width,
+            maximum_width: self.maximum_width,
+            source_language_sha256: self.source_language_sha256,
+            schema_version: self.schema_version,
+            strategy: self.strategy,
+            semantics: self.semantics,
+            abi: self.abi,
+            miss_sentinel: self.miss_sentinel,
+            target_architecture: self.target_architecture,
+            target_operating_system: self.target_operating_system,
+            target_features: self.target_features,
+            program_bytes: self.program_bytes,
+            program_sha256: self.program_sha256,
+            cursor_register: self.cursor_register,
+            success_edge_count: self.success_edge_count,
+            inside_match_edge_count: self.inside_match_edge_count,
+            exclusive_end_edge_count: self.exclusive_end_edge_count,
+            success_edges_sha256: self.success_edges_sha256,
+            trusted_core_offset: self.trusted_core_offset,
+            trusted_core_sha256: self.trusted_core_sha256,
+            ordinary_entry_symbol_sha256: self.ordinary_entry_symbol_sha256,
+            ordinary_entry_code_sha256: self.ordinary_entry_code_sha256,
+            wrapper_entry_offset: self.wrapper_entry_offset,
+            wrapper_bytes: self.wrapper_bytes,
+            wrapper_sha256: self.wrapper_sha256,
+            endpoint_symbol_sha256: self.endpoint_symbol_sha256,
+            native_code_sha256: self.native_code_sha256,
+            relocations_sha256: self.relocations_sha256,
+            object_sha256: self.object_sha256,
+            runtime_call_count: self.runtime_call_count,
+        }
+    }
+
+    fn authenticates_request(
+        self,
+        request_key: [u8; 32],
+        case_insensitive: bool,
+        entry_symbol: &str,
+    ) -> bool {
+        let endpoint_symbol_sha256: [u8; 32] = Sha256::digest(entry_symbol.as_bytes()).into();
+        let hashes = [
+            self.source_language_sha256,
+            self.program_sha256,
+            self.success_edges_sha256,
+            self.trusted_core_sha256,
+            self.ordinary_entry_symbol_sha256,
+            self.ordinary_entry_code_sha256,
+            self.wrapper_sha256,
+            self.endpoint_symbol_sha256,
+            self.native_code_sha256,
+            self.relocations_sha256,
+            self.object_sha256,
+            self.receipt_identity_sha256,
+        ];
+        let target_shape = matches!(
+            (self.target_architecture, self.cursor_register),
+            (
+                LF_LINE_WITNESS_TARGET_X86_64,
+                LF_LINE_WITNESS_CURSOR_X86_RDX
+            ) | (
+                LF_LINE_WITNESS_TARGET_AARCH64,
+                LF_LINE_WITNESS_CURSOR_AARCH64_X2
+            )
+        );
+        let source_geometry = self.source_count != 0
+            && self.source_bytes != 0
+            && self.minimum_width != 0
+            && self.minimum_width <= self.maximum_width
+            && self
+                .source_count
+                .checked_mul(self.minimum_width)
+                .is_some_and(|minimum_bytes| minimum_bytes <= self.source_bytes)
+            && self
+                .source_count
+                .checked_mul(self.maximum_width)
+                .is_some_and(|maximum_bytes| self.source_bytes <= maximum_bytes);
+        self.manifest_profile_key == request_key
+            && self.case_insensitive == case_insensitive
+            && source_geometry
+            && self.schema_version == MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION
+            && self.strategy == LF_LINE_WITNESS_STRATEGY_NATIVE_COMPLETE_DFA_TRUSTED_CORE_V1
+            && self.semantics == LF_LINE_WITNESS_SEMANTICS_MATCHING_LF_LINE_BYTE_V1
+            && self.abi == LF_LINE_WITNESS_ABI_HAYSTACK_LEN_U64_OUT_STATUS_V1
+            && self.miss_sentinel == MATCHING_LF_LINE_WITNESS_MISS
+            && self.target_architecture == lf_line_witness_runtime_target_architecture()
+            && self.target_operating_system == lf_line_witness_runtime_target_os()
+            && self.target_features
+                == generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_TARGET_FEATURES
+            && target_shape
+            && self.program_bytes != 0
+            && self.success_edge_count != 0
+            && u16::from(self.inside_match_edge_count) + u16::from(self.exclusive_end_edge_count)
+                == u16::from(self.success_edge_count)
+            && self.wrapper_bytes != 0
+            && hashes.iter().all(|hash| *hash != [0; 32])
+            && self.endpoint_symbol_sha256 == endpoint_symbol_sha256
+            && self.runtime_call_count == 0
+            && self.identity_input().identity() == Some(self.receipt_identity_sha256)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MatchingLfLineWitnessSpec {
+    manifest_profile_key: [u8; 32],
+    description: &'static str,
+    entry_symbol: &'static str,
+    entry: NativeMatchingLfLineWitness,
+    receipt: AotMatchingLfLineWitnessReceiptV1,
+}
+
+/// Safe result of a whole-buffer matching-LF-line witness endpoint.
+///
+/// A candidate is never a confirmed match. Stock ripgrep remains
+/// authoritative for matching-line, span, and capture semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AotMatchingLfLineWitnessOutcome {
+    /// The independently authenticated finite language does not occur.
+    ConfirmedMiss,
+    /// One byte in an LF-delimited line that may contain a match.
+    Candidate { position: usize },
+}
+
+/// Authenticated stateless handle to one matching-LF-line witness endpoint.
+#[derive(Clone, Copy, Debug)]
+pub struct AotMatchingLfLineWitnessFactory {
+    spec: &'static MatchingLfLineWitnessSpec,
+}
+
 type AbiResult = FreAotRegexResultV1;
 type AbiHaystack = FreAotRegexHaystackV1;
 type NativeIterState = FreAotRegexIterStateV1;
@@ -706,6 +967,14 @@ mod generated_exact64_sets {
 )]
 mod generated_first_candidates {
     include!(concat!(env!("OUT_DIR"), "/first_candidate_registry.rs"));
+}
+
+#[allow(
+    unsafe_code,
+    reason = "generated declarations are bound to authenticated stateless matching-LF-line witness entries"
+)]
+mod generated_lf_line_witnesses {
+    include!(concat!(env!("OUT_DIR"), "/lf_line_witness_registry.rs"));
 }
 
 #[cfg(test)]
@@ -1192,6 +1461,128 @@ fn native_exact_singleton_first_candidate(
         );
     }
     Ok(AotExactSingletonFirstCandidateOutcome::Candidate { position })
+}
+
+impl AotMatchingLfLineWitnessFactory {
+    /// Select one stateless whole-buffer witness before acquiring a haystack.
+    ///
+    /// Only Optimizing/Exists tuples independently proved at build time to be
+    /// assertion-free exact finite nonempty LF-free languages can appear.
+    /// An absent or compiler-declined endpoint returns `Ok(None)`; every
+    /// mismatch in a present raw-free receipt is terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a raw-free error for an ambiguous, malformed, or stale present
+    /// registry row.
+    pub fn select(
+        mode: AotMode,
+        output: AotOutput,
+        pattern: &str,
+        case_insensitive: bool,
+    ) -> Result<Option<Self>, String> {
+        select_matching_lf_line_witness_spec(
+            generated_lf_line_witnesses::MATCHING_LF_LINE_WITNESS_SPECS,
+            mode,
+            output,
+            pattern,
+            case_insensitive,
+        )
+        .map(|spec| spec.map(|spec| Self { spec }))
+    }
+
+    /// Raw-free structural route description.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        self.spec.description
+    }
+
+    /// Authenticated build receipt for the selected stateless endpoint.
+    #[must_use]
+    pub const fn receipt(&self) -> AotMatchingLfLineWitnessReceiptV1 {
+        self.spec.receipt
+    }
+
+    /// Find one byte in an LF-delimited line that may contain a match.
+    ///
+    /// `ConfirmedMiss` is authoritative under the receipt's independent
+    /// exact finite nonempty LF-free language proof. A positive result remains
+    /// a candidate whose containing line must be checked by stock ripgrep.
+    ///
+    /// # Errors
+    ///
+    /// Any native failure, malformed sentinel, or out-of-range or
+    /// delimiter-valued success after receiving the haystack is terminal and
+    /// is never converted to fallback.
+    pub fn find(&self, haystack: &[u8]) -> Result<AotMatchingLfLineWitnessOutcome, String> {
+        native_matching_lf_line_witness(self.spec.entry, haystack)
+    }
+}
+
+fn select_matching_lf_line_witness_spec<'a>(
+    specs: &'a [MatchingLfLineWitnessSpec],
+    mode: AotMode,
+    output: AotOutput,
+    pattern: &str,
+    case_insensitive: bool,
+) -> Result<Option<&'a MatchingLfLineWitnessSpec>, String> {
+    if mode != AotMode::Optimizing || output != AotOutput::Exists {
+        return Ok(None);
+    }
+    let request_key = manifest_profile_key(pattern, case_insensitive);
+    let mut matching = specs
+        .iter()
+        .filter(|spec| spec.manifest_profile_key == request_key);
+    let Some(spec) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err(
+            "matching-LF-line witness registry contains an ambiguous profile key".to_owned(),
+        );
+    }
+    if spec.receipt.manifest_profile_key != spec.manifest_profile_key
+        || !spec
+            .receipt
+            .authenticates_request(request_key, case_insensitive, spec.entry_symbol)
+    {
+        return Err("matching-LF-line witness registry receipt authentication failed".to_owned());
+    }
+    Ok(Some(spec))
+}
+
+#[allow(
+    unsafe_code,
+    reason = "single checked call boundary for an authenticated compiler-produced stateless matching-LF-line entry"
+)]
+fn native_matching_lf_line_witness(
+    entry: NativeMatchingLfLineWitness,
+    haystack: &[u8],
+) -> Result<AotMatchingLfLineWitnessOutcome, String> {
+    let mut position = MaybeUninit::<u64>::uninit();
+    // SAFETY: the slice is readable for its complete extent and `position` is
+    // aligned, writable, and disjoint. The authenticated V1 entry retains no
+    // argument and initializes the result exactly when returning status zero.
+    let status = unsafe { entry(haystack.as_ptr(), haystack.len(), position.as_mut_ptr()) };
+    if status != 0 {
+        return Err(format!(
+            "compiled matching-LF-line witness entry failed with status {status}"
+        ));
+    }
+    // The compiler-produced ABI initializes the result exactly on success.
+    let position = unsafe { position.assume_init() };
+    if position == MATCHING_LF_LINE_WITNESS_MISS {
+        return Ok(AotMatchingLfLineWitnessOutcome::ConfirmedMiss);
+    }
+    let position = usize::try_from(position).map_err(|_| {
+        "compiled matching-LF-line witness entry returned an invalid position".to_owned()
+    })?;
+    if position >= haystack.len() || haystack[position] == b'\n' {
+        return Err(
+            "compiled matching-LF-line witness entry returned an invalid position".to_owned(),
+        );
+    }
+    Ok(AotMatchingLfLineWitnessOutcome::Candidate { position })
 }
 
 impl AotExact64SetFactory {
@@ -2352,6 +2743,8 @@ mod tests {
     const _: () = assert_sync::<AotExact64SetFactory>();
     const _: () = assert_send::<AotExactSingletonFirstCandidateFactory>();
     const _: () = assert_sync::<AotExactSingletonFirstCandidateFactory>();
+    const _: () = assert_send::<AotMatchingLfLineWitnessFactory>();
+    const _: () = assert_sync::<AotMatchingLfLineWitnessFactory>();
 
     static SEARCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -2365,6 +2758,7 @@ mod tests {
     static EXACT64_FIRST_ANY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EXACT64_SELECTION_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FIRST_CANDIDATE_SELECTION_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static LF_LINE_WITNESS_SELECTION_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
     const EXACT64_PUBLIC_RAW_SENTINELS: [&str; 3] = [
         "fixture_raw_sentinel_one",
         "fixture_raw_sentinel_one_suffix",
@@ -2488,6 +2882,50 @@ mod tests {
         0
     }
 
+    unsafe extern "C" fn lf_line_witness_entry(
+        _haystack: *const u8,
+        haystack_len: usize,
+        position: *mut u64,
+    ) -> u32 {
+        if position.is_null() {
+            return 2;
+        }
+        let value = if haystack_len >= 5 {
+            2
+        } else {
+            MATCHING_LF_LINE_WITNESS_MISS
+        };
+        unsafe { position.write(value) };
+        0
+    }
+
+    unsafe extern "C" fn lf_line_witness_selection_entry(
+        _haystack: *const u8,
+        _haystack_len: usize,
+        _position: *mut u64,
+    ) -> u32 {
+        LF_LINE_WITNESS_SELECTION_ENTRY_CALLS.fetch_add(1, Ordering::Relaxed);
+        2
+    }
+
+    unsafe extern "C" fn lf_line_witness_failure_after_write_entry(
+        _haystack: *const u8,
+        _haystack_len: usize,
+        position: *mut u64,
+    ) -> u32 {
+        unsafe { position.write(0) };
+        9
+    }
+
+    unsafe extern "C" fn lf_line_witness_out_of_range_entry(
+        _haystack: *const u8,
+        haystack_len: usize,
+        position: *mut u64,
+    ) -> u32 {
+        unsafe { position.write(u64::try_from(haystack_len).unwrap_or(u64::MAX - 1)) };
+        0
+    }
+
     fn first_candidate_test_spec(
         pattern: &str,
         case_insensitive: bool,
@@ -2548,6 +2986,69 @@ mod tests {
         ExactSingletonFirstCandidateSpec {
             manifest_profile_key,
             description: "public-test-exact-singleton-first-candidate",
+            entry_symbol: ENTRY_SYMBOL,
+            entry,
+            receipt,
+        }
+    }
+
+    fn lf_line_witness_test_spec(
+        pattern: &str,
+        case_insensitive: bool,
+        entry: NativeMatchingLfLineWitness,
+    ) -> MatchingLfLineWitnessSpec {
+        const ENTRY_SYMBOL: &str = "fre_aot_regex_matching_lf_line_witness_v1_public_test";
+        let manifest_profile_key = manifest_profile_key(pattern, case_insensitive);
+        let endpoint_symbol_sha256: [u8; 32] = Sha256::digest(ENTRY_SYMBOL.as_bytes()).into();
+        let cursor_register = if cfg!(target_arch = "x86_64") {
+            LF_LINE_WITNESS_CURSOR_X86_RDX
+        } else {
+            LF_LINE_WITNESS_CURSOR_AARCH64_X2
+        };
+        let mut receipt = AotMatchingLfLineWitnessReceiptV1 {
+            manifest_profile_key,
+            case_insensitive,
+            source_count: 2,
+            source_bytes: 9,
+            minimum_width: 4,
+            maximum_width: 5,
+            source_language_sha256: [1; 32],
+            schema_version: MATCHING_LF_LINE_WITNESS_AOT_SCHEMA_VERSION,
+            strategy: LF_LINE_WITNESS_STRATEGY_NATIVE_COMPLETE_DFA_TRUSTED_CORE_V1,
+            semantics: LF_LINE_WITNESS_SEMANTICS_MATCHING_LF_LINE_BYTE_V1,
+            abi: LF_LINE_WITNESS_ABI_HAYSTACK_LEN_U64_OUT_STATUS_V1,
+            miss_sentinel: MATCHING_LF_LINE_WITNESS_MISS,
+            target_architecture: lf_line_witness_runtime_target_architecture(),
+            target_operating_system: lf_line_witness_runtime_target_os(),
+            target_features: generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_TARGET_FEATURES,
+            program_bytes: 101,
+            program_sha256: [2; 32],
+            cursor_register,
+            success_edge_count: 4,
+            inside_match_edge_count: 2,
+            exclusive_end_edge_count: 2,
+            success_edges_sha256: [3; 32],
+            trusted_core_offset: 17,
+            trusted_core_sha256: [4; 32],
+            ordinary_entry_symbol_sha256: [5; 32],
+            ordinary_entry_code_sha256: [6; 32],
+            wrapper_entry_offset: 31,
+            wrapper_bytes: 48,
+            wrapper_sha256: [7; 32],
+            endpoint_symbol_sha256,
+            native_code_sha256: [8; 32],
+            relocations_sha256: [9; 32],
+            object_sha256: [10; 32],
+            runtime_call_count: 0,
+            receipt_identity_sha256: [0; 32],
+        };
+        receipt.receipt_identity_sha256 = receipt
+            .identity_input()
+            .identity()
+            .expect("test receipt identity");
+        MatchingLfLineWitnessSpec {
+            manifest_profile_key,
+            description: "public-test-matching-lf-line-witness",
             entry_symbol: ENTRY_SYMBOL,
             entry,
             receipt,
@@ -3551,6 +4052,278 @@ mod tests {
             assert_eq!(
                 factory.find(b"unrelated").expect("linked candidate miss"),
                 AotExactSingletonFirstCandidateOutcome::ConfirmedMiss
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one mutation table covers every field in the raw-free witness receipt identity"
+    )]
+    fn lf_line_witness_selection_is_structural_and_every_receipt_field_is_bound() {
+        const RAW_SENTINEL: &str = "fixture_raw_lf_line_witness_sentinel";
+        LF_LINE_WITNESS_SELECTION_ENTRY_CALLS.store(0, Ordering::Relaxed);
+        let spec = lf_line_witness_test_spec(RAW_SENTINEL, false, lf_line_witness_selection_entry);
+        let selected = select_matching_lf_line_witness_spec(
+            std::slice::from_ref(&spec),
+            AotMode::Optimizing,
+            AotOutput::Exists,
+            RAW_SENTINEL,
+            false,
+        )
+        .expect("authenticated selection")
+        .expect("known tuple");
+        assert_eq!(selected.manifest_profile_key, spec.manifest_profile_key);
+
+        for (mode, output) in [
+            (AotMode::Fast, AotOutput::Exists),
+            (AotMode::Optimizing, AotOutput::Span),
+        ] {
+            assert!(
+                select_matching_lf_line_witness_spec(
+                    std::slice::from_ref(&spec),
+                    mode,
+                    output,
+                    RAW_SENTINEL,
+                    false,
+                )
+                .expect("unsupported route is a structural decline")
+                .is_none()
+            );
+        }
+        assert!(
+            select_matching_lf_line_witness_spec(
+                std::slice::from_ref(&spec),
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                "absent-public-pattern",
+                false,
+            )
+            .expect("absent row")
+            .is_none()
+        );
+
+        type MutateReceipt = fn(&mut AotMatchingLfLineWitnessReceiptV1);
+        let mutations: &[MutateReceipt] = &[
+            |value| value.manifest_profile_key[0] ^= 1,
+            |value| value.case_insensitive = !value.case_insensitive,
+            |value| value.source_count += 1,
+            |value| value.source_bytes += 1,
+            |value| value.minimum_width += 1,
+            |value| value.maximum_width += 1,
+            |value| value.source_language_sha256[0] ^= 1,
+            |value| value.schema_version ^= 1,
+            |value| value.strategy ^= 1,
+            |value| value.semantics ^= 1,
+            |value| value.abi ^= 1,
+            |value| value.miss_sentinel ^= 1,
+            |value| value.target_architecture ^= 1,
+            |value| value.target_operating_system ^= 1,
+            |value| value.target_features ^= 1,
+            |value| value.program_bytes += 1,
+            |value| value.program_sha256[0] ^= 1,
+            |value| value.cursor_register ^= 1,
+            |value| value.success_edge_count += 1,
+            |value| value.inside_match_edge_count += 1,
+            |value| value.exclusive_end_edge_count += 1,
+            |value| value.success_edges_sha256[0] ^= 1,
+            |value| value.trusted_core_offset += 1,
+            |value| value.trusted_core_sha256[0] ^= 1,
+            |value| value.ordinary_entry_symbol_sha256[0] ^= 1,
+            |value| value.ordinary_entry_code_sha256[0] ^= 1,
+            |value| value.wrapper_entry_offset += 1,
+            |value| value.wrapper_bytes += 1,
+            |value| value.wrapper_sha256[0] ^= 1,
+            |value| value.endpoint_symbol_sha256[0] ^= 1,
+            |value| value.native_code_sha256[0] ^= 1,
+            |value| value.relocations_sha256[0] ^= 1,
+            |value| value.object_sha256[0] ^= 1,
+            |value| value.runtime_call_count += 1,
+            |value| value.receipt_identity_sha256[0] ^= 1,
+        ];
+        for mutate in mutations {
+            let mut corrupted = spec;
+            mutate(&mut corrupted.receipt);
+            let error = select_matching_lf_line_witness_spec(
+                std::slice::from_ref(&corrupted),
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                RAW_SENTINEL,
+                false,
+            )
+            .expect_err("every receipt mutation is terminal");
+            assert!(error.contains("receipt authentication failed"), "{error}");
+            assert!(!error.contains(RAW_SENTINEL));
+        }
+
+        let mut wrong_symbol = spec;
+        wrong_symbol.entry_symbol = "public_wrong_lf_line_witness_symbol";
+        assert!(
+            select_matching_lf_line_witness_spec(
+                std::slice::from_ref(&wrong_symbol),
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                RAW_SENTINEL,
+                false,
+            )
+            .expect_err("entry-symbol substitution is terminal")
+            .contains("receipt authentication failed")
+        );
+        let duplicate_specs = [spec, spec];
+        assert!(
+            select_matching_lf_line_witness_spec(
+                &duplicate_specs,
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                RAW_SENTINEL,
+                false,
+            )
+            .expect_err("duplicate profile key is terminal")
+            .contains("ambiguous profile key")
+        );
+        assert_eq!(
+            LF_LINE_WITNESS_SELECTION_ENTRY_CALLS.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn lf_line_witness_native_boundary_returns_only_miss_or_unconfirmed_valid_position() {
+        assert_eq!(
+            native_matching_lf_line_witness(lf_line_witness_entry, b"abcde")
+                .expect("candidate success"),
+            AotMatchingLfLineWitnessOutcome::Candidate { position: 2 }
+        );
+        assert_eq!(
+            native_matching_lf_line_witness(lf_line_witness_entry, b"abcd").expect("short miss"),
+            AotMatchingLfLineWitnessOutcome::ConfirmedMiss
+        );
+        assert!(
+            native_matching_lf_line_witness(lf_line_witness_entry, b"ab\ncd")
+                .expect_err("an LF byte is not a valid line witness")
+                .contains("invalid position")
+        );
+        let failure =
+            native_matching_lf_line_witness(lf_line_witness_failure_after_write_entry, b"haystack")
+                .expect_err("nonzero status is terminal despite an output write");
+        assert!(failure.contains("status 9"));
+        assert!(
+            native_matching_lf_line_witness(lf_line_witness_out_of_range_entry, b"haystack")
+                .expect_err("out-of-range position")
+                .contains("invalid position")
+        );
+        assert!(
+            native_matching_lf_line_witness(lf_line_witness_out_of_range_entry, b"")
+                .expect_err("a non-sentinel empty-haystack position is invalid")
+                .contains("invalid position")
+        );
+    }
+
+    #[test]
+    fn generated_lf_line_witness_registry_is_raw_free_and_receipt_closed() {
+        let generated_source =
+            include_str!(concat!(env!("OUT_DIR"), "/lf_line_witness_registry.rs"));
+        for raw_source in [
+            "PM_RESUME",
+            "Sherlock Holmes",
+            "Шерлок Холмс",
+            "FirstCandidatePublicShape",
+            "PublicSingletonNeedle",
+            "FirstCandidatePublicAlpha",
+            "FirstCandidatePublicBravo",
+        ] {
+            assert!(
+                !generated_source.contains(raw_source),
+                "matching-LF-line witness registry leaked a raw source"
+            );
+        }
+        assert_eq!(
+            generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_ADMITTED_COUNT,
+            generated_lf_line_witnesses::MATCHING_LF_LINE_WITNESS_SPECS.len()
+        );
+        assert!(
+            generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_ADMITTED_COUNT
+                <= generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_INDEPENDENTLY_ELIGIBLE_COUNT
+        );
+        if generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_PUBLIC_FIXTURE_SELECTED
+            && generated::BUILD_VARIANT_POLICY != "optimizing-grep-count"
+            && generated::BUILD_PATTERN_COUNT == 4
+        {
+            assert_eq!(
+                generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_INDEPENDENTLY_ELIGIBLE_COUNT,
+                4
+            );
+            assert!(
+                !generated_lf_line_witnesses::MATCHING_LF_LINE_WITNESS_SPECS.is_empty(),
+                "public finite-language fixture must exercise a linked witness endpoint"
+            );
+        }
+        for spec in generated_lf_line_witnesses::MATCHING_LF_LINE_WITNESS_SPECS {
+            let receipt = spec.receipt;
+            assert_eq!(spec.manifest_profile_key, receipt.manifest_profile_key());
+            assert!(
+                generated::ALL_MANIFEST_PROFILE_KEYS.contains(&spec.manifest_profile_key),
+                "witness row has no selected manifest profile"
+            );
+            assert_eq!(
+                receipt.target_features(),
+                generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_TARGET_FEATURES
+            );
+            assert_ne!(receipt.source_count(), 0);
+            assert_ne!(receipt.source_bytes(), 0);
+            assert_ne!(receipt.minimum_width(), 0);
+            assert!(receipt.minimum_width() <= receipt.maximum_width());
+            assert_ne!(receipt.source_language_sha256(), [0; 32]);
+            assert_ne!(receipt.object_sha256(), [0; 32]);
+            assert_eq!(
+                receipt.identity_input().identity(),
+                Some(receipt.receipt_identity_sha256)
+            );
+            let endpoint_symbol_sha256: [u8; 32] =
+                Sha256::digest(spec.entry_symbol.as_bytes()).into();
+            assert_eq!(endpoint_symbol_sha256, receipt.endpoint_symbol_sha256);
+            assert!(!spec.description.contains("pattern="));
+            // SAFETY: null output is invalid independently of the deliberately
+            // null zero-length haystack and must be rejected before scanning.
+            let status = unsafe { (spec.entry)(std::ptr::null(), 0, std::ptr::null_mut()) };
+            assert_eq!(status, 2);
+        }
+
+        if generated_lf_line_witnesses::BUILD_LF_LINE_WITNESS_PUBLIC_FIXTURE_SELECTED
+            && generated::BUILD_VARIANT_POLICY != "optimizing-grep-count"
+            && generated::BUILD_PATTERN_COUNT == 4
+        {
+            let factory = AotMatchingLfLineWitnessFactory::select(
+                AotMode::Optimizing,
+                AotOutput::Exists,
+                "(?:FirstCandidatePublicAlpha|FirstCandidatePublicBravo)",
+                false,
+            )
+            .expect("known public tuple receipt")
+            .expect("public finite alternation witness");
+            assert!(
+                factory
+                    .description()
+                    .contains("api=matching-lf-line-witness-v1")
+            );
+            let hit = b"head\n--FirstCandidatePublicBravo--\ntail";
+            let line_start = 5;
+            let line_end = hit
+                .iter()
+                .rposition(|&byte| byte == b'\n')
+                .expect("matching-line terminator");
+            let AotMatchingLfLineWitnessOutcome::Candidate { position } =
+                factory.find(hit).expect("linked witness hit")
+            else {
+                panic!("known matching line returned a miss");
+            };
+            assert!((line_start..line_end).contains(&position));
+            assert_eq!(
+                factory
+                    .find(b"unrelated\nbytes")
+                    .expect("linked witness miss"),
+                AotMatchingLfLineWitnessOutcome::ConfirmedMiss
             );
         }
     }

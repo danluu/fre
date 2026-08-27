@@ -110,7 +110,11 @@ pub(super) fn x86_emit_bounded_suffix_retry(
     assembler.bind(accepted)?;
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x49, 0x89, 0x00])?;
-    assembler.branch(&[0xe9], matched)?;
+    assembler.branch_lf_line_success(
+        &[0xe9],
+        matched,
+        NativeDirectSearchLfLineRoute::BoundedRetryExclusiveEndOffset,
+    )?;
 
     // Terminal candidate bases are monotone. If this exact suffix would
     // extend past the semantic end, every later base does too. Interior plans
@@ -198,7 +202,10 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
     assembler.branch(retry_scan)?;
 
     assembler.bind(accepted)?;
-    assembler.branch(matched)?;
+    assembler.branch_lf_line_success(
+        matched,
+        NativeDirectSearchLfLineRoute::BoundedRetryExclusiveEndOffset,
+    )?;
     Ok(())
 }
 

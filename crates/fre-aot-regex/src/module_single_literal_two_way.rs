@@ -360,6 +360,8 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
             program_sha256,
         },
         success_cursor: Some(success_cursor),
+        matching_lf_line_cursor: None,
+        matching_lf_line_success_edges_sha256: None,
     };
     authenticate_native_direct_search_trusted_core(
         target.architecture,
@@ -2610,17 +2612,57 @@ mod tests {
                 usize::MAX,
             )
             .expect("emit non-Two-Way batch");
+            let matching_line_module = decline_batch_module
+                .clone()
+                .append_direct_matching_lf_line_witness(OutputContract::Exists)
+                .expect("append complete-DFA matching-line witness")
+                .expect("matching-line witness eligibility");
+            let matching_line_object = crate::emit_object(
+                &matching_line_module,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit complete-DFA matching-line witness");
+            assert!(matching_line_object.len() > decline_batch_object.len());
             let declined = crate::compile_with_independent_exists_batch(decline_request)
-                .expect("structural endpoint decline");
-            assert_eq!(declined.object(), decline_batch_object);
-            assert_eq!(declined.module(), &decline_batch_module);
+                .expect("complete-DFA matching-line endpoint");
+            assert_eq!(declined.object(), matching_line_object);
+            assert_eq!(declined.module(), &matching_line_module);
             assert!(declined
                 .module()
                 .direct_exact_singleton_first_candidate_symbol()
                 .is_none());
             assert!(declined
+                .module()
+                .direct_matching_lf_line_witness_symbol()
+                .is_some());
+            assert!(declined
                 .receipt()
                 .exact_singleton_first_candidate_aot
+                .is_none());
+            assert!(declined
+                .receipt()
+                .matching_lf_line_witness_aot
+                .is_some());
+
+            let mut limits = crate::CompileLimitsV1::default();
+            limits.max_object_bytes = decline_batch_object.len();
+            let capped = crate::compile_with_independent_exists_batch(
+                CompileRequest::new(&non_two_way_pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists)
+                    .limits(limits),
+            )
+            .expect("matching-line final ObjectBytes decline");
+            assert_eq!(capped.object(), decline_batch_object);
+            assert_eq!(capped.module(), &decline_batch_module);
+            assert!(capped
+                .module()
+                .direct_matching_lf_line_witness_symbol()
+                .is_none());
+            assert!(capped
+                .receipt()
+                .matching_lf_line_witness_aot
                 .is_none());
         }
     }
