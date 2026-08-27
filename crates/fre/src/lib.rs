@@ -7798,7 +7798,6 @@ impl PortableBuilder {
         BuildError,
     > {
         if patterns.len() < 2
-            || patterns.len() > finite::FLAT_LITERAL_SET_STACK_HANDOFF_MAX_PATTERNS
             || !matches!(forbidden_byte, None | Some(b'\x00'))
         {
             return Ok(None);
@@ -31804,7 +31803,7 @@ mod tests {
 
     #[test]
     fn ripgrep_ordinary_literal_census_is_fused_and_transient() {
-        let mut patterns = (0..129)
+        let mut patterns = (0..257)
             .map(|index| format!("value{index:04}"))
             .collect::<Vec<_>>();
         patterns[0] = "valueé\0".to_owned();
