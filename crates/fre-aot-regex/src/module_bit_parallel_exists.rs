@@ -308,6 +308,7 @@ fn lower_native_bit_parallel_layout(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },

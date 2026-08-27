@@ -2782,9 +2782,10 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
     }
     match success_mode {
         ExactFiniteTeddySuccessMode::SelectedEnd
-            if incumbent
-                .exact_finite_exists_complete_dfa_receipt
-                .is_some() =>
+            if incumbent.exact_finite_exists_complete_dfa_receipt.is_some()
+                || incumbent
+                    .exact_finite_exists_complete_dfa_expected_receipt_sha256
+                    .is_some() =>
         {
             return Err(ObjectError::InvalidModule(
                 "SelectedEnd Teddy incumbent carried an Exists physical receipt",
@@ -2821,6 +2822,7 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
     // lowering. Consume the domain-specific receipt only after the sole
     // recoverable cap decline, which must restore every incumbent field.
     incumbent.exact_finite_exists_complete_dfa_receipt = None;
+    incumbent.exact_finite_exists_complete_dfa_expected_receipt_sha256 = None;
     reserve_exact_finite_teddy_native_data(&mut incumbent.data, additional)?;
     let incumbent_trusted_core = incumbent.direct_search_trusted_core.take();
     let incumbent_code = core::mem::take(&mut incumbent.code);
@@ -3785,6 +3787,21 @@ mod tests {
         pattern
     }
 
+    fn power_of_two_class_row_pattern() -> String {
+        let roots = &SCANNER_FREE_BYTES[..15];
+        let mut pattern = String::from("(?-u:");
+        for (ordinal, &root) in roots.iter().enumerate() {
+            if ordinal != 0 {
+                pattern.push('|');
+            }
+            for _ in 0..6 + usize::from(ordinal + 1 == roots.len()) {
+                pattern.push_str(&format!("\\x{root:02x}"));
+            }
+        }
+        pattern.push(')');
+        pattern
+    }
+
     fn x86_rel32_target(code: &[u8], displacement_offset: usize) -> usize {
         let displacement = i64::from(i32::from_le_bytes(
             code[displacement_offset..displacement_offset + 4]
@@ -4298,6 +4315,12 @@ mod tests {
                 .is_none(),
             "the composed Teddy lowering must consume its complete-DFA receipt",
         );
+        assert!(
+            lowering
+                .exact_finite_exists_complete_dfa_expected_receipt_sha256
+                .is_none(),
+            "the composed Teddy lowering must consume its receipt authentication basis",
+        );
         lowering
     }
 
@@ -4630,6 +4653,77 @@ mod tests {
     }
 
     #[test]
+    fn exact_finite_exists_receipt_representation_vocabulary_covers_every_dense_layout() {
+        let cases = [
+            (
+                TransitionLayout::DirectByte,
+                NativeCellEncoding::Compact8Direct,
+                NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteCompact8,
+            ),
+            (
+                TransitionLayout::DirectByte,
+                NativeCellEncoding::Compact16,
+                NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteCompact16,
+            ),
+            (
+                TransitionLayout::DirectByte,
+                NativeCellEncoding::Wide32,
+                NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteWide32,
+            ),
+            (
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16,
+                NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16,
+            ),
+            (
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16Indexed(4),
+                NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16Indexed,
+            ),
+            (
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16Ordinal(16),
+                NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16Ordinal,
+            ),
+            (
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Wide32,
+                NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedWide32,
+            ),
+        ];
+        let mut seen_tags = [false; 8];
+        for (transitions, cells, expected) in cases {
+            assert_eq!(
+                NativeExactFiniteExistsCompleteDfaRepresentation::from_transition_encoding(
+                    transitions,
+                    cells,
+                ),
+                Some(expected),
+            );
+            assert_eq!(expected.layout(8), Some((transitions, cells)));
+            let tag = usize::from(expected.tag());
+            assert!((1..=7).contains(&tag));
+            assert!(!seen_tags[tag]);
+            seen_tags[tag] = true;
+        }
+        assert!(seen_tags[1..].iter().all(|seen| *seen));
+        assert_eq!(
+            NativeExactFiniteExistsCompleteDfaRepresentation::from_transition_encoding(
+                TransitionLayout::DirectByte,
+                NativeCellEncoding::Compact16Indexed(4),
+            ),
+            None,
+        );
+        assert_eq!(
+            NativeExactFiniteExistsCompleteDfaRepresentation::from_transition_encoding(
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact8Direct,
+            ),
+            None,
+        );
+    }
+
+    #[test]
     fn valid_ascii_deterministic_coalescer_shape_selects_exists_teddy() {
         let pattern = deterministic_coalescer_ascii_pattern();
         for target in [
@@ -4674,6 +4768,13 @@ mod tests {
                 report.incumbent_complete_dfa,
             )
             .unwrap());
+            let receipt = received
+                .exact_finite_exists_complete_dfa_receipt
+                .expect("exact-finite Exists physical receipt");
+            assert_eq!(
+                received.exact_finite_exists_complete_dfa_expected_receipt_sha256,
+                Some(receipt.receipt_sha256),
+            );
         }
     }
 
@@ -4743,7 +4844,7 @@ mod tests {
                 .program()
                 .native_finite_exists_choice_view()
                 .expect("authenticated exact finite Exists Choice");
-            for mutation in 0..8 {
+            for mutation in 0..10 {
                 let (mut incumbent, baseline) =
                     complete_exists_dfa_baseline(&compiled, target);
                 let selection = select_exact_finite_exists_teddy(
@@ -4776,6 +4877,13 @@ mod tests {
                     5 => receipt.data_sha256[0] ^= 1,
                     6 => receipt.relocations_sha256[0] ^= 1,
                     7 => receipt.receipt_sha256[0] ^= 1,
+                    8 => incumbent
+                        .exact_finite_exists_complete_dfa_expected_receipt_sha256
+                        .as_mut()
+                        .unwrap()[0] ^= 1,
+                    9 => {
+                        incumbent.exact_finite_exists_complete_dfa_expected_receipt_sha256 = None;
+                    }
                     _ => unreachable!(),
                 }
                 assert!(
@@ -4792,6 +4900,106 @@ mod tests {
                     "forged physical receipt {mutation} reached the cap decline on {target:?}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn exists_teddy_self_resigned_representation_is_hard_before_cap_on_both_isas() {
+        let power_of_two_pattern = power_of_two_class_row_pattern();
+        for target in [
+            avx2_target(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ] {
+            let compiled = compile_exists(&power_of_two_pattern, target);
+            let choice = compiled
+                .program()
+                .native_finite_exists_choice_view()
+                .expect("authenticated exact finite Exists Choice");
+            let (mut incumbent, baseline) = complete_exists_dfa_baseline(&compiled, target);
+            let selection = select_exact_finite_exists_teddy(
+                compiled.program().artifact_identity(),
+                choice,
+                target,
+                baseline,
+            )
+            .expect("profitable exact finite Exists Teddy selection");
+            let required = exact_finite_selected_end_teddy_required_data_bytes(
+                selection,
+                incumbent.data.len(),
+            )
+            .unwrap();
+            let expected_receipt_sha256 = incumbent
+                .exact_finite_exists_complete_dfa_expected_receipt_sha256
+                .expect("independent expected receipt digest");
+            let receipt = incumbent
+                .exact_finite_exists_complete_dfa_receipt
+                .as_mut()
+                .expect("exact-finite Exists physical receipt");
+            let original_layout = receipt
+                .representation
+                .layout(receipt.alphabet_classes)
+                .unwrap();
+            assert_eq!(receipt.alphabet_classes, 16);
+            receipt.representation = match receipt.representation {
+                NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16 => {
+                    NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16Indexed
+                }
+                NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16Indexed => {
+                    NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16
+                }
+                representation => panic!(
+                    "public power-of-two-class-row fixture used unexpected {representation:?} on {target:?}"
+                ),
+            };
+            let forged_layout = receipt
+                .representation
+                .layout(receipt.alphabet_classes)
+                .unwrap();
+            assert_eq!(
+                native_row_bytes(
+                    original_layout.0,
+                    original_layout.1,
+                    receipt.alphabet_classes,
+                ),
+                native_row_bytes(
+                    forged_layout.0,
+                    forged_layout.1,
+                    receipt.alphabet_classes,
+                ),
+                "fixture must retain the old authenticator's ambiguous table geometry",
+            );
+            assert_eq!(
+                native_table_prefix_bytes(
+                    original_layout.0,
+                    original_layout.1,
+                    receipt.alphabet_classes,
+                ),
+                native_table_prefix_bytes(
+                    forged_layout.0,
+                    forged_layout.1,
+                    receipt.alphabet_classes,
+                ),
+                "fixture must retain the old authenticator's ambiguous table prefix",
+            );
+            receipt.hot_loop = native_exact_finite_exists_complete_dfa_hot_loop_cost(
+                target,
+                receipt.representation,
+            );
+            receipt.receipt_sha256 =
+                native_exact_finite_exists_complete_dfa_receipt_digest(receipt).unwrap();
+            assert_ne!(receipt.receipt_sha256, expected_receipt_sha256);
+            assert!(matches!(
+                wrap_exact_finite_exists_teddy(
+                    selection,
+                    incumbent,
+                    baseline,
+                    target,
+                    required - 1,
+                ),
+                Err(ObjectError::InvalidModule(_))
+            ));
         }
     }
 
@@ -7958,6 +8166,8 @@ mod tests {
             let original = incumbent
                 .exact_finite_exists_complete_dfa_receipt
                 .expect("exact-finite Exists physical receipt");
+            let original_expected_receipt_sha256 = incumbent
+                .exact_finite_exists_complete_dfa_expected_receipt_sha256;
             let ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(restored) =
                 wrap_exact_finite_exists_teddy(
                     selection,
@@ -7973,6 +8183,10 @@ mod tests {
             assert_eq!(
                 restored.exact_finite_exists_complete_dfa_receipt,
                 Some(original),
+            );
+            assert_eq!(
+                restored.exact_finite_exists_complete_dfa_expected_receipt_sha256,
+                original_expected_receipt_sha256,
             );
         }
     }
@@ -8007,6 +8221,8 @@ mod tests {
         let original_suffix = incumbent.exact_pair_suffix_lowered;
         let original_physical_receipt =
             incumbent.exact_finite_exists_complete_dfa_receipt;
+        let original_expected_receipt_sha256 =
+            incumbent.exact_finite_exists_complete_dfa_expected_receipt_sha256;
         let original_core = incumbent.direct_search_trusted_core;
         let original_span_reduce = incumbent.complete_span_reduce_source.as_deref().copied();
         let ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(restored) =
@@ -8033,6 +8249,10 @@ mod tests {
         assert_eq!(
             restored.exact_finite_exists_complete_dfa_receipt,
             original_physical_receipt,
+        );
+        assert_eq!(
+            restored.exact_finite_exists_complete_dfa_expected_receipt_sha256,
+            original_expected_receipt_sha256,
         );
         assert_eq!(restored.direct_search_trusted_core, original_core);
         assert_eq!(

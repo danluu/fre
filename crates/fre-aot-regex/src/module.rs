@@ -4257,6 +4257,10 @@ struct NativeLowering {
     /// wrapper replaces the complete-DFA lowering.
     exact_finite_exists_complete_dfa_receipt:
         Option<NativeExactFiniteExistsCompleteDfaPhysicalReceipt>,
+    /// Trusted capture-time digest for the adjacent claimed receipt. Keeping
+    /// this outside the receipt prevents a rewritten representation and its
+    /// self-consistent digest from authenticating itself.
+    exact_finite_exists_complete_dfa_expected_receipt_sha256: Option<[u8; 32]>,
     direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
     complete_span_reduce_source: Option<Box<NativeCompleteSpanReduceSource>>,
 }
@@ -4305,7 +4309,6 @@ struct NativeExactFiniteExistsCompleteDfaPhysicalReceipt {
     anchored_prefix_filter_bytes: u8,
     synchronizing_accept_reverse_lowered: bool,
     exact_pair_suffix_lowered: bool,
-    has_auxiliary_hot_path: bool,
     code_sha256: [u8; 32],
     data_sha256: [u8; 32],
     relocation_count: usize,
@@ -4777,7 +4780,14 @@ fn native_exact_finite_dfa_semantic_digest(
 
 impl NativeExactFiniteExistsCompleteDfaRepresentation {
     const fn from_layout(layout: NativeDfaLayout) -> Option<Self> {
-        match (layout.transitions, layout.cells) {
+        Self::from_transition_encoding(layout.transitions, layout.cells)
+    }
+
+    const fn from_transition_encoding(
+        transitions: TransitionLayout,
+        cells: NativeCellEncoding,
+    ) -> Option<Self> {
+        match (transitions, cells) {
             (TransitionLayout::DirectByte, NativeCellEncoding::Compact8Direct) => {
                 Some(Self::DirectByteCompact8)
             }
@@ -4922,7 +4932,7 @@ fn native_exact_finite_exists_complete_dfa_receipt_digest(
             .to_le_bytes())
     }
     let mut digest = Sha256::new();
-    digest.update(b"fre-exact-finite-exists-complete-dfa-physical-v1\0");
+    digest.update(b"fre-exact-finite-exists-complete-dfa-physical-v2\0");
     digest.update([
         match receipt.target.architecture {
             Architecture::X86_64 => 1,
@@ -4963,7 +4973,6 @@ fn native_exact_finite_exists_complete_dfa_receipt_digest(
         receipt.anchored_prefix_filter_bytes,
         u8::from(receipt.synchronizing_accept_reverse_lowered),
         u8::from(receipt.exact_pair_suffix_lowered),
-        u8::from(receipt.has_auxiliary_hot_path),
     ]);
     digest.update(receipt.code_sha256);
     digest.update(receipt.data_sha256);
@@ -5069,22 +5078,6 @@ fn native_exact_finite_exists_complete_dfa_physical_receipt(
         exact_finite_selected_end_relocation_digest(&emission.relocations).ok_or(
             ObjectError::InvalidModule("exact-finite Exists receipt relocation digest"),
         )?;
-    let has_auxiliary_hot_path = layout.start_filter.is_some()
-        || layout.exact_start_byte_set.is_some()
-        || layout.suffix_filter.is_some()
-        || layout.mandatory_teddy.is_some()
-        || layout.seeded_reverse.is_some()
-        || layout.loop_skip.is_some()
-        || layout.loop_skip_secondary.is_some()
-        || layout.vector_filter.is_some()
-        || layout.prefix_filter.is_some()
-        || layout.prefix_relation.is_some()
-        || layout.prefix_block.is_some()
-        || layout.prefix_fast_forward.is_some()
-        || layout.asimd_lane_index_offset.is_some()
-        || emission.scanner.is_some()
-        || emission.suffix_scanner.is_some()
-        || emission.conjunction.is_some();
     let mut receipt = NativeExactFiniteExistsCompleteDfaPhysicalReceipt {
         target,
         semantic_dfa_sha256: native_exact_finite_dfa_semantic_digest(
@@ -5105,7 +5098,6 @@ fn native_exact_finite_exists_complete_dfa_physical_receipt(
         anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
-        has_auxiliary_hot_path,
         code_sha256: Sha256::digest(&emission.code).into(),
         data_sha256: Sha256::digest(data).into(),
         relocation_count: emission.relocations.len(),
@@ -5125,6 +5117,17 @@ fn native_exact_finite_exists_complete_dfa_receipt_authenticates(
     let Some(receipt) = lowering.exact_finite_exists_complete_dfa_receipt else {
         return Ok(false);
     };
+    let Some(expected_receipt_sha256) =
+        lowering.exact_finite_exists_complete_dfa_expected_receipt_sha256
+    else {
+        return Ok(false);
+    };
+    if receipt.receipt_sha256 != expected_receipt_sha256
+        || receipt.receipt_sha256
+            != native_exact_finite_exists_complete_dfa_receipt_digest(&receipt)?
+    {
+        return Ok(false);
+    }
     target.validate()?;
     let Some((transitions, cells)) = receipt
         .representation
@@ -5180,9 +5183,7 @@ fn native_exact_finite_exists_complete_dfa_receipt_authenticates(
         && receipt.code_sha256 == code_sha256
         && receipt.data_sha256 == data_sha256
         && receipt.relocation_count == lowering.relocations.len()
-        && receipt.relocations_sha256 == relocations_sha256
-        && receipt.receipt_sha256
-            == native_exact_finite_exists_complete_dfa_receipt_digest(&receipt)?)
+        && receipt.relocations_sha256 == relocations_sha256)
 }
 
 fn exact_finite_selected_end_dfa_baseline_authenticates(
@@ -18503,6 +18504,7 @@ fn lower_runtime_adapter(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -18754,6 +18756,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -19188,6 +19191,7 @@ fn lower_native_endpoint_oracle_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -19537,6 +19541,7 @@ fn lower_native_dynamic_rows_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -19761,6 +19766,7 @@ fn lower_native_slow_partial_with_data_limit(
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
         exact_finite_exists_complete_dfa_receipt: None,
+        exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
         direct_search_trusted_core: None,
         complete_span_reduce_source: None,
     }))
@@ -21057,6 +21063,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -21815,6 +21822,7 @@ fn lower_native_partial_prepared(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -29270,6 +29278,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -29428,6 +29437,7 @@ fn lower_selected_native_finite_language(
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -30366,6 +30376,8 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
         }
         NativeExactFiniteExistsCompleteDfaReceiptPolicy::Capture => None,
     };
+    let exact_finite_exists_complete_dfa_expected_receipt_sha256 =
+        exact_finite_exists_complete_dfa_receipt.map(|receipt| receipt.receipt_sha256);
     Ok(Some(NativeLowering {
         code: emission.code,
         data,
@@ -30377,6 +30389,7 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
         exact_finite_exists_complete_dfa_receipt,
+        exact_finite_exists_complete_dfa_expected_receipt_sha256,
         direct_search_trusted_core: emission.direct_search_trusted_core,
         complete_span_reduce_source,
     }))
@@ -92635,6 +92648,7 @@ mod tests {
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         })
@@ -93032,6 +93046,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
+                exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             },
@@ -93286,6 +93301,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
+                exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             },
@@ -93459,6 +93475,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
+                exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             },
@@ -93616,6 +93633,7 @@ mod tests {
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
+                exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             },
@@ -116665,6 +116683,7 @@ int main(void){{
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
                 exact_finite_exists_complete_dfa_receipt: None,
+                exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             };
@@ -146774,6 +146793,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
             exact_finite_exists_complete_dfa_receipt: None,
+            exact_finite_exists_complete_dfa_expected_receipt_sha256: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         };
