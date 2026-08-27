@@ -18887,6 +18887,62 @@ pub(crate) enum PortableOrdinaryCanonical<'a> {
     FixedPredicateWord64(&'a FixedPredicateWord64Plan),
 }
 
+#[cfg(test)]
+mod ordinary_literal_class_run_find_at_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+}
+
+/// Search one assertion-free literal/class-run tail without reconstructing
+/// the finite/accounted search envelope. The same bounded offset projection is
+/// shared by the first ordinary `find_at` and every later span continuation.
+#[inline]
+fn ordinary_literal_class_run_find_at_value(
+    plan: &LiteralClassRunLiteralPlan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<Match>, SearchError> {
+    #[cfg(test)]
+    ordinary_literal_class_run_find_at_probe::record();
+    let tail = haystack.get(start..).ok_or_else(|| {
+        SearchError::from(LiteralClassRunLiteralSearchError::InvalidWindow {
+            start,
+            end: haystack.len(),
+            haystack_len: haystack.len(),
+        })
+    })?;
+    let Some((relative_start, relative_end)) =
+        plan.find_full_ordinary_value(tail).map_err(SearchError::from)?
+    else {
+        return Ok(None);
+    };
+    let matched_start = start
+        .checked_add(relative_start)
+        .expect("a relative tail match remains in the haystack");
+    let matched_end = start
+        .checked_add(relative_end)
+        .expect("a relative tail match remains in the haystack");
+    Ok(Some(Match {
+        start: matched_start,
+        end: matched_end,
+    }))
+}
+
 impl<'a> PortableOrdinaryCanonical<'a> {
     pub(crate) fn try_new(regex: &'a PortableRegex) -> Result<Self, SearchError> {
         match &regex.plan {
@@ -19021,6 +19077,13 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            Self::Native(regex)
+                if let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan
+                    && plan.boundary_semantics()
+                        == LiteralClassRunLiteralBoundarySemantics::Unguarded =>
+            {
+                ordinary_literal_class_run_find_at_value(plan, haystack, start)
+            }
             Self::Native(regex) => {
                 regex.find_window_value(haystack, window, SearchLimits::unlimited())
             }
@@ -19051,47 +19114,8 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 haystack.len(),
                 start,
                 |search_start| {
-                    let tail = haystack.get(search_start..).ok_or_else(|| {
-                        PortableFindIterError::Search(SearchError::from(
-                            LiteralClassRunLiteralSearchError::InvalidWindow {
-                                start: search_start,
-                                end: haystack.len(),
-                                haystack_len: haystack.len(),
-                            },
-                        ))
-                    })?;
-                    let Some((relative_start, relative_end)) = plan
-                        .find_full_ordinary_value(tail)
-                        .map_err(SearchError::from)
-                        .map_err(PortableFindIterError::Search)?
-                    else {
-                        return Ok(None);
-                    };
-                    let matched_start = search_start.checked_add(relative_start).ok_or_else(
-                        || {
-                            PortableFindIterError::Search(SearchError::from(
-                                LiteralClassRunLiteralSearchError::from(
-                                    LiteralClassRunLiteralReduceError::ArithmeticOverflow {
-                                        computation:
-                                            "ordinary literal/class-run match start",
-                                    },
-                                ),
-                            ))
-                        },
-                    )?;
-                    let matched_end = search_start.checked_add(relative_end).ok_or_else(|| {
-                        PortableFindIterError::Search(SearchError::from(
-                            LiteralClassRunLiteralSearchError::from(
-                                LiteralClassRunLiteralReduceError::ArithmeticOverflow {
-                                    computation: "ordinary literal/class-run match end",
-                                },
-                            ),
-                        ))
-                    })?;
-                    Ok(Some(Match {
-                        start: matched_start,
-                        end: matched_end,
-                    }))
+                    ordinary_literal_class_run_find_at_value(plan, haystack, search_start)
+                        .map_err(PortableFindIterError::Search)
                 },
                 visitor,
             );
@@ -49498,6 +49522,74 @@ mod tests {
             ordinary.count_positive_width_selected_ends_at(haystack, usize::MAX),
             Ok(None),
         );
+    }
+
+    #[test]
+    fn ordinary_literal_class_run_binding_finds_report_free_tails() {
+        for (pattern, haystack) in [
+            (
+                r"(?-u:ab[xy]+cd)",
+                b"zabxcd--abyycd--abxyce--abxxxcd".as_slice(),
+            ),
+            (
+                r"(?-u:[ab]+aba)",
+                b"aababa!aba!bbaba!aababa".as_slice(),
+            ),
+        ] {
+            let baseline = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(regex.build_report().plan, PlanKind::LiteralClassRunLiteral);
+            let mut ordinary = regex.ordinary_session().unwrap();
+            for start in 0..=haystack.len() {
+                let expected = baseline.find_at(haystack, start).map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+                super::ordinary_literal_class_run_find_at_probe::reset();
+                assert_eq!(
+                    ordinary.find_at(haystack, start),
+                    Ok(expected),
+                    "pattern={pattern:?}, start={start}",
+                );
+                assert_eq!(super::ordinary_literal_class_run_find_at_probe::calls(), 1);
+            }
+
+            super::ordinary_literal_class_run_find_at_probe::reset();
+            assert!(matches!(
+                ordinary.find_at(haystack, haystack.len() + 1),
+                Err(SearchError::LiteralClassRunLiteral(
+                    fre_kernels::LiteralClassRunLiteralSearchError::InvalidWindow { .. }
+                )),
+            ));
+            assert_eq!(super::ordinary_literal_class_run_find_at_probe::calls(), 1);
+        }
+
+        let pattern = r"(?-u:\b\w+ing\b)";
+        let baseline = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let guarded = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(guarded.build_report().plan, PlanKind::LiteralClassRunLiteral);
+        let haystack = b"testing singing xing bringing";
+        let start = 1;
+        let expected = baseline.find_at(haystack, start).map(|matched| Match {
+            start: matched.start(),
+            end: matched.end(),
+        });
+        let mut ordinary = guarded.ordinary_session().unwrap();
+        super::ordinary_literal_class_run_find_at_probe::reset();
+        assert_eq!(ordinary.find_at(haystack, start), Ok(expected));
+        assert_eq!(super::ordinary_literal_class_run_find_at_probe::calls(), 0);
     }
 
     #[test]
