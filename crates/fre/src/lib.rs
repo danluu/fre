@@ -31671,6 +31671,19 @@ mod tests {
             .collect()
     }
 
+    fn public_short_uniform_ripgrep_literals(count: usize, width: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                let suffix = format!("{index:04x}");
+                assert!(suffix.len() <= width);
+                let mut pattern = String::with_capacity(width);
+                pattern.extend(core::iter::repeat_n('q', width - suffix.len()));
+                pattern.push_str(&suffix);
+                pattern
+            })
+            .collect()
+    }
+
     fn build_public_uniform_ripgrep_literals(patterns: &[String]) -> PortableRegex {
         let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
         PortableBuilder::new("")
@@ -32085,20 +32098,23 @@ mod tests {
 
     #[test]
     fn ripgrep_ordinary_builder_preserves_portable_fallbacks_and_global_limits() {
-        let short = public_uniform_ripgrep_literals(256, 127);
+        let below_ordinary_width = public_short_uniform_ripgrep_literals(4_096, 7);
         assert!(matches!(
-            build_public_uniform_ripgrep_ordinary(&short),
+            build_public_uniform_ripgrep_ordinary(&below_ordinary_width),
             RipgrepStandardLiteralsBuild::Portable(_),
         ));
 
-        let wide = public_uniform_ripgrep_literals(256, 128);
+        let exact_ordinary_width = public_short_uniform_ripgrep_literals(4_096, 8);
         let RipgrepStandardLiteralsBuild::Ordinary(admitted) =
-            build_public_uniform_ripgrep_ordinary(&wide)
+            build_public_uniform_ripgrep_ordinary(&exact_ordinary_width)
         else {
             panic!("eligible ripgrep literals retained a portable owner");
         };
         let exact = admitted.build_report().charged_persistent_bytes;
-        let borrowed = wide.iter().map(String::as_str).collect::<Vec<_>>();
+        let borrowed = exact_ordinary_width
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let exact_owner = PortableBuilder::new("")
             .multi_line(true)
             .limits(BuildLimits {
