@@ -4251,8 +4251,72 @@ struct NativeLowering {
     /// This drives a final-object retry to the exact pre-feature complete-DFA
     /// portfolio and never enters frozen data.
     exact_pair_suffix_lowered: bool,
+    /// Target-final physical identity of the one public exact-finite Exists
+    /// complete-DFA incumbent. The receipt is authenticated before an
+    /// additive wrapper may decline for resources and is consumed when that
+    /// wrapper replaces the complete-DFA lowering.
+    exact_finite_exists_complete_dfa_receipt:
+        Option<NativeExactFiniteExistsCompleteDfaPhysicalReceipt>,
     direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
     complete_span_reduce_source: Option<Box<NativeCompleteSpanReduceSource>>,
+}
+
+/// Closed vocabulary for every dense transition representation that can be
+/// published by a complete native DFA. Parameters of the indexed and ordinal
+/// compact forms are uniquely reconstructed from `alphabet_classes`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeExactFiniteExistsCompleteDfaRepresentation {
+    DirectByteCompact8,
+    DirectByteCompact16,
+    DirectByteWide32,
+    ClassMappedCompact16,
+    ClassMappedCompact16Indexed,
+    ClassMappedCompact16Ordinal,
+    ClassMappedWide32,
+}
+
+/// Target-final, favorable lower bound for one ordinary DFA state step.
+/// These are physical lookup costs, not the target-neutral scheduler score;
+/// recording them therefore cannot change the current selection policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeExactFiniteExistsCompleteDfaHotLoopCost {
+    dependent_loads_per_byte: u8,
+    hot_branches_per_byte: u8,
+    lookup_instruction_units: u8,
+    address_latency_units: u8,
+}
+
+/// Compiler-private receipt for an independently regenerable exact-finite
+/// Exists complete-DFA incumbent. It binds the semantic graph to the exact
+/// target, dense table geometry, emitted object fragments, and conservative
+/// target-final hot-loop facts. The canonical digest excludes only itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeExactFiniteExistsCompleteDfaPhysicalReceipt {
+    target: Target,
+    semantic_dfa_sha256: [u8; 32],
+    representation: NativeExactFiniteExistsCompleteDfaRepresentation,
+    forward_states: usize,
+    alphabet_classes: usize,
+    forward_table_offset: u32,
+    forward_table_bytes: usize,
+    native_data_bytes: usize,
+    hot_loop: NativeExactFiniteExistsCompleteDfaHotLoopCost,
+    start_accelerator: StartAccelerator,
+    anchored_prefix_filter_bytes: u8,
+    synchronizing_accept_reverse_lowered: bool,
+    exact_pair_suffix_lowered: bool,
+    has_auxiliary_hot_path: bool,
+    code_sha256: [u8; 32],
+    data_sha256: [u8; 32],
+    relocation_count: usize,
+    relocations_sha256: [u8; 32],
+    receipt_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeExactFiniteExistsCompleteDfaReceiptPolicy {
+    None,
+    Capture,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4711,6 +4775,416 @@ fn native_exact_finite_dfa_semantic_digest(
     Ok(digest.finalize().into())
 }
 
+impl NativeExactFiniteExistsCompleteDfaRepresentation {
+    const fn from_layout(layout: NativeDfaLayout) -> Option<Self> {
+        match (layout.transitions, layout.cells) {
+            (TransitionLayout::DirectByte, NativeCellEncoding::Compact8Direct) => {
+                Some(Self::DirectByteCompact8)
+            }
+            (TransitionLayout::DirectByte, NativeCellEncoding::Compact16) => {
+                Some(Self::DirectByteCompact16)
+            }
+            (TransitionLayout::DirectByte, NativeCellEncoding::Wide32) => {
+                Some(Self::DirectByteWide32)
+            }
+            (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16) => {
+                Some(Self::ClassMappedCompact16)
+            }
+            (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Indexed(_)) => {
+                Some(Self::ClassMappedCompact16Indexed)
+            }
+            (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Ordinal(_)) => {
+                Some(Self::ClassMappedCompact16Ordinal)
+            }
+            (TransitionLayout::ClassMapped, NativeCellEncoding::Wide32) => {
+                Some(Self::ClassMappedWide32)
+            }
+            _ => None,
+        }
+    }
+
+    fn layout(
+        self,
+        alphabet_classes: usize,
+    ) -> Option<(TransitionLayout, NativeCellEncoding)> {
+        let class_row_bytes = alphabet_classes.checked_mul(core::mem::size_of::<u16>())?;
+        match self {
+            Self::DirectByteCompact8 => Some((
+                TransitionLayout::DirectByte,
+                NativeCellEncoding::Compact8Direct,
+            )),
+            Self::DirectByteCompact16 => Some((
+                TransitionLayout::DirectByte,
+                NativeCellEncoding::Compact16,
+            )),
+            Self::DirectByteWide32 => {
+                Some((TransitionLayout::DirectByte, NativeCellEncoding::Wide32))
+            }
+            Self::ClassMappedCompact16 => Some((
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16,
+            )),
+            Self::ClassMappedCompact16Indexed => {
+                let physical_row_bytes = class_row_bytes.checked_next_power_of_two()?;
+                let shift = u8::try_from(physical_row_bytes.trailing_zeros()).ok()?;
+                Some((
+                    TransitionLayout::ClassMapped,
+                    NativeCellEncoding::Compact16Indexed(shift),
+                ))
+            }
+            Self::ClassMappedCompact16Ordinal => Some((
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16Ordinal(u16::try_from(class_row_bytes).ok()?),
+            )),
+            Self::ClassMappedWide32 => Some((
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Wide32,
+            )),
+        }
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::DirectByteCompact8 => 1,
+            Self::DirectByteCompact16 => 2,
+            Self::DirectByteWide32 => 3,
+            Self::ClassMappedCompact16 => 4,
+            Self::ClassMappedCompact16Indexed => 5,
+            Self::ClassMappedCompact16Ordinal => 6,
+            Self::ClassMappedWide32 => 7,
+        }
+    }
+}
+
+fn native_exact_finite_exists_complete_dfa_hot_loop_cost(
+    target: Target,
+    representation: NativeExactFiniteExistsCompleteDfaRepresentation,
+) -> NativeExactFiniteExistsCompleteDfaHotLoopCost {
+    let direct = matches!(
+        representation,
+        NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteCompact8
+            | NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteCompact16
+            | NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteWide32
+    );
+    let (lookup_instruction_units, address_latency_units) = match (
+        target.architecture,
+        representation,
+    ) {
+        (_, NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteCompact8) => (2, 0),
+        (
+            Architecture::X86_64,
+            NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteCompact16
+            | NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16,
+        ) => (3, 0),
+        (
+            Architecture::X86_64,
+            NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16Indexed,
+        ) => (4, 1),
+        (
+            Architecture::X86_64,
+            NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16Ordinal,
+        ) => (4, 2),
+        (
+            Architecture::X86_64,
+            NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteWide32
+            | NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedWide32,
+        ) => (6, 0),
+        (
+            Architecture::Aarch64,
+            NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteCompact16
+            | NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16
+            | NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16Indexed,
+        ) => (3, 0),
+        (
+            Architecture::Aarch64,
+            NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedCompact16Ordinal,
+        ) => (3, 1),
+        (
+            Architecture::Aarch64,
+            NativeExactFiniteExistsCompleteDfaRepresentation::DirectByteWide32
+            | NativeExactFiniteExistsCompleteDfaRepresentation::ClassMappedWide32,
+        ) => (5, 0),
+    };
+    NativeExactFiniteExistsCompleteDfaHotLoopCost {
+        dependent_loads_per_byte: if direct { 2 } else { 3 },
+        hot_branches_per_byte: 1,
+        lookup_instruction_units,
+        address_latency_units,
+    }
+}
+
+fn native_exact_finite_exists_complete_dfa_receipt_digest(
+    receipt: &NativeExactFiniteExistsCompleteDfaPhysicalReceipt,
+) -> Result<[u8; 32], ObjectError> {
+    fn usize_bytes(value: usize, site: &'static str) -> Result<[u8; 8], ObjectError> {
+        Ok(u64::try_from(value)
+            .map_err(|_| ObjectError::ArithmeticOverflow(site))?
+            .to_le_bytes())
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"fre-exact-finite-exists-complete-dfa-physical-v1\0");
+    digest.update([
+        match receipt.target.architecture {
+            Architecture::X86_64 => 1,
+            Architecture::Aarch64 => 2,
+        },
+        match receipt.target.operating_system {
+            OperatingSystem::Linux => 1,
+            OperatingSystem::Macos => 2,
+        },
+        match receipt.target.abi {
+            CallAbi::SystemV => 1,
+            CallAbi::Aapcs64 => 2,
+        },
+    ]);
+    digest.update(receipt.target.features.bits().to_le_bytes());
+    digest.update(receipt.semantic_dfa_sha256);
+    digest.update([receipt.representation.tag()]);
+    digest.update(usize_bytes(receipt.forward_states, "Exists DFA receipt states")?);
+    digest.update(usize_bytes(
+        receipt.alphabet_classes,
+        "Exists DFA receipt classes",
+    )?);
+    digest.update(receipt.forward_table_offset.to_le_bytes());
+    digest.update(usize_bytes(
+        receipt.forward_table_bytes,
+        "Exists DFA receipt table bytes",
+    )?);
+    digest.update(usize_bytes(
+        receipt.native_data_bytes,
+        "Exists DFA receipt native data bytes",
+    )?);
+    digest.update([
+        receipt.hot_loop.dependent_loads_per_byte,
+        receipt.hot_loop.hot_branches_per_byte,
+        receipt.hot_loop.lookup_instruction_units,
+        receipt.hot_loop.address_latency_units,
+        start_accelerator_tag(receipt.start_accelerator),
+        receipt.anchored_prefix_filter_bytes,
+        u8::from(receipt.synchronizing_accept_reverse_lowered),
+        u8::from(receipt.exact_pair_suffix_lowered),
+        u8::from(receipt.has_auxiliary_hot_path),
+    ]);
+    digest.update(receipt.code_sha256);
+    digest.update(receipt.data_sha256);
+    digest.update(usize_bytes(
+        receipt.relocation_count,
+        "Exists DFA receipt relocation count",
+    )?);
+    digest.update(receipt.relocations_sha256);
+    Ok(digest.finalize().into())
+}
+
+fn native_exact_finite_exists_complete_dfa_receipt_shape_is_eligible(
+    view: &NativeProgramView<'_>,
+    entry_contract: NativeDfaEntryContract,
+    layout: NativeDfaLayout,
+) -> bool {
+    entry_contract == NativeDfaEntryContract::Public
+        && view.output == OutputContract::Exists
+        && layout.output == OutputContract::Exists
+        && view.partial_discovered_states.is_none()
+        && !view.collapse_partial_holes
+        && view.exact_product_width.is_none()
+        && view.exact_match_width.is_none()
+        && !view.dfa.initial_pending
+        && view.dfa.class_count != 0
+        && !view.dfa.forward_cells.is_empty()
+        && view
+            .dfa
+            .forward_cells
+            .len()
+            .is_multiple_of(view.dfa.class_count)
+        && view.dfa.reverse_initial.is_none()
+        && view.dfa.reverse_cells.is_empty()
+        && layout.partial.is_none()
+        && !layout.has_reverse
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the target-final receipt binds each independently regenerated lowering surface"
+)]
+fn native_exact_finite_exists_complete_dfa_physical_receipt(
+    view: &NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    layout: NativeDfaLayout,
+    emission: &NativeDfaEmission,
+    data: &[u8],
+    start_accelerator: StartAccelerator,
+    anchored_prefix_filter_bytes: u8,
+    synchronizing_accept_reverse_lowered: bool,
+    exact_pair_suffix_lowered: bool,
+) -> Result<NativeExactFiniteExistsCompleteDfaPhysicalReceipt, ObjectError> {
+    if !native_exact_finite_exists_complete_dfa_receipt_shape_is_eligible(
+        view,
+        entry_contract,
+        layout,
+    ) {
+        return Err(ObjectError::InvalidModule(
+            "exact-finite Exists receipt requested for a non-complete public DFA",
+        ));
+    }
+    target.validate()?;
+    let representation = NativeExactFiniteExistsCompleteDfaRepresentation::from_layout(layout)
+        .ok_or(ObjectError::InvalidModule(
+            "exact-finite Exists complete DFA has a non-dense representation",
+        ))?;
+    let forward_states = view
+        .dfa
+        .forward_cells
+        .len()
+        .checked_div(view.dfa.class_count)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "exact-finite Exists receipt states",
+        ))?;
+    let row_bytes = native_row_bytes(layout.transitions, layout.cells, view.dfa.class_count)
+        .ok_or(ObjectError::InvalidModule(
+            "exact-finite Exists receipt row geometry",
+        ))?;
+    let forward_table_bytes = forward_states.checked_mul(row_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("exact-finite Exists receipt table bytes"),
+    )?;
+    let expected_offset = native_table_prefix_bytes(
+        layout.transitions,
+        layout.cells,
+        view.dfa.class_count,
+    )
+    .ok_or(ObjectError::InvalidModule(
+        "exact-finite Exists receipt table prefix",
+    ))?;
+    let forward_table_end = expected_offset.checked_add(forward_table_bytes).ok_or(
+        ObjectError::ArithmeticOverflow("exact-finite Exists receipt table end"),
+    )?;
+    if usize::try_from(layout.forward_offset).ok() != Some(expected_offset)
+        || forward_table_end > data.len()
+        || emission.code.is_empty()
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact-finite Exists receipt disagrees with final table geometry",
+        ));
+    }
+    let relocations_sha256 =
+        exact_finite_selected_end_relocation_digest(&emission.relocations).ok_or(
+            ObjectError::InvalidModule("exact-finite Exists receipt relocation digest"),
+        )?;
+    let has_auxiliary_hot_path = layout.start_filter.is_some()
+        || layout.exact_start_byte_set.is_some()
+        || layout.suffix_filter.is_some()
+        || layout.mandatory_teddy.is_some()
+        || layout.seeded_reverse.is_some()
+        || layout.loop_skip.is_some()
+        || layout.loop_skip_secondary.is_some()
+        || layout.vector_filter.is_some()
+        || layout.prefix_filter.is_some()
+        || layout.prefix_relation.is_some()
+        || layout.prefix_block.is_some()
+        || layout.prefix_fast_forward.is_some()
+        || layout.asimd_lane_index_offset.is_some()
+        || emission.scanner.is_some()
+        || emission.suffix_scanner.is_some()
+        || emission.conjunction.is_some();
+    let mut receipt = NativeExactFiniteExistsCompleteDfaPhysicalReceipt {
+        target,
+        semantic_dfa_sha256: native_exact_finite_dfa_semantic_digest(
+            view,
+            OutputContract::Exists,
+        )?,
+        representation,
+        forward_states,
+        alphabet_classes: view.dfa.class_count,
+        forward_table_offset: layout.forward_offset,
+        forward_table_bytes,
+        native_data_bytes: data.len(),
+        hot_loop: native_exact_finite_exists_complete_dfa_hot_loop_cost(
+            target,
+            representation,
+        ),
+        start_accelerator,
+        anchored_prefix_filter_bytes,
+        synchronizing_accept_reverse_lowered,
+        exact_pair_suffix_lowered,
+        has_auxiliary_hot_path,
+        code_sha256: Sha256::digest(&emission.code).into(),
+        data_sha256: Sha256::digest(data).into(),
+        relocation_count: emission.relocations.len(),
+        relocations_sha256,
+        receipt_sha256: [0; 32],
+    };
+    receipt.receipt_sha256 =
+        native_exact_finite_exists_complete_dfa_receipt_digest(&receipt)?;
+    Ok(receipt)
+}
+
+fn native_exact_finite_exists_complete_dfa_receipt_authenticates(
+    lowering: &NativeLowering,
+    target: Target,
+    baseline: ExactFiniteSelectedEndDfaBaselineReport,
+) -> Result<bool, ObjectError> {
+    let Some(receipt) = lowering.exact_finite_exists_complete_dfa_receipt else {
+        return Ok(false);
+    };
+    target.validate()?;
+    let Some((transitions, cells)) = receipt
+        .representation
+        .layout(receipt.alphabet_classes)
+    else {
+        return Ok(false);
+    };
+    let Some(row_bytes) = native_row_bytes(transitions, cells, receipt.alphabet_classes) else {
+        return Ok(false);
+    };
+    let Some(table_bytes) = receipt.forward_states.checked_mul(row_bytes) else {
+        return Ok(false);
+    };
+    let Some(prefix_bytes) =
+        native_table_prefix_bytes(transitions, cells, receipt.alphabet_classes)
+    else {
+        return Ok(false);
+    };
+    let Some(table_end) = prefix_bytes.checked_add(table_bytes) else {
+        return Ok(false);
+    };
+    let Some(relocations_sha256) =
+        exact_finite_selected_end_relocation_digest(&lowering.relocations)
+    else {
+        return Ok(false);
+    };
+    let code_sha256: [u8; 32] = Sha256::digest(&lowering.code).into();
+    let data_sha256: [u8; 32] = Sha256::digest(&lowering.data).into();
+    Ok(receipt.target == target
+        && receipt.semantic_dfa_sha256 == baseline.semantic_dfa_sha256
+        && receipt.forward_states == baseline.forward_states
+        && receipt.alphabet_classes == baseline.alphabet_classes
+        && receipt
+            .forward_states
+            .checked_mul(receipt.alphabet_classes)
+            == Some(baseline.transition_cells)
+        && receipt.forward_table_offset == u32::try_from(prefix_bytes).ok().unwrap_or(u32::MAX)
+        && receipt.forward_table_bytes == table_bytes
+        && table_end <= receipt.native_data_bytes
+        && receipt.native_data_bytes == baseline.native_data_bytes
+        && receipt.native_data_bytes == lowering.data.len()
+        && receipt.hot_loop
+            == native_exact_finite_exists_complete_dfa_hot_loop_cost(
+                target,
+                receipt.representation,
+            )
+        && receipt.start_accelerator == baseline.scanner
+        && receipt.start_accelerator == lowering.start_accelerator
+        && receipt.anchored_prefix_filter_bytes == lowering.anchored_prefix_filter_bytes
+        && receipt.synchronizing_accept_reverse_lowered
+            == lowering.synchronizing_accept_reverse_lowered
+        && receipt.exact_pair_suffix_lowered == lowering.exact_pair_suffix_lowered
+        && receipt.code_sha256 == code_sha256
+        && receipt.data_sha256 == data_sha256
+        && receipt.relocation_count == lowering.relocations.len()
+        && receipt.relocations_sha256 == relocations_sha256
+        && receipt.receipt_sha256
+            == native_exact_finite_exists_complete_dfa_receipt_digest(&receipt)?)
+}
+
 fn exact_finite_selected_end_dfa_baseline_authenticates(
     view: &NativeProgramView<'_>,
     report: ExactFiniteSelectedEndDfaBaselineReport,
@@ -4845,7 +5319,7 @@ fn exact_finite_exists_dfa_lowering_authenticates(
     )? {
         return Ok(false);
     }
-    let Some(lowering) = lower_exact_finite_teddy_incumbent_with_data_limit(
+    let Some(lowering) = lower_exact_finite_exists_teddy_incumbent_with_data_limit(
         *view,
         target,
         report.incumbent_data_bytes,
@@ -4856,6 +5330,11 @@ fn exact_finite_exists_dfa_lowering_authenticates(
         && lowering.slow_partial_table.is_none()
         && lowering.start_accelerator == report.incumbent_complete_dfa.scanner
         && lowering.data.len() == report.incumbent_data_bytes
+        && native_exact_finite_exists_complete_dfa_receipt_authenticates(
+            &lowering,
+            target,
+            report.incumbent_complete_dfa,
+        )?
         && Sha256::digest(&lowering.code).as_slice() == report.incumbent_code_sha256
         && Sha256::digest(&lowering.data).as_slice() == report.incumbent_data_sha256
         && module_exact_finite_selected_end_teddy::relocation_digest(&lowering.relocations)
@@ -5936,10 +6415,10 @@ impl CompiledModule {
             let direct_exists_endpoint_request = direct_exists_endpoint_request();
             let publish_exists_teddy_trusted_core =
                 direct_exists_endpoint_request != DirectExistsEndpointRequest::None;
-            let exact_finite_exists_teddy_choice = (semantic_native.output
-                == OutputContract::Exists)
+            let exact_finite_exists_choice = (semantic_native.output == OutputContract::Exists)
                 .then(|| program.native_finite_exists_choice_view())
-                .flatten()
+                .flatten();
+            let exact_finite_exists_teddy_choice = exact_finite_exists_choice
                 .filter(|&choice| {
                     module_exact_finite_selected_end_teddy::
                             exact_finite_exists_teddy_is_structurally_eligible(
@@ -5990,11 +6469,19 @@ impl CompiledModule {
             // terminal. If the complete DFA is unavailable, retry the finite
             // candidate without that unavailable competitor before entering
             // the later optimizer portfolio.
-            let mut incumbent = lower_exact_finite_teddy_incumbent_with_data_limit(
-                semantic_native,
-                target,
-                effective_native_data_limit_bytes,
-            )?;
+            let mut incumbent = if exact_finite_exists_choice.is_some() {
+                lower_exact_finite_exists_teddy_incumbent_with_data_limit(
+                    semantic_native,
+                    target,
+                    effective_native_data_limit_bytes,
+                )?
+            } else {
+                lower_exact_finite_teddy_incumbent_with_data_limit(
+                    semantic_native,
+                    target,
+                    effective_native_data_limit_bytes,
+                )?
+            };
             if incumbent.is_none()
                 && let Some(finite_view) = finite_view
                 && let Some((lowering, report)) =
@@ -9385,7 +9872,7 @@ impl CompiledModule {
             .ok_or(ObjectError::InvalidModule(
                 "exact finite Exists Teddy has no complete-DFA cost",
             ))?;
-        let incumbent = lower_exact_finite_teddy_incumbent_with_data_limit(
+        let incumbent = lower_exact_finite_exists_teddy_incumbent_with_data_limit(
             semantic_native,
             self.target,
             lowering_report.incumbent_data_bytes,
@@ -18015,6 +18502,7 @@ fn lower_runtime_adapter(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -18265,6 +18753,7 @@ fn lower_native_ordered_nfa_prepared_reported(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -18698,6 +19187,7 @@ fn lower_native_endpoint_oracle_prepared(
             anchored_prefix_filter_bytes: bit.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -19046,6 +19536,7 @@ fn lower_native_dynamic_rows_prepared(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -19269,6 +19760,7 @@ fn lower_native_slow_partial_with_data_limit(
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        exact_finite_exists_complete_dfa_receipt: None,
         direct_search_trusted_core: None,
         complete_span_reduce_source: None,
     }))
@@ -20564,6 +21056,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -21321,6 +21814,7 @@ fn lower_native_partial_prepared(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -28775,6 +29269,7 @@ fn lower_optional_native_finite_exists_byte_set_with_data_limit(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -28932,6 +29427,7 @@ fn lower_selected_native_finite_language(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         },
@@ -29249,6 +29745,28 @@ fn lower_exact_finite_teddy_incumbent_with_data_limit(
             max_native_data_bytes,
             true,
             true,
+        ),
+        max_native_data_bytes,
+    )
+}
+
+/// Materialize the same ordinary incumbent while retaining the physical
+/// receipt authorized by the caller's exact-finite Exists program proof.
+/// The receipt policy is otherwise unreachable from generic DFA lowering.
+fn lower_exact_finite_exists_teddy_incumbent_with_data_limit(
+    view: NativeProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    exact_finite_teddy_incumbent_outcome(
+        lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
+            view,
+            target,
+            NativeDfaEntryContract::Public,
+            max_native_data_bytes,
+            true,
+            true,
+            NativeExactFiniteExistsCompleteDfaReceiptPolicy::Capture,
         ),
         max_native_data_bytes,
     )
@@ -29605,6 +30123,26 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
     allow_synchronizing_accept_reverse: bool,
     allow_exact_pair: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        allow_exact_pair,
+        NativeExactFiniteExistsCompleteDfaReceiptPolicy::None,
+    )
+}
+
+fn lower_native_dfa_with_entry_contract_data_limit_optional_and_receipt_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+    receipt_policy: NativeExactFiniteExistsCompleteDfaReceiptPolicy,
+) -> Result<Option<NativeLowering>, ObjectError> {
     let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
         .min(max_native_data_bytes);
@@ -29801,6 +30339,33 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
         && layout
             .suffix_filter
             .is_some_and(|suffix| suffix.exact_pair_filter.is_some());
+    let anchored_prefix_filter_bytes = layout
+        .prefix_filter
+        .map_or(0, |filter| filter.guaranteed_bytes);
+    let exact_finite_exists_complete_dfa_receipt = match receipt_policy {
+        NativeExactFiniteExistsCompleteDfaReceiptPolicy::None => None,
+        NativeExactFiniteExistsCompleteDfaReceiptPolicy::Capture
+            if native_exact_finite_exists_complete_dfa_receipt_shape_is_eligible(
+                &view,
+                entry_contract,
+                layout,
+            ) =>
+        {
+            Some(native_exact_finite_exists_complete_dfa_physical_receipt(
+                &view,
+                target,
+                entry_contract,
+                layout,
+                &emission,
+                &data,
+                start_accelerator,
+                anchored_prefix_filter_bytes,
+                synchronizing_accept_reverse_lowered,
+                exact_pair_suffix_lowered,
+            )?)
+        }
+        NativeExactFiniteExistsCompleteDfaReceiptPolicy::Capture => None,
+    };
     Ok(Some(NativeLowering {
         code: emission.code,
         data,
@@ -29808,11 +30373,10 @@ fn lower_native_dfa_with_entry_contract_data_limit_and_optional_policy(
         slow_partial_table: None,
         needs_runtime: false,
         start_accelerator,
-        anchored_prefix_filter_bytes: layout
-            .prefix_filter
-            .map_or(0, |filter| filter.guaranteed_bytes),
+        anchored_prefix_filter_bytes,
         synchronizing_accept_reverse_lowered,
         exact_pair_suffix_lowered,
+        exact_finite_exists_complete_dfa_receipt,
         direct_search_trusted_core: emission.direct_search_trusted_core,
         complete_span_reduce_source,
     }))
@@ -92070,6 +92634,7 @@ mod tests {
                 .map_or(0, |filter| filter.guaranteed_bytes),
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         })
@@ -92466,6 +93031,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                exact_finite_exists_complete_dfa_receipt: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             },
@@ -92719,6 +93285,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                exact_finite_exists_complete_dfa_receipt: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             },
@@ -92891,6 +93458,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                exact_finite_exists_complete_dfa_receipt: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             },
@@ -93047,6 +93615,7 @@ mod tests {
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                exact_finite_exists_complete_dfa_receipt: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             },
@@ -116095,6 +116664,7 @@ int main(void){{
                 anchored_prefix_filter_bytes: 0,
                 synchronizing_accept_reverse_lowered: false,
                 exact_pair_suffix_lowered: false,
+                exact_finite_exists_complete_dfa_receipt: None,
                 direct_search_trusted_core: None,
                 complete_span_reduce_source: None,
             };
@@ -146203,6 +146773,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         };

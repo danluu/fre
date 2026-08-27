@@ -2780,6 +2780,29 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
             "exact finite SelectedEnd Teddy incumbent is not a complete native DFA",
         ));
     }
+    match success_mode {
+        ExactFiniteTeddySuccessMode::SelectedEnd
+            if incumbent
+                .exact_finite_exists_complete_dfa_receipt
+                .is_some() =>
+        {
+            return Err(ObjectError::InvalidModule(
+                "SelectedEnd Teddy incumbent carried an Exists physical receipt",
+            ));
+        }
+        ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent
+            if !native_exact_finite_exists_complete_dfa_receipt_authenticates(
+                &incumbent,
+                target,
+                incumbent_complete_dfa,
+            )? =>
+        {
+            return Err(ObjectError::InvalidModule(
+                "Exists Teddy incumbent physical receipt did not authenticate",
+            ));
+        }
+        _ => {}
+    }
     let checkpoint = incumbent.data.len();
     let required_data_bytes =
         exact_finite_selected_end_teddy_required_data_bytes(selection, checkpoint)?;
@@ -2794,6 +2817,10 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
             .ok_or(ObjectError::InvalidModule(
                 "exact finite SelectedEnd Teddy required data regressed",
             ))?;
+    // A selected Teddy composition is no longer itself a complete-DFA
+    // lowering. Consume the domain-specific receipt only after the sole
+    // recoverable cap decline, which must restore every incumbent field.
+    incumbent.exact_finite_exists_complete_dfa_receipt = None;
     reserve_exact_finite_teddy_native_data(&mut incumbent.data, additional)?;
     let incumbent_trusted_core = incumbent.direct_search_trusted_core.take();
     let incumbent_code = core::mem::take(&mut incumbent.code);
@@ -4229,7 +4256,11 @@ mod tests {
         let cost = NativeCompleteDfaCost::estimate_exists(&semantic)
             .unwrap()
             .expect("Exists baseline cost");
-        let incumbent = lower_native_dfa(semantic, target)
+        let incumbent = lower_exact_finite_exists_teddy_incumbent_with_data_limit(
+            semantic,
+            target,
+            usize::MAX,
+        )
             .unwrap()
             .expect("Exists baseline lowering");
         let report = cost
@@ -4261,6 +4292,12 @@ mod tests {
         else {
             panic!("uncapped exact finite Exists Teddy fixture must select")
         };
+        assert!(
+            lowering
+                .exact_finite_exists_complete_dfa_receipt
+                .is_none(),
+            "the composed Teddy lowering must consume its complete-DFA receipt",
+        );
         lowering
     }
 
@@ -4276,7 +4313,7 @@ mod tests {
         let cost = NativeCompleteDfaCost::estimate_exists(&semantic)
             .unwrap()
             .expect("Exists complete-DFA cost");
-        let incumbent = lower_exact_finite_teddy_incumbent_with_data_limit(
+        let incumbent = lower_exact_finite_exists_teddy_incumbent_with_data_limit(
             semantic,
             target,
             usize::MAX,
@@ -4615,6 +4652,28 @@ mod tests {
                 report.incumbent_complete_dfa.scanner,
                 StartAccelerator::None,
             );
+            let semantic = compiled.program().native_dfa_view().unwrap();
+            assert!(
+                lower_native_dfa(semantic, target)
+                    .unwrap()
+                    .unwrap()
+                    .exact_finite_exists_complete_dfa_receipt
+                    .is_none(),
+                "generic lowering must not mint an exact-finite receipt",
+            );
+            let received = lower_exact_finite_exists_teddy_incumbent_with_data_limit(
+                semantic,
+                target,
+                usize::MAX,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(native_exact_finite_exists_complete_dfa_receipt_authenticates(
+                &received,
+                target,
+                report.incumbent_complete_dfa,
+            )
+            .unwrap());
         }
     }
 
@@ -4667,6 +4726,72 @@ mod tests {
             )
             .unwrap();
             assert_eq!(compiled.object(), unchanged_object);
+        }
+    }
+
+    #[test]
+    fn exists_teddy_physical_receipt_forgery_is_hard_before_cap_on_both_isas() {
+        let pattern = scanner_free_exact_finite_pattern();
+        for target in [
+            avx2_target(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ] {
+            let compiled = compile_exists(&pattern, target);
+            let choice = compiled
+                .program()
+                .native_finite_exists_choice_view()
+                .expect("authenticated exact finite Exists Choice");
+            for mutation in 0..8 {
+                let (mut incumbent, baseline) =
+                    complete_exists_dfa_baseline(&compiled, target);
+                let selection = select_exact_finite_exists_teddy(
+                    compiled.program().artifact_identity(),
+                    choice,
+                    target,
+                    baseline,
+                )
+                .expect("profitable exact finite Exists Teddy selection");
+                let required = exact_finite_selected_end_teddy_required_data_bytes(
+                    selection,
+                    incumbent.data.len(),
+                )
+                .unwrap();
+                let receipt = incumbent
+                    .exact_finite_exists_complete_dfa_receipt
+                    .as_mut()
+                    .expect("exact-finite Exists physical receipt");
+                match mutation {
+                    0 => {
+                        receipt.target.operating_system = match receipt.target.operating_system {
+                            OperatingSystem::Linux => OperatingSystem::Macos,
+                            OperatingSystem::Macos => OperatingSystem::Linux,
+                        };
+                    }
+                    1 => receipt.semantic_dfa_sha256[0] ^= 1,
+                    2 => receipt.forward_table_offset ^= 1,
+                    3 => receipt.hot_loop.lookup_instruction_units ^= 1,
+                    4 => receipt.code_sha256[0] ^= 1,
+                    5 => receipt.data_sha256[0] ^= 1,
+                    6 => receipt.relocations_sha256[0] ^= 1,
+                    7 => receipt.receipt_sha256[0] ^= 1,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(
+                        wrap_exact_finite_exists_teddy(
+                            selection,
+                            incumbent,
+                            baseline,
+                            target,
+                            required - 1,
+                        ),
+                        Err(ObjectError::InvalidModule(_))
+                    ),
+                    "forged physical receipt {mutation} reached the cap decline on {target:?}",
+                );
+            }
         }
     }
 
@@ -7804,6 +7929,55 @@ mod tests {
     }
 
     #[test]
+    fn exists_teddy_cap_decline_preserves_physical_receipt_on_both_isas() {
+        let pattern = scanner_free_exact_finite_pattern();
+        for target in [
+            avx2_target(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ] {
+            let compiled = compile_exists(&pattern, target);
+            let choice = compiled
+                .program()
+                .native_finite_exists_choice_view()
+                .unwrap();
+            let (incumbent, baseline) = complete_exists_dfa_baseline(&compiled, target);
+            let selection = select_exact_finite_exists_teddy(
+                compiled.program().artifact_identity(),
+                choice,
+                target,
+                baseline,
+            )
+            .unwrap();
+            let required = exact_finite_selected_end_teddy_required_data_bytes(
+                selection,
+                incumbent.data.len(),
+            )
+            .unwrap();
+            let original = incumbent
+                .exact_finite_exists_complete_dfa_receipt
+                .expect("exact-finite Exists physical receipt");
+            let ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(restored) =
+                wrap_exact_finite_exists_teddy(
+                    selection,
+                    incumbent,
+                    baseline,
+                    target,
+                    required - 1,
+                )
+                .unwrap()
+            else {
+                panic!("one-byte-short Exists Teddy ceiling must decline")
+            };
+            assert_eq!(
+                restored.exact_finite_exists_complete_dfa_receipt,
+                Some(original),
+            );
+        }
+    }
+
+    #[test]
     fn exists_declared_native_data_cap_restores_every_incumbent_field() {
         let target = avx2_target();
         let compiled = compile_exists(&scanner_free_exact_finite_pattern(), target);
@@ -7831,6 +8005,8 @@ mod tests {
         let original_prefix = incumbent.anchored_prefix_filter_bytes;
         let original_sync = incumbent.synchronizing_accept_reverse_lowered;
         let original_suffix = incumbent.exact_pair_suffix_lowered;
+        let original_physical_receipt =
+            incumbent.exact_finite_exists_complete_dfa_receipt;
         let original_core = incumbent.direct_search_trusted_core;
         let original_span_reduce = incumbent.complete_span_reduce_source.as_deref().copied();
         let ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(restored) =
@@ -7854,6 +8030,10 @@ mod tests {
         assert_eq!(restored.anchored_prefix_filter_bytes, original_prefix);
         assert_eq!(restored.synchronizing_accept_reverse_lowered, original_sync);
         assert_eq!(restored.exact_pair_suffix_lowered, original_suffix);
+        assert_eq!(
+            restored.exact_finite_exists_complete_dfa_receipt,
+            original_physical_receipt,
+        );
         assert_eq!(restored.direct_search_trusted_core, original_core);
         assert_eq!(
             restored.complete_span_reduce_source.as_deref().copied(),

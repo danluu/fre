@@ -3222,6 +3222,7 @@ fn try_lower_context_reverse_primary(
         anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
+            exact_finite_exists_complete_dfa_receipt: None,
             direct_search_trusted_core: None,
             complete_span_reduce_source: None,
         }))
@@ -3612,6 +3613,7 @@ fn lower_native_context_impl(
         )?,
         synchronizing_accept_reverse_lowered: false,
         exact_pair_suffix_lowered: false,
+        exact_finite_exists_complete_dfa_receipt: None,
         direct_search_trusted_core: None,
         complete_span_reduce_source: None,
     })
