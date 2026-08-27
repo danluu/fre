@@ -98,6 +98,7 @@ mod k0_casefold_prefix_class_span;
 mod k0_class_delimiter_exists;
 mod k0_line_prefix_tail;
 mod k0_line_token_loop_exists;
+mod k0_whole_line_run_chain;
 mod k0_literal_class_corridor;
 mod k0_literal_prefix_class_exists;
 mod k0_uri_exists;
@@ -11359,6 +11360,63 @@ impl PortableBuilder {
         } else {
             None
         };
+        // A whole-line chain of two positive, disjoint unbounded byte runs
+        // and one singleton terminal has an exact ordinary-only engine. The
+        // terminal is sought first, then the second run is decoded backward;
+        // checked K0 execution remains authoritative for every other API.
+        let whole_line_run_chain_inspection = if line_token_loop_inspection.is_none()
+            && line_prefix_tail_inspection.is_none()
+            && correlated_terminal.is_none()
+            && k0_absolute_end_proof.is_none()
+            && packed_frontier_plan.is_none()
+            && self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && fallback_planner_work < self.limits.max_planner_work
+            && {
+                let properties = rust.hir.properties();
+                (properties.look_set_prefix().contains(Look::StartLF)
+                    && properties.look_set_suffix().contains(Look::EndLF))
+                    || (properties.look_set_prefix().contains(Look::StartCRLF)
+                        && properties.look_set_suffix().contains(Look::EndCRLF))
+            }
+        {
+            match k0_whole_line_run_chain::inspect(
+                &rust.hir,
+                self.profile.options.line_terminator,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    match inspection {
+                        k0_whole_line_run_chain::InspectionOutcome::Eligible {
+                            plan,
+                            ..
+                        } => Some(plan),
+                        k0_whole_line_run_chain::InspectionOutcome::Ineligible { .. } => None,
+                    }
+                }
+                Err(k0_whole_line_run_chain::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(k0_whole_line_run_chain::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "whole-line run-chain planner arithmetic overflow",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         // The exact unanchored language `(BRANCH | ...)+ TERMINAL` fills the
         // remaining deterministic-token gap. A globally unique token alphabet
         // makes reverse decoding deterministic, while the terminal's disjoint
@@ -11379,6 +11437,7 @@ impl PortableBuilder {
             });
         let unanchored_token_loop_inspection = if line_token_loop_inspection.is_none()
             && line_prefix_tail_inspection.is_none()
+            && whole_line_run_chain_inspection.is_none()
             && let Some(authenticated_terminal) = authenticated_unanchored_terminal
             && (authenticated_terminal.len() > 1 || mandatory_suffix_plan.is_none())
             && correlated_terminal.is_none()
@@ -11437,11 +11496,13 @@ impl PortableBuilder {
             line_token_loop_inspection,
             line_prefix_tail_inspection,
             unanchored_token_loop_inspection,
+            whole_line_run_chain_inspection,
         ) {
-            (Some(plan), None, None) => Some(K0LinePlan::TokenLoop(plan)),
-            (None, Some(plan), None) => Some(K0LinePlan::PrefixTail(plan)),
-            (None, None, Some(plan)) => Some(K0LinePlan::UnanchoredTokenLoop(plan)),
-            (None, None, None) => None,
+            (Some(plan), None, None, None) => Some(K0LinePlan::TokenLoop(plan)),
+            (None, Some(plan), None, None) => Some(K0LinePlan::PrefixTail(plan)),
+            (None, None, Some(plan), None) => Some(K0LinePlan::UnanchoredTokenLoop(plan)),
+            (None, None, None, Some(plan)) => Some(K0LinePlan::WholeLineRunChain(plan)),
+            (None, None, None, None) => None,
             _ => {
                 return Err(BuildError::InternalInvariant(
                     "exclusive K0 compact sidecars were inspected together",
@@ -11921,6 +11982,7 @@ enum K0LinePlan {
     TokenLoop(k0_line_token_loop_exists::Plan),
     UnanchoredTokenLoop(k0_line_token_loop_exists::UnanchoredPlan),
     LiteralClassCorridor(k0_literal_class_corridor::Plan),
+    WholeLineRunChain(k0_whole_line_run_chain::Plan),
 }
 
 impl K0LinePlan {
@@ -11934,7 +11996,8 @@ impl K0LinePlan {
             Self::TokenLoop(plan) => Some(plan),
             Self::PrefixTail(_)
             | Self::UnanchoredTokenLoop(_)
-            | Self::LiteralClassCorridor(_) => None,
+            | Self::LiteralClassCorridor(_)
+            | Self::WholeLineRunChain(_) => None,
         }
     }
 
@@ -11944,7 +12007,10 @@ impl K0LinePlan {
     ) -> Option<&k0_line_token_loop_exists::UnanchoredPlan> {
         match self {
             Self::UnanchoredTokenLoop(plan) => Some(plan),
-            Self::PrefixTail(_) | Self::TokenLoop(_) | Self::LiteralClassCorridor(_) => None,
+            Self::PrefixTail(_)
+            | Self::TokenLoop(_)
+            | Self::LiteralClassCorridor(_)
+            | Self::WholeLineRunChain(_) => None,
         }
     }
 
@@ -11952,7 +12018,20 @@ impl K0LinePlan {
     const fn literal_class_corridor(&self) -> Option<&k0_literal_class_corridor::Plan> {
         match self {
             Self::LiteralClassCorridor(plan) => Some(plan),
-            Self::PrefixTail(_) | Self::TokenLoop(_) | Self::UnanchoredTokenLoop(_) => None,
+            Self::PrefixTail(_)
+            | Self::TokenLoop(_)
+            | Self::UnanchoredTokenLoop(_)
+            | Self::WholeLineRunChain(_) => None,
+        }
+    }
+
+    const fn whole_line_run_chain(&self) -> Option<&k0_whole_line_run_chain::Plan> {
+        match self {
+            Self::WholeLineRunChain(plan) => Some(plan),
+            Self::PrefixTail(_)
+            | Self::TokenLoop(_)
+            | Self::UnanchoredTokenLoop(_)
+            | Self::LiteralClassCorridor(_) => None,
         }
     }
 
@@ -11961,6 +12040,7 @@ impl K0LinePlan {
             Self::PrefixTail(_) | Self::TokenLoop(_) => k0_line_token_loop_exists::MIN_INPUT_BYTES,
             Self::UnanchoredTokenLoop(plan) => plan.minimum_input_bytes(),
             Self::LiteralClassCorridor(plan) => plan.minimum_input_bytes(),
+            Self::WholeLineRunChain(plan) => plan.minimum_input_bytes(),
         }
     }
 
@@ -11978,6 +12058,7 @@ impl K0LinePlan {
                 }
                 matched
             }
+            Self::WholeLineRunChain(plan) => plan.try_is_match_full(haystack),
         }
     }
 
@@ -11995,6 +12076,7 @@ impl K0LinePlan {
                 }
                 matched
             }
+            Self::WholeLineRunChain(plan) => plan.try_find_full(haystack),
         }
     }
 }
@@ -12042,6 +12124,14 @@ impl K0ExclusivePlan {
     fn literal_class_corridor(&self) -> Option<&k0_literal_class_corridor::Plan> {
         match self {
             Self::Line(plan) => plan.literal_class_corridor(),
+            Self::None | Self::Correlated(_) | Self::Packed(_) => None,
+        }
+    }
+
+    #[inline]
+    fn whole_line_run_chain(&self) -> Option<&k0_whole_line_run_chain::Plan> {
+        match self {
+            Self::Line(plan) => plan.whole_line_run_chain(),
             Self::None | Self::Correlated(_) | Self::Packed(_) => None,
         }
     }
@@ -14666,13 +14756,17 @@ impl PortableRegex {
                 let assertion_free_nullable = self.report.minimum_match_bytes == Some(0)
                     && !k0.automaton.stats().has_assertions();
                 let endpoint_eligible = positive || assertion_free_nullable;
-                PortableOrdinarySessionPlan::K0 {
-                    executor: K0OrdinaryExecutor::new(
-                        &k0.automaton,
-                        endpoint_eligible,
-                        positive,
-                    )?,
+                let executor = K0OrdinaryExecutor::new(
+                    &k0.automaton,
+                    endpoint_eligible,
                     positive,
+                )?;
+                if let Some(plan) = k0.exclusive.whole_line_run_chain() {
+                    PortableOrdinarySessionPlan::K0WholeLineRunChain {
+                        engine: k0_whole_line_run_chain::Engine::new(plan, executor),
+                    }
+                } else {
+                    PortableOrdinarySessionPlan::K0 { executor, positive }
                 }
             }
             PortablePlan::RequiredLiteral(required)
@@ -18768,6 +18862,12 @@ enum PortableOrdinarySessionPlan<'a> {
     LiteralSetDfaNarrowAscii {
         executor: LiteralSetOrdinaryExecutor<'a>,
         ascii_engine: PortableOrdinaryLiteralSetEngine<'a>,
+    },
+    /// A construction-proved ordinary-only whole-line engine. Appending this
+    /// variant preserves established discriminants and leaves checked K0
+    /// session construction untouched.
+    K0WholeLineRunChain {
+        engine: k0_whole_line_run_chain::Engine<'a>,
     },
 }
 
@@ -24919,6 +25019,13 @@ impl<'r> PortableOrdinarySession<'r> {
                 .first_acceptance_at(haystack, start)
                 .map(|endpoint| endpoint.is_some())
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::K0WholeLineRunChain { engine } => {
+                validate_k0_facade_window(
+                    haystack.len(),
+                    SearchWindow::new(start, haystack.len()),
+                )?;
+                engine.is_match_at(haystack, start).map_err(SearchError::from)
+            }
             PortableOrdinarySessionPlan::Canonical(session) => session
                 .shortest_match_at_value(haystack, start)
                 .map(|endpoint| endpoint.is_some()),
@@ -24995,6 +25102,15 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::K0 { executor, .. } => executor
                 .first_acceptance_at(haystack, start)
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::K0WholeLineRunChain { engine } => {
+                validate_k0_facade_window(
+                    haystack.len(),
+                    SearchWindow::new(start, haystack.len()),
+                )?;
+                engine
+                    .first_acceptance_at(haystack, start)
+                    .map_err(SearchError::from)
+            }
             PortableOrdinarySessionPlan::Canonical(session) => {
                 session.shortest_match_at_value(haystack, start)
             }
@@ -25095,6 +25211,19 @@ impl<'r> PortableOrdinarySession<'r> {
                     })
                 })
                 .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::K0WholeLineRunChain { engine } => {
+                validate_k0_facade_window(
+                    haystack.len(),
+                    SearchWindow::new(start, haystack.len()),
+                )?;
+                engine
+                    .find_at(haystack, start)
+                    .map(|matched| matched.map(|(matched_start, end)| Match {
+                        start: matched_start,
+                        end,
+                    }))
+                    .map_err(SearchError::from)
+            }
             PortableOrdinarySessionPlan::RequiredLiteral { regex, .. } => regex
                 .find_window_value(
                     haystack,
@@ -25242,6 +25371,23 @@ impl<'r> PortableOrdinarySession<'r> {
                     },
                     visitor,
                 )
+            }
+            PortableOrdinarySessionPlan::K0WholeLineRunChain { engine } => {
+                validate_k0_facade_window(
+                    haystack.len(),
+                    SearchWindow::new(start, haystack.len()),
+                )
+                .map_err(PortableFindIterError::Search)?;
+                let mut visitor = visitor;
+                engine
+                    .try_visit_spans_at(haystack, start, |(matched_start, end)| {
+                        visitor(Match {
+                            start: matched_start,
+                            end,
+                        })
+                    })
+                    .map_err(SearchError::from)
+                    .map_err(PortableFindIterError::Search)
             }
             PortableOrdinarySessionPlan::RequiredLiteral { regex, .. } => {
                 PortableOrdinaryCanonical::Native(regex)
@@ -25414,6 +25560,16 @@ impl<'r> PortableOrdinarySession<'r> {
                         },
                     ))?;
                 }
+            }
+            PortableOrdinarySessionPlan::K0WholeLineRunChain { engine } => {
+                validate_k0_facade_window(
+                    haystack.len(),
+                    SearchWindow::new(start, haystack.len()),
+                )?;
+                engine
+                    .count_at(haystack, start)
+                    .map(Some)
+                    .map_err(SearchError::from)
             }
             PortableOrdinarySessionPlan::RequiredLiteral { projection, .. } => {
                 #[cfg(test)]
@@ -48573,6 +48729,9 @@ mod tests {
         fn route(session: &super::PortableOrdinarySession<'_>) -> &'static str {
             match &session.plan {
                 super::PortableOrdinarySessionPlan::K0 { .. } => "k0",
+                super::PortableOrdinarySessionPlan::K0WholeLineRunChain { .. } => {
+                    "k0-whole-line-run-chain"
+                }
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::Native(_),
                 ) => "canonical-native",
