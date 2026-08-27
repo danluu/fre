@@ -2537,7 +2537,7 @@ mod tests {
     #[test]
     fn exact_singleton_first_candidate_decline_and_final_cap_keep_exact_batch_incumbent() {
         let endpoint_pattern = format!("{}b", "a".repeat(MIN_TWO_WAY_LITERAL_BYTES));
-        let non_two_way_pattern = "x".repeat(MIN_TWO_WAY_LITERAL_BYTES - 1);
+        let non_two_way_pattern = "(?:alpha|beta\\r|(?:xy){2})";
         for target in [
             Target::x86_64_linux(),
             Target::x86_64_macos(),
@@ -2595,11 +2595,12 @@ mod tests {
                 <[u8; 32]>::from(Sha256::digest(&batch_object)),
             );
 
-            let decline_request = CompileRequest::new(&non_two_way_pattern, target)
+            let decline_request = CompileRequest::new(non_two_way_pattern, target)
                 .mode(CompileMode::Optimizing)
                 .output(OutputContract::Exists);
             let decline_ordinary =
-                compile(decline_request.clone()).expect("ordinary non-Two-Way control");
+                super::with_matching_lf_line_witness_recipe(|| compile(decline_request.clone()))
+                    .expect("explicitly tracked non-Two-Way control");
             let decline_batch_module = decline_ordinary
                 .module()
                 .clone()
@@ -2624,8 +2625,9 @@ mod tests {
             )
             .expect("emit complete-DFA matching-line witness");
             assert!(matching_line_object.len() > decline_batch_object.len());
-            let declined = crate::compile_with_independent_exists_batch(decline_request)
-                .expect("complete-DFA matching-line endpoint");
+            let declined =
+                crate::compile_with_independent_matching_lf_line_witness(decline_request)
+                    .expect("complete-DFA matching-line endpoint");
             assert_eq!(declined.object(), matching_line_object);
             assert_eq!(declined.module(), &matching_line_module);
             assert!(declined
@@ -2645,10 +2647,24 @@ mod tests {
                 .matching_lf_line_witness_aot
                 .is_some());
 
+            // The final-outcome classifier is target-independent and is
+            // covered directly for every error class. Keep one natural
+            // transaction-level cap fixture whose base compiler route has a
+            // byte-size window between its batch incumbent and LF endpoint;
+            // other targets may legitimately switch to a smaller complete
+            // DFA before the additive endpoint is considered.
+            if target != Target::x86_64_linux() {
+                continue;
+            }
             let mut limits = crate::CompileLimitsV1::default();
-            limits.max_object_bytes = decline_batch_object.len();
-            let capped = crate::compile_with_independent_exists_batch(
-                CompileRequest::new(&non_two_way_pattern, target)
+            // Admit the already selected ordinary route and its batch export,
+            // but reject this route's additive line-witness object by one byte.
+            // A tighter cap can legitimately make the base compiler select a
+            // different, smaller complete-DFA route before this endpoint is
+            // considered, which would not exercise endpoint-only decline.
+            limits.max_object_bytes = matching_line_object.len() - 1;
+            let capped = crate::compile_with_independent_matching_lf_line_witness(
+                CompileRequest::new(non_two_way_pattern, target)
                     .mode(CompileMode::Optimizing)
                     .output(OutputContract::Exists)
                     .limits(limits),

@@ -10,6 +10,7 @@ use fre_aot_regex::{
     PreparedAggregateExports, PreparedAggregateStrategy, StartAccelerator, Target, compile,
     compile_with_exact_finite_selected_end_grep_count,
     compile_with_independent_exists_batch,
+    compile_with_independent_matching_lf_line_witness,
 };
 use fre_syntax::RustProfile;
 
@@ -173,7 +174,11 @@ fn main() {
                     .mode(mode)
                     .output(output);
                 let compiled = if output == OutputContract::Exists {
-                    compile_with_independent_exists_batch(request)
+                    if independent_lf_line_witness_proof.is_some() {
+                        compile_with_independent_matching_lf_line_witness(request)
+                    } else {
+                        compile_with_independent_exists_batch(request)
+                    }
                 } else {
                     compile(request).map_err(IndependentExistsBatchCompileError::from)
                 }

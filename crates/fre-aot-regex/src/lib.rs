@@ -1329,21 +1329,16 @@ fn install_independent_exists_variant(
 /// authenticated exact singleton whose core publishes a proved earliest
 /// candidate cursor, the compiler also appends a helper-free position entry.
 /// It returns the inclusive final byte of the earliest match or `u64::MAX` on
-/// miss through the `FreAotRegexExactSingletonFirstCandidateV1` ABI. A
-/// complete-DFA Exists artifact may instead receive a separately named
-/// `FreAotRegexMatchingLfLineWitnessV1` entry. Under an independent proof that
-/// every exact finite source member is nonempty and contains no LF, a hit from
-/// that entry is one byte on a matching LF-delimited line; it is deliberately
-/// not an exact boundary or inclusive final byte. The ordinary entry and its
-/// public ABI remain unchanged. Direct artifacts without an applicable
-/// structural receipt retain the preceding exact artifact. Only numeric
-/// `ObjectBytes` refusal during a completed endpoint's final object emission
-/// may retain that endpoint's byte-identical incumbent; allocator, backend,
-/// and authentication failures remain terminal. Consumers must inspect
+/// miss through the `FreAotRegexExactSingletonFirstCandidateV1` ABI. The
+/// ordinary entry and its public ABI remain unchanged. Direct artifacts
+/// without an applicable structural receipt retain the preceding exact
+/// artifact. Only numeric `ObjectBytes` refusal during a completed endpoint's
+/// final object emission may retain that endpoint's byte-identical incumbent;
+/// allocator, backend, and authentication failures remain terminal. Consumers
+/// must inspect
 /// [`CompiledModule::direct_exists_batch_symbol`],
-/// [`CompiledModule::direct_exact_singleton_first_candidate_symbol`], and
-/// [`CompiledModule::direct_matching_lf_line_witness_symbol`]. The canonical
-/// function types live in `fre-aot-regex-runtime` and its C header.
+/// [`CompiledModule::direct_exact_singleton_first_candidate_symbol`]. The
+/// canonical function types live in `fre-aot-regex-runtime` and its C header.
 ///
 /// # Errors
 ///
@@ -1354,6 +1349,39 @@ fn install_independent_exists_variant(
 pub fn compile_with_independent_exists_batch(
     request: CompileRequest,
 ) -> Result<CompiledRegex, IndependentExistsBatchCompileError> {
+    compile_with_independent_exists_batch_policy(request, false)
+}
+
+/// Compile an Exists program with the established independent batch entries
+/// and explicitly request a complete-DFA matching-LF-line witness.
+///
+/// Callers must invoke this entry only after independently authenticating that
+/// the source denotes an exact finite, nonempty, assertion-free byte language
+/// whose every member is nonempty and LF-free. Unlike
+/// [`compile_with_independent_exists_batch`], this transaction enables private
+/// final-assembler success-edge tracking. The compiler still declines
+/// nullable, non-complete-DFA, and otherwise structurally inapplicable native
+/// layouts. A hit is only an unconfirmed byte on a matching LF-delimited line;
+/// it is neither an exact boundary nor the inclusive-final-byte result of the
+/// exact-singleton endpoint.
+///
+/// # Errors
+///
+/// Returns [`IndependentExistsBatchCompileError::RequiresExists`] for another
+/// output contract. Once an applicable tracked lowering begins, allocation,
+/// backend, authentication, and structural failures are terminal. Only the
+/// completed endpoint object's numeric `ObjectBytes` refusal may retain the
+/// byte-identical generic batch incumbent.
+pub fn compile_with_independent_matching_lf_line_witness(
+    request: CompileRequest,
+) -> Result<CompiledRegex, IndependentExistsBatchCompileError> {
+    compile_with_independent_exists_batch_policy(request, true)
+}
+
+fn compile_with_independent_exists_batch_policy(
+    request: CompileRequest,
+    matching_lf_line_witness_requested: bool,
+) -> Result<CompiledRegex, IndependentExistsBatchCompileError> {
     if request.output != OutputContract::Exists {
         return Err(IndependentExistsBatchCompileError::RequiresExists {
             actual: request.output,
@@ -1361,7 +1389,13 @@ pub fn compile_with_independent_exists_batch(
     }
     let target = request.target;
     let max_object_bytes = request.limits.max_object_bytes;
-    let mut compiled = compile(request)?;
+    let mut compiled = {
+        let scope =
+            module::matching_lf_line_witness_recipe_scope(matching_lf_line_witness_requested);
+        let compiled = compile(request)?;
+        drop(scope);
+        compiled
+    };
     if compiled.module.prepared_exists_batch_symbol().is_some()
         || compiled.module.direct_exists_batch_symbol().is_some()
     {
@@ -1433,6 +1467,10 @@ pub fn compile_with_independent_exists_batch(
             return Ok(compiled);
         };
         install_independent_exists_variant(&mut compiled, module, object);
+    }
+
+    if !matching_lf_line_witness_requested {
+        return Ok(compiled);
     }
 
     // A complete-DFA incumbent cannot also be the exact Two-Way singleton

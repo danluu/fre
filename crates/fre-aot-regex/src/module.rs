@@ -1666,6 +1666,178 @@ struct NativeCompleteSpanReduceSource {
 
 const COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE: &str =
     "complete Span reducer source";
+const MATCHING_LF_LINE_WITNESS_TRACKING_ALLOCATION_SITE: &str =
+    "matching-LF-line final-edge tracking";
+const MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE: &str =
+    "matching-LF-line final-edge tracking is inconsistent";
+
+std::thread_local! {
+    static MATCHING_LF_LINE_WITNESS_RECIPE_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct MatchingLfLineWitnessRecipeScope {
+    previous: bool,
+}
+
+impl Drop for MatchingLfLineWitnessRecipeScope {
+    fn drop(&mut self) {
+        MATCHING_LF_LINE_WITNESS_RECIPE_ENABLED.with(|enabled| {
+            enabled.set(self.previous);
+        });
+    }
+}
+
+/// Enable final physical-success-edge tracking for one explicitly requested
+/// matching-LF-line witness compile. Ordinary compilation and the established
+/// independent-batch API leave this disabled, preserving their exact native
+/// bytes and pre-feature allocation/failure surface.
+pub(crate) fn matching_lf_line_witness_recipe_scope(
+    requested: bool,
+) -> MatchingLfLineWitnessRecipeScope {
+    let previous = MATCHING_LF_LINE_WITNESS_RECIPE_ENABLED.with(|enabled| {
+        enabled.replace(requested)
+    });
+    MatchingLfLineWitnessRecipeScope { previous }
+}
+
+fn matching_lf_line_witness_recipe_enabled() -> bool {
+    MATCHING_LF_LINE_WITNESS_RECIPE_ENABLED.with(std::cell::Cell::get)
+}
+
+fn matching_lf_line_witness_tracking_outcome<T>(
+    outcome: Result<T, ObjectError>,
+) -> Result<T, ObjectError> {
+    outcome.map_err(|error| match error {
+        ObjectError::Allocation(_) => {
+            ObjectError::Allocation(MATCHING_LF_LINE_WITNESS_TRACKING_ALLOCATION_SITE)
+        }
+        _ => ObjectError::InvalidModule(MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE),
+    })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static MATCHING_LF_LINE_WITNESS_TRACKING_FAILURE_INJECTION: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum MatchingLfLineWitnessTrackingFailureInjection {
+    Allocation = 1,
+    Invalid = 2,
+    PreFinishInvalid = 4,
+}
+
+#[cfg(test)]
+struct MatchingLfLineWitnessTrackingFailureGuard;
+
+#[cfg(test)]
+impl MatchingLfLineWitnessTrackingFailureGuard {
+    fn arm(kind: MatchingLfLineWitnessTrackingFailureInjection) -> Self {
+        MATCHING_LF_LINE_WITNESS_TRACKING_FAILURE_INJECTION.with(|state| {
+            assert_eq!(
+                state.replace(kind as u8),
+                0,
+                "matching-LF-line tracking failure injection was already armed",
+            );
+        });
+        Self
+    }
+
+    fn assert_failed_once(&self) {
+        MATCHING_LF_LINE_WITNESS_TRACKING_FAILURE_INJECTION.with(|state| {
+            assert_eq!(
+                state.get(),
+                3,
+                "matching-LF-line tracking failure was not consumed exactly once",
+            );
+        });
+    }
+
+    fn assert_not_attempted(&self, kind: MatchingLfLineWitnessTrackingFailureInjection) {
+        MATCHING_LF_LINE_WITNESS_TRACKING_FAILURE_INJECTION.with(|state| {
+            assert_eq!(
+                state.get(),
+                kind as u8,
+                "matching-LF-line tracking was unexpectedly attempted",
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for MatchingLfLineWitnessTrackingFailureGuard {
+    fn drop(&mut self) {
+        MATCHING_LF_LINE_WITNESS_TRACKING_FAILURE_INJECTION.with(|state| state.set(0));
+    }
+}
+
+#[cfg(test)]
+fn inject_matching_lf_line_witness_pre_finish_failure() -> Result<(), ObjectError> {
+    MATCHING_LF_LINE_WITNESS_TRACKING_FAILURE_INJECTION.with(|state| match state.get() {
+        4 => {
+            state.set(3);
+            Err(ObjectError::InvalidModule(
+                MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE,
+            ))
+        }
+        3 => panic!("matching-LF-line tracking retried after terminal failure"),
+        _ => Ok(()),
+    })
+}
+
+fn finish_matching_lf_line_witness_tracking<T>(
+    finish: impl FnOnce() -> Result<T, ObjectError>,
+) -> Result<T, ObjectError> {
+    #[cfg(test)]
+    {
+        let failure = MATCHING_LF_LINE_WITNESS_TRACKING_FAILURE_INJECTION.with(|state| {
+            let failure = state.get();
+            if matches!(failure, 1 | 2) {
+                state.set(3);
+            }
+            failure
+        });
+        match failure {
+            1 => {
+                return Err(ObjectError::Allocation(
+                    MATCHING_LF_LINE_WITNESS_TRACKING_ALLOCATION_SITE,
+                ));
+            }
+            2 => {
+                return Err(ObjectError::InvalidModule(
+                    MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE,
+                ));
+            }
+            0 => {}
+            3 => panic!("matching-LF-line tracked finish retried after terminal failure"),
+            _ => unreachable!("invalid matching-LF-line tracking injection state"),
+        }
+    }
+    matching_lf_line_witness_tracking_outcome(finish())
+}
+
+fn is_matching_lf_line_witness_tracking_failure(error: &ObjectError) -> bool {
+    matches!(
+        error,
+        ObjectError::Allocation(site)
+            if *site == MATCHING_LF_LINE_WITNESS_TRACKING_ALLOCATION_SITE
+    ) || matches!(
+        error,
+        ObjectError::InvalidModule(site)
+            if *site == MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE
+    )
+}
+
+#[cfg(test)]
+fn with_matching_lf_line_witness_recipe<T>(run: impl FnOnce() -> T) -> T {
+    let scope = matching_lf_line_witness_recipe_scope(true);
+    let result = run();
+    drop(scope);
+    result
+}
 
 std::thread_local! {
     static COMPLETE_SPAN_REDUCE_RECIPE_ENABLED: std::cell::Cell<bool> =
@@ -1808,6 +1980,11 @@ fn is_complete_span_reduce_source_allocation(error: &ObjectError) -> bool {
         ObjectError::Allocation(site)
             if *site == COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
     )
+}
+
+fn is_required_native_recipe_failure(error: &ObjectError) -> bool {
+    is_complete_span_reduce_source_allocation(error)
+        || is_matching_lf_line_witness_tracking_failure(error)
 }
 
 fn allocate_complete_span_reduce_source(
@@ -2168,7 +2345,7 @@ fn matching_lf_line_witness_success_edges_digest(
         match (architecture, edge.control) {
             (Architecture::X86_64, NativeDirectSearchSuccessEdgeControl::Taken) => {
                 let (after, delta) = match instruction {
-                    [(0xeb | 0x70..=0x7f), displacement] => {
+                    [0xeb | 0x70..=0x7f, displacement] => {
                         let after = edge.instruction_offset.checked_add(2).ok_or(
                             ObjectError::ArithmeticOverflow("x86 LF-line short branch base"),
                         )?;
@@ -2393,6 +2570,7 @@ fn authenticate_native_direct_search_trusted_core(
                         }
                     }
                 }
+                (OutputContract::Exists, None, None) => {}
                 (OutputContract::Exists, _, _) => {
                     return Err(ObjectError::InvalidModule(
                         "complete Exists DFA has no matching-LF-line cursor proof",
@@ -10533,8 +10711,9 @@ impl CompiledModule {
 
     /// Append a whole-buffer matching-LF-line witness endpoint to an already
     /// completed direct Exists-batch module. Non-complete-DFA cores decline;
-    /// every inconsistency after the complete-DFA landmark is observed is
-    /// terminal so callers cannot silently publish a less-authenticated route.
+    /// complete-DFA cores without the explicitly requested cursor proof also
+    /// decline. Every partial or inconsistent proof is terminal so callers
+    /// cannot silently publish a less-authenticated route.
     #[allow(
         clippy::too_many_lines,
         reason = "core-edge authentication, wrapper identity, and publication are one failure-atomic transaction"
@@ -10565,9 +10744,18 @@ impl CompiledModule {
         if trusted_core.landmark != NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1 {
             return Ok(None);
         }
-        let cursor = trusted_core.matching_lf_line_cursor.ok_or(
-            ObjectError::InvalidModule("matching-LF-line core has no cursor proof"),
-        )?;
+        let cursor = match (
+            trusted_core.matching_lf_line_cursor,
+            trusted_core.matching_lf_line_success_edges_sha256,
+        ) {
+            (Some(cursor), Some(_)) => cursor,
+            (None, None) => return Ok(None),
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "complete Exists DFA has no matching-LF-line cursor proof",
+                ));
+            }
+        };
         let edge_count = usize::from(cursor.edge_count);
         let mut inside_match_edge_count = 0_u8;
         let mut exclusive_end_edge_count = 0_u8;
@@ -19204,7 +19392,7 @@ fn slow_partial_prepared_outcome(
 ) -> Result<SlowPartialPreparedOutcome, ObjectError> {
     match outcome {
         Ok(lowering) => Ok(lowering),
-        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        Err(error) if is_required_native_recipe_failure(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => Ok(SlowPartialPreparedOutcome::AllocationFailure),
         Err(ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
@@ -24387,6 +24575,7 @@ fn is_optional_native_table_decline(error: &ObjectError) -> bool {
             *site != SYNCHRONIZING_SEEDED_REVERSE_ALLOCATION_SITE
                 && *site != SYNCHRONIZING_SEEDED_REVERSE_BARRIER_ALLOCATION_SITE
                 && *site != SYNCHRONIZING_SEEDED_REVERSE_TABLE_ALLOCATION_SITE
+                && *site != MATCHING_LF_LINE_WITNESS_TRACKING_ALLOCATION_SITE
         }
         ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
@@ -27904,7 +28093,7 @@ fn measured_native_dfa_outcome(
     match outcome {
         Ok(Some(lowering)) => Ok(MeasuredNativeDfaOutcome::Lowered(lowering)),
         Ok(None) => Ok(MeasuredNativeDfaOutcome::Declined),
-        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        Err(error) if is_required_native_recipe_failure(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => {
             Ok(MeasuredNativeDfaOutcome::AllocationFailure)
         }
@@ -27982,7 +28171,7 @@ fn legacy_fixed_k0_lowering_outcome(
             lowering: None,
             may_continue_compilation: true,
         }),
-        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        Err(error) if is_required_native_recipe_failure(&error) => Err(error),
         Err(ObjectError::Allocation(_)) => Ok(LegacyFixedK0LoweringAttempt {
             lowering: None,
             may_continue_compilation: false,
@@ -28013,7 +28202,7 @@ fn compiler_k0_lowering_error(
             lowering: None,
             may_continue_compilation: true,
         }),
-        error if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        error if is_required_native_recipe_failure(&error) => Err(error),
         ObjectError::Allocation(_) => Ok(CompilerK0LoweringAttempt {
             lowering: None,
             may_continue_compilation: false,
@@ -28110,7 +28299,7 @@ fn optional_native_lowering_outcome(
 ) -> Result<Option<NativeLowering>, ObjectError> {
     match outcome {
         Ok(lowering) => Ok(lowering),
-        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        Err(error) if is_required_native_recipe_failure(&error) => Err(error),
         Err(ObjectError::Allocation(_) | ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
             ..
@@ -28120,15 +28309,15 @@ fn optional_native_lowering_outcome(
 }
 
 /// Preserve the legacy materialized-K0 fallback policy for all established
-/// lowering failures, while keeping the new complete-Span recipe allocation
-/// terminal. The latter is required metadata for a successfully selected
-/// public lowering; losing it and entering a fresh fallback transaction would
-/// violate the allocator-failure boundary.
+/// lowering failures, while keeping required complete-Span source allocation
+/// and matching-LF-line tracking failures terminal. This metadata belongs to
+/// a successfully selected public lowering; losing it and entering a fresh
+/// fallback transaction would violate the failure boundary.
 fn materialized_native_fallback_outcome(
     outcome: Result<Option<NativeLowering>, ObjectError>,
 ) -> Result<Option<NativeLowering>, ObjectError> {
     match outcome {
-        Err(error) if is_complete_span_reduce_source_allocation(&error) => Err(error),
+        Err(error) if is_required_native_recipe_failure(&error) => Err(error),
         Ok(lowering) => Ok(lowering),
         Err(_) => Ok(None),
     }
@@ -41002,13 +41191,17 @@ impl X86Assembler {
         if !self.track_lf_line_success {
             return Ok(());
         }
+        #[cfg(test)]
+        inject_matching_lf_line_witness_pre_finish_failure()?;
         let fixup = self
             .fixups
             .last_mut()
-            .ok_or(ObjectError::InvalidModule("x86 LF-line success branch is absent"))?;
+            .ok_or(ObjectError::InvalidModule(
+                MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE,
+            ))?;
         if fixup.lf_line_taken_route.replace(route).is_some() {
             return Err(ObjectError::InvalidModule(
-                "x86 LF-line success branch was tagged twice",
+                MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE,
             ));
         }
         Ok(())
@@ -49031,8 +49224,10 @@ fn lower_x86_64_dfa_with_entry_contract(
     }
     let has_direct_search_trusted_core = entry_contract == NativeDfaEntryContract::Public
         && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
-    let track_matching_lf_line =
-        has_direct_search_trusted_core && layout.output == OutputContract::Exists;
+    let track_matching_lf_line = matching_lf_line_witness_recipe_enabled()
+        && has_direct_search_trusted_core
+        && layout.output == OutputContract::Exists
+        && !layout.initial_pending;
     if track_matching_lf_line {
         assembler.track_lf_line_success_edges();
     }
@@ -49965,7 +50160,9 @@ fn lower_x86_64_dfa_with_entry_contract(
     };
 
     let mut finished = if track_matching_lf_line {
-        assembler.finish_with_label_offsets_and_lf_line_cursor(matched)?
+        finish_matching_lf_line_witness_tracking(|| {
+            assembler.finish_with_label_offsets_and_lf_line_cursor(matched)
+        })?
     } else {
         assembler.finish_with_label_offsets()?
     };
@@ -50019,7 +50216,13 @@ fn lower_x86_64_dfa_with_entry_contract(
     let code = finished.code;
     let matching_lf_line_success_edges_sha256 = matching_lf_line_cursor
         .map(|cursor| {
-            matching_lf_line_witness_success_edges_digest(Architecture::X86_64, &code, cursor)
+            matching_lf_line_witness_tracking_outcome(
+                matching_lf_line_witness_success_edges_digest(
+                    Architecture::X86_64,
+                    &code,
+                    cursor,
+                ),
+            )
         })
         .transpose()?;
     let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
@@ -65514,12 +65717,14 @@ impl Aarch64Assembler {
         if !self.track_lf_line_success {
             return Ok(());
         }
+        #[cfg(test)]
+        inject_matching_lf_line_witness_pre_finish_failure()?;
         let fixup = self.fixups.last_mut().ok_or(ObjectError::InvalidModule(
-            "AArch64 LF-line success branch is absent",
+            MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE,
         ))?;
         if fixup.lf_line_taken_route.replace(route).is_some() {
             return Err(ObjectError::InvalidModule(
-                "AArch64 LF-line success branch was tagged twice",
+                MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE,
             ));
         }
         Ok(())
@@ -74189,8 +74394,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     }
     let has_direct_search_trusted_core = entry_contract == NativeDfaEntryContract::Public
         && matches!(layout.output, OutputContract::Exists | OutputContract::Span);
-    let track_matching_lf_line =
-        has_direct_search_trusted_core && layout.output == OutputContract::Exists;
+    let track_matching_lf_line = matching_lf_line_witness_recipe_enabled()
+        && has_direct_search_trusted_core
+        && layout.output == OutputContract::Exists
+        && !layout.initial_pending;
     if track_matching_lf_line {
         assembler.track_lf_line_success_edges();
     }
@@ -75464,8 +75671,12 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
 
     let mut relocation_offsets = [table_page, table_page_offset];
     let (code, matching_lf_line_cursor) = if track_matching_lf_line {
-        let (code, cursor) = assembler
-            .finish_with_offsets_and_lf_line_cursor(&mut relocation_offsets, matched)?;
+        let (code, cursor) = finish_matching_lf_line_witness_tracking(|| {
+            assembler.finish_with_offsets_and_lf_line_cursor(
+                &mut relocation_offsets,
+                matched,
+            )
+        })?;
         (code, Some(cursor))
     } else {
         (
@@ -75475,7 +75686,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     };
     let matching_lf_line_success_edges_sha256 = matching_lf_line_cursor
         .map(|cursor| {
-            matching_lf_line_witness_success_edges_digest(Architecture::Aarch64, &code, cursor)
+            matching_lf_line_witness_tracking_outcome(
+                matching_lf_line_witness_success_edges_digest(
+                    Architecture::Aarch64,
+                    &code,
+                    cursor,
+                ),
+            )
         })
         .transpose()?;
     let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
@@ -85375,6 +85592,98 @@ mod tests {
     }
 
     #[test]
+    fn matching_lf_line_tracking_failures_are_terminal_only_for_the_explicit_api() {
+        let request = || {
+            CompileRequest::new("needle", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+        };
+
+        let unrequested = MatchingLfLineWitnessTrackingFailureGuard::arm(
+            MatchingLfLineWitnessTrackingFailureInjection::Allocation,
+        );
+        let established = crate::compile_with_independent_exists_batch(request())
+            .expect("established batch compilation must not track LF-line edges");
+        unrequested.assert_not_attempted(
+            MatchingLfLineWitnessTrackingFailureInjection::Allocation,
+        );
+        drop(unrequested);
+        assert!(established
+            .module()
+            .direct_matching_lf_line_witness_symbol()
+            .is_none());
+
+        for kind in [
+            MatchingLfLineWitnessTrackingFailureInjection::Allocation,
+            MatchingLfLineWitnessTrackingFailureInjection::Invalid,
+            MatchingLfLineWitnessTrackingFailureInjection::PreFinishInvalid,
+        ] {
+            let injection = MatchingLfLineWitnessTrackingFailureGuard::arm(kind);
+            let result =
+                crate::compile_with_independent_matching_lf_line_witness(request());
+            injection.assert_failed_once();
+            drop(injection);
+            match kind {
+                MatchingLfLineWitnessTrackingFailureInjection::Allocation => assert!(matches!(
+                    result,
+                    Err(crate::IndependentExistsBatchCompileError::Compile(
+                        CompileError::Object(ObjectError::Allocation(
+                            MATCHING_LF_LINE_WITNESS_TRACKING_ALLOCATION_SITE
+                        ))
+                    ))
+                )),
+                MatchingLfLineWitnessTrackingFailureInjection::Invalid
+                | MatchingLfLineWitnessTrackingFailureInjection::PreFinishInvalid => {
+                    assert!(matches!(
+                        result,
+                        Err(crate::IndependentExistsBatchCompileError::Compile(
+                            CompileError::Object(ObjectError::InvalidModule(
+                                MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE
+                            ))
+                        ))
+                    ))
+                }
+            }
+        }
+
+        let failures = [
+            ObjectError::Allocation(MATCHING_LF_LINE_WITNESS_TRACKING_ALLOCATION_SITE),
+            ObjectError::InvalidModule(MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE),
+        ];
+        for failure in failures {
+            assert!(is_required_native_recipe_failure(&failure));
+            assert!(matches!(
+                optional_native_lowering_outcome(Err(failure.clone())),
+                Err(error) if error == failure
+            ));
+            assert!(matches!(
+                measured_native_dfa_outcome(Err(failure.clone()), false, usize::MAX),
+                Err(error) if error == failure
+            ));
+            assert!(matches!(
+                legacy_fixed_k0_lowering_outcome(Err(failure.clone())),
+                Err(error) if error == failure
+            ));
+            assert!(matches!(
+                compiler_k0_lowering_error(failure.clone()),
+                Err(error) if error == failure
+            ));
+            assert!(matches!(
+                materialized_native_fallback_outcome(Err(failure.clone())),
+                Err(error) if error == failure
+            ));
+            assert!(matches!(
+                exact_finite_teddy_incumbent_outcome(Err(failure.clone()), usize::MAX),
+                Err(error) if error == failure
+            ));
+            assert!(matches!(
+                slow_partial_prepared_outcome(Err(failure.clone())),
+                Err(error) if error == failure
+            ));
+        }
+    }
+
+    #[test]
     fn matching_lf_line_witness_append_is_core_preserving_and_tamper_evident() {
         let pattern = "x".repeat(
             module_single_literal_two_way::MIN_TWO_WAY_LITERAL_BYTES
@@ -85387,12 +85696,29 @@ mod tests {
             Target::aarch64_linux(),
             Target::aarch64_macos(),
         ] {
-            let ordinary = compile(
-                CompileRequest::new(&pattern, target)
-                    .mode(CompileMode::Optimizing)
-                    .output(OutputContract::Exists),
-            )
-            .expect("compile complete-DFA witness fixture");
+            let request = CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists);
+            let untracked = compile(request.clone())
+                .expect("compile ordinary complete-DFA control");
+            let ordinary = with_matching_lf_line_witness_recipe(|| compile(request))
+                .expect("compile explicitly tracked complete-DFA witness fixture");
+            assert_eq!(ordinary.object(), untracked.object());
+            assert_eq!(ordinary.module().sections, untracked.module().sections);
+            assert_eq!(ordinary.module().symbols, untracked.module().symbols);
+            assert_eq!(ordinary.module().relocations, untracked.module().relocations);
+            assert_eq!(
+                ordinary.module().native_direct_search_module_surface_seal,
+                untracked.module().native_direct_search_module_surface_seal,
+            );
+            let untracked_core = untracked
+                .module()
+                .native_direct_search_trusted_core
+                .expect("ordinary complete-DFA trusted core");
+            assert!(untracked_core.matching_lf_line_cursor.is_none());
+            assert!(untracked_core
+                .matching_lf_line_success_edges_sha256
+                .is_none());
             let ordinary_core = ordinary
                 .module()
                 .native_direct_search_trusted_core
@@ -85603,26 +85929,25 @@ mod tests {
             ));
         }
 
-        let nullable = compile(
-            CompileRequest::new("x*", Target::x86_64_linux())
-                .mode(CompileMode::Optimizing)
-                .output(OutputContract::Exists),
+        let nullable_request = CompileRequest::new("x*", Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists);
+        let nullable_batch = crate::compile_with_independent_exists_batch(
+            nullable_request.clone(),
         )
-        .expect("compile nullable complete DFA");
-        let nullable_batch = nullable
+        .expect("established nullable generic batch");
+        let nullable_opt_in =
+            crate::compile_with_independent_matching_lf_line_witness(nullable_request)
+                .expect("nullable matching-line request structurally declines");
+        assert_eq!(nullable_opt_in.object(), nullable_batch.object());
+        assert_eq!(nullable_opt_in.module(), nullable_batch.module());
+        assert_eq!(nullable_opt_in.receipt(), nullable_batch.receipt());
+        assert!(nullable_opt_in
             .module()
-            .clone()
-            .append_direct_exists_batch(OutputContract::Exists)
-            .expect("append nullable generic batch")
-            .expect("nullable generic batch eligibility");
-        assert!(matches!(
-            nullable_batch.append_direct_matching_lf_line_witness(OutputContract::Exists),
-            Err(ObjectError::InvalidModule(
-                "matching-LF-line endpoint cannot admit nullable success"
-            ))
-        ));
+            .direct_matching_lf_line_witness_symbol()
+            .is_none());
 
-        let width_one = crate::compile_with_independent_exists_batch(
+        let width_one = crate::compile_with_independent_matching_lf_line_witness(
             CompileRequest::new("x", Target::x86_64_linux())
                 .mode(CompileMode::Optimizing)
                 .output(OutputContract::Exists),

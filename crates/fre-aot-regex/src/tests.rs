@@ -16,8 +16,10 @@ use crate::{
     PreparedAggregateExports, PreparedAggregateStrategy,
     PreparedBulkStrategy, DirectExistsBatchStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
-    ObjectError, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
+    ObjectError, ObjectFormat, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target,
+    compile,
     compile_with_exact_finite_selected_end_grep_count, compile_with_independent_exists_batch,
+    compile_with_independent_matching_lf_line_witness,
     compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
     independent_exists_batch_append_outcome, independent_exists_batch_object_outcome,
     independent_exact_singleton_first_candidate_append_outcome,
@@ -686,6 +688,26 @@ fn independent_exists_batch_is_opt_in_authenticated_and_resource_atomic() {
             .expect("direct Exists batch artifact");
         let repeated = compile_with_independent_exists_batch(request.clone())
             .expect("deterministic direct Exists batch artifact");
+        let expected_parent_module = ordinary
+            .module()
+            .clone()
+            .append_direct_exists_batch(OutputContract::Exists)
+            .expect("append established direct batch")
+            .expect("established direct batch eligibility");
+        let expected_parent_object = emit_object(
+            &expected_parent_module,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit established direct batch object");
+        assert_eq!(batched.module(), &expected_parent_module);
+        assert_eq!(batched.object(), expected_parent_object);
+        assert!(
+            batched
+                .module()
+                .direct_matching_lf_line_witness_symbol()
+                .is_none()
+        );
         assert_eq!(batched.object(), repeated.object());
         assert_eq!(batched.module(), repeated.module());
         assert_eq!(
@@ -761,6 +783,27 @@ fn independent_exists_batch_is_opt_in_authenticated_and_resource_atomic() {
             assert_eq!(batched.receipt().exact_single_literal_aot, Some(expected));
         }
 
+        let witnessed = compile_with_independent_matching_lf_line_witness(request.clone())
+            .expect("explicit matching-LF-line witness artifact");
+        assert!(
+            witnessed
+                .module()
+                .direct_matching_lf_line_witness_symbol()
+                .is_some()
+        );
+        assert!(witnessed.receipt().matching_lf_line_witness_aot.is_some());
+        let witnessed_text = witnessed
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("witnessed text");
+        assert_eq!(
+            ordinary_text.bytes().get(entry_start..entry_end),
+            witnessed_text.bytes().get(entry_start..entry_end),
+            "explicit matching-line endpoint changed the ordinary entry",
+        );
+
         let mut limits = CompileLimitsV1::default();
         limits.max_object_bytes = ordinary.object().len();
         let declined = compile_with_independent_exists_batch(request.limits(limits))
@@ -799,6 +842,17 @@ fn independent_exists_batch_is_opt_in_authenticated_and_resource_atomic() {
             actual: OutputContract::Span
         })
     ));
+
+    let nullable_request = CompileRequest::new("x*", Target::x86_64_linux())
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::Exists);
+    let nullable_batch = compile_with_independent_exists_batch(nullable_request.clone())
+        .expect("established nullable batch");
+    let nullable_witness = compile_with_independent_matching_lf_line_witness(nullable_request)
+        .expect("nullable witness structurally declines");
+    assert_eq!(nullable_witness.object(), nullable_batch.object());
+    assert_eq!(nullable_witness.module(), nullable_batch.module());
+    assert_eq!(nullable_witness.receipt(), nullable_batch.receipt());
 }
 
 #[test]
