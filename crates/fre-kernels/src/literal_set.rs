@@ -59,6 +59,10 @@ const ORDINARY_DIRECT_DFA_BULK_BYTES: usize = 4;
 const ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES: usize = ORDINARY_DIRECT_DFA_NATIVE_BYTES;
 const ORDINARY_UNIFORM_SPAN_MAX_GAP_BYTES: usize = 2;
 
+// Repeated count-only Set4 seeks need enough source for several classifier
+// extents. Short ripgrep lines retain the incumbent endpoint loop verbatim.
+const ORDINARY_UNIFORM_COUNT_SET4_MIN_BYTES: usize = ORDINARY_ROOT_SET4_MIN_BYTES * 4;
+
 pub(super) const ALPHABET_LEN: usize = 256;
 pub(super) const BYTES_PER_DFA_CELL_ENVELOPE: usize = 16;
 pub(super) const BYTES_PER_TRIE_STATE_ENVELOPE: usize = 256;
@@ -2180,11 +2184,11 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         true
     }
 
-    /// Seek one exact Set4 root after a caller reaches a long selected-span
-    /// fallback. The scanner itself remains range-only, so count and every
-    /// dense uniform operation preserve their established layout and setup.
+    /// Seek one exact Set4 root after a caller reaches a long span fallback.
+    /// The scanner itself remains range-only, so other root shapes preserve
+    /// their established layout and setup.
     #[inline(always)]
-    fn seek_set4_root_for_selected_span(&mut self, buckets: NonZeroU16) -> bool {
+    fn seek_set4_root(&mut self, buckets: NonZeroU16) -> bool {
         let at = self.restart;
         if self.end - at < ORDINARY_ROOT_SET4_MIN_BYTES {
             return true;
@@ -2215,6 +2219,58 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         };
         self.restart = at + relative;
         true
+    }
+
+    /// Whether a marked Set4 bucket occurs inside the direct DFA's established
+    /// native prefix. Such a candidate is deliberately conservative: the
+    /// exact root may be farther away, but continuing the incumbent loop
+    /// avoids paying classifier setup on dense or bucket-false-positive data.
+    #[inline(always)]
+    fn set4_root_may_be_native(&self, buckets: NonZeroU16) -> bool {
+        let at = self.restart;
+        if self.end - at < ORDINARY_ROOT_SET4_MIN_BYTES {
+            return true;
+        }
+        let native_end = at
+            .saturating_add(ORDINARY_DIRECT_DFA_NATIVE_BYTES)
+            .min(self.end);
+        self.haystack[at..native_end]
+            .iter()
+            .any(|&byte| buckets.get() & (1_u16 << (byte >> 4)) != 0)
+    }
+
+    /// Count uniform endpoints while seeking only the exact Set4 root between
+    /// sparse matches. Keeping this loop out of line leaves non-Set4 count
+    /// code and every span projection on their existing instruction shape.
+    #[inline(never)]
+    fn count_uniform_set4_ends(
+        &mut self,
+        pattern_bytes: usize,
+        buckets: NonZeroU16,
+    ) -> usize {
+        debug_assert!(pattern_bytes <= ORDINARY_DIRECT_DFA_NATIVE_BYTES);
+        let mut count = 0_usize;
+        loop {
+            if !self.seek_set4_root(buckets) {
+                break;
+            }
+            let restart = self.restart;
+            let Some(selected_end) = self.next_uniform_count_end(pattern_bytes) else {
+                break;
+            };
+            debug_assert!(
+                selected_end > restart,
+                "a positive-width literal-set count must advance",
+            );
+            count += 1;
+            if self.set4_root_may_be_native(buckets) {
+                while self.next_uniform_count_end(pattern_bytes).is_some() {
+                    count += 1;
+                }
+                break;
+            }
+        }
+        count
     }
 
     #[inline(always)]
@@ -2763,7 +2819,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
                 .and_then(LiteralSetDirectDfaIdentity::root)
                 .and_then(LiteralSetDfaRoot::set4_bucket_mask)
             {
-                if !scanner.seek_set4_root_for_selected_span(buckets) {
+                if !scanner.seek_set4_root(buckets) {
                     return Ok(None);
                 }
             } else if !scanner.seek_root_range_for_selected_span() {
@@ -2931,7 +2987,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
                 .and_then(LiteralSetDfaRoot::set4_bucket_mask);
             loop {
                 let may_have_root = if let Some(buckets) = set4_buckets {
-                    scanner.seek_set4_root_for_selected_span(buckets)
+                    scanner.seek_set4_root(buckets)
                 } else {
                     scanner.seek_root_range_for_selected_span()
                 };
@@ -2999,6 +3055,22 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
             let mut previous_end = window.start();
             let build = self.plan.build;
             if self.is_uniform_positive() {
+                if scanner.end - scanner.restart >= ORDINARY_UNIFORM_COUNT_SET4_MIN_BYTES
+                    && build.minimum_pattern_bytes <= ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                    && let Some(buckets) = self
+                        .direct_dfa_identity
+                        .and_then(LiteralSetDirectDfaIdentity::root)
+                        .and_then(LiteralSetDfaRoot::set4_bucket_mask)
+                    && !scanner.set4_root_may_be_native(buckets)
+                {
+                    return u64::try_from(scanner.count_uniform_set4_ends(
+                        build.minimum_pattern_bytes,
+                        buckets,
+                    ))
+                    .map_err(|_| LiteralSetError::ArithmeticOverflow {
+                        computation: "positive-width literal-set match count",
+                    });
+                }
                 while let Some(selected_end) =
                     scanner.next_uniform_count_end(build.minimum_pattern_bytes)
                 {
@@ -7830,6 +7902,25 @@ mod tests {
         root_set4_patterns_for_roots([b'A', b'Q', b'a', b'q'])
     }
 
+    fn root_set4_uniform_patterns(
+        patterns_per_root: usize,
+        pattern_bytes: usize,
+    ) -> Vec<Vec<u8>> {
+        assert!(pattern_bytes >= 4);
+        [b'B', b'F', b'J', b'N']
+            .into_iter()
+            .flat_map(|root| {
+                (0..patterns_per_root).map(move |index| {
+                    let mut pattern = vec![b'0'; pattern_bytes];
+                    pattern[0] = root;
+                    let encoded = format!("{index:0>width$}", width = pattern_bytes - 1);
+                    pattern[1..].copy_from_slice(encoded.as_bytes());
+                    pattern
+                })
+            })
+            .collect()
+    }
+
     const ROOT_ASCII_24: [u8; 24] = [
         b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'K', b'M', b'O', b'Q',
         b'S', b'U', b'W', b'Y', b'a', b'c', b'e', b'g', b'i', b'k',
@@ -8329,6 +8420,97 @@ mod tests {
                 ordinary_direct_probe::root_set4_skipped_bytes(),
                 expected_skipped,
             );
+        }
+    }
+
+    #[test]
+    fn ordinary_direct_dfa_root_set4_accelerates_sparse_uniform_counts() {
+        for (patterns_per_root, pattern_bytes) in [(17, 16), (32, 17)] {
+            let patterns = root_set4_uniform_patterns(patterns_per_root, pattern_bytes);
+            let plan = LiteralSetPlan::new(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert!(plan.automaton.prefilter().is_none());
+            let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            assert!(ordinary.is_uniform_positive());
+            let identity = ordinary
+                .direct_dfa_identity
+                .expect("the direct DFA retains its identity");
+            assert!(identity
+                .root()
+                .and_then(LiteralSetDfaRoot::set4_bucket_mask)
+                .is_some());
+
+            let gap = ORDINARY_ROOT_SET4_MIN_BYTES + 17;
+            let selected = [
+                patterns[0].as_slice(),
+                patterns[patterns_per_root * 2].as_slice(),
+                patterns[patterns.len() - 1].as_slice(),
+            ];
+            let mut sparse = vec![b'x'; gap];
+            for pattern in selected {
+                sparse.extend_from_slice(pattern);
+                sparse.extend(core::iter::repeat_n(b'x', gap));
+            }
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                ordinary.count_spans_window_value(&sparse, Window::full(&sparse)),
+                Ok(3),
+            );
+            assert_eq!(ordinary_direct_probe::root_set4_calls(), 4);
+            assert_eq!(
+                ordinary_direct_probe::root_set4_skipped_bytes(),
+                gap * 4,
+            );
+
+            // Adjacent and short-separated matches finish inside the native
+            // prefix and never prepare or invoke the Set4 search leaf.
+            let mut dense = Vec::new();
+            for index in 0..8 {
+                dense.extend_from_slice(&patterns[index]);
+                dense.extend_from_slice(b"xxx");
+            }
+            ordinary_direct_probe::reset();
+            assert_eq!(
+                ordinary.count_spans_window_value(&dense, Window::full(&dense)),
+                Ok(8),
+            );
+            assert_eq!(ordinary_direct_probe::root_set4_calls(), 0);
+
+            // Compare every subwindow against the checked canonical engine,
+            // including cuts through roots and matches.
+            let mut curated = vec![b'x'; 7];
+            curated.extend_from_slice(&patterns[1]);
+            curated.extend_from_slice(b"xxx");
+            curated.extend_from_slice(&patterns[patterns_per_root + 2]);
+            curated.extend(core::iter::repeat_n(b'x', gap));
+            curated.extend_from_slice(&patterns[patterns.len() - 2]);
+            for start in 0..=curated.len() {
+                for end in start..=curated.len() {
+                    let window = Window::new(start, end);
+                    let mut expected = 0_u64;
+                    let mut cursor = start;
+                    while let Some((_, selected_end)) = plan
+                        .find_window(
+                            &curated,
+                            Window::new(cursor, end),
+                            LiteralSetSearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .0
+                    {
+                        expected += 1;
+                        cursor = selected_end;
+                    }
+                    assert_eq!(
+                        ordinary.count_spans_window_value(&curated, window),
+                        Ok(expected),
+                        "geometry={patterns_per_root}x{pattern_bytes} window={window:?}",
+                    );
+                }
+            }
         }
     }
 
