@@ -11265,8 +11265,8 @@ impl CompiledProgram {
             .native_exists_choice_view(self.identity.artifact, self.output)
     }
 
-    /// Return the authenticated exact finite `SelectedEnd` Teddy candidate.
-    /// Target lowering still owns ISA selection and direct-leaf admission.
+    /// Return the authenticated exact finite endpoint Teddy candidate. Target
+    /// lowering still owns ISA selection and direct-leaf admission.
     pub(crate) fn native_finite_selected_end_teddy_view(
         &self,
     ) -> Option<NativeFiniteSelectedEndTeddyView<'_>> {

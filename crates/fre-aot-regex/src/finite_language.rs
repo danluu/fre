@@ -1409,12 +1409,13 @@ pub(crate) struct NativeFiniteExistsChoiceView<'a> {
     total_source_bytes: usize,
 }
 
-/// Re-authenticated exact finite language used by the direct `SelectedEnd`
-/// Teddy leaf. Fingerprints only select candidate bases and buckets; the
-/// retained source-order literals remain the match authority.
+/// Re-authenticated exact finite language used by the direct endpoint Teddy
+/// leaf. Fingerprints only select candidate bases and buckets; the retained
+/// source-order literals remain the match authority.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeFiniteSelectedEndTeddyView<'a> {
     artifact_identity: [u8; 32],
+    output: OutputContract,
     literals: &'a [Vec<u8>],
     portfolio: MandatoryTeddyPortfolio,
     minimum_width: u32,
@@ -1455,7 +1456,7 @@ impl<'a> NativeFiniteSelectedEndTeddyView<'a> {
     }
 
     pub(crate) const fn output(self) -> OutputContract {
-        OutputContract::SelectedEnd
+        self.output
     }
 
     pub(crate) const fn total_source_bytes(self) -> usize {
@@ -1553,12 +1554,17 @@ impl NativeFiniteSelectedEndTeddyChoice {
     fn native_view<'a>(
         &self,
         artifact_identity: [u8; 32],
+        output: OutputContract,
         literals: &'a [Vec<u8>],
     ) -> Option<NativeFiniteSelectedEndTeddyView<'a>> {
+        if !matches!(output, OutputContract::SelectedEnd | OutputContract::Span) {
+            return None;
+        }
         let rebuilt = Self::derive(literals, self.total_source_bytes, self.maximum_width)?;
         (artifact_identity != [0; 32] && rebuilt == *self).then_some(
             NativeFiniteSelectedEndTeddyView {
                 artifact_identity,
+                output,
                 literals,
                 portfolio: self.portfolio,
                 minimum_width: self.minimum_width,
@@ -2300,7 +2306,7 @@ pub(crate) struct NativeFiniteLanguageProgram {
     exists_literals: Vec<Vec<u8>>,
     exists_choice: Option<NativeFiniteExistsChoice>,
     /// Exact source-order alternatives retained only for the bounded direct
-    /// `SelectedEnd` Teddy candidate.
+    /// endpoint Teddy candidate.
     selected_end_literals: Vec<Vec<u8>>,
     selected_end_teddy_choice: Option<NativeFiniteSelectedEndTeddyChoice>,
     /// Exact singleton retained only for the explicit Count-v3 portfolio when
@@ -2434,7 +2440,10 @@ impl NativeFiniteLanguageProgram {
         } else {
             None
         };
-        let selected_end_teddy_choice = if output == OutputContract::SelectedEnd {
+        let selected_end_teddy_choice = if matches!(
+            output,
+            OutputContract::SelectedEnd | OutputContract::Span
+        ) {
             NativeFiniteSelectedEndTeddyChoice::derive(
                 &candidate.strings,
                 candidate.total_bytes,
@@ -2530,7 +2539,10 @@ impl NativeFiniteLanguageProgram {
                 })
             || (self.output != OutputContract::Exists
                 && (self.exists_choice.is_some() || !self.exists_literals.is_empty()))
-            || (self.output == OutputContract::SelectedEnd
+            || (matches!(
+                self.output,
+                OutputContract::SelectedEnd | OutputContract::Span
+            )
                 && match self.selected_end_teddy_choice.as_ref() {
                     Some(_) => {
                         self.selected_end_literals.len()
@@ -2538,7 +2550,10 @@ impl NativeFiniteLanguageProgram {
                     }
                     None => !self.selected_end_literals.is_empty(),
                 })
-            || (self.output != OutputContract::SelectedEnd
+            || (!matches!(
+                self.output,
+                OutputContract::SelectedEnd | OutputContract::Span
+            )
                 && (self.selected_end_teddy_choice.is_some()
                     || !self.selected_end_literals.is_empty()))
         {
@@ -2650,21 +2665,21 @@ impl NativeFiniteLanguageProgram {
     }
 
     /// Return the independently re-authenticated exact finite language used
-    /// by the target-final direct `SelectedEnd` Teddy leaf.
+    /// by the target-final direct endpoint Teddy leaf.
     pub(crate) fn native_selected_end_teddy_view(
         &self,
         artifact_identity: [u8; 32],
         output: OutputContract,
     ) -> Option<NativeFiniteSelectedEndTeddyView<'_>> {
         if !self.authenticates(artifact_identity, output)
-            || output != OutputContract::SelectedEnd
+            || !matches!(output, OutputContract::SelectedEnd | OutputContract::Span)
             || self.selected_end_literals.len() != usize::try_from(self.source_count).ok()?
         {
             return None;
         }
         self.selected_end_teddy_choice
             .as_ref()?
-            .native_view(artifact_identity, &self.selected_end_literals)
+            .native_view(artifact_identity, output, &self.selected_end_literals)
     }
 
     /// Re-authenticate the complete exact finite language and prove that its

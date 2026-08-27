@@ -639,9 +639,9 @@ pub struct MatchingLfLineWitnessAotReport {
     pub runtime_call_count: u8,
 }
 
-/// Actual instruction family emitted by the direct exact-finite
-/// `SelectedEnd` Teddy leaf. Stronger targets may reuse an audited narrower
-/// sequence, so this is distinct from the authorizing target tier.
+/// Actual instruction family emitted by the direct exact-finite endpoint
+/// Teddy leaf. Stronger targets may reuse an audited narrower sequence, so
+/// this is distinct from the authorizing target tier.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExactFiniteSelectedEndTeddyAotIsa {
     X86Avx2,
@@ -649,8 +649,8 @@ pub enum ExactFiniteSelectedEndTeddyAotIsa {
     Aarch64Sve,
 }
 
-/// Target capability tier authorizing the direct exact-finite
-/// `SelectedEnd` Teddy leaf.
+/// Target capability tier authorizing the direct exact-finite endpoint Teddy
+/// leaf.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ExactFiniteSelectedEndTeddyAotTargetTier {
     X86Avx2,
@@ -660,7 +660,7 @@ pub enum ExactFiniteSelectedEndTeddyAotTargetTier {
     Aarch64Sve2,
 }
 
-/// Transient provenance for a direct exact-finite `SelectedEnd` Teddy leaf.
+/// Transient provenance for a direct exact-finite endpoint Teddy leaf.
 /// Long valid windows start in the emitted scanner and source-order verifier.
 /// A deterministic exact-verification budget tail-enters the retained
 /// incumbent at the still-unresolved candidate; short or invalid calls enter
@@ -681,6 +681,19 @@ pub struct ExactFiniteSelectedEndDfaBaselineReport {
     pub has_accelerator: bool,
     /// Scanner actually emitted by the retained complete-DFA lowering.
     pub scanner: StartAccelerator,
+}
+
+fn exact_finite_dfa_baseline_reverse_states(
+    report: ExactFiniteSelectedEndDfaBaselineReport,
+) -> Option<usize> {
+    if report.alphabet_classes == 0
+        || !report
+            .transition_cells
+            .is_multiple_of(report.alphabet_classes)
+    {
+        return None;
+    }
+    (report.transition_cells / report.alphabet_classes).checked_sub(report.forward_states)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4657,6 +4670,19 @@ impl NativeCompleteDfaCost {
         )
     }
 
+    fn span_report(
+        self,
+        view: &NativeProgramView<'_>,
+        lowering: &NativeLowering,
+    ) -> Result<Option<ExactFiniteSelectedEndDfaBaselineReport>, ObjectError> {
+        self.exact_finite_report_with_basis(
+            view,
+            lowering,
+            OutputContract::Span,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        )
+    }
+
     fn exists_report(
         self,
         view: &NativeProgramView<'_>,
@@ -4687,7 +4713,10 @@ impl NativeCompleteDfaCost {
             }
         };
         if view.output != expected_output
-            || !matches!(expected_output, OutputContract::Exists | OutputContract::SelectedEnd)
+            || !matches!(
+                expected_output,
+                OutputContract::Exists | OutputContract::SelectedEnd | OutputContract::Span
+            )
             || !admitted_accelerator
             || lowering.needs_runtime
             || lowering.slow_partial_table.is_some()
@@ -4729,8 +4758,22 @@ fn native_exact_finite_dfa_semantic_digest(
     view: &NativeProgramView<'_>,
     expected_output: OutputContract,
 ) -> Result<[u8; 32], ObjectError> {
+    let reverse_geometry_is_valid = match expected_output {
+        OutputContract::Span => {
+            view.dfa.class_count != 0
+                && view.dfa.reverse_initial.is_some()
+                && !view.dfa.reverse_cells.is_empty()
+                && view
+                    .dfa
+                    .reverse_cells
+                    .len()
+                    .is_multiple_of(view.dfa.class_count)
+        }
+        OutputContract::Exists | OutputContract::SelectedEnd => {
+            view.dfa.reverse_initial.is_none() && view.dfa.reverse_cells.is_empty()
+        }
+    };
     if view.output != expected_output
-        || !matches!(expected_output, OutputContract::Exists | OutputContract::SelectedEnd)
         || view.dfa.class_count == 0
         || view.dfa.forward_cells.is_empty()
         || !view
@@ -4738,8 +4781,7 @@ fn native_exact_finite_dfa_semantic_digest(
             .forward_cells
             .len()
             .is_multiple_of(view.dfa.class_count)
-        || view.dfa.reverse_initial.is_some()
-        || !view.dfa.reverse_cells.is_empty()
+        || !reverse_geometry_is_valid
     {
         return Err(ObjectError::InvalidModule(
             "exact-finite complete DFA semantic digest geometry",
@@ -4749,7 +4791,7 @@ fn native_exact_finite_dfa_semantic_digest(
     digest.update(match expected_output {
         OutputContract::Exists => b"fre-exists-complete-dfa-v1".as_slice(),
         OutputContract::SelectedEnd => b"fre-selected-end-complete-dfa-v1".as_slice(),
-        OutputContract::Span => unreachable!(),
+        OutputContract::Span => b"fre-span-complete-dfa-v1".as_slice(),
     });
     digest.update(view.dfa.initial_state.to_le_bytes());
     digest.update([u8::from(view.dfa.initial_pending)]);
@@ -4774,6 +4816,25 @@ fn native_exact_finite_dfa_semantic_digest(
     for cell in view.dfa.forward_cells {
         digest.update(cell.next().to_le_bytes());
         digest.update([u8::from(cell.accepted())]);
+    }
+    if expected_output == OutputContract::Span {
+        digest.update(
+            view.dfa
+                .reverse_initial
+                .ok_or(ObjectError::InvalidModule(
+                    "exact-finite Span DFA has no reverse initial state",
+                ))?
+                .to_le_bytes(),
+        );
+        digest.update(
+            u64::try_from(view.dfa.reverse_cells.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("exact-finite reverse DFA cells"))?
+                .to_le_bytes(),
+        );
+        for cell in view.dfa.reverse_cells {
+            digest.update(cell.next().to_le_bytes());
+            digest.update([u8::from(cell.reaches_start())]);
+        }
     }
     Ok(digest.finalize().into())
 }
@@ -5202,12 +5263,31 @@ fn exact_finite_selected_end_dfa_baseline_authenticates_with_basis(
     report: ExactFiniteSelectedEndDfaBaselineReport,
     selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
 ) -> Result<bool, ObjectError> {
-    let Some(cost) = NativeCompleteDfaCost::estimate_selected_end(view)? else {
+    if view.output == OutputContract::Span
+        && selection_basis
+            == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility
+    {
+        return Ok(false);
+    }
+    let cost = match view.output {
+        OutputContract::SelectedEnd => NativeCompleteDfaCost::estimate_selected_end(view)?,
+        OutputContract::Span => NativeCompleteDfaCost::estimate(view)?,
+        OutputContract::Exists => None,
+    };
+    let Some(cost) = cost else {
         return Ok(false);
     };
     let Some(forward_states) = view
         .dfa
         .forward_cells
+        .len()
+        .checked_div(view.dfa.class_count)
+    else {
+        return Ok(false);
+    };
+    let Some(reverse_states) = view
+        .dfa
+        .reverse_cells
         .len()
         .checked_div(view.dfa.class_count)
     else {
@@ -5221,9 +5301,11 @@ fn exact_finite_selected_end_dfa_baseline_authenticates_with_basis(
             report.has_accelerator == (report.scanner != StartAccelerator::None)
         }
     };
-    Ok(view.output == OutputContract::SelectedEnd
-        && report.semantic_dfa_sha256 == native_selected_end_dfa_semantic_digest(view)?
+    Ok(matches!(view.output, OutputContract::SelectedEnd | OutputContract::Span)
+        && report.semantic_dfa_sha256
+            == native_exact_finite_dfa_semantic_digest(view, view.output)?
         && report.forward_states == forward_states
+        && exact_finite_dfa_baseline_reverse_states(report) == Some(reverse_states)
         && report.alphabet_classes == view.dfa.class_count
         && report.transition_cells == cost.transition_cells
         && report.minimum_native_data_bytes == cost.minimum_data_bytes
@@ -5253,6 +5335,7 @@ fn exact_finite_exists_dfa_baseline_authenticates(
         && report.semantic_dfa_sha256
             == native_exact_finite_dfa_semantic_digest(view, OutputContract::Exists)?
         && report.forward_states == forward_states
+        && exact_finite_dfa_baseline_reverse_states(report) == Some(0)
         && report.alphabet_classes == view.dfa.class_count
         && report.transition_cells == cost.transition_cells
         && report.minimum_native_data_bytes == cost.minimum_data_bytes
@@ -6628,6 +6711,8 @@ impl CompiledModule {
             if teddy_policy != crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled
                 && let Some(teddy_view) = program.native_finite_selected_end_teddy_view()
                 && let Some(baseline_cost) = complete_cost
+                && (teddy_view.output() == OutputContract::SelectedEnd
+                    || teddy_policy == crate::ExactFiniteSelectedEndTeddyPolicyV2::Automatic)
                 && (teddy_policy
                     == crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible
                     || !baseline_cost.has_accelerator)
@@ -6645,7 +6730,14 @@ impl CompiledModule {
                 if let Some(incumbent_ref) = incumbent.as_ref() {
                     let baseline_report = match selection_basis {
                         ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
-                            baseline_cost.selected_end_report(&semantic_native, incumbent_ref)?
+                            match teddy_view.output() {
+                                OutputContract::SelectedEnd => baseline_cost
+                                    .selected_end_report(&semantic_native, incumbent_ref)?,
+                                OutputContract::Span => {
+                                    baseline_cost.span_report(&semantic_native, incumbent_ref)?
+                                }
+                                OutputContract::Exists => None,
+                            }
                         }
                         ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
                             baseline_cost.selected_end_report_with_basis(
@@ -6682,14 +6774,29 @@ impl CompiledModule {
                             let incumbent_prefix = incumbent_lowering.anchored_prefix_filter_bytes;
                             let outcome = match selection_basis {
                                 ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1 => {
-                                    module_exact_finite_selected_end_teddy::
-                                        wrap_exact_finite_selected_end_teddy(
-                                            selection,
-                                            incumbent_lowering,
-                                            baseline_report,
-                                            target,
-                                            effective_native_data_limit_bytes,
-                                        )?
+                                    match teddy_view.output() {
+                                        OutputContract::SelectedEnd => {
+                                            module_exact_finite_selected_end_teddy::
+                                                wrap_exact_finite_selected_end_teddy(
+                                                    selection,
+                                                    incumbent_lowering,
+                                                    baseline_report,
+                                                    target,
+                                                    effective_native_data_limit_bytes,
+                                                )?
+                                        }
+                                        OutputContract::Span => {
+                                            module_exact_finite_selected_end_teddy::
+                                                wrap_exact_finite_span_teddy(
+                                                    selection,
+                                                    incumbent_lowering,
+                                                    baseline_report,
+                                                    target,
+                                                    effective_native_data_limit_bytes,
+                                                )?
+                                        }
+                                        OutputContract::Exists => unreachable!(),
+                                    }
                                 }
                                 ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility => {
                                     module_exact_finite_selected_end_teddy::

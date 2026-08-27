@@ -141,10 +141,13 @@ const fn exact_finite_exists_teddy_source_count_is_supported(source_count: usize
 }
 
 impl<'a> ExactFiniteTeddyLiteralView<'a> {
-    const fn from_selected_end(view: NativeFiniteSelectedEndTeddyView<'a>) -> Self {
-        Self {
+    const fn from_endpoint(view: NativeFiniteSelectedEndTeddyView<'a>) -> Option<Self> {
+        if !matches!(view.output(), OutputContract::SelectedEnd | OutputContract::Span) {
+            return None;
+        }
+        Some(Self {
             artifact_identity: view.artifact_identity(),
-            output: OutputContract::SelectedEnd,
+            output: view.output(),
             literals: view.literals(),
             portfolio: view.portfolio(),
             minimum_width: view.minimum_width(),
@@ -153,7 +156,7 @@ impl<'a> ExactFiniteTeddyLiteralView<'a> {
             source_count: view.source_count(),
             total_source_bytes: view.total_source_bytes(),
             literal_digest: view.literal_digest(),
-        }
+        })
     }
 
     fn from_exists(
@@ -271,6 +274,7 @@ pub(super) enum ExactFiniteSelectedEndTeddyWrapOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExactFiniteTeddySuccessMode {
     SelectedEnd,
+    Span,
     /// Preserve the verified candidate and tail-enter the exact incumbent at
     /// that base, retaining its positive result and LF-cursor authority.
     ExistsReverifyInIncumbent,
@@ -336,14 +340,11 @@ fn complete_dfa_baseline_report_has_valid_geometry(
             report.has_accelerator == (report.scanner != StartAccelerator::None)
         }
     };
+    let reverse_states = exact_finite_dfa_baseline_reverse_states(report);
     report.semantic_dfa_sha256 != [0; 32]
         && report.forward_states != 0
         && (1..=256).contains(&report.alphabet_classes)
-        && report.transition_cells
-            == report
-                .forward_states
-                .checked_mul(report.alphabet_classes)
-                .unwrap_or(0)
+        && reverse_states.is_some()
         && report.minimum_native_data_bytes != 0
         && report.native_data_bytes >= report.minimum_native_data_bytes
         && report.hot_loads_per_byte != 0
@@ -388,6 +389,10 @@ fn exact_finite_selected_end_teddy_costs<B: AsRef<[u8]>>(
     selection_horizon_bytes: usize,
     selection_basis: ExactFiniteSelectedEndTeddySelectionBasisV2,
 ) -> Option<ExactFiniteSelectedEndTeddyCosts> {
+    let reverse_states = exact_finite_dfa_baseline_reverse_states(incumbent)?;
+    if (output == OutputContract::Span) != (reverse_states != 0) {
+        return None;
+    }
     let (root_frequency_units, root_cardinality) = root_frequency_and_cardinality(root_members)?;
     let horizon = u128::try_from(selection_horizon_bytes).ok()?;
     let candidate_budget = dynamic_correlated_prefix_candidate_budget(
@@ -548,7 +553,7 @@ pub(super) fn select_exact_finite_selected_end_teddy<'a>(
     target: Target,
     incumbent: ExactFiniteSelectedEndDfaBaselineReport,
 ) -> Option<ExactFiniteSelectedEndTeddySelection<'a>> {
-    let view = ExactFiniteTeddyLiteralView::from_selected_end(view);
+    let view = ExactFiniteTeddyLiteralView::from_endpoint(view)?;
     let selection_horizon_bytes =
         PARTIAL_DFA_MIN_INPUT_BYTES.checked_mul(COST_HORIZON_MULTIPLIER)?;
     if !complete_dfa_baseline_report_has_valid_geometry(
@@ -559,7 +564,7 @@ pub(super) fn select_exact_finite_selected_end_teddy<'a>(
     }
     let selected = recompute_exact_finite_selected_end_teddy_selection(
         view.literals(),
-        OutputContract::SelectedEnd,
+        view.output(),
         view.portfolio(),
         view.minimum_width(),
         view.root_members(),
@@ -646,7 +651,10 @@ pub(super) fn select_exact_finite_selected_end_teddy_forced_v2<'a>(
     target: Target,
     incumbent: ExactFiniteSelectedEndDfaBaselineReport,
 ) -> Option<ExactFiniteSelectedEndTeddySelection<'a>> {
-    let view = ExactFiniteTeddyLiteralView::from_selected_end(view);
+    let view = ExactFiniteTeddyLiteralView::from_endpoint(view)?;
+    if view.output() != OutputContract::SelectedEnd {
+        return None;
+    }
     let selection_horizon_bytes =
         PARTIAL_DFA_MIN_INPUT_BYTES.checked_mul(COST_HORIZON_MULTIPLIER)?;
     if !complete_dfa_baseline_report_has_valid_geometry(
@@ -742,6 +750,13 @@ fn report_plan_digest(
     let baseline = report.incumbent_complete_dfa;
     digest.update(baseline.semantic_dfa_sha256);
     digest.update(u64::try_from(baseline.forward_states).ok()?.to_le_bytes());
+    if report.output == OutputContract::Span {
+        digest.update(
+            u64::try_from(exact_finite_dfa_baseline_reverse_states(baseline)?)
+                .ok()?
+                .to_le_bytes(),
+        );
+    }
     digest.update(u64::try_from(baseline.alphabet_classes).ok()?.to_le_bytes());
     digest.update(u64::try_from(baseline.transition_cells).ok()?.to_le_bytes());
     digest.update(
@@ -856,7 +871,15 @@ pub(crate) fn exact_finite_selected_end_teddy_report_v2(
             ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
         )
     );
+    let valid_output = match lowering.output {
+        OutputContract::SelectedEnd => true,
+        OutputContract::Span => {
+            selection_basis == ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1
+        }
+        OutputContract::Exists => false,
+    };
     if !valid_policy
+        || !valid_output
         || !complete_dfa_baseline_report_has_valid_geometry(
             lowering.incumbent_complete_dfa,
             selection_basis,
@@ -892,6 +915,10 @@ fn report_v2_metadata_authenticates(report: &ExactFiniteSelectedEndTeddyAotRepor
             == (report.selection_basis
                 == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility)
         && report.tail_enters_exact_incumbent
+        && matches!(report.lowering.output, OutputContract::SelectedEnd | OutputContract::Span)
+        && !(report.lowering.output == OutputContract::Span
+            && report.selection_basis
+                == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility)
         && matches!(
             (report.requested_policy, report.selection_basis),
             (
@@ -1523,6 +1550,13 @@ fn lower_x86_wrapper(
         ExactFiniteTeddySuccessMode::SelectedEnd => {
             assembler.instruction(&[0x48, 0x8d, 0x04, 0x0a])?; // selected end
             assembler.instruction(&[0x49, 0x89, 0x06])?;
+            assembler.instruction(&[0x49, 0x89, 0x46, 0x08])?;
+            assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+            assembler.branch(&[0xe9], returned)?;
+        }
+        ExactFiniteTeddySuccessMode::Span => {
+            assembler.instruction(&[0x48, 0x8d, 0x04, 0x0a])?; // selected end
+            assembler.instruction(&[0x49, 0x89, 0x16])?; // selected start
             assembler.instruction(&[0x49, 0x89, 0x46, 0x08])?;
             assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
             assembler.branch(&[0xe9], returned)?;
@@ -2366,6 +2400,16 @@ fn lower_aarch64_wrapper(
             assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
             assembler.instruction(0xd65f_03c0)?;
         }
+        ExactFiniteTeddySuccessMode::Span => {
+            assembler.instruction(aarch64_add_x_reg(6, 2, 1)?)?;
+            assembler.instruction(aarch64_store_x(2, 4, 0)?)?;
+            assembler.instruction(aarch64_store_x(6, 4, 8)?)?;
+            assembler.instruction(aarch64_movz_w(0, 1)?)?;
+            assembler.instruction(aarch64_load_x_imm(21, 31, 16)?)?;
+            assembler.instruction(aarch64_load_pair_x(19, 20, 31, 0)?)?;
+            assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
+            assembler.instruction(0xd65f_03c0)?;
+        }
         ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent => {
             // X2 still names the byte-exact candidate base.
             assembler.branch(runtime_fallback)?;
@@ -2717,6 +2761,28 @@ pub(super) fn wrap_exact_finite_selected_end_teddy(
     )
 }
 
+/// Compose the authenticated exact-finite Teddy scanner with a complete
+/// variable-width `Span` incumbent. The exact verifier supplies both the
+/// source-priority literal width and its candidate base.
+pub(super) fn wrap_exact_finite_span_teddy(
+    selection: ExactFiniteSelectedEndTeddySelection<'_>,
+    incumbent: NativeLowering,
+    incumbent_complete_dfa: ExactFiniteSelectedEndDfaBaselineReport,
+    target: Target,
+    maximum_native_data_bytes: usize,
+) -> Result<ExactFiniteSelectedEndTeddyWrapOutcome, ObjectError> {
+    wrap_exact_finite_selected_end_teddy_with_basis(
+        selection,
+        incumbent,
+        incumbent_complete_dfa,
+        target,
+        maximum_native_data_bytes,
+        ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        ExactFiniteTeddySuccessMode::Span,
+        false,
+    )
+}
+
 pub(super) fn wrap_exact_finite_selected_end_teddy_forced_v2(
     selection: ExactFiniteSelectedEndTeddySelection<'_>,
     incumbent: NativeLowering,
@@ -2795,6 +2861,7 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
         || selection.view.output()
             != match success_mode {
                 ExactFiniteTeddySuccessMode::SelectedEnd => OutputContract::SelectedEnd,
+                ExactFiniteTeddySuccessMode::Span => OutputContract::Span,
                 ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent => OutputContract::Exists,
             }
         || native_mandatory_teddy_isa(target) != Some(selection.isa)
@@ -2812,7 +2879,7 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
         ));
     }
     match success_mode {
-        ExactFiniteTeddySuccessMode::SelectedEnd
+        ExactFiniteTeddySuccessMode::SelectedEnd | ExactFiniteTeddySuccessMode::Span
             if incumbent.exact_finite_exists_complete_dfa_receipt.is_some()
                 || incumbent
                     .exact_finite_exists_complete_dfa_expected_receipt_sha256
@@ -3000,6 +3067,14 @@ fn wrap_exact_finite_selected_end_teddy_with_basis(
             ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
         ) => report_matches_lowering_with_basis(&report, &incumbent, target, selection_basis)?,
         (
+            ExactFiniteTeddySuccessMode::Span,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        ) => report_matches_lowering(&report, &incumbent, target)?,
+        (
+            ExactFiniteTeddySuccessMode::Span,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility,
+        ) => false,
+        (
             ExactFiniteTeddySuccessMode::ExistsReverifyInIncumbent,
             ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
         ) => exists_report_matches_lowering(&report, &incumbent, target)?,
@@ -3049,7 +3124,7 @@ fn report_matches_lowering_with_basis(
         lowering.anchored_prefix_filter_bytes,
         target,
         selection_basis,
-        OutputContract::SelectedEnd,
+        report.output,
     )
 }
 
@@ -3129,7 +3204,7 @@ pub(super) fn report_matches_parts(
         anchored_prefix_filter_bytes,
         target,
         ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
-        OutputContract::SelectedEnd,
+        report.output,
     )
 }
 
@@ -3160,7 +3235,7 @@ pub(super) fn report_v2_matches_parts(
             anchored_prefix_filter_bytes,
             target,
             report.selection_basis,
-            OutputContract::SelectedEnd,
+            report.lowering.output,
         )?)
 }
 
@@ -3213,7 +3288,17 @@ fn report_matches_parts_with_basis(
             && verifier_data_authenticates(report, data)?
             && report.artifact_identity != [0; 32]
             && report.output == expected_output
-            && matches!(expected_output, OutputContract::Exists | OutputContract::SelectedEnd)
+            && matches!(
+                expected_output,
+                OutputContract::Exists | OutputContract::SelectedEnd | OutputContract::Span
+            )
+            && !(expected_output == OutputContract::Span
+                && selection_basis
+                    == ExactFiniteSelectedEndTeddySelectionBasisV2::ForcedStructuralEligibility)
+            && exact_finite_dfa_baseline_reverse_states(report.incumbent_complete_dfa)
+                .is_some_and(|reverse_states| {
+                    (expected_output == OutputContract::Span) == (reverse_states != 0)
+                })
             && report.source_count >= 4
             && report.source_count <= 64
             && usize::try_from(report.minimum_width)
@@ -3643,6 +3728,7 @@ pub(super) fn refresh_report_parts(
     anchored_prefix_filter_bytes: u8,
     target: Target,
 ) -> Result<(), ObjectError> {
+    let output = report.output;
     refresh_report_parts_with_basis(
         report,
         code,
@@ -3654,7 +3740,7 @@ pub(super) fn refresh_report_parts(
         anchored_prefix_filter_bytes,
         target,
         ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
-        OutputContract::SelectedEnd,
+        output,
     )
 }
 
@@ -3716,6 +3802,7 @@ pub(super) fn refresh_report_v2_parts(
     anchored_prefix_filter_bytes: u8,
     target: Target,
 ) -> Result<(), ObjectError> {
+    let output = report.lowering.output;
     refresh_report_parts_with_basis(
         &mut report.lowering,
         code,
@@ -3727,7 +3814,7 @@ pub(super) fn refresh_report_v2_parts(
         anchored_prefix_filter_bytes,
         target,
         report.selection_basis,
-        OutputContract::SelectedEnd,
+        output,
     )?;
     report.route_binding_sha256 = v2_route_binding_digest(report);
     if !report_v2_matches_parts(
@@ -4216,6 +4303,49 @@ mod tests {
         compiled
     }
 
+    fn compile_span(pattern: &str, target: Target) -> CompiledRegex {
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .expect("compile exact finite Span Teddy fixture");
+        let report = compiled
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .unwrap_or_else(|| {
+                let view = compiled.program().native_finite_selected_end_teddy_view();
+                let semantic = compiled.program().native_dfa_view().unwrap();
+                let cost = NativeCompleteDfaCost::estimate(&semantic).unwrap().unwrap();
+                let incumbent = lower_native_dfa(semantic, target).unwrap().unwrap();
+                let baseline = cost.span_report(&semantic, &incumbent).unwrap();
+                panic!(
+                    "direct exact finite Span Teddy route: pattern={pattern:?} engine={:?} view={} static_accelerator={} scanner={:?} baseline={} selection={}",
+                    compiled.receipt().engine,
+                    view.is_some(),
+                    cost.has_accelerator,
+                    incumbent.start_accelerator,
+                    baseline.is_some(),
+                    view.zip(baseline)
+                        .and_then(|(view, baseline)|
+                            select_exact_finite_selected_end_teddy(view, target, baseline))
+                        .is_some(),
+                )
+            });
+        assert_eq!(report.output, OutputContract::Span);
+        assert!((4..=64).contains(&report.source_count));
+        assert!(report.minimum_width >= 3);
+        assert!(report.bucket_count <= 8);
+        assert!(compiled.receipt().ordered_finite_language_aot.is_none());
+        assert!(
+            compiled
+                .receipt()
+                .passes
+                .contains(&OptimizationPass::ExactFiniteSelectedEndTeddyLowering),
+        );
+        compiled
+    }
+
     fn compile_exists(pattern: &str, target: Target) -> CompiledRegex {
         let compiled = compile(
             CompileRequest::new(pattern, target)
@@ -4290,6 +4420,27 @@ mod tests {
             .selected_end_report(&semantic, &incumbent)
             .unwrap()
             .expect("SelectedEnd baseline report");
+        (incumbent, report)
+    }
+
+    fn complete_span_dfa_baseline(
+        compiled: &CompiledRegex,
+        target: Target,
+    ) -> (NativeLowering, ExactFiniteSelectedEndDfaBaselineReport) {
+        let semantic = compiled
+            .program()
+            .native_dfa_view()
+            .expect("complete Span semantic DFA");
+        let cost = NativeCompleteDfaCost::estimate(&semantic)
+            .unwrap()
+            .expect("Span baseline cost");
+        let incumbent = lower_native_dfa(semantic, target)
+            .unwrap()
+            .expect("Span baseline lowering");
+        let report = cost
+            .span_report(&semantic, &incumbent)
+            .unwrap()
+            .expect("Span baseline report");
         (incumbent, report)
     }
 
@@ -5892,6 +6043,27 @@ mod tests {
     }
 
     #[test]
+    fn span_teddy_post_selection_allocation_failure_is_terminal_end_to_end() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        compile_span(&pattern, target);
+
+        let injection = ExactFiniteTeddyNativeDataAllocationInjection::arm();
+        let result = compile(
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        );
+        injection.assert_failed_once();
+        assert!(matches!(
+            result,
+            Err(crate::CompileError::Object(ObjectError::Allocation(
+                EXACT_FINITE_TEDDY_NATIVE_DATA_ALLOCATION_SITE,
+            ))),
+        ));
+    }
+
+    #[test]
     fn exists_teddy_admission_charges_incumbent_reverify_and_retains_material_gain() {
         let target = avx2_target();
         let pattern = scanner_free_exact_finite_pattern();
@@ -6423,6 +6595,172 @@ mod tests {
             compiled.module(),
             &unchanged_selected_end_module(&compiled, target),
         );
+    }
+
+    #[test]
+    fn span_teddy_writes_authenticated_start_and_end_on_both_isas() {
+        let pattern = scanner_free_exact_finite_pattern();
+        let x86 = compile_span(&pattern, avx2_target());
+        let x86_report = x86
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("Span Teddy x86 report");
+        assert_eq!(x86_report.output, OutputContract::Span);
+        assert!(exact_finite_selected_end_dfa_baseline_authenticates(
+            &x86.program().native_dfa_view().unwrap(),
+            x86_report.incumbent_complete_dfa,
+        )
+        .unwrap());
+        let mut wrong_output = x86_report;
+        wrong_output.output = OutputContract::SelectedEnd;
+        assert!(
+            !report_matches_parts(
+                &wrong_output,
+                x86.module().sections()[TEXT_SECTION].bytes(),
+                x86.module().sections()[PROGRAM_SECTION].bytes(),
+                x86.module().relocations(),
+                false,
+                false,
+                x86.module().start_accelerator(),
+                x86.module().anchored_prefix_filter_bytes(),
+                avx2_target(),
+            )
+            .unwrap(),
+            "the receipt binds Span independently of the legacy field name",
+        );
+        let x86_result = [
+            0x48, 0x8d, 0x04, 0x0a, // end = candidate base + source width
+            0x49, 0x89, 0x16, // result[0] = candidate base
+            0x49, 0x89, 0x46, 0x08, // result[1] = end
+            0xb8, 0x01, 0, 0, 0, // matched status
+        ];
+        assert!(
+            x86.module().sections()[TEXT_SECTION]
+                .bytes()
+                .windows(x86_result.len())
+                .any(|window| window == x86_result),
+            "x86 Span success must publish the verified candidate base and source width",
+        );
+
+        let aarch64_target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let aarch64 = compile_span(&pattern, aarch64_target);
+        let aarch64_report = aarch64
+            .receipt()
+            .exact_finite_selected_end_teddy_aot
+            .expect("Span Teddy AArch64 report");
+        assert_eq!(aarch64_report.output, OutputContract::Span);
+        assert!(exact_finite_selected_end_dfa_baseline_authenticates(
+            &aarch64.program().native_dfa_view().unwrap(),
+            aarch64_report.incumbent_complete_dfa,
+        )
+        .unwrap());
+        let words = aarch64.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let aarch64_result_pair = [
+            aarch64_add_x_reg(6, 2, 1).unwrap(),
+            aarch64_store_pair_x(2, 6, 4, 0).unwrap(),
+            aarch64_movz_w(0, 1).unwrap(),
+        ];
+        let aarch64_result_separate = [
+            aarch64_add_x_reg(6, 2, 1).unwrap(),
+            aarch64_store_x(2, 4, 0).unwrap(),
+            aarch64_store_x(6, 4, 8).unwrap(),
+            aarch64_movz_w(0, 1).unwrap(),
+        ];
+        assert!(
+            words
+                .windows(aarch64_result_pair.len())
+                .any(|window| window == aarch64_result_pair)
+                || words
+                    .windows(aarch64_result_separate.len())
+                    .any(|window| window == aarch64_result_separate),
+            "AArch64 Span success must publish the verified candidate base and source width",
+        );
+    }
+
+    #[test]
+    fn span_teddy_automatic_v2_is_stable_and_forced_remains_inactive() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let request = || {
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let stable = compile_span(&pattern, target);
+        let automatic = crate::compile_v2(crate::CompileRequestV2::new(request())).unwrap();
+        assert_eq!(automatic.object(), stable.object());
+        assert_eq!(automatic.module(), stable.module());
+        assert_eq!(automatic.receipt(), stable.receipt());
+        let supplement = automatic
+            .receipt_v2()
+            .exact_finite_selected_end_teddy_aot
+            .expect("V2 Automatic describes the stable Span selection");
+        assert_eq!(supplement.lowering.output, OutputContract::Span);
+        assert_eq!(
+            supplement.selection_basis,
+            ExactFiniteSelectedEndTeddySelectionBasisV2::AutomaticV1,
+        );
+
+        let forced = crate::compile_v2(
+            crate::CompileRequestV2::new(request()).exact_finite_selected_end_teddy(
+                crate::ExactFiniteSelectedEndTeddyPolicyV2::ForceStructurallyEligible,
+            ),
+        )
+        .unwrap();
+        let disabled = crate::compile_v2(
+            crate::CompileRequestV2::new(request()).exact_finite_selected_end_teddy(
+                crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled,
+            ),
+        )
+        .unwrap();
+        assert!(
+            forced
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+            "the experimental forced policy remains SelectedEnd-only",
+        );
+        assert_eq!(forced.object(), disabled.object());
+        assert_eq!(forced.module(), disabled.module());
+        assert_eq!(forced.receipt(), disabled.receipt());
+    }
+
+    #[test]
+    fn span_teddy_accelerator_and_cost_declines_are_truthfully_inactive() {
+        let target = avx2_target();
+        for (kind, pattern) in [
+            ("accelerated", accelerated_exact_finite_pattern().to_owned()),
+            ("noncompetitive", dense_scanner_free_exact_finite_pattern()),
+        ] {
+            let request = || {
+                CompileRequest::new(&pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+            };
+            let automatic = compile(request()).unwrap();
+            assert!(
+                automatic
+                    .receipt()
+                    .exact_finite_selected_end_teddy_aot
+                    .is_none(),
+                "{kind}",
+            );
+            let disabled = crate::compile_v2(
+                crate::CompileRequestV2::new(request()).exact_finite_selected_end_teddy(
+                    crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled,
+                ),
+            )
+            .unwrap();
+            assert_eq!(automatic.object(), disabled.object(), "{kind}");
+            assert_eq!(automatic.module(), disabled.module(), "{kind}");
+            assert_eq!(automatic.receipt(), disabled.receipt(), "{kind}");
+        }
     }
 
     #[test]
@@ -8324,6 +8662,76 @@ mod tests {
     }
 
     #[test]
+    fn span_teddy_cap_decline_restores_every_incumbent_field_and_policy_surface() {
+        let target = avx2_target();
+        let pattern = scanner_free_exact_finite_pattern();
+        let compiled = compile_span(&pattern, target);
+        let teddy_view = compiled
+            .program()
+            .native_finite_selected_end_teddy_view()
+            .unwrap();
+        let (incumbent, baseline) = complete_span_dfa_baseline(&compiled, target);
+        let selection =
+            select_exact_finite_selected_end_teddy(teddy_view, target, baseline).unwrap();
+        let required =
+            exact_finite_selected_end_teddy_required_data_bytes(selection, incumbent.data.len())
+                .unwrap();
+        let original_code = incumbent.code.clone();
+        let original_data = incumbent.data.clone();
+        let original_relocations = incumbent.relocations.clone();
+        let original_scanner = incumbent.start_accelerator;
+        let original_prefix = incumbent.anchored_prefix_filter_bytes;
+        let ExactFiniteSelectedEndTeddyWrapOutcome::ResourceDeclined(restored) =
+            wrap_exact_finite_span_teddy(
+                selection,
+                incumbent,
+                baseline,
+                target,
+                required - 1,
+            )
+            .unwrap()
+        else {
+            panic!("one-byte-short Span Teddy ceiling must decline")
+        };
+        assert_eq!(restored.code, original_code);
+        assert_eq!(restored.data, original_data);
+        assert_eq!(restored.relocations, original_relocations);
+        assert_eq!(restored.start_accelerator, original_scanner);
+        assert_eq!(restored.anchored_prefix_filter_bytes, original_prefix);
+
+        let limits = crate::SlowAotLimits {
+            max_native_data_bytes: required - 1,
+            ..crate::SlowAotLimits::default()
+        };
+        let request = || {
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+        };
+        let automatic = crate::compile_v2_with_slow_aot_limits(
+            crate::CompileRequestV2::new(request()),
+            limits,
+        )
+        .unwrap();
+        let disabled = crate::compile_v2_with_slow_aot_limits(
+            crate::CompileRequestV2::new(request()).exact_finite_selected_end_teddy(
+                crate::ExactFiniteSelectedEndTeddyPolicyV2::Disabled,
+            ),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(automatic.object(), disabled.object());
+        assert_eq!(automatic.module(), disabled.module());
+        assert_eq!(automatic.receipt(), disabled.receipt());
+        assert!(
+            automatic
+                .receipt_v2()
+                .exact_finite_selected_end_teddy_aot
+                .is_none(),
+        );
+    }
+
+    #[test]
     fn exists_teddy_cap_decline_preserves_physical_receipt_on_both_isas() {
         let pattern = scanner_free_exact_finite_pattern();
         for target in [
@@ -8857,6 +9265,116 @@ mod tests {
         assert!(status.success(), "host linker rejected Exists Teddy smoke");
         let status = Command::new(&executable_path).status().unwrap();
         assert!(status.success(), "native Exists Teddy smoke failed");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn linked_host_span_teddy_matches_portable_source_order_and_width() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let Some(target) = linked_host_target() else {
+            return;
+        };
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        if Command::new(compiler).arg("--version").output().is_err() {
+            return;
+        }
+        // Both six and seven 0xaa bytes begin at the same candidate. With the
+        // longer source first, an exact endpoint leaf must publish its width,
+        // not merely the shortest or longest width in the language.
+        let pattern = scanner_free_overlapping_pattern(true);
+        let compiled = compile_span(&pattern, target);
+        let reference = compile(
+            CompileRequest::new(&pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let literal = compiled
+            .program()
+            .native_finite_selected_end_teddy_view()
+            .unwrap()
+            .literals()[0]
+            .clone();
+        let negative = vec![0xff; EXACT_FINITE_PREFIX_MIN_INPUT_BYTES + 96];
+        let mut ordered_overlap = negative.clone();
+        ordered_overlap[73..80].fill(0xaa);
+        let mut variable_width = negative.clone();
+        variable_width[111..111 + literal.len()].copy_from_slice(&literal);
+        let cases = [
+            (negative, 17_usize),
+            (ordered_overlap, 17_usize),
+            (variable_width, 41_usize),
+        ];
+        let symbol = compiled.module().entry_symbol();
+        let mut source = format!(
+            "#include <stdint.h>\n#include <stddef.h>\nextern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);\nint main(void){{size_t r[2];uint32_t s;\n"
+        );
+        for (index, (haystack, start)) in cases.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{index}[]={{{bytes}}};").unwrap();
+            let expected = reference
+                .search(haystack, SearchWindow::new(*start, haystack.len()))
+                .unwrap();
+            match expected {
+                MatchResult::Span(Some((match_start, match_end))) => writeln!(
+                    source,
+                    "r[0]=91;r[1]=92;s={symbol}(h{index},sizeof(h{index}),{start},sizeof(h{index}),r);if(s!=1||r[0]!={match_start}||r[1]!={match_end})return {};",
+                    10 + index,
+                ),
+                MatchResult::Span(None) => writeln!(
+                    source,
+                    "r[0]=91;r[1]=92;s={symbol}(h{index},sizeof(h{index}),{start},sizeof(h{index}),r);if(s!=0||r[0]!=0||r[1]!=0)return {};",
+                    10 + index,
+                ),
+                _ => unreachable!(),
+            }
+            .unwrap();
+        }
+        source.push_str("r[0]=91;r[1]=92;s=");
+        write!(
+            source,
+            "{symbol}(h0,sizeof(h0),1,0,r);if(s!=2||r[0]!=91||r[1]!=92)return 90;return 0;}}\n"
+        )
+        .unwrap();
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-span-teddy-smoke-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("smoke.c");
+        let object_path = directory.join("smoke.o");
+        let executable_path = directory.join("smoke");
+        fs::write(&source_path, source).unwrap();
+        fs::write(&object_path, compiled.object()).unwrap();
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&source_path)
+            .arg(&object_path)
+            .arg("-o")
+            .arg(&executable_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "host linker rejected Span Teddy smoke");
+        let status = Command::new(&executable_path).status().unwrap();
+        assert!(status.success(), "native Span Teddy differential failed");
         fs::remove_dir_all(directory).unwrap();
     }
 

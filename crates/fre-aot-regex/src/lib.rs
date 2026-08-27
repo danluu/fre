@@ -784,7 +784,8 @@ pub struct CompileReceipt {
     /// strategy identifies whether it entered a complete-DFA core or a
     /// self-framed exact-finite Teddy entry.
     pub matching_lf_line_witness_aot: Option<MatchingLfLineWitnessAotReport>,
-    /// Direct exact finite-language Teddy `SelectedEnd` leaf, when selected.
+    /// Direct exact finite-language Teddy endpoint leaf, when selected. The
+    /// report's output contract distinguishes `SelectedEnd` from `Span`.
     pub exact_finite_selected_end_teddy_aot: Option<ExactFiniteSelectedEndTeddyAotReport>,
     /// Authenticated target-neutral and native-data geometry for a selected
     /// ordered finite-language leaf. This is never stable program data.
