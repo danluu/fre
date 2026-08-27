@@ -2451,10 +2451,11 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         }
         let already_prepared = roots.is_some();
         if !already_prepared {
-            // The construction marker proves that leaving the start state is
-            // exact root membership. Preserve the incumbent DFA on a cold,
-            // immediately dense source without first reconstructing the whole
-            // classifier; a sparse initial pair still prepares it once below.
+            // The marker, positive-width admission and pinned unanchored DFA
+            // construction together make leaving this start state exact root
+            // membership. Preserve the incumbent DFA on a cold, immediately
+            // dense source without first reconstructing the whole classifier;
+            // a sparse initial pair still prepares it once below.
             let anchored = Anchored::No;
             if self
                 .automaton
@@ -9845,6 +9846,25 @@ mod tests {
         );
         assert_eq!(
             prepared.find_window_value(&cold_dense, Window::full(&cold_dense)),
+            Ok(None),
+        );
+        assert!(prepared.prepared_ascii_root.is_none());
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+
+        // The same cold bypass preserves the first proved separator and
+        // restarts exactly at a root in the second post-prefix byte.
+        let mut cold_second = vec![
+            b'!';
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_ASCII_MIN_BYTES
+        ];
+        cold_second[ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1] = ROOT_ASCII_24[0];
+        assert_eq!(
+            ordinary.find_window_value(&cold_second, Window::full(&cold_second)),
+            Ok(None),
+        );
+        assert_eq!(
+            prepared.find_window_value(&cold_second, Window::full(&cold_second)),
             Ok(None),
         );
         assert!(prepared.prepared_ascii_root.is_none());
