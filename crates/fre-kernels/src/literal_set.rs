@@ -41,12 +41,19 @@ const ORDINARY_ROOT_SET4_MIN_BYTES: usize = BYTE_SET_BLOCK_BYTES * 4;
 // narrow entry behind a conservative source-independent amortization floor.
 const ORDINARY_ROOT_ASCII_MIN_BYTES: usize = ASCII_NARROW_BYTES * 8;
 
+// A second tier admits at most twice as many exact ASCII roots only after
+// twice the source extent. This preserves the existing 5..=24-member route
+// and its threshold while keeping the wider classifier behind the same
+// source-independent bytes-per-root amortization floor.
+const ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES: usize = ORDINARY_ROOT_ASCII_MIN_BYTES * 2;
+
 // Keep an arbitrary root sparse enough that two uniformly distributed
 // full-byte classifier blocks contain at most three expected exact-DFA
 // candidates. Tying the limit to three halves of the physical 16-byte
 // classifier width makes the density boundary explicit instead of embedding
 // an unrelated pattern-count constant.
 const ORDINARY_ROOT_ASCII_MAX_MEMBERS: usize = ASCII_NARROW_BYTES * 3 / 2;
+const ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS: usize = ORDINARY_ROOT_ASCII_MAX_MEMBERS * 2;
 
 // Direct existence keeps its native classifier for a short accepting prefix.
 // Past that prefix, four straight transitions amortize cursor and loop control
@@ -352,10 +359,11 @@ impl LiteralSetDfaRootRange {
 /// Biased exact ranges occupy the nonzero low-16-bit domain. A non-contiguous
 /// set of at most four exact roots instead records the nonzero mask of their
 /// high-nibble buckets in the high 16 bits, leaving the range half exactly
-/// zero. The all-buckets high-half value marks a construction-proved 5..=24
-/// member ASCII root whose exact classifier may be prepared by an ordinary
-/// worker. The selected-span scanner can retain the incumbent low-half
-/// `Option<NonZeroU16>` projection without learning about either wider form.
+/// zero. Two otherwise impossible high-half bucket masks mark
+/// construction-proved 5..=24 and 25..=48 member ASCII roots whose exact
+/// classifier may be prepared by an ordinary worker. The selected-span
+/// scanner can retain the incumbent low-half `Option<NonZeroU16>` projection
+/// without learning about either wider form.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LiteralSetDfaRoot(NonZeroU32);
@@ -363,6 +371,9 @@ struct LiteralSetDfaRoot(NonZeroU32);
 impl LiteralSetDfaRoot {
     const SET4_BUCKET_SHIFT: u32 = u16::BITS;
     const ASCII_SPARSE_MARKER: u16 = u16::MAX;
+    // A real Set4 root marks at most four of the sixteen buckets, so a mask
+    // with fifteen set bits is also free for the wider sparse-ASCII tier.
+    const ASCII_SPARSE_WIDE_MARKER: u16 = u16::MAX - 1;
 
     fn from_range(range: LiteralSetDfaRootRange) -> Self {
         Self(
@@ -386,8 +397,13 @@ impl LiteralSetDfaRoot {
         )
     }
 
-    fn from_ascii_sparse() -> Self {
-        let encoded = u32::from(Self::ASCII_SPARSE_MARKER) << Self::SET4_BUCKET_SHIFT;
+    fn from_ascii_sparse(wide: bool) -> Self {
+        let marker = if wide {
+            Self::ASCII_SPARSE_WIDE_MARKER
+        } else {
+            Self::ASCII_SPARSE_MARKER
+        };
+        let encoded = u32::from(marker) << Self::SET4_BUCKET_SHIFT;
         Self(
             NonZeroU32::new(encoded)
                 .expect("the sparse ASCII marker occupies the nonzero high half"),
@@ -415,13 +431,26 @@ impl LiteralSetDfaRoot {
     fn set4_bucket_mask(self) -> Option<NonZeroU16> {
         let buckets =
             NonZeroU16::new((self.0.get() >> Self::SET4_BUCKET_SHIFT) as u16)?;
-        (buckets.get() != Self::ASCII_SPARSE_MARKER).then_some(buckets)
+        self.ascii_sparse_min_bytes().is_none().then_some(buckets)
     }
 
     fn is_ascii_sparse(self) -> bool {
-        self.as_range().is_none()
-            && (self.0.get() >> Self::SET4_BUCKET_SHIFT)
-                == u32::from(Self::ASCII_SPARSE_MARKER)
+        self.ascii_sparse_min_bytes().is_some()
+    }
+
+    fn ascii_sparse_min_bytes(self) -> Option<usize> {
+        if self.as_range().is_some() {
+            return None;
+        }
+        match self.0.get() >> Self::SET4_BUCKET_SHIFT {
+            marker if marker == u32::from(Self::ASCII_SPARSE_MARKER) => {
+                Some(ORDINARY_ROOT_ASCII_MIN_BYTES)
+            }
+            marker if marker == u32::from(Self::ASCII_SPARSE_WIDE_MARKER) => {
+                Some(ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -583,14 +612,12 @@ fn direct_dfa_set4_members_from_buckets(
 /// Derive one exact arbitrary ASCII root set for the ordinary-session engine.
 ///
 /// Set4 and contiguous-range roots retain their smaller existing bindings.
-/// The construction marker proves that this wider route has 5..=24 exact
+/// The construction marker proves that this wider route has 5..=48 exact
 /// roots and that every one is ASCII. Replaying only the ASCII half of the
 /// DFA alphabet therefore reconstructs the complete set without revisiting
-/// 128 transitions that construction already proved cannot be roots.
-/// Twenty-four roots occupy at most three thirty-seconds of the complete byte
-/// domain, so two 16-byte classifier blocks have at most three expected
-/// candidates under a uniform byte distribution before the exact DFA verifies
-/// them.
+/// 128 transitions that construction already proved cannot be roots. The
+/// 25..=48 tier requires twice the source extent used by the existing
+/// 5..=24-member tier before this same classifier is prepared or consulted.
 #[cold]
 #[inline(never)]
 fn direct_dfa_ascii_root_set(
@@ -615,7 +642,7 @@ fn direct_dfa_ascii_root_set(
         words[word] |= 1_u64 << bit;
         members = members.checked_add(1)?;
     }
-    (members > 4 && members <= ORDINARY_ROOT_ASCII_MAX_MEMBERS)
+    (members > 4 && members <= ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS)
         .then_some(AsciiByteSet::from_words(words))
 }
 
@@ -933,8 +960,12 @@ fn direct_dfa_root(
     if members > exact_members.len() {
         #[cfg(target_arch = "aarch64")]
         {
-            return (all_ascii && members <= ORDINARY_ROOT_ASCII_MAX_MEMBERS)
-                .then_some(LiteralSetDfaRoot::from_ascii_sparse());
+            if !all_ascii || members > ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS {
+                return None;
+            }
+            return Some(LiteralSetDfaRoot::from_ascii_sparse(
+                members > ORDINARY_ROOT_ASCII_MAX_MEMBERS,
+            ));
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -2183,6 +2214,7 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     fn next_pattern_with_ascii_root(
         &mut self,
         roots: &mut Option<AsciiByteSetClassifier>,
+        minimum_bytes: usize,
     ) -> Option<LiteralSetDfaSpanSelection> {
         let anchored = Anchored::No;
         let restart = self.restart;
@@ -2219,10 +2251,10 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         }
         if selected_end == restart
             && state == self.start_state
-            && self.end - at >= ORDINARY_ROOT_ASCII_MIN_BYTES
+            && self.end - at >= minimum_bytes
         {
             self.restart = at;
-            if !self.seek_ascii_root_for_selected_span(roots) {
+            if !self.seek_ascii_root_for_selected_span(roots, minimum_bytes) {
                 return None;
             }
             return self.next_pattern();
@@ -2356,9 +2388,10 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     fn seek_ascii_root_for_selected_span(
         &mut self,
         roots: &mut Option<AsciiByteSetClassifier>,
+        minimum_bytes: usize,
     ) -> bool {
         let at = self.restart;
-        if self.end - at < ORDINARY_ROOT_ASCII_MIN_BYTES {
+        if self.end - at < minimum_bytes {
             return true;
         }
         let roots = roots.get_or_insert_with(|| {
@@ -2503,9 +2536,10 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     fn next_span_with_ascii_root(
         &mut self,
         roots: &mut Option<AsciiByteSetClassifier>,
+        minimum_bytes: usize,
     ) -> Option<(usize, usize)> {
         let restart = self.restart;
-        let matched = self.next_pattern_with_ascii_root(roots)?;
+        let matched = self.next_pattern_with_ascii_root(roots, minimum_bytes)?;
         Some(self.span_from_selection(restart, matched))
     }
 
@@ -2761,6 +2795,7 @@ fn ordinary_direct_dfa_first_acceptance_end_lazy_ascii(
     start_state: StateID,
     haystack: &[u8],
     roots: &mut Option<AsciiByteSetClassifier>,
+    minimum_bytes: usize,
 ) -> Option<usize> {
     debug_assert!(automaton.prefilter().is_none());
     debug_assert_eq!(automaton.match_kind(), MatchKind::LeftmostFirst);
@@ -2784,7 +2819,7 @@ fn ordinary_direct_dfa_first_acceptance_end_lazy_ascii(
         }
     }
     let remaining = &haystack[at..];
-    if remaining.len() >= ORDINARY_ROOT_ASCII_MIN_BYTES && state == start_state {
+    if remaining.len() >= minimum_bytes && state == start_state {
         let roots = roots.get_or_insert_with(|| {
             let roots = direct_dfa_ascii_root_set(automaton, start_state)
                 .expect("the construction-sealed sparse ASCII root remains exact");
@@ -2813,11 +2848,12 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     /// Bind one worker-owned engine whose exact ASCII root can be prepared
     /// lazily against this executor's immutable direct-DFA identity.
     ///
-    /// AArch64 retains one exact 5..=24-member ASCII classifier only when its
-    /// direct-DFA identity carries the construction marker. Other targets and
-    /// root shapes retain the unchanged executor alone. Binding performs no
-    /// classifier construction, so short and unused operations do not pay its
-    /// setup cost.
+    /// AArch64 retains one exact 5..=48-member ASCII classifier only when its
+    /// direct-DFA identity carries one of the two construction markers. Other
+    /// targets and root shapes retain the unchanged executor alone. The wider
+    /// marker also retains its larger source threshold in the packed identity.
+    /// Binding performs no classifier construction, so short and unused
+    /// operations do not pay its setup cost.
     #[doc(hidden)]
     #[must_use]
     pub fn bind_engine(self) -> Option<LiteralSetOrdinaryEngine<'a>> {
@@ -3247,6 +3283,15 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
 }
 
 impl<'a> LiteralSetOrdinaryEngine<'a> {
+    #[inline(always)]
+    fn ascii_root_minimum_bytes(&self) -> usize {
+        self.executor
+            .direct_dfa_identity
+            .and_then(LiteralSetDirectDfaIdentity::root)
+            .and_then(LiteralSetDfaRoot::ascii_sparse_min_bytes)
+            .expect("the bound ASCII engine retains one sparse-root tier")
+    }
+
     /// Return the selected leftmost-first span through the worker-bound ASCII
     /// root engine.
     ///
@@ -3263,6 +3308,7 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
     ) -> Result<Option<(usize, usize)>, LiteralSetError> {
         validate_window(window, haystack.len())?;
         let executor = self.executor;
+        let minimum_bytes = self.ascii_root_minimum_bytes();
         if let Some(mut scanner) = LiteralSetDfaScanner::new(executor, haystack, window) {
             if executor.is_uniform_positive() {
                 let width = executor.plan.build.minimum_pattern_bytes;
@@ -3275,7 +3321,10 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                     }
                 }
             }
-            return Ok(scanner.next_span_with_ascii_root(&mut self.prepared_ascii_root));
+            return Ok(scanner.next_span_with_ascii_root(
+                &mut self.prepared_ascii_root,
+                minimum_bytes,
+            ));
         }
         executor.plan.try_find_window_value(haystack, window)
     }
@@ -3300,6 +3349,7 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
     {
         validate_window(window, haystack.len())?;
         let executor = self.executor;
+        let minimum_bytes = self.ascii_root_minimum_bytes();
         if let Some(mut scanner) = LiteralSetDfaScanner::new(executor, haystack, window) {
             if executor.is_uniform_positive() {
                 let width = executor.plan.build.minimum_pattern_bytes;
@@ -3317,7 +3367,10 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                 }
             }
             while let Some(matched) =
-                scanner.next_span_with_ascii_root(&mut self.prepared_ascii_root)
+                scanner.next_span_with_ascii_root(
+                    &mut self.prepared_ascii_root,
+                    minimum_bytes,
+                )
             {
                 match visitor(matched) {
                     Ok(true) => {}
@@ -3384,6 +3437,10 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
             identity.start_state(),
             source,
             &mut self.prepared_ascii_root,
+            identity
+                .root()
+                .and_then(LiteralSetDfaRoot::ascii_sparse_min_bytes)
+                .expect("the bound ASCII engine retains one sparse-root tier"),
         );
         Ok(relative_end.map(|end| {
             debug_assert!(end <= window_bytes);
@@ -6541,6 +6598,7 @@ mod tests {
         LiteralSetSearchLimits, ORDINARY_DIRECT_DFA_BULK_BYTES,
         ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
         ORDINARY_ROOT_ASCII_MAX_MEMBERS, ORDINARY_ROOT_ASCII_MIN_BYTES,
+        ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS, ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES,
         ORDINARY_ROOT_SET4_MIN_BYTES, ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES,
         PINNED_AHO_PREFILTER_TEDDY_MAX_PATTERNS,
         decode_direct_dfa_start_state, encode_direct_dfa_start_state,
@@ -8388,10 +8446,10 @@ mod tests {
         b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'K', b'M', b'O', b'Q',
         b'S', b'U', b'W', b'Y', b'a', b'c', b'e', b'g', b'i', b'k',
     ];
-    const ROOT_ASCII_25: [u8; 25] = [
-        b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'K', b'M', b'O', b'Q',
-        b'S', b'U', b'W', b'Y', b'a', b'c', b'e', b'g', b'i', b'k', b'm',
-    ];
+
+    fn root_ascii_wide_test_roots() -> Vec<u8> {
+        (0_u8..=96).step_by(2).collect()
+    }
 
     fn root_ascii_patterns_for_roots(roots: &[u8]) -> Vec<Vec<u8>> {
         // Seventeen widths per non-contiguous root exceed the compact Set4
@@ -9176,6 +9234,69 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn ordinary_direct_dfa_ascii_root_admits_wide_tier_after_larger_extent() {
+        let roots = root_ascii_wide_test_roots();
+        assert_eq!(roots.len(), ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS + 1);
+        for root_count in [25_usize, 32, 40, ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS] {
+            let patterns = root_ascii_patterns_for_roots(&roots[..root_count]);
+            let plan = LiteralSetPlan::new_stable(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert!(plan.automaton.prefilter().is_none());
+            let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            let root = ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root)
+                .expect("the admitted wide ASCII root retains its marker");
+            assert!(root.is_ascii_sparse());
+            assert_eq!(
+                root.ascii_sparse_min_bytes(),
+                Some(ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES),
+            );
+            assert_eq!(root.as_range(), None);
+            assert_eq!(root.set4_bucket_mask(), None);
+
+            let mut engine = ordinary
+                .bind_engine()
+                .expect("an admitted wide ASCII root binds its lazy engine");
+            let short_miss = vec![
+                b'!';
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                    + ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES
+                    - 1
+            ];
+            assert_eq!(
+                engine.exists_window_value(&short_miss, Window::full(&short_miss)),
+                Ok(false),
+            );
+            assert!(engine.prepared_ascii_root.is_none());
+
+            let long_miss = vec![
+                b'!';
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                    + ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES
+            ];
+            assert_eq!(
+                engine.exists_window_value(&long_miss, Window::full(&long_miss)),
+                Ok(false),
+            );
+            let retained_roots = engine
+                .prepared_ascii_root
+                .as_ref()
+                .expect("the first wide-tier eligible call prepares its classifier")
+                .set()
+                .words()
+                .into_iter()
+                .map(u64::count_ones)
+                .sum::<u32>();
+            assert_eq!(usize::try_from(retained_roots).unwrap(), root_count);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn ordinary_direct_dfa_ascii_root_prepares_once_for_exists_and_span() {
         #[cfg(not(feature = "static-dispatch"))]
         assert_eq!(
@@ -9445,13 +9566,102 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn ordinary_direct_dfa_wide_ascii_root_matches_incumbent_in_curated_windows() {
+        let roots = root_ascii_wide_test_roots();
+        let patterns = root_ascii_patterns_for_roots(
+            &roots[..ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS],
+        );
+        let plan = LiteralSetPlan::new_stable(
+            &patterns,
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap();
+        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+        let mut engine = ordinary
+            .bind_engine()
+            .expect("forty-eight non-contiguous ASCII roots bind the wide engine");
+
+        let mut haystack = vec![b'!'; ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES + 37];
+        let first_match = haystack.len();
+        haystack.extend_from_slice(&patterns[0]);
+        haystack.extend(core::iter::repeat_n(b'!', 41));
+        let second_match = haystack.len();
+        haystack.extend_from_slice(&patterns[patterns.len() - 1]);
+        haystack.extend(core::iter::repeat_n(b'!', 19));
+        let ends = [
+            0,
+            1,
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES,
+            first_match,
+            first_match + 1,
+            first_match + patterns[0].len(),
+            second_match,
+            second_match + patterns[patterns.len() - 1].len(),
+            haystack.len(),
+        ];
+        for &start in &ends {
+            for &end in &ends {
+                if start > end {
+                    continue;
+                }
+                let window = Window::new(start, end);
+                let expected_endpoint =
+                    ordinary.first_acceptance_window_value(&haystack, window);
+                assert_eq!(
+                    engine.first_acceptance_window_value(&haystack, window),
+                    expected_endpoint,
+                    "endpoint window={window:?}",
+                );
+                assert_eq!(
+                    engine.exists_window_value(&haystack, window),
+                    expected_endpoint.map(|endpoint| endpoint.is_some()),
+                    "exists window={window:?}",
+                );
+                assert_eq!(
+                    engine.find_window_value(&haystack, window),
+                    ordinary.find_window_value(&haystack, window),
+                    "span window={window:?}",
+                );
+
+                let mut expected_spans = Vec::new();
+                assert_eq!(
+                    ordinary.try_visit_spans_window_value(
+                        &haystack,
+                        window,
+                        |matched| {
+                            expected_spans.push(matched);
+                            Ok::<bool, ()>(true)
+                        },
+                    ),
+                    Ok(Ok(())),
+                );
+                let mut actual_spans = Vec::new();
+                assert_eq!(
+                    engine.try_visit_spans_window_value(
+                        &haystack,
+                        window,
+                        |matched| {
+                            actual_spans.push(matched);
+                            Ok::<bool, ()>(true)
+                        },
+                    ),
+                    Ok(Ok(())),
+                );
+                assert_eq!(actual_spans, expected_spans, "spans window={window:?}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn ordinary_direct_dfa_ascii_root_rejects_over_density_or_non_ascii_roots() {
+        let over_density = root_ascii_wide_test_roots();
         for roots in [
             &[
                 b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'a', b'c',
                 b'e', b'g', b'i', 0x80,
             ][..],
-            &ROOT_ASCII_25[..],
+            over_density.as_slice(),
         ] {
             let patterns = root_ascii_patterns_for_roots(roots);
             let plan = LiteralSetPlan::new_stable(
