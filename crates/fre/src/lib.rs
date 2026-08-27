@@ -7008,6 +7008,8 @@ where
     )
 }
 
+#[cold]
+#[inline(never)]
 fn ripgrep_standard_literal_context_from_impl<
     'literal,
     Literal,
@@ -7902,6 +7904,8 @@ impl PortableBuilder {
     /// fixed-string configuration. Every value, resource and engine decline
     /// remains `Ok(None)` for the unchanged configured-HIR fallback.
     #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
     pub fn build_ripgrep_fixed_literals_ordinary_with_census(
         self,
         patterns: &[&str],
@@ -7927,6 +7931,8 @@ impl PortableBuilder {
         )
     }
 
+    #[cold]
+    #[inline(never)]
     fn build_ripgrep_standard_literal_bytes_with_census<
         T,
         F,
