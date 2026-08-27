@@ -17,15 +17,21 @@ mod build_proof;
 mod build_support;
 mod build_target;
 mod exact64_set_build;
+mod first_candidate_build;
+mod first_candidate_receipt;
 mod registry_key;
 
-use build_proof::{exact_crlf_free_finite_language, ripgrep_grep_count_profile};
+use build_proof::{
+    exact_crlf_free_finite_language, exact_nonempty_lf_free_singleton_literal,
+    ripgrep_grep_count_profile,
+};
 use build_support::{
     BuildMode, BuildOutput, EXACT64_SETS_FILE_ENV, PATTERNS_FILE_ENV, VARIANTS_ENV, VariantPolicy,
     exact64_sets_path, patterns_path, purge_generated_artifacts, read_exact64_sets, read_patterns,
 };
 use build_target::{CARGO_TARGET_FEATURE_ENV, FEATURES_ENV, selected_features};
 use exact64_set_build::generate as generate_exact64_sets;
+use first_candidate_build::FirstCandidateRegistryBuild;
 use registry_key::manifest_profile_key;
 
 #[allow(
@@ -37,6 +43,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build_support.rs");
     println!("cargo:rerun-if-changed=build_target.rs");
     println!("cargo:rerun-if-changed=exact64_set_build.rs");
+    println!("cargo:rerun-if-changed=first_candidate_build.rs");
+    println!("cargo:rerun-if-changed=first_candidate_receipt.rs");
     println!("cargo:rerun-if-changed=registry_key.rs");
     println!("cargo:rerun-if-env-changed={FEATURES_ENV}");
     println!("cargo:rerun-if-env-changed={CARGO_TARGET_FEATURE_ENV}");
@@ -77,6 +85,14 @@ fn main() {
             (Ok(selected), Ok(public)) if selected == public
         )
     });
+    let public_first_candidate_fixture = manifest_dir.join("testdata/public-first-candidate.tsv");
+    let public_first_candidate_fixture_selected = matches!(
+        (
+            fs::canonicalize(&patterns_path),
+            fs::canonicalize(&public_first_candidate_fixture),
+        ),
+        (Ok(selected), Ok(public)) if selected == public
+    );
     let mut patterns = read_patterns(&patterns_path)
         .unwrap_or_else(|error| panic!("AOT patterns manifest: {error}"));
     let manifest_pattern_count = patterns.len();
@@ -104,6 +120,7 @@ fn main() {
     let mut rows = String::new();
     let mut grep_count_rows = String::new();
     let mut grep_count_admitted = 0_usize;
+    let mut first_candidates = FirstCandidateRegistryBuild::new();
     let mut objects = Vec::new();
 
     for pattern in &patterns {
@@ -135,6 +152,10 @@ fn main() {
                 }
                 let mut profile = RustProfile::default();
                 profile.options.case_insensitive = pattern.case_insensitive;
+                let independent_first_candidate_literal = (mode == CompileMode::Optimizing
+                    && output == OutputContract::Exists)
+                    .then(|| exact_nonempty_lf_free_singleton_literal(&pattern.source, &profile))
+                    .flatten();
                 let request = CompileRequest::new(pattern.source.clone(), target)
                     .profile(profile)
                     .mode(mode)
@@ -151,6 +172,14 @@ fn main() {
                     )
                 });
                 let receipt = compiled.receipt();
+                if mode == CompileMode::Optimizing && output == OutputContract::Exists {
+                    first_candidates.consider(
+                        pattern,
+                        target,
+                        &compiled,
+                        independent_first_candidate_literal.as_deref(),
+                    );
+                }
                 let has_prepared_entry = compiled.module().prepared_entry_symbol().is_some();
                 let route = if has_prepared_entry {
                     "compiled-prepared"
@@ -483,6 +512,11 @@ fn main() {
     generated.push_str(&grep_count_rows);
     generated.push_str("];\n");
     fs::write(out_dir.join("registry.rs"), generated).expect("write generated registry");
+    fs::write(
+        out_dir.join("first_candidate_registry.rs"),
+        first_candidates.finish(target, public_first_candidate_fixture_selected),
+    )
+    .expect("write generated exact-singleton first-candidate registry");
     let exact64_generated = generate_exact64_sets(
         &exact64_sets,
         target,

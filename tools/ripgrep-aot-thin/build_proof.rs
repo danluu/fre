@@ -32,23 +32,23 @@ pub(crate) fn ripgrep_exact64_set_profile(case_insensitive: bool) -> RustProfile
 /// The exact64 compiler repeats this proof under its own authenticated witness
 /// transaction. This adapter-side pass prevents a registry entry from being
 /// requested solely on the strength of the optional compiler optimization.
-pub(crate) fn exact_nonempty_lf_free_singleton(
+pub(crate) fn exact_nonempty_lf_free_singleton_literal(
     pattern: &str,
     profile: &RustProfile,
-) -> bool {
+) -> Option<Vec<u8>> {
     let operation = FactOperation::capture_erased(FactOutput::Exists)
         .with_optional_proofs(FactOptionalProofs::FiniteLanguage);
     let Ok(parsed) = fre_syntax::parse(ParseRequest::rust(
         pattern,
         CompatibilityProfile::RustBytes(profile.clone()),
     )) else {
-        return false;
+        return None;
     };
     let CanonicalPattern::Rust(parsed) = parsed.pattern else {
-        return false;
+        return None;
     };
     let Ok(facts) = analyze_facts(&parsed, operation, FactLimits::default()) else {
-        return false;
+        return None;
     };
     if !facts.identity().authenticates_current()
         || facts.operation() != operation
@@ -62,16 +62,24 @@ pub(crate) fn exact_nonempty_lf_free_singleton(
             .as_proven()
             .is_some_and(Vec::is_empty)
     {
-        return false;
+        return None;
     }
     let FactProof::Proven(language) = facts.finite_language() else {
-        return false;
+        return None;
     };
-    language.len() == 1
-        && language
-            .strings()
-            .next()
-            .is_some_and(|literal| !literal.is_empty() && !literal.contains(&b'\n'))
+    if language.len() != 1 {
+        return None;
+    }
+    language
+        .strings()
+        .next()
+        .filter(|literal| !literal.is_empty() && !literal.contains(&b'\n'))
+        .map(<[u8]>::to_vec)
+}
+
+/// Boolean wrapper used by registries that need only independent admission.
+pub(crate) fn exact_nonempty_lf_free_singleton(pattern: &str, profile: &RustProfile) -> bool {
+    exact_nonempty_lf_free_singleton_literal(pattern, profile).is_some()
 }
 /// Independently prove the source language required by the native line-jump
 /// `GrepCount` compiler. Any parse, construction, identity, or proof refusal is
@@ -203,5 +211,26 @@ mod tests {
             "Alpha",
             &ripgrep_exact64_set_profile(true)
         ));
+    }
+
+    #[test]
+    fn singleton_proof_returns_the_exact_bytes_without_source_heuristics() {
+        let profile = RustProfile::default();
+        assert_eq!(
+            exact_nonempty_lf_free_singleton_literal(r"a\x62\t", &profile),
+            Some(b"ab\t".to_vec())
+        );
+        assert_eq!(
+            exact_nonempty_lf_free_singleton_literal("(?:ab){2}", &profile),
+            Some(b"abab".to_vec())
+        );
+        assert_eq!(
+            exact_nonempty_lf_free_singleton_literal(r"a\nb", &profile),
+            None
+        );
+        assert_eq!(
+            exact_nonempty_lf_free_singleton_literal("a|b", &profile),
+            None
+        );
     }
 }

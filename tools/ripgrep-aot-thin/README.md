@@ -87,6 +87,48 @@ ordinary matcher authoritative for them.
 Unset, empty, and `all` continue to emit exactly the original four variants
 and an empty GrepCount registry.
 
+## Exact-singleton first-candidate endpoint
+
+Every emitted Optimizing/Exists row is also considered for a separate
+stateless `FIRST_CANDIDATE_SPECS` registry. The build independently parses and
+lowers the Rust byte regex and admits only a language containing exactly one
+nonempty, assertion-free LF-free literal. A compiler decline simply omits the
+row. A present compiler endpoint is linked only after its literal length and
+SHA-256 agree with the independent proof and its target, feature, ISA, ABI,
+sentinel, position semantics, trusted core, wrapper, code, relocations,
+symbols, call-free property, and complete object identity authenticate.
+Generated first-candidate registry source contains only domain-separated keys,
+digests, lengths, numeric metadata, and identity-derived symbol names; it does
+not contain regex sources or literal bytes. Existing matcher and batch
+registries are unchanged.
+
+Call `AotExactSingletonFirstCandidateFactory::select` before obtaining a
+haystack. Selection takes the ordinary `(mode, output, pattern,
+case_insensitive)` tuple plus the exact literal bytes independently recovered
+from the configured stock-matcher HIR. Unsupported modes/outputs and a missing
+or compiler-declined row return `Ok(None)`. Once a manifest/profile row is
+present, a configured-literal, target, feature, symbol, or receipt mismatch is
+a raw-free terminal error.
+
+`find(&[u8])` makes one stateless native call and returns
+`AotExactSingletonFirstCandidateOutcome::ConfirmedMiss` or
+`Candidate { position }`, where `position` is the inclusive final byte of the
+earliest-completing possible match. A candidate is never confirmed: stock
+ripgrep remains authoritative for the containing line, spans, and captures.
+Native status errors and malformed success positions are terminal after the
+haystack is supplied. The miss is authoritative only under the authenticated
+exact-language receipt.
+
+`testdata/public-first-candidate.tsv` supplies only generated wide singleton
+shapes (plus one deliberate finite-alternation decline) for a nonempty linked
+registry build check:
+
+```sh
+FRE_RIPGREP_AOT_PATTERNS_FILE=testdata/public-first-candidate.tsv \
+  FRE_RIPGREP_AOT_VARIANTS=optimizing-exists \
+  cargo test -p fre-ripgrep-aot-thin
+```
+
 ## Opt-in Exact64 set prefilter
 
 The static multi-pattern registry is a separate additive opt-in. With the

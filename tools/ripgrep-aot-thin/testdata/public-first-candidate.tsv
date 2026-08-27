@@ -1,0 +1,5 @@
+# Public generated wide singleton shapes for first-candidate build validation.
+wide_alpha	0	FirstCandidatePublicShape_0123456789_abcdefghijklmnopqrstuvwxyz_ABCDEFGHIJKLMNOPQRSTUVWXYZ
+wide_mixed	0	PublicSingletonNeedle_9a8B7c6D5e4F3g2H1i0J_repeated_shape_control_0123456789
+escaped_wide	0	Public\x5fEscaped\x5fSingleton\x5fShape\x5f0123456789\x5fabcdefghijklmnopqrstuvwxyz
+ineligible_alt	0	(?:FirstCandidatePublicAlpha|FirstCandidatePublicBravo)
