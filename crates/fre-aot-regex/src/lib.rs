@@ -1226,6 +1226,29 @@ fn independent_exists_batch_object_outcome(
     }
 }
 
+/// Preserve endpoint append failure provenance. Only a structurally absent
+/// `Ok(None)` may retain the completed generic batch incumbent.
+fn independent_exact_singleton_first_candidate_append_outcome(
+    outcome: Result<Option<CompiledModule>, ObjectError>,
+) -> Result<Option<CompiledModule>, IndependentExistsBatchCompileError> {
+    outcome.map_err(|error| CompileError::from(error).into())
+}
+
+/// Once the authenticated endpoint module is complete, its final numeric
+/// object-byte excess alone may retain the byte-identical generic batch.
+fn independent_exact_singleton_first_candidate_object_outcome(
+    outcome: Result<Vec<u8>, ObjectError>,
+) -> Result<Option<Vec<u8>>, IndependentExistsBatchCompileError> {
+    match outcome {
+        Ok(object) => Ok(Some(object)),
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(CompileError::from(error).into()),
+    }
+}
+
 /// Compile an Exists program and request one independent-haystack batch
 /// entry for a self-contained direct object.
 ///
@@ -1233,14 +1256,19 @@ fn independent_exists_batch_object_outcome(
 /// are returned unchanged. Runtime-backed artifacts retain their checked
 /// compatibility route. A direct artifact receives an additive handle-free
 /// symbol whose loop enters an independently authenticated private
-/// full-window Exists core after validating each descriptor. The ordinary
-/// entry and its public ABI remain unchanged. Direct artifacts without that
-/// compiler receipt are returned unchanged. If only the additive wrapper
-/// exceeds the requested final object-byte limit, the exact scalar artifact
-/// is likewise returned without that optional symbol; consumers must inspect
-/// [`CompiledModule::direct_exists_batch_symbol`]. The canonical function type
-/// is `FreAotRegexIndependentExistsBatchV1` in `fre-aot-regex-runtime` and its
-/// C header.
+/// full-window Exists core after validating each descriptor. For an
+/// authenticated exact singleton whose core publishes a proved earliest
+/// candidate cursor, the compiler also appends a helper-free position entry.
+/// It returns the inclusive final byte of the earliest match or `u64::MAX` on
+/// miss through the `FreAotRegexExactSingletonFirstCandidateV1` ABI. The
+/// ordinary entry and its public ABI remain unchanged. Direct artifacts
+/// without either structural receipt retain the preceding exact artifact. If
+/// only the generic batch exceeds the requested final object-byte limit, the
+/// ordinary artifact is retained; if only the position endpoint exceeds it,
+/// the byte-identical generic batch is retained. Consumers must inspect
+/// [`CompiledModule::direct_exists_batch_symbol`] and
+/// [`CompiledModule::direct_exact_singleton_first_candidate_symbol`]. The
+/// canonical function types live in `fre-aot-regex-runtime` and its C header.
 ///
 /// # Errors
 ///
@@ -1290,6 +1318,57 @@ pub fn compile_with_independent_exists_batch(
         .copied();
     compiled.receipt.exact_single_literal_aot =
         module.exact_single_literal_aot_report().copied();
+    compiled.receipt.exact_finite_selected_end_teddy_aot = module
+        .exact_finite_selected_end_teddy_aot_report()
+        .copied();
+    compiled.receipt.ordered_finite_language_aot = module
+        .ordered_finite_language_aot_report()
+        .copied();
+    compiled.receipt.slow_context_aot = module.slow_context_aot_report().cloned();
+    compiled.receipt.runtime_helper_required = module.required_runtime_symbols().next().is_some();
+    compiled.receipt.code_bytes = module.code_bytes();
+    compiled.receipt.data_bytes = module
+        .sections()
+        .iter()
+        .filter(|section| section.kind == SectionKind::ReadOnlyData)
+        .map(|section| section.data.len())
+        .sum();
+    compiled.receipt.object_bytes = object.len();
+    compiled.module = module;
+    compiled.object = object.into_boxed_slice();
+
+    // The generic batch is now a complete, byte-stable incumbent. Append the
+    // exact-singleton position endpoint on a clone so final endpoint-only
+    // ObjectBytes may retain this exact artifact.
+    let Some(module) = independent_exact_singleton_first_candidate_append_outcome(
+        compiled
+            .module
+            .clone()
+            .append_direct_exact_singleton_first_candidate(OutputContract::Exists),
+    )?
+    else {
+        return Ok(compiled);
+    };
+    let Some(object) = independent_exact_singleton_first_candidate_object_outcome(emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ))?
+    else {
+        return Ok(compiled);
+    };
+    compiled.receipt.passes = selected_passes(&compiled.program, &module).into_boxed_slice();
+    compiled.receipt.object_sha256 = Sha256::digest(&object).into();
+    compiled.receipt.slow_aot = module.slow_aot_report().cloned();
+    compiled.receipt.compiler_k0_aot = module.compiler_k0_aot_report().cloned();
+    compiled.receipt.exact_finite_exists_byte_set_aot = module
+        .exact_finite_exists_byte_set_aot_report()
+        .copied();
+    compiled.receipt.exact_single_literal_aot =
+        module.exact_single_literal_aot_report().copied();
+    compiled.receipt.exact_singleton_first_candidate_aot = module
+        .direct_exact_singleton_first_candidate_aot_report()
+        .copied();
     compiled.receipt.exact_finite_selected_end_teddy_aot = module
         .exact_finite_selected_end_teddy_aot_report()
         .copied();

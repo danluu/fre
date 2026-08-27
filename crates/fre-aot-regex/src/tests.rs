@@ -20,6 +20,8 @@ use crate::{
     compile_with_exact_finite_selected_end_grep_count, compile_with_independent_exists_batch,
     compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
     independent_exists_batch_append_outcome, independent_exists_batch_object_outcome,
+    independent_exact_singleton_first_candidate_append_outcome,
+    independent_exact_singleton_first_candidate_object_outcome,
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
@@ -588,6 +590,36 @@ fn independent_exists_batch_allocator_failure_is_terminal_at_both_optional_seams
         .expect("final ObjectBytes cap is the sole optional resource decline")
         .is_none()
     );
+
+    const ENDPOINT_APPEND_SITE: &str =
+        "injected exact-singleton first-candidate append allocation";
+    const ENDPOINT_OBJECT_SITE: &str =
+        "injected exact-singleton first-candidate object allocation";
+    assert!(matches!(
+        independent_exact_singleton_first_candidate_append_outcome(Err(
+            ObjectError::Allocation(ENDPOINT_APPEND_SITE)
+        )),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(ENDPOINT_APPEND_SITE))
+        ))
+    ));
+    assert!(matches!(
+        independent_exact_singleton_first_candidate_object_outcome(Err(
+            ObjectError::Allocation(ENDPOINT_OBJECT_SITE)
+        )),
+        Err(IndependentExistsBatchCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(ENDPOINT_OBJECT_SITE))
+        ))
+    ));
+    assert!(independent_exact_singleton_first_candidate_object_outcome(Err(
+        ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 63,
+            required: 64,
+        }
+    ))
+    .expect("final endpoint-only ObjectBytes cap retains the batch incumbent")
+    .is_none());
 }
 
 #[test]

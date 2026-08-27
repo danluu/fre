@@ -2269,18 +2269,51 @@ mod tests {
             let batched = crate::compile_with_independent_exists_batch(request.clone())
                 .expect("append Two-Way independent Exists batch");
             assert!(batched.module().direct_exists_batch_symbol().is_some());
-            assert!(batched
+            let endpoint_symbol = batched
                 .module()
                 .direct_exact_singleton_first_candidate_symbol()
-                .is_none());
-            assert!(batched
+                .expect("exact-singleton first-candidate symbol");
+            assert!(endpoint_symbol
+                .starts_with(DIRECT_EXACT_SINGLETON_FIRST_CANDIDATE_SYMBOL_PREFIX));
+            assert_eq!(
+                batched
+                    .module()
+                    .direct_exact_singleton_first_candidate_strategy(),
+                Some(ExactSingletonFirstCandidateStrategy::NativeTwoWayTrustedCoreV1),
+            );
+            let endpoint_report = batched
                 .module()
                 .direct_exact_singleton_first_candidate_aot_report()
-                .is_none());
-            assert!(batched
-                .receipt()
-                .exact_singleton_first_candidate_aot
-                .is_none());
+                .copied()
+                .expect("exact-singleton first-candidate report");
+            assert_eq!(
+                batched.receipt().exact_singleton_first_candidate_aot,
+                Some(endpoint_report),
+            );
+            assert_eq!(endpoint_report.literal_bytes, pattern.len());
+            assert_eq!(
+                endpoint_report.literal_sha256,
+                <[u8; 32]>::from(Sha256::digest(pattern)),
+            );
+            assert_eq!(endpoint_report.runtime_call_count, 0);
+            assert_eq!(endpoint_report.target, target);
+            assert_eq!(
+                endpoint_report.native_code_sha256,
+                <[u8; 32]>::from(Sha256::digest(
+                    batched.module().sections[TEXT_SECTION].bytes(),
+                )),
+            );
+            assert_eq!(
+                endpoint_report.success_edge_count,
+                if target.architecture == Architecture::Aarch64
+                    && endpoint_report.emitted_isa
+                        == ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter
+                {
+                    2
+                } else {
+                    1
+                },
+            );
             assert_eq!(
                 batched.module().direct_exists_batch_strategy(),
                 Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop),
@@ -2497,6 +2530,99 @@ mod tests {
             .append_direct_exact_singleton_first_candidate(OutputContract::Exists)
             .expect("non-Two-Way structural decline")
             .is_none());
+    }
+
+    #[test]
+    fn exact_singleton_first_candidate_decline_and_final_cap_keep_exact_batch_incumbent() {
+        let endpoint_pattern = format!("{}b", "a".repeat(MIN_TWO_WAY_LITERAL_BYTES));
+        let non_two_way_pattern = "x".repeat(MIN_TWO_WAY_LITERAL_BYTES - 1);
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let endpoint_request = CompileRequest::new(&endpoint_pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists);
+            let ordinary = compile(endpoint_request.clone()).expect("ordinary exact singleton");
+            let batch_module = ordinary
+                .module()
+                .clone()
+                .append_direct_exists_batch(OutputContract::Exists)
+                .expect("append batch")
+                .expect("batch eligible");
+            let batch_object = crate::emit_object(
+                &batch_module,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit batch incumbent");
+            let endpoint_module = batch_module
+                .clone()
+                .append_direct_exact_singleton_first_candidate(OutputContract::Exists)
+                .expect("append endpoint")
+                .expect("endpoint eligible");
+            let endpoint_object = crate::emit_object(
+                &endpoint_module,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit endpoint object");
+            assert!(endpoint_object.len() > batch_object.len());
+
+            let mut limits = crate::CompileLimitsV1::default();
+            limits.max_object_bytes = batch_object.len();
+            let capped = crate::compile_with_independent_exists_batch(
+                endpoint_request.clone().limits(limits),
+            )
+            .expect("endpoint-only ObjectBytes decline");
+            assert_eq!(capped.object(), batch_object);
+            assert_eq!(capped.module(), &batch_module);
+            assert!(capped.module().direct_exists_batch_symbol().is_some());
+            assert!(capped
+                .module()
+                .direct_exact_singleton_first_candidate_symbol()
+                .is_none());
+            assert!(capped
+                .receipt()
+                .exact_singleton_first_candidate_aot
+                .is_none());
+            assert_eq!(
+                capped.receipt().object_sha256,
+                <[u8; 32]>::from(Sha256::digest(&batch_object)),
+            );
+
+            let decline_request = CompileRequest::new(&non_two_way_pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists);
+            let decline_ordinary =
+                compile(decline_request.clone()).expect("ordinary non-Two-Way control");
+            let decline_batch_module = decline_ordinary
+                .module()
+                .clone()
+                .append_direct_exists_batch(OutputContract::Exists)
+                .expect("append non-Two-Way batch")
+                .expect("non-Two-Way batch eligible");
+            let decline_batch_object = crate::emit_object(
+                &decline_batch_module,
+                crate::ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit non-Two-Way batch");
+            let declined = crate::compile_with_independent_exists_batch(decline_request)
+                .expect("structural endpoint decline");
+            assert_eq!(declined.object(), decline_batch_object);
+            assert_eq!(declined.module(), &decline_batch_module);
+            assert!(declined
+                .module()
+                .direct_exact_singleton_first_candidate_symbol()
+                .is_none());
+            assert!(declined
+                .receipt()
+                .exact_singleton_first_candidate_aot
+                .is_none());
+        }
     }
 
     #[test]
