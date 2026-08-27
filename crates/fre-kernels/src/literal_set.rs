@@ -301,21 +301,18 @@ pub struct LiteralSetOrdinaryExecutor<'a> {
     direct_dfa_identity: Option<LiteralSetDirectDfaIdentity>,
 }
 
-/// Worker-bound endpoint-only ordinary literal-set projection.
+/// Worker-bound ordinary literal-set engine.
 ///
 /// Identity and direct-DFA capabilities are sealed once when the worker
-/// constructs this projection. Exists and first acceptance lazily prepare one
-/// exact ASCII root only when a call reaches the branch that can use it. This
-/// type deliberately exposes no
-/// selected-span executor: the ordinary facade retains the original compact
-/// executor beside this optional projection, so find, visit and count keep
-/// their established direct route. Finite, accounted and explicit
-/// search-session entry points do not construct or use this type.
+/// constructs this engine. Exists, first acceptance and selected-span searches
+/// share one exact ASCII root, prepared only when a call reaches a long branch
+/// that can use it. Finite, accounted and explicit search-session entry points
+/// do not construct or use this type.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct LiteralSetOrdinaryEngine<'a> {
     executor: LiteralSetOrdinaryExecutor<'a>,
-    prepared_exists_root: Option<AsciiByteSetClassifier>,
+    prepared_ascii_root: Option<AsciiByteSetClassifier>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2105,16 +2102,30 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
 
     #[inline(always)]
     fn next_pattern(&mut self) -> Option<LiteralSetDfaSpanSelection> {
-        let anchored = Anchored::No;
-        let mut state = self.start_state;
         let restart = self.restart;
-        let mut at = restart;
         // Positive width makes the search restart an exact no-selection
         // sentinel: every acceptance ends strictly after it. Keep that proof
         // in the endpoint instead of carrying and rewriting a separate
         // `Option<LiteralSetDfaSelection>` tag through the transition loop.
-        let mut selected_end = restart;
-        let mut selected_pattern = PatternID::ZERO;
+        self.next_pattern_from(
+            restart,
+            self.start_state,
+            restart,
+            restart,
+            PatternID::ZERO,
+        )
+    }
+
+    #[inline(always)]
+    fn next_pattern_from(
+        &mut self,
+        restart: usize,
+        mut state: StateID,
+        mut at: usize,
+        mut selected_end: usize,
+        mut selected_pattern: PatternID,
+    ) -> Option<LiteralSetDfaSpanSelection> {
+        let anchored = Anchored::No;
         while at < self.end {
             state = self.automaton.next_state(anchored, state, self.haystack[at]);
             at += 1;
@@ -2142,6 +2153,16 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
                 selected_pattern = self.automaton.match_pattern(state, 0);
             }
         }
+        self.finish_pattern_selection(restart, selected_end, selected_pattern)
+    }
+
+    #[inline(always)]
+    fn finish_pattern_selection(
+        &mut self,
+        restart: usize,
+        selected_end: usize,
+        selected_pattern: PatternID,
+    ) -> Option<LiteralSetDfaSpanSelection> {
         if selected_end == restart {
             self.restart = self.end;
             return None;
@@ -2151,6 +2172,61 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
             end: selected_end,
             pattern: selected_pattern,
         })
+    }
+
+    /// Run one native selected-span prefix before preparing or consulting the
+    /// worker's exact arbitrary-ASCII root classifier. A return to the start
+    /// state with no pending match proves that the prefix can be discarded;
+    /// every other state resumes the unchanged DFA loop without replay.
+    #[inline(always)]
+    fn next_pattern_with_ascii_root(
+        &mut self,
+        roots: &mut Option<AsciiByteSetClassifier>,
+    ) -> Option<LiteralSetDfaSpanSelection> {
+        let anchored = Anchored::No;
+        let restart = self.restart;
+        let mut state = self.start_state;
+        let mut at = restart;
+        let mut selected_end = restart;
+        let mut selected_pattern = PatternID::ZERO;
+        let native_end = at
+            .saturating_add(ORDINARY_DIRECT_DFA_NATIVE_BYTES)
+            .min(self.end);
+        while at < native_end {
+            state = self.automaton.next_state(anchored, state, self.haystack[at]);
+            at += 1;
+            debug_assert_eq!(
+                self.automaton.is_special(state),
+                state < self.start_state,
+                "Aho's concrete DFA special-state ordering changed",
+            );
+            if state < self.start_state {
+                if self.automaton.is_dead(state) {
+                    return self.finish_pattern_selection(
+                        restart,
+                        selected_end,
+                        selected_pattern,
+                    );
+                }
+                debug_assert!(
+                    self.automaton.is_match(state),
+                    "a DFA without a prefilter has no other special states",
+                );
+                selected_end = at;
+                selected_pattern = self.automaton.match_pattern(state, 0);
+            }
+        }
+        if selected_end == restart
+            && state == self.start_state
+            && self.end - at >= ORDINARY_ROOT_ASCII_MIN_BYTES
+        {
+            self.restart = at;
+            if !self.seek_ascii_root_for_selected_span(roots) {
+                return None;
+            }
+            return self.next_pattern();
+        }
+        self.next_pattern_from(restart, state, at, selected_end, selected_pattern)
     }
 
     /// Seek one exact root before entering the unchanged selected-span DFA
@@ -2273,6 +2349,40 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         count
     }
 
+    /// Seek one exact arbitrary ASCII root through a worker-prepared
+    /// classifier before entering the unchanged selected-span DFA loop.
+    #[inline(always)]
+    fn seek_ascii_root_for_selected_span(
+        &mut self,
+        roots: &mut Option<AsciiByteSetClassifier>,
+    ) -> bool {
+        let at = self.restart;
+        if self.end - at < ORDINARY_ROOT_ASCII_MIN_BYTES {
+            return true;
+        }
+        let roots = roots.get_or_insert_with(|| {
+            let roots = direct_dfa_ascii_root_set(self.automaton, self.start_state)
+                .expect("the construction-sealed sparse ASCII root remains exact");
+            #[cfg(test)]
+            ordinary_direct_probe::record_root_ascii_preparation();
+            AsciiByteSetClassifier::new(roots)
+        });
+        if roots.set().contains(self.haystack[at]) {
+            return true;
+        }
+        if roots.set().contains(self.haystack[at + 1]) {
+            self.restart = at + 1;
+            return true;
+        }
+        let remaining = &self.haystack[at..self.end];
+        let Some(relative) = find_direct_dfa_ascii_root_after_initial_miss(roots, remaining) else {
+            self.restart = self.end;
+            return false;
+        };
+        self.restart = at + relative;
+        true
+    }
+
     #[inline(always)]
     fn next_end(&mut self) -> Option<usize> {
         self.next::<false>().map(|matched| matched.end)
@@ -2385,11 +2495,30 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
     fn next_span(&mut self) -> Option<(usize, usize)> {
         let restart = self.restart;
         let matched = self.next_pattern()?;
+        Some(self.span_from_selection(restart, matched))
+    }
+
+    #[inline(always)]
+    fn next_span_with_ascii_root(
+        &mut self,
+        roots: &mut Option<AsciiByteSetClassifier>,
+    ) -> Option<(usize, usize)> {
+        let restart = self.restart;
+        let matched = self.next_pattern_with_ascii_root(roots)?;
+        Some(self.span_from_selection(restart, matched))
+    }
+
+    #[inline(always)]
+    fn span_from_selection(
+        &self,
+        restart: usize,
+        matched: LiteralSetDfaSpanSelection,
+    ) -> (usize, usize) {
         let end = matched.end;
         let pattern_bytes = self.automaton.pattern_len(matched.pattern);
         debug_assert!(pattern_bytes > 0);
         debug_assert!(pattern_bytes <= end.saturating_sub(restart));
-        Some((end - pattern_bytes, end))
+        (end - pattern_bytes, end)
     }
 }
 
@@ -2680,15 +2809,14 @@ fn ordinary_direct_dfa_first_acceptance_end_lazy_ascii(
 }
 
 impl<'a> LiteralSetOrdinaryExecutor<'a> {
-    /// Bind one worker-owned endpoint projection whose exact ASCII Exists root
-    /// can be prepared lazily against this executor's immutable direct-DFA
-    /// identity.
+    /// Bind one worker-owned engine whose exact ASCII root can be prepared
+    /// lazily against this executor's immutable direct-DFA identity.
     ///
     /// AArch64 retains one exact 5..=24-member ASCII classifier only when its
     /// direct-DFA identity carries the construction marker. Other targets and
     /// root shapes retain the unchanged executor alone. Binding performs no
-    /// classifier construction, so selected-span and count-only workers do not
-    /// pay for the unused Exists projection.
+    /// classifier construction, so short and unused operations do not pay its
+    /// setup cost.
     #[doc(hidden)]
     #[must_use]
     pub fn bind_engine(self) -> Option<LiteralSetOrdinaryEngine<'a>> {
@@ -2704,7 +2832,7 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
             }
             Some(LiteralSetOrdinaryEngine {
                 executor: self,
-                prepared_exists_root: None,
+                prepared_ascii_root: None,
             })
         }
     }
@@ -3118,8 +3246,93 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
 }
 
 impl<'a> LiteralSetOrdinaryEngine<'a> {
-    /// Return whether any literal accepts inside `window` through the lazy
-    /// Exists projection.
+    /// Return the selected leftmost-first span through the worker-bound ASCII
+    /// root engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralSetError::InvalidWindow`] when `window` lies outside
+    /// the original haystack.
+    #[doc(hidden)]
+    #[inline]
+    pub fn find_window_value(
+        &mut self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<(usize, usize)>, LiteralSetError> {
+        validate_window(window, haystack.len())?;
+        let executor = self.executor;
+        if let Some(mut scanner) = LiteralSetDfaScanner::new(executor, haystack, window) {
+            if executor.is_uniform_positive() {
+                let width = executor.plan.build.minimum_pattern_bytes;
+                if width <= ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES {
+                    if let Some(end) = scanner.next_near_uniform_end(width) {
+                        return Ok(Some((end - width, end)));
+                    }
+                    if scanner.restart == scanner.end {
+                        return Ok(None);
+                    }
+                }
+            }
+            return Ok(scanner.next_span_with_ascii_root(&mut self.prepared_ascii_root));
+        }
+        executor.plan.try_find_window_value(haystack, window)
+    }
+
+    /// Visit every non-overlapping selected span through the same worker-bound
+    /// ASCII root engine used by Exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralSetError::InvalidWindow`] when `window` lies outside
+    /// the original haystack.
+    #[doc(hidden)]
+    #[inline]
+    pub fn try_visit_spans_window_value<F, E>(
+        &mut self,
+        haystack: &[u8],
+        window: Window,
+        mut visitor: F,
+    ) -> Result<Result<(), E>, LiteralSetError>
+    where
+        F: FnMut((usize, usize)) -> Result<bool, E>,
+    {
+        validate_window(window, haystack.len())?;
+        let executor = self.executor;
+        if let Some(mut scanner) = LiteralSetDfaScanner::new(executor, haystack, window) {
+            if executor.is_uniform_positive() {
+                let width = executor.plan.build.minimum_pattern_bytes;
+                if width <= ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES {
+                    while let Some(end) = scanner.next_near_uniform_end(width) {
+                        match visitor((end - width, end)) {
+                            Ok(true) => {}
+                            Ok(false) => return Ok(Ok(())),
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
+                    if scanner.restart == scanner.end {
+                        return Ok(Ok(()));
+                    }
+                }
+            }
+            while let Some(matched) =
+                scanner.next_span_with_ascii_root(&mut self.prepared_ascii_root)
+            {
+                match visitor(matched) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Ok(())),
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            return Ok(Ok(()));
+        }
+        Ok(executor.try_visit_spans_window_value_total(
+            haystack, window, visitor,
+        ))
+    }
+
+    /// Return whether any literal accepts inside `window` through the shared
+    /// ordinary engine.
     ///
     /// # Errors
     ///
@@ -3137,7 +3350,7 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
             .map(|endpoint| endpoint.is_some())
     }
 
-    /// Return the first accepting endpoint through the lazy Exists projection
+    /// Return the first accepting endpoint through the shared ordinary engine
     /// without selecting a pattern or reconstructing a start.
     ///
     /// # Errors
@@ -3169,7 +3382,7 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
             executor.plan.automaton.as_ref(),
             identity.start_state(),
             source,
-            &mut self.prepared_exists_root,
+            &mut self.prepared_ascii_root,
         );
         Ok(relative_end.map(|end| {
             debug_assert!(end <= window_bytes);
@@ -8681,12 +8894,12 @@ mod tests {
             let mut prepared = ordinary
                 .bind_engine()
                 .expect("an admitted sparse ASCII root binds its lazy engine");
-            assert!(prepared.prepared_exists_root.is_none());
+            assert!(prepared.prepared_ascii_root.is_none());
             assert_eq!(
                 prepared.exists_window_value(&[], Window::full(&[])),
                 Ok(false),
             );
-            assert!(prepared.prepared_exists_root.is_none());
+            assert!(prepared.prepared_ascii_root.is_none());
             let long_miss = vec![
                 b'!';
                 ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_ASCII_MIN_BYTES
@@ -8699,7 +8912,7 @@ mod tests {
                 Ok(false),
             );
             let retained_roots = prepared
-                .prepared_exists_root
+                .prepared_ascii_root
                 .as_ref()
                 .expect("the first accelerator-eligible Exists call prepares its classifier")
                 .set()
@@ -8713,7 +8926,7 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn ordinary_direct_dfa_ascii_root_prepares_once_for_exists_only() {
+    fn ordinary_direct_dfa_ascii_root_prepares_once_for_exists_and_span() {
         #[cfg(not(feature = "static-dispatch"))]
         assert_eq!(
             core::mem::size_of::<Option<super::AsciiByteSetClassifier>>(),
@@ -8741,7 +8954,7 @@ mod tests {
         let mut prepared = ordinary
             .bind_engine()
             .expect("twenty-four non-contiguous ASCII roots bind a lazy engine");
-        assert!(prepared.prepared_exists_root.is_none());
+        assert!(prepared.prepared_ascii_root.is_none());
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         assert_eq!(
             ordinary_direct_probe::root_ascii_preparation_transitions(),
@@ -8768,10 +8981,9 @@ mod tests {
         haystack[root_offset..root_offset + patterns[0].len()]
             .copy_from_slice(&patterns[0]);
 
-        // Binding and span/count-only execution never construct the Exists
-        // classifier, even for a window that would use it if asked. Those
-        // operations remain on the original executor rather than projecting
-        // one back out of the endpoint-only engine.
+        // Binding and execution through the compact executor never construct
+        // the worker engine's classifier. Count deliberately retains that
+        // route, while span operations opt into the engine explicitly.
         assert_eq!(
             ordinary.find_window_value(&haystack, Window::full(&haystack)),
             Ok(Some((root_offset, root_offset + patterns[0].len()))),
@@ -8817,7 +9029,7 @@ mod tests {
             0,
         );
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
-        assert!(prepared.prepared_exists_root.is_none());
+        assert!(prepared.prepared_ascii_root.is_none());
 
         // Source length alone does not trigger preparation: an acceptance in
         // the native prefix returns before the idle-root accelerator branch.
@@ -8856,7 +9068,7 @@ mod tests {
         assert_eq!(ordinary_direct_probe::root_ascii_skipped_bytes(), long_suffix);
         assert_eq!(
             prepared
-                .prepared_exists_root
+                .prepared_ascii_root
                 .as_ref()
                 .expect("the first accelerator-eligible Exists call retains its classifier")
                 .set()
@@ -8881,6 +9093,31 @@ mod tests {
             ordinary_direct_probe::root_ascii_skipped_bytes(),
             long_suffix + 19,
         );
+
+        assert_eq!(
+            prepared.find_window_value(&haystack, Window::full(&haystack)),
+            Ok(Some((root_offset, root_offset + patterns[0].len()))),
+        );
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
+        assert_eq!(
+            ordinary_direct_probe::root_ascii_preparation_transitions(),
+            128,
+        );
+
+        let mut spans = Vec::new();
+        assert_eq!(
+            prepared.try_visit_spans_window_value(
+                &haystack,
+                Window::full(&haystack),
+                |matched| {
+                    spans.push(matched);
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(spans, [(root_offset, root_offset + patterns[0].len())]);
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 1);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -8920,6 +9157,38 @@ mod tests {
                     expected.map(|endpoint| endpoint.is_some()),
                     "exists window={window:?}",
                 );
+                let expected_span = ordinary.find_window_value(&haystack, window);
+                assert_eq!(
+                    prepared.find_window_value(&haystack, window),
+                    expected_span,
+                    "span window={window:?}",
+                );
+
+                let mut expected_spans = Vec::new();
+                assert_eq!(
+                    ordinary.try_visit_spans_window_value(
+                        &haystack,
+                        window,
+                        |matched| {
+                            expected_spans.push(matched);
+                            Ok::<bool, ()>(true)
+                        },
+                    ),
+                    Ok(Ok(())),
+                );
+                let mut actual_spans = Vec::new();
+                assert_eq!(
+                    prepared.try_visit_spans_window_value(
+                        &haystack,
+                        window,
+                        |matched| {
+                            actual_spans.push(matched);
+                            Ok::<bool, ()>(true)
+                        },
+                    ),
+                    Ok(Ok(())),
+                );
+                assert_eq!(actual_spans, expected_spans, "spans window={window:?}");
             }
         }
     }

@@ -14622,8 +14622,8 @@ impl PortableRegex {
     /// the already-proven native regex owner for spans. An attachment-free,
     /// positive-width leftmost-first literal set binds its immutable span
     /// executor and, on AArch64, may retain a wider exact ASCII-root
-    /// capability whose engine is bound on the first Exists projection and
-    /// whose classifier is prepared only when that call reaches the branch
+    /// capability whose engine is bound on the first eligible operation and
+    /// whose classifier is prepared only when a call reaches the branch
     /// that can use it. A
     /// uniform-standard literal set additionally starts with one cleared
     /// performance-only route bit; near acceptances may spend that bit on one
@@ -14703,7 +14703,7 @@ impl PortableRegex {
                     } else {
                         PortableOrdinarySessionPlan::LiteralSetDfa {
                             executor,
-                            ascii_exists: PortableOrdinaryLiteralSetExists::Unbound,
+                            ascii_engine: PortableOrdinaryLiteralSetEngine::Unbound,
                         }
                     }
                 } else {
@@ -18659,12 +18659,12 @@ pub struct PortableSearchSession<'a> {
 /// A Unicode word-run binding reuses its aggregate reducer only for an exact
 /// full-source count; a nonzero start retains the canonical context-aware
 /// fallback.
-/// A positive leftmost-first literal set similarly binds one compact span
-/// executor and leaves its endpoint-only sidecar unbound. The first Exists
-/// call settles that sidecar once, caching both a qualified AArch64 ASCII-root
-/// engine and an unavailable result. A qualified engine still prepares its
-/// classifier only when a call first reaches the branch that can use it. Span
-/// visitation and count-only calls leave the sidecar unbound.
+/// A positive leftmost-first literal set similarly binds one compact executor
+/// and leaves its shared ASCII-root engine sidecar unbound. The first eligible
+/// endpoint or span call settles that sidecar once, caching both a qualified
+/// AArch64 engine and an unavailable result. A qualified engine still prepares
+/// its classifier only when a call first reaches the branch that can use it.
+/// Count-only calls retain the compact executor directly.
 /// Other matcher families retain only their compact binding. No method on this
 /// type accepts finite limits or publishes accounting; callers that need
 /// either contract should use [`PortableSearchSession`] instead.
@@ -18686,13 +18686,13 @@ pub struct PortableOrdinarySession<'a> {
 }
 
 #[derive(Debug)]
-enum PortableOrdinaryLiteralSetExists<'a> {
+enum PortableOrdinaryLiteralSetEngine<'a> {
     Unbound,
     Unavailable,
     Bound(LiteralSetOrdinaryEngine<'a>),
 }
 
-impl<'a> PortableOrdinaryLiteralSetExists<'a> {
+impl<'a> PortableOrdinaryLiteralSetEngine<'a> {
     #[inline]
     fn get_or_bind(
         &mut self,
@@ -18700,7 +18700,7 @@ impl<'a> PortableOrdinaryLiteralSetExists<'a> {
     ) -> Option<&mut LiteralSetOrdinaryEngine<'a>> {
         if matches!(self, Self::Unbound) {
             #[cfg(test)]
-            literal_set_dfa_ordinary_exists_bind_probe::record();
+            literal_set_dfa_ordinary_engine_bind_probe::record();
             *self = match executor.bind_engine() {
                 Some(engine) => Self::Bound(engine),
                 None => Self::Unavailable,
@@ -18729,10 +18729,9 @@ enum PortableOrdinarySessionPlan<'a> {
     },
     LiteralSetDfa {
         executor: LiteralSetOrdinaryExecutor<'a>,
-        /// A lazily sealed endpoint-only projection. Keeping it beside the
-        /// incumbent span executor lets find, visit and count retain their
-        /// exact established facade arm without binding the unused sidecar.
-        ascii_exists: PortableOrdinaryLiteralSetExists<'a>,
+        /// A lazily sealed shared endpoint/span engine. Keeping it beside the
+        /// compact executor lets count retain its established direct route.
+        ascii_engine: PortableOrdinaryLiteralSetEngine<'a>,
     },
     LiteralSetUniformStandardDfa {
         executor: LiteralSetUniformStandardOrdinaryExecutor<'a>,
@@ -19241,7 +19240,7 @@ mod ordinary_session_full_is_match_probe {
 }
 
 #[cfg(test)]
-mod literal_set_dfa_ordinary_exists_bind_probe {
+mod literal_set_dfa_ordinary_engine_bind_probe {
     use std::cell::Cell;
 
     std::thread_local! {
@@ -24915,11 +24914,11 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa {
                 executor,
-                ascii_exists,
+                ascii_engine,
             } => {
                 let window = LiteralWindow::new(start, haystack.len());
-                if let Some(projection) = ascii_exists.get_or_bind(*executor) {
-                    projection
+                if let Some(engine) = ascii_engine.get_or_bind(*executor) {
+                    engine
                         .exists_window_value(haystack, window)
                         .map_err(SearchError::from)
                 } else {
@@ -24987,11 +24986,11 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map_err(SearchError::from),
             PortableOrdinarySessionPlan::LiteralSetDfa {
                 executor,
-                ascii_exists,
+                ascii_engine,
             } => {
                 let window = LiteralWindow::new(start, haystack.len());
-                if let Some(projection) = ascii_exists.get_or_bind(*executor) {
-                    projection
+                if let Some(engine) = ascii_engine.get_or_bind(*executor) {
+                    engine
                         .first_acceptance_window_value(haystack, window)
                         .map_err(SearchError::from)
                 } else {
@@ -25083,10 +25082,23 @@ impl<'r> PortableOrdinarySession<'r> {
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
-            PortableOrdinarySessionPlan::LiteralSetDfa { executor, .. } => executor
-                .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
-                .map(|matched| matched.map(|(start, end)| Match { start, end }))
-                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::LiteralSetDfa {
+                executor,
+                ascii_engine,
+            } => {
+                let window = LiteralWindow::new(start, haystack.len());
+                if let Some(engine) = ascii_engine.get_or_bind(*executor) {
+                    engine
+                        .find_window_value(haystack, window)
+                        .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                        .map_err(SearchError::from)
+                } else {
+                    executor
+                        .find_window_value(haystack, window)
+                        .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                        .map_err(SearchError::from)
+                }
+            }
             PortableOrdinarySessionPlan::LiteralSetCompact { executor } => executor
                 .find_window_value(haystack, LiteralWindow::new(start, haystack.len()))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
@@ -25218,16 +25230,31 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map_err(SearchError::from)
                 .map_err(PortableFindIterError::Search)
             }
-            PortableOrdinarySessionPlan::LiteralSetDfa { executor, .. } => {
+            PortableOrdinarySessionPlan::LiteralSetDfa {
+                executor,
+                ascii_engine,
+            } => {
                 let mut visitor = visitor;
-                executor
-                    .try_visit_spans_window_value(
-                        haystack,
-                        LiteralWindow::new(start, haystack.len()),
-                        |(start, end)| visitor(Match { start, end }),
-                    )
-                    .map_err(SearchError::from)
-                    .map_err(PortableFindIterError::Search)
+                let window = LiteralWindow::new(start, haystack.len());
+                if let Some(engine) = ascii_engine.get_or_bind(*executor) {
+                    engine
+                        .try_visit_spans_window_value(
+                            haystack,
+                            window,
+                            |(start, end)| visitor(Match { start, end }),
+                        )
+                        .map_err(SearchError::from)
+                        .map_err(PortableFindIterError::Search)
+                } else {
+                    executor
+                        .try_visit_spans_window_value(
+                            haystack,
+                            window,
+                            |(start, end)| visitor(Match { start, end }),
+                        )
+                        .map_err(SearchError::from)
+                        .map_err(PortableFindIterError::Search)
+                }
             }
             PortableOrdinarySessionPlan::LiteralSetCompact { executor } => {
                 let mut visitor = visitor;
@@ -48520,12 +48547,12 @@ mod tests {
         ) -> (&'static str, bool) {
             match &session.plan {
                 super::PortableOrdinarySessionPlan::LiteralSetDfa {
-                    ascii_exists, ..
+                    ascii_engine, ..
                 } => (
-                    match ascii_exists {
-                        super::PortableOrdinaryLiteralSetExists::Unbound => "unbound",
-                        super::PortableOrdinaryLiteralSetExists::Unavailable => "unavailable",
-                        super::PortableOrdinaryLiteralSetExists::Bound(_) => "bound",
+                    match ascii_engine {
+                        super::PortableOrdinaryLiteralSetEngine::Unbound => "unbound",
+                        super::PortableOrdinaryLiteralSetEngine::Unavailable => "unavailable",
+                        super::PortableOrdinaryLiteralSetEngine::Bound(_) => "bound",
                     },
                     false,
                 ),
@@ -51259,7 +51286,7 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn ordinary_literal_set_dfa_prepares_arbitrary_ascii_roots_for_exists_only() {
+    fn ordinary_literal_set_dfa_shares_arbitrary_ascii_roots_with_spans() {
         let source = [
             "0", "2", "4", "6", "8", "A", "C", "E", "G", "I", "a", "c", "e", "g", "i", "k",
         ]
@@ -51279,13 +51306,13 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
-        super::literal_set_dfa_ordinary_exists_bind_probe::reset();
+        super::literal_set_dfa_ordinary_engine_bind_probe::reset();
         let mut ordinary = regex.ordinary_session().unwrap();
-        assert_eq!(super::literal_set_dfa_ordinary_exists_bind_probe::calls(), 0);
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
         assert!(matches!(
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::LiteralSetDfa {
-                ascii_exists: super::PortableOrdinaryLiteralSetExists::Unbound,
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
                 ..
             }
         ));
@@ -51293,8 +51320,8 @@ mod tests {
         let matched_start = 32 + 19;
         let mut haystack = vec![b'!'; 32 + 128 + 16];
         haystack[matched_start..matched_start + 4].copy_from_slice(b"AAAA");
-        // Selected-span and count projections work without binding the Exists
-        // sidecar or preparing its qualified root classifier.
+        // The first selected-span operation binds the qualified worker engine;
+        // later spans and Exists calls reuse the same prepared classifier.
         assert_eq!(
             ordinary.find_at(&haystack, 0),
             Ok(Some(Match {
@@ -51323,20 +51350,20 @@ mod tests {
             ordinary.count_positive_width_selected_ends_at(&haystack, 0),
             Ok(Some(1)),
         );
-        assert_eq!(super::literal_set_dfa_ordinary_exists_bind_probe::calls(), 0);
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
         assert!(matches!(
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::LiteralSetDfa {
-                ascii_exists: super::PortableOrdinaryLiteralSetExists::Unbound,
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Bound(_),
                 ..
             }
         ));
         assert_eq!(ordinary.is_match_at(&haystack, 0), Ok(true));
-        assert_eq!(super::literal_set_dfa_ordinary_exists_bind_probe::calls(), 1);
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
         assert!(matches!(
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::LiteralSetDfa {
-                ascii_exists: super::PortableOrdinaryLiteralSetExists::Bound(_),
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Bound(_),
                 ..
             }
         ));
@@ -51344,7 +51371,7 @@ mod tests {
             ordinary.first_acceptance_at(&haystack, 0),
             Ok(Some(matched_start + 4)),
         );
-        assert_eq!(super::literal_set_dfa_ordinary_exists_bind_probe::calls(), 1);
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
     }
 
     #[test]
@@ -51361,9 +51388,9 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
-        super::literal_set_dfa_ordinary_exists_bind_probe::reset();
+        super::literal_set_dfa_ordinary_engine_bind_probe::reset();
         let mut ordinary = regex.ordinary_session().unwrap();
-        assert_eq!(super::literal_set_dfa_ordinary_exists_bind_probe::calls(), 0);
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
         let super::PortableOrdinarySessionPlan::LiteralSetDfa { executor, .. } = &ordinary.plan
         else {
             panic!("nonuniform literal set did not bind its ordinary executor");
@@ -51380,20 +51407,27 @@ mod tests {
             ordinary.count_positive_width_selected_ends_at(b"abc", 0),
             Ok(Some(1)),
         );
-        assert_eq!(super::literal_set_dfa_ordinary_exists_bind_probe::calls(), 0);
-
-        assert_eq!(ordinary.first_acceptance_at(b"abc", 0), Ok(Some(2)));
-        assert_eq!(super::literal_set_dfa_ordinary_exists_bind_probe::calls(), 1);
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
         assert!(matches!(
             &ordinary.plan,
             super::PortableOrdinarySessionPlan::LiteralSetDfa {
-                ascii_exists: super::PortableOrdinaryLiteralSetExists::Unavailable,
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unavailable,
+                ..
+            }
+        ));
+
+        assert_eq!(ordinary.first_acceptance_at(b"abc", 0), Ok(Some(2)));
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
+        assert!(matches!(
+            &ordinary.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unavailable,
                 ..
             }
         ));
         assert_eq!(ordinary.shortest_match_at(b"abc", 0), Ok(Some(2)));
         assert_eq!(ordinary.is_match_at(b"abc", 0), Ok(true));
-        assert_eq!(super::literal_set_dfa_ordinary_exists_bind_probe::calls(), 1);
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 1);
         assert_eq!(
             ordinary.find_at(b"abc", 0),
             Ok(Some(Match { start: 0, end: 3 })),
