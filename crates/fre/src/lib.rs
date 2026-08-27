@@ -31682,7 +31682,8 @@ mod tests {
             assert_eq!(ordinary.find_at(haystack, 0), Ok(expected));
             assert_eq!(
                 super::unicode_word_run::full_prepared_find_call_count(),
-                0,
+                1,
+                "a zero-origin ordinary-session span enters the prepared full route",
             );
         }
 
@@ -48049,8 +48050,18 @@ mod tests {
                 .search_session(SearchSessionLimits::unlimited())
                 .unwrap();
             assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+            assert_eq!(
+                super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+                0,
+                "finite, accounted, ranged, and explicit-session APIs stay canonical",
+            );
             let mut ordinary = regex.ordinary_session().unwrap();
             assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+            assert_eq!(
+                super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+                1,
+                "a zero-origin ordinary-session span enters the ordinary full route",
+            );
             assert_eq!(
                 regex
                     .find_iter(haystack, PortableFindIterLimits::unlimited())
@@ -48074,20 +48085,20 @@ mod tests {
             );
             assert_eq!(
                 super::literal_class_run_literal_ordinary_find_probe::snapshot(),
-                0,
-                "finite, accounted, ranged, session, iterator, and capture APIs stay canonical",
+                1,
+                "iterator and capture APIs stay canonical after the ordinary-session handoff",
             );
 
             assert!(regex.is_match(haystack));
             assert_eq!(
                 super::literal_class_run_literal_ordinary_find_probe::snapshot(),
-                0,
-                "the already-specialized ordinary existence facade is independent",
+                1,
+                "the already-specialized ordinary existence facade leaves the span route unchanged",
             );
             assert_eq!(regex.find(haystack), expected);
             assert_eq!(
                 super::literal_class_run_literal_ordinary_find_probe::snapshot(),
-                1,
+                2,
             );
         }
     }
@@ -48194,8 +48205,18 @@ mod tests {
                 .unwrap();
             assert!(session.is_match_value(haystack, unlimited).unwrap());
             assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, 0),
+                "finite, ranged, accounted, and explicit-session APIs stay canonical",
+            );
             let mut ordinary = regex.ordinary_session().unwrap();
             assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, usize::from(ordinary_guarded)),
+                "an eligible zero-origin ordinary-session span enters the ordinary full route",
+            );
             assert_eq!(
                 regex
                     .find_iter(haystack, PortableFindIterLimits::unlimited())
@@ -48219,19 +48240,19 @@ mod tests {
             );
             assert_eq!(
                 super::literal_class_run_search_ordinary_facade_probe::snapshot(),
-                (0, 0),
-                "finite, ranged, accounted, session, iterator, and capture APIs stay canonical",
+                (0, usize::from(ordinary_guarded)),
+                "iterator and capture APIs stay canonical after the ordinary-session handoff",
             );
 
             assert!(regex.is_match(haystack));
             assert_eq!(
                 super::literal_class_run_search_ordinary_facade_probe::snapshot(),
-                (0, 0),
+                (0, usize::from(ordinary_guarded)),
             );
             assert_eq!(regex.find(haystack), expected);
             assert_eq!(
                 super::literal_class_run_search_ordinary_facade_probe::snapshot(),
-                (0, usize::from(ordinary_guarded)),
+                (0, 2 * usize::from(ordinary_guarded)),
             );
         }
     }
@@ -57624,8 +57645,18 @@ mod tests {
                 .unwrap(),
             expected,
         );
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, accounted, windowed, and explicit-session APIs stay canonical",
+        );
         let mut ordinary = ascii.ordinary_session().unwrap();
         assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (0, 1),
+            "a zero-origin ordinary-session span enters the ordinary full route",
+        );
         let expected_iter = vec![(5, 11)];
         let accounted_iter = ascii
             .find_iter(haystack, PortableFindIterLimits::unlimited())
@@ -57659,8 +57690,8 @@ mod tests {
         );
         assert_eq!(
             super::bounded_required_literal_ordinary_facade_probe::snapshot(),
-            (0, 0),
-            "finite, accounted, windowed, session, and capture APIs stay canonical",
+            (0, 1),
+            "iterator and capture APIs stay canonical after the ordinary-session handoff",
         );
 
         assert!(ascii.is_match(haystack));
@@ -57674,7 +57705,7 @@ mod tests {
         );
         assert_eq!(
             super::bounded_required_literal_ordinary_facade_probe::snapshot(),
-            (2, 3),
+            (2, 4),
             "only anchor-free ordinary boolean/span calls enter the bounded route",
         );
 
@@ -57694,7 +57725,7 @@ mod tests {
         assert_eq!(unbounded.find(b"aaaaZQ"), Some(Match { start: 0, end: 6 }));
         assert_eq!(
             super::bounded_required_literal_ordinary_facade_probe::snapshot(),
-            (2, 3),
+            (2, 4),
             "anchored bounded and unbounded plans retain their existing routes",
         );
 
@@ -59676,8 +59707,18 @@ mod tests {
             .unwrap();
         assert!(session.is_match_value(haystack, unlimited).unwrap());
         assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, windowed, and explicit-session APIs stay canonical",
+        );
         let mut ordinary_session = regex.ordinary_session().unwrap();
         assert_eq!(ordinary_session.find_at(haystack, 0).unwrap(), expected);
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (0, 1),
+            "a zero-origin ordinary-session span enters the ordinary full route",
+        );
 
         assert_eq!(
             regex
@@ -59710,15 +59751,15 @@ mod tests {
         );
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (0, 0),
-            "finite, windowed, session, iterator, and capture APIs stay canonical",
+            (0, 1),
+            "iterator and capture APIs stay canonical after the ordinary-session handoff",
         );
 
         assert!(regex.is_match(haystack));
         assert_eq!(regex.find(haystack), expected);
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (1, 1),
+            (1, 2),
         );
 
         let fixed = PortableBuilder::new(pattern)
@@ -59731,7 +59772,7 @@ mod tests {
         assert_eq!(fixed.find(haystack), expected);
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (2, 2),
+            (2, 3),
             "fixed-end ordinary values use only their full-window projection",
         );
 
@@ -59745,7 +59786,7 @@ mod tests {
         assert_eq!(unrelated.find(haystack), expected);
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (2, 2),
+            (2, 3),
             "unrelated owners cannot enter the forward ordinary route",
         );
     }
@@ -60177,6 +60218,11 @@ mod tests {
                 .is_match_value(haystack, SearchLimits::unlimited())
                 .unwrap()
         );
+        assert_eq!(
+            super::unicode_scalar_run_ordinary_facade_probe::calls(),
+            ordinary,
+            "finite, windowed, and explicit-session APIs stay canonical",
+        );
         let mut ordinary_session = regex.ordinary_session().unwrap();
         assert_eq!(
             ordinary_session
@@ -60184,6 +60230,11 @@ mod tests {
                 .unwrap()
                 .map(|matched| (matched.start(), matched.end())),
             expected,
+        );
+        assert_eq!(
+            super::unicode_scalar_run_ordinary_facade_probe::calls(),
+            ordinary + 1,
+            "a zero-origin ordinary-session span enters the ordinary full route",
         );
         assert!(ordinary_session.is_match_at(haystack, 0).unwrap());
 
@@ -60243,8 +60294,8 @@ mod tests {
         ));
         assert_eq!(
             super::unicode_scalar_run_ordinary_facade_probe::calls(),
-            ordinary,
-            "finite, windowed, session, iterator, capture, and ordinary-session APIs stay canonical",
+            ordinary + 1,
+            "iterator, capture, finite refusal, and invalid-window APIs stay canonical",
         );
 
         let capture_cases: &[(&str, &[Option<&str>])] = &[
