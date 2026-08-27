@@ -6262,6 +6262,9 @@ struct RipgrepStandardLiteralContext {
     source: Box<str>,
     admission: AdmissionStatus,
     syntax: ParseSummary,
+    // Authentication already visits every positive literal. Retain its exact
+    // minimum so typed publication does not rescan the complete borrowed set.
+    minimum_match_bytes: usize,
 }
 
 /// Already-derived facade fields moved only into the authenticated large flat
@@ -6747,6 +6750,10 @@ fn build_ripgrep_flat_literal_handoff(
 
 impl RipgrepStandardLiteralContext {
     fn with_hir(self, hir: Hir) -> PortableParsedBuildContext {
+        debug_assert_eq!(
+            hir.properties().minimum_len(),
+            Some(self.minimum_match_bytes),
+        );
         PortableParsedBuildContext {
             source: self.source,
             admission: self.admission,
@@ -7069,6 +7076,7 @@ where
     }
 
     let mut literal_bytes = 0_u64;
+    let mut minimum_match_bytes = usize::MAX;
     let mut source_bytes = if pattern_count >= 2 {
         // The pinned HIR Printer wraps every alternation in `(?:...)` and
         // places one `|` between branches. Since `hir_nodes` is the branch
@@ -7109,6 +7117,7 @@ where
         if bytes_slice.is_empty() {
             return None;
         }
+        minimum_match_bytes = minimum_match_bytes.min(bytes_slice.len());
         let bytes = u64::try_from(bytes_slice.len()).ok()?;
         let next_literal_bytes = literal_bytes.checked_add(bytes)?;
         let unescaped_source_bytes = source_bytes.checked_add(bytes)?;
@@ -7218,6 +7227,7 @@ where
                 largest_finite_repeat: None,
                 guarantees_valid_utf8_nonempty: true,
             },
+            minimum_match_bytes,
         },
         literal_byte_census.map(RipgrepStandardLiteralByteCensusAccumulator::into_census),
     ))
@@ -7997,7 +8007,7 @@ impl PortableBuilder {
         if planner_work > self.limits.max_planner_work {
             return Ok(None);
         }
-        let minimum_match_bytes = patterns.iter().map(|pattern| pattern.len()).min();
+        let minimum_match_bytes = Some(context.minimum_match_bytes);
         let source_storage_bytes = context.source.len();
         let CaptureNameMetadata {
             names: capture_names,
@@ -32419,7 +32429,7 @@ mod tests {
             ".", "[", "]", "(", ")", "{", "}", "*", "+", "?", "|", "^", "$", "\\",
             "-", "&", "~", "#",
         ];
-        let patterns = (0..64)
+        let mut patterns = (0..64)
             .map(|index| {
                 format!(
                     "{}fixed{index:04}é",
@@ -32427,6 +32437,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        patterns[63] = ".".to_owned();
         let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
         let hir = Hir::alternation(
             patterns
@@ -32458,6 +32469,7 @@ mod tests {
 
         assert_eq!(typed.as_str(), owned.as_str());
         assert_eq!(typed.build_report(), owned.build_report());
+        assert_eq!(typed.build_report().minimum_match_bytes, Some(1));
         assert_eq!(
             typed.runtime_implementation_id(),
             owned.runtime_implementation_id(),
