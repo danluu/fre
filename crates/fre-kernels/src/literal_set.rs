@@ -815,6 +815,7 @@ mod ordinary_direct_probe {
         static ROOT_ASCII_CALLS: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
         static SPAN_ASCII_REUSES: Cell<usize> = const { Cell::new(0) };
+        static SPAN_ASCII_DENSE_HANDOFFS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
@@ -832,6 +833,7 @@ mod ordinary_direct_probe {
         ROOT_ASCII_CALLS.set(0);
         ROOT_ASCII_SKIPPED_BYTES.set(0);
         SPAN_ASCII_REUSES.set(0);
+        SPAN_ASCII_DENSE_HANDOFFS.set(0);
     }
 
     pub(super) fn record() {
@@ -939,6 +941,16 @@ mod ordinary_direct_probe {
 
     pub(super) fn span_ascii_reuses() -> usize {
         SPAN_ASCII_REUSES.get()
+    }
+
+    pub(super) fn record_span_ascii_dense_handoff() {
+        SPAN_ASCII_DENSE_HANDOFFS.set(
+            SPAN_ASCII_DENSE_HANDOFFS.get().saturating_add(1),
+        );
+    }
+
+    pub(super) fn span_ascii_dense_handoffs() -> usize {
+        SPAN_ASCII_DENSE_HANDOFFS.get()
     }
 }
 
@@ -3467,6 +3479,8 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                     }
                     previous_end = matched.1;
                     if follows_match_nearby {
+                        #[cfg(test)]
+                        ordinary_direct_probe::record_span_ascii_dense_handoff();
                         while let Some(matched) = scanner.next_span() {
                             match visitor(matched) {
                                 Ok(true) => {}
@@ -3495,6 +3509,8 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                     }
                     previous_end = matched.1;
                     if follows_match_nearby {
+                        #[cfg(test)]
+                        ordinary_direct_probe::record_span_ascii_dense_handoff();
                         while let Some(matched) = scanner.next_span() {
                             match visitor(matched) {
                                 Ok(true) => {}
@@ -9808,6 +9824,7 @@ mod tests {
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 3);
         assert_eq!(ordinary_direct_probe::span_ascii_reuses(), 2);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 0);
 
         // Dense spans stay on the established native route even though the
         // same worker already owns a prepared classifier.
@@ -9833,6 +9850,67 @@ mod tests {
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
         assert_eq!(ordinary_direct_probe::span_ascii_reuses(), 0);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 1);
+
+        // The established two-byte boundary is exact. A third separator
+        // retains root-aware traversal, and callback stop/error on the second
+        // selected span never commits a handoff for an abandoned traversal.
+        let mut spaced = Vec::new();
+        for index in 0..8 {
+            spaced.extend_from_slice(&patterns[(index % ROOT_ASCII_24.len()) * 17]);
+            spaced.extend_from_slice(b"!!!");
+        }
+        ordinary_direct_probe::reset();
+        let mut spaced_spans = 0;
+        assert_eq!(
+            prepared.try_visit_spans_window_value(
+                &spaced,
+                Window::full(&spaced),
+                |_| {
+                    spaced_spans += 1;
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(spaced_spans, 8);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 0);
+
+        ordinary_direct_probe::reset();
+        let mut stopped_spans = 0;
+        assert_eq!(
+            prepared.try_visit_spans_window_value(
+                &dense,
+                Window::full(&dense),
+                |_| {
+                    stopped_spans += 1;
+                    Ok::<bool, ()>(stopped_spans < 2)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(stopped_spans, 2);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 0);
+
+        ordinary_direct_probe::reset();
+        let mut errored_spans = 0;
+        assert_eq!(
+            prepared.try_visit_spans_window_value(
+                &dense,
+                Window::full(&dense),
+                |_| {
+                    errored_spans += 1;
+                    if errored_spans == 2 {
+                        Err("stop")
+                    } else {
+                        Ok(true)
+                    }
+                },
+            ),
+            Ok(Err("stop")),
+        );
+        assert_eq!(errored_spans, 2);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 0);
     }
 
     #[cfg(target_arch = "aarch64")]
