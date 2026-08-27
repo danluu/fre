@@ -53,6 +53,12 @@ const ORDINARY_ROOT_ASCII_MAX_MEMBERS: usize = ASCII_NARROW_BYTES * 3 / 2;
 const ORDINARY_DIRECT_DFA_NATIVE_BYTES: usize = 32;
 const ORDINARY_DIRECT_DFA_BULK_BYTES: usize = 4;
 
+// A near uniform span can use first acceptance without paying a full-tail
+// scan on sparse inputs. Keep the proof inside the direct scanner's existing
+// native prefix and admit the common two-byte separator between dense hits.
+const ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES: usize = ORDINARY_DIRECT_DFA_NATIVE_BYTES;
+const ORDINARY_UNIFORM_SPAN_MAX_GAP_BYTES: usize = 2;
+
 pub(super) const ALPHABET_LEN: usize = 256;
 pub(super) const BYTES_PER_DFA_CELL_ENVELOPE: usize = 16;
 pub(super) const BYTES_PER_TRIE_STATE_ENVELOPE: usize = 256;
@@ -2229,6 +2235,33 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         None
     }
 
+    /// Return a uniform acceptance only when it ends within the bounded near
+    /// prefix. An artificial-edge miss restores the exact semantic restart so
+    /// the incumbent selected-span scanner can replay without losing a match
+    /// that crosses the probe edge.
+    #[inline(always)]
+    fn next_near_uniform_end(&mut self, pattern_bytes: usize) -> Option<usize> {
+        debug_assert!(pattern_bytes <= ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES);
+        let semantic_end = self.end;
+        let probe_end = self
+            .restart
+            .saturating_add(pattern_bytes)
+            .saturating_add(ORDINARY_UNIFORM_SPAN_MAX_GAP_BYTES)
+            .min(semantic_end);
+        if probe_end == semantic_end {
+            return self.next_uniform_end(pattern_bytes);
+        }
+
+        let restart = self.restart;
+        self.end = probe_end;
+        let accepted = self.next_uniform_end(pattern_bytes);
+        self.end = semantic_end;
+        if accepted.is_none() {
+            self.restart = restart;
+        }
+        accepted
+    }
+
     #[inline(always)]
     fn next_span(&mut self) -> Option<(usize, usize)> {
         let restart = self.restart;
@@ -2651,6 +2684,17 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     ) -> Result<Option<(usize, usize)>, LiteralSetError> {
         validate_window(window, haystack.len())?;
         if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
+            if self.is_uniform_positive() {
+                let width = self.plan.build.minimum_pattern_bytes;
+                if width <= ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES {
+                    if let Some(end) = scanner.next_near_uniform_end(width) {
+                        return Ok(Some((end - width, end)));
+                    }
+                    if scanner.restart == scanner.end {
+                        return Ok(None);
+                    }
+                }
+            }
             if !scanner.seek_root_range_for_selected_span() {
                 return Ok(None);
             }
@@ -2795,6 +2839,21 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
         debug_assert!(window.start() <= window.end());
         debug_assert!(window.end() <= haystack.len());
         if let Some(mut scanner) = LiteralSetDfaScanner::new(*self, haystack, window) {
+            if self.is_uniform_positive() {
+                let width = self.plan.build.minimum_pattern_bytes;
+                if width <= ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES {
+                    while let Some(end) = scanner.next_near_uniform_end(width) {
+                        match visitor((end - width, end)) {
+                            Ok(true) => {}
+                            Ok(false) => return Ok(()),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if scanner.restart == scanner.end {
+                        return Ok(());
+                    }
+                }
+            }
             while scanner.seek_root_range_for_selected_span() {
                 let Some(matched) = scanner.next_span() else {
                     break;
@@ -6011,7 +6070,7 @@ mod tests {
         LiteralSetSearchLimits, ORDINARY_DIRECT_DFA_BULK_BYTES,
         ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
         ORDINARY_ROOT_ASCII_MAX_MEMBERS, ORDINARY_ROOT_ASCII_MIN_BYTES,
-        ORDINARY_ROOT_SET4_MIN_BYTES,
+        ORDINARY_ROOT_SET4_MIN_BYTES, ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES,
         decode_direct_dfa_start_state, encode_direct_dfa_start_state,
         direct_dfa_set4_contains, direct_dfa_set4_members_from_buckets,
         first_acceptance_end_for_count, first_acceptance_end_for_span_visit,
@@ -7229,7 +7288,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_uniform_leftmost_count_stops_at_first_possible_acceptance() {
+    fn ordinary_uniform_leftmost_operations_stop_at_first_possible_acceptance() {
         let mut patterns = Vec::new();
         for (root, low, high) in [
             (b'B', b'p', b'q'),
@@ -7282,19 +7341,37 @@ mod tests {
                         else {
                             break;
                         };
-                        expected.push(matched.end());
+                        expected.push((matched.start(), matched.end()));
                         cursor = matched.end();
                     }
 
                     let mut scanner = LiteralSetDfaScanner::new(ordinary, haystack, window)
                         .expect("the direct endpoint scanner is bound");
-                    let mut actual = Vec::new();
+                    let mut actual_ends = Vec::new();
                     while let Some(end) = scanner.next_uniform_end(16) {
-                        actual.push(end);
+                        actual_ends.push(end);
                     }
                     assert_eq!(
-                        actual, expected,
-                        "haystack={haystack:?}, window={window:?}",
+                        actual_ends,
+                        expected.iter().map(|&(_, end)| end).collect::<Vec<_>>(),
+                        "endpoints: haystack={haystack:?}, window={window:?}",
+                    );
+                    assert_eq!(
+                        ordinary.find_window_value(haystack, window),
+                        Ok(expected.first().copied()),
+                        "find: haystack={haystack:?}, window={window:?}",
+                    );
+                    let mut actual_spans = Vec::new();
+                    assert_eq!(
+                        ordinary.try_visit_spans_window_value(haystack, window, |matched| {
+                            actual_spans.push(matched);
+                            Ok::<bool, ()>(true)
+                        }),
+                        Ok(Ok(())),
+                    );
+                    assert_eq!(
+                        actual_spans, expected,
+                        "spans: haystack={haystack:?}, window={window:?}",
                     );
                     assert_eq!(
                         ordinary.count_spans_window_value(haystack, window),
@@ -7304,6 +7381,136 @@ mod tests {
                 }
             }
         }
+
+        let mut stopped = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&dense, Window::full(&dense), |matched| {
+                stopped.push(matched);
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&dense, Window::full(&dense), |_| {
+                Err::<bool, _>("callback")
+            }),
+            Ok(Err("callback")),
+        );
+    }
+
+    #[test]
+    fn ordinary_uniform_near_span_boundaries_match_canonical_all_windows() {
+        fn assert_differential(patterns: &[Vec<u8>], haystacks: &[Vec<u8>]) {
+            let plan = LiteralSetPlan::new(patterns, LiteralSetBuildLimits::default()).unwrap();
+            assert_eq!(plan.automaton.match_kind(), MatchKind::LeftmostFirst);
+            assert!(plan.automaton.prefilter().is_none());
+            let width = patterns[0].len();
+            assert!(width > 0);
+            assert!(patterns.iter().all(|pattern| pattern.len() == width));
+            let ordinary = plan.ordinary_executor().expect("positive ordered executor");
+            assert!(ordinary.direct_count_scanner_supported());
+            assert!(ordinary.is_uniform_positive());
+
+            for haystack in haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = Window::new(start, end);
+                        let mut expected = Vec::new();
+                        let mut cursor = start;
+                        while cursor < end {
+                            let Some(matched) = plan
+                                .automaton
+                                .try_find(&Input::new(haystack).span(cursor..end))
+                                .unwrap()
+                            else {
+                                break;
+                            };
+                            expected.push((matched.start(), matched.end()));
+                            cursor = matched.end();
+                        }
+
+                        assert_eq!(
+                            ordinary.find_window_value(haystack, window),
+                            Ok(expected.first().copied()),
+                            "find: width={width}, haystack={haystack:?}, window={window:?}",
+                        );
+                        let mut actual = Vec::new();
+                        assert_eq!(
+                            ordinary.try_visit_spans_window_value(
+                                haystack,
+                                window,
+                                |matched| {
+                                    actual.push(matched);
+                                    Ok::<bool, ()>(true)
+                                },
+                            ),
+                            Ok(Ok(())),
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "spans: width={width}, haystack={haystack:?}, window={window:?}",
+                        );
+                    }
+                }
+            }
+        }
+
+        let width_one_patterns = (0_u8..=130).map(|byte| vec![byte]).collect::<Vec<_>>();
+        let mut width_one_gap_three = Vec::new();
+        for _ in 0..4 {
+            width_one_gap_three.push(65);
+            width_one_gap_three.extend_from_slice(&[255; 3]);
+        }
+        assert_differential(
+            &width_one_patterns,
+            &[
+                Vec::new(),
+                vec![255; 9],
+                vec![0, 255, 1, 255, 2],
+                width_one_gap_three,
+            ],
+        );
+
+        let mut width_thirty_two_patterns = Vec::new();
+        for (root, low, high) in [
+            (b'B', b'p', b'q'),
+            (b'F', b'r', b's'),
+            (b'J', b't', b'u'),
+            (b'N', b'v', b'w'),
+        ] {
+            for ordinal in 0_u8..17 {
+                let mut pattern = vec![low; ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES];
+                pattern[0] = root;
+                pattern[1] = high;
+                for bit in 0..5 {
+                    pattern[2 + bit] = if ordinal & (1 << bit) == 0 { low } else { high };
+                }
+                width_thirty_two_patterns.push(pattern);
+            }
+        }
+        let first = width_thirty_two_patterns[0].as_slice();
+        let second = width_thirty_two_patterns[51].as_slice();
+        let mut gap_three = Vec::new();
+        gap_three.extend_from_slice(first);
+        gap_three.extend_from_slice(b"xxx");
+        gap_three.extend_from_slice(second);
+        gap_three.extend_from_slice(b"xxx");
+        gap_three.extend_from_slice(first);
+        let mut gap_two = Vec::new();
+        gap_two.extend_from_slice(first);
+        gap_two.extend_from_slice(b"xx");
+        gap_two.extend_from_slice(second);
+        assert_differential(
+            &width_thirty_two_patterns,
+            &[
+                vec![b'!'; 65],
+                b"BxFxJxNx".repeat(9),
+                first.repeat(3),
+                gap_two,
+                gap_three,
+            ],
+        );
     }
 
     #[test]
