@@ -13,6 +13,7 @@ use crate::{
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage,
     DeterminizeLimits, EngineKind, EngineSelectionReason, EntryAbi,
     ExactFiniteGrepCountCompileError, FeatureSet, IndependentExistsBatchCompileError,
+    IndependentSpanFillCompileError,
     PreparedAggregateExports, PreparedAggregateStrategy,
     PreparedBulkStrategy, DirectExistsBatchStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
@@ -20,12 +21,14 @@ use crate::{
     compile,
     compile_with_exact_finite_selected_end_grep_count, compile_with_independent_exists_batch,
     compile_with_independent_matching_lf_line_witness,
+    compile_with_independent_span_fill,
     compile_with_prepared_aggregate_exports, compile_with_slow_aot_limits, emit_object,
     independent_exists_batch_append_outcome, independent_exists_batch_object_outcome,
     independent_exact_singleton_first_candidate_append_outcome,
     independent_exact_singleton_first_candidate_object_outcome,
     independent_matching_lf_line_witness_append_outcome,
     independent_matching_lf_line_witness_object_outcome,
+    independent_span_fill_append_outcome, independent_span_fill_object_outcome,
 };
 use crate::{COMPILER_VERSION, OPTIMIZER_VERSION};
 
@@ -689,6 +692,163 @@ fn independent_exists_batch_allocator_failure_is_terminal_at_both_optional_seams
     ))
     .expect("only final witness ObjectBytes may retain the exact batch incumbent")
     .is_none());
+
+    const SPAN_FILL_APPEND_SITE: &str = "injected direct Span fill append allocation";
+    const SPAN_FILL_OBJECT_SITE: &str = "injected direct Span fill object allocation";
+    assert!(matches!(
+        independent_span_fill_append_outcome(Err(ObjectError::Allocation(
+            SPAN_FILL_APPEND_SITE
+        ))),
+        Err(IndependentSpanFillCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(SPAN_FILL_APPEND_SITE))
+        ))
+    ));
+    assert!(matches!(
+        independent_span_fill_append_outcome(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 63,
+            required: 64,
+        })),
+        Err(IndependentSpanFillCompileError::Compile(
+            CompileError::Object(ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit: 63,
+                required: 64,
+            })
+        ))
+    ));
+    assert!(matches!(
+        independent_span_fill_object_outcome(Err(ObjectError::Allocation(
+            SPAN_FILL_OBJECT_SITE
+        ))),
+        Err(IndependentSpanFillCompileError::Compile(
+            CompileError::Object(ObjectError::Allocation(SPAN_FILL_OBJECT_SITE))
+        ))
+    ));
+    assert!(
+        independent_span_fill_object_outcome(Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit: 63,
+            required: 64,
+        }))
+        .expect("only final Span-fill ObjectBytes may retain the ordinary incumbent")
+        .is_none()
+    );
+}
+
+#[test]
+fn independent_span_fill_is_opt_in_authenticated_and_resource_atomic() {
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let request = CompileRequest::new("Sherlock Holmes", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span);
+        let ordinary = compile(request.clone()).expect("ordinary direct Span artifact");
+        assert!(ordinary.module().prepared_entry_symbol().is_none());
+        assert!(ordinary.module().direct_span_fill_symbol().is_none());
+
+        let filled = compile_with_independent_span_fill(request.clone())
+            .expect("direct Span-fill artifact");
+        let repeated = compile_with_independent_span_fill(request.clone())
+            .expect("deterministic direct Span-fill artifact");
+        assert_eq!(filled.object(), repeated.object());
+        assert_eq!(filled.module(), repeated.module());
+        assert_eq!(filled.receipt(), repeated.receipt());
+        let symbol = filled
+            .module()
+            .direct_span_fill_symbol()
+            .expect("handle-free direct Span-fill symbol");
+        assert!(symbol.starts_with("fre_aot_regex_fill_spans_v1_"));
+        assert!(filled.module().prepared_span_fill_symbol().is_none());
+        assert!(filled.module().required_runtime_symbols().next().is_none());
+        assert_eq!(filled.receipt().passes, ordinary.receipt().passes);
+        assert_eq!(
+            ordinary.program().serialize().expect("ordinary program bytes"),
+            filled.program().serialize().expect("filled program bytes")
+        );
+        assert_eq!(
+            ordinary.receipt().automaton_sha256,
+            filled.receipt().automaton_sha256
+        );
+        assert_eq!(
+            ordinary.receipt().program_sha256,
+            filled.receipt().program_sha256
+        );
+        assert_eq!(ordinary.module().entry_symbol(), filled.module().entry_symbol());
+
+        let ordinary_text = ordinary
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("ordinary text");
+        let filled_text = filled
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::Text)
+            .expect("filled text");
+        let entry = ordinary
+            .module()
+            .symbols()
+            .iter()
+            .find(|entry| entry.name == ordinary.module().entry_symbol())
+            .expect("ordinary entry extent");
+        let entry_start = usize::try_from(entry.offset).expect("entry start");
+        let entry_size = usize::try_from(entry.size).expect("entry size");
+        let entry_end = entry_start.checked_add(entry_size).expect("entry end");
+        assert_eq!(
+            ordinary_text.bytes().get(entry_start..entry_end),
+            filled_text.bytes().get(entry_start..entry_end),
+            "additive Span fill changed the ordinary entry"
+        );
+        let ordinary_data = ordinary
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::ReadOnlyData)
+            .expect("ordinary data");
+        let filled_data = filled
+            .module()
+            .sections()
+            .iter()
+            .find(|section| section.kind == SectionKind::ReadOnlyData)
+            .expect("filled data");
+        assert_eq!(ordinary_data.bytes(), filled_data.bytes());
+
+        let mut limits = CompileLimitsV1::default();
+        limits.max_object_bytes = ordinary.object().len();
+        let capped = compile_with_independent_span_fill(request.limits(limits))
+            .expect("optional Span-fill object-byte decline");
+        assert_eq!(capped.object(), ordinary.object());
+        assert_eq!(capped.module(), ordinary.module());
+        assert_eq!(capped.receipt(), ordinary.receipt());
+        assert!(capped.module().direct_span_fill_symbol().is_none());
+    }
+
+    assert!(matches!(
+        compile_with_independent_span_fill(
+            CompileRequest::new("needle", Target::x86_64_linux())
+                .output(OutputContract::Exists)
+        ),
+        Err(IndependentSpanFillCompileError::RequiresSpan {
+            actual: OutputContract::Exists
+        })
+    ));
+
+    let fast_request = CompileRequest::new("Sherlock Holmes", Target::x86_64_linux())
+        .mode(CompileMode::Fast)
+        .output(OutputContract::Span);
+    let ordinary_fast = compile(fast_request.clone()).expect("ordinary prepared Span artifact");
+    let requested_fast = compile_with_independent_span_fill(fast_request)
+        .expect("prepared Span-fill artifact remains authoritative");
+    assert_eq!(requested_fast.object(), ordinary_fast.object());
+    assert_eq!(requested_fast.module(), ordinary_fast.module());
+    assert_eq!(requested_fast.receipt(), ordinary_fast.receipt());
 }
 
 #[test]

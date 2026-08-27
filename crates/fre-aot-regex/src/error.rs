@@ -182,6 +182,43 @@ impl From<CompileError> for IndependentExistsBatchCompileError {
     }
 }
 
+/// Failure from the opt-in independent Span-fill compiler API.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum IndependentSpanFillCompileError {
+    RequiresSpan {
+        actual: crate::OutputContract,
+    },
+    Compile(CompileError),
+}
+
+impl fmt::Display for IndependentSpanFillCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequiresSpan { actual } => write!(
+                formatter,
+                "independent Span-fill export requires Span output, got {actual:?}"
+            ),
+            Self::Compile(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for IndependentSpanFillCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RequiresSpan { .. } => None,
+            Self::Compile(error) => Some(error),
+        }
+    }
+}
+
+impl From<CompileError> for IndependentSpanFillCompileError {
+    fn from(value: CompileError) -> Self {
+        Self::Compile(value)
+    }
+}
+
 impl From<fre_syntax::ParseError> for CompileError {
     fn from(value: fre_syntax::ParseError) -> Self {
         Self::Syntax(value)

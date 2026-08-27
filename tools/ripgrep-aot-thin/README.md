@@ -58,6 +58,28 @@ This emits only Optimizing/Exists for every selected row. Requests for Fast or
 Span then return a runtime error that names the build policy and available
 variant. Unset, empty, or `all` retains the default four-variant registry.
 
+## Direct Span-fill entries
+
+For an Optimizing/Span artifact backed by a freshly lowered, authenticated
+complete native DFA, the build may add a handle-free
+`direct-span-fill-v1` entry. The entry reuses the compiler's prepared
+Span-iteration loop but dispatches each search directly to the authenticated
+trusted core, so one ABI call refills the adapter's bounded span buffer. Its
+registry description reports
+`bulk=native-direct-trusted-core-loop`. This is a trusted-core loop, not a
+single continuous DFA scan: it preserves the ordinary non-overlapping and
+nullable-match progression by starting a new trusted-core search for each
+match.
+
+The compiler accepts this additive route only for a fresh direct Span module
+whose target, serialized program, program/text sections, entry symbol, native
+bytes, relocations, and trusted core all re-authenticate. A structural decline
+leaves the existing scalar adapter route unchanged; allocator, object, and
+authentication errors remain terminal. The safe adapter validates the
+returned initialized prefix and iterator state before publishing spans, and
+continues to surface a native error only after any valid prefix from that
+refill has been consumed.
+
 ## Opt-in aggregate GrepCount endpoint
 
 An integration that needs only ripgrep's whole-haystack matching-line count

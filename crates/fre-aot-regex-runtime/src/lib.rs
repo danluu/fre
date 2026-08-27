@@ -787,6 +787,22 @@ pub type FreAotRegexExclusiveSpanFillV1 = unsafe extern "C" fn(
     *mut usize,
 ) -> u32;
 
+/// Compiler-produced handle-free Span-fill entry for a self-contained direct
+/// program.
+///
+/// Its state, result-prefix, empty-progress, and status contracts are exactly
+/// those of [`FreAotRegexExclusiveSpanFillV1`], except that no prepared handle
+/// is required. The haystack pointer is nonnull even for an empty haystack and
+/// its length is in the signed address domain.
+pub type FreAotRegexIndependentSpanFillV1 = unsafe extern "C" fn(
+    *const u8,
+    usize,
+    *mut FreAotRegexIterStateV1,
+    *mut FreAotRegexResultV1,
+    usize,
+    *mut usize,
+) -> u32;
+
 /// Compiler-produced Exists-batch entry for one exclusively prepared program.
 ///
 /// Status zero means all independent haystacks were processed. After argument
@@ -10731,6 +10747,7 @@ mod tests {
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ITER_PENDING_EMPTY 2u"));
         assert!(C_API_V1_HEADER.contains("FRE_AOT_REGEX_ITER_FINISHED 4u"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveSpanFillV1"));
+        assert!(C_API_V1_HEADER.contains("FreAotRegexIndependentSpanFillV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExclusiveExistsBatchV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexIndependentExistsBatchV1"));
         assert!(C_API_V1_HEADER.contains("FreAotRegexExactSingletonFirstCandidateV1"));
@@ -10783,6 +10800,10 @@ mod tests {
         );
         assert_eq!(
             size_of::<FreAotRegexExclusiveSpanFillV1>(),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            size_of::<FreAotRegexIndependentSpanFillV1>(),
             size_of::<usize>()
         );
         assert_eq!(

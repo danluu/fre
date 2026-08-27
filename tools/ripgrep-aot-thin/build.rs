@@ -11,6 +11,7 @@ use fre_aot_regex::{
     compile_with_exact_finite_selected_end_grep_count,
     compile_with_independent_exists_batch,
     compile_with_independent_matching_lf_line_witness,
+    compile_with_independent_span_fill,
 };
 use fre_syntax::RustProfile;
 
@@ -123,11 +124,12 @@ fn main() {
         );
     }
     let mut generated = format!(
-        "#[allow(unused_imports, reason = \"a fully declined aggregate-only registry declares no handle-taking symbol\")]\nuse fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\n#[allow(unused_imports, reason = \"additive ABI types are absent unless their explicit build profile is selected\")]\nuse super::{{AbiHaystack, AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, GrepCountSpec, NativeFillOutcome, NativeIterState, PreparedSpanFillFactory, fill_native_spans}};\n\npub(super) const BUILD_VARIANT_POLICY: &str = {:?};\n#[allow(dead_code, reason = \"generated-registry cardinality is checked by the package tests\")]\npub(super) const BUILD_PATTERN_COUNT: usize = {};\n#[allow(dead_code, reason = \"the raw-free manifest-key cardinality is checked by the package tests\")]\npub(super) const BUILD_MANIFEST_PATTERN_COUNT: usize = {manifest_pattern_count};\n\n/// Raw-free identities for every pattern/profile row in the selected manifest.\npub(super) const ALL_MANIFEST_PROFILE_KEYS: &[[u8; 32]] = &[\n{manifest_profile_key_rows}];\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {{\n",
+        "#[allow(unused_imports, reason = \"a fully declined aggregate-only registry declares no handle-taking symbol\")]\nuse fre_aot_regex_runtime::FreAotRegexExclusiveHandleV1;\n\n#[allow(unused_imports, reason = \"additive ABI types are absent unless their explicit build profile is selected\")]\nuse super::{{AbiHaystack, AbiResult, AotMode, AotOutput, BackendFactory, CompiledSpec, DirectSpanFill, GrepCountSpec, NativeFillOutcome, NativeIterState, PreparedSpanFillFactory, fill_direct_spans, fill_native_spans}};\n\npub(super) const BUILD_VARIANT_POLICY: &str = {:?};\n#[allow(dead_code, reason = \"generated-registry cardinality is checked by the package tests\")]\npub(super) const BUILD_PATTERN_COUNT: usize = {};\n#[allow(dead_code, reason = \"the raw-free manifest-key cardinality is checked by the package tests\")]\npub(super) const BUILD_MANIFEST_PATTERN_COUNT: usize = {manifest_pattern_count};\n\n/// Raw-free identities for every pattern/profile row in the selected manifest.\npub(super) const ALL_MANIFEST_PROFILE_KEYS: &[[u8; 32]] = &[\n{manifest_profile_key_rows}];\n\n#[allow(unsafe_code, clippy::unreadable_literal, reason = \"generated declarations for audited FRE AOT object entries\")]\nunsafe extern \"C\" {{\n",
         variant_policy.name(),
         patterns.len(),
     );
     let mut native_fills = String::new();
+    let mut direct_span_fill_rows = String::new();
     let mut rows = String::new();
     let mut grep_count_rows = String::new();
     let mut grep_count_admitted = 0_usize;
@@ -178,16 +180,23 @@ fn main() {
                     .profile(profile)
                     .mode(mode)
                     .output(output);
-                let compiled = if output == OutputContract::Exists {
-                    if ENABLE_MATCHING_LF_LINE_WITNESS
-                        && independent_lf_line_witness_proof.is_some()
-                    {
-                        compile_with_independent_matching_lf_line_witness(request)
-                    } else {
-                        compile_with_independent_exists_batch(request)
+                let compiled = match output {
+                    OutputContract::Exists => {
+                        if ENABLE_MATCHING_LF_LINE_WITNESS
+                            && independent_lf_line_witness_proof.is_some()
+                        {
+                            compile_with_independent_matching_lf_line_witness(request)
+                                .map_err(|error| error.to_string())
+                        } else {
+                            compile_with_independent_exists_batch(request)
+                                .map_err(|error| error.to_string())
+                        }
                     }
-                } else {
-                    compile(request).map_err(IndependentExistsBatchCompileError::from)
+                    OutputContract::Span => compile_with_independent_span_fill(request)
+                        .map_err(|error| error.to_string()),
+                    OutputContract::SelectedEnd => compile(request)
+                        .map_err(IndependentExistsBatchCompileError::from)
+                        .map_err(|error| error.to_string()),
                 }
                 .unwrap_or_else(|error| {
                     panic!(
@@ -230,6 +239,11 @@ fn main() {
                         "exists-batch-v1"
                     }
                     OutputContract::Span
+                        if compiled.module().direct_span_fill_symbol().is_some() =>
+                    {
+                        "direct-span-fill-v1"
+                    }
+                    OutputContract::Span
                         if compiled.module().prepared_span_fill_symbol().is_some() =>
                     {
                         "span-fill-v1"
@@ -251,6 +265,9 @@ fn main() {
                     Some(PreparedBulkStrategy::NativeOrderedNfaLoop) => "native-ordered-nfa-loop",
                     None if compiled.module().direct_exists_batch_symbol().is_some() => {
                         "native-direct-trusted-full-window-loop"
+                    }
+                    None if compiled.module().direct_span_fill_symbol().is_some() => {
+                        "native-direct-trusted-core-loop"
                     }
                     None if has_prepared_entry => "compatibility",
                     None => "none",
@@ -369,11 +386,27 @@ fn main() {
                     .expect("String writes cannot fail");
                     let fill = if output == OutputContract::Span {
                         let fill = format!("fill_{stem}");
-                        writeln!(
-                            &mut native_fills,
-                            "#[allow(unsafe_code, reason = \"generated shim calls its exact compiler-produced AOT entry\")]\nfn {fill}(haystack: &[u8], state: &mut NativeIterState, output: &mut [core::mem::MaybeUninit<AbiResult>]) -> NativeFillOutcome {{\n    // SAFETY: this closure invokes the exact compiler-produced Span entry; status 1 initializes result and no argument is retained.\n    unsafe {{\n        fill_native_spans(haystack, state, output, |haystack, start, result| {{\n            {declaration}(haystack.as_ptr(), haystack.len(), start, haystack.len(), result)\n        }})\n    }}\n}}\n"
-                        )
-                        .expect("String writes cannot fail");
+                        if let Some(symbol) = compiled.module().direct_span_fill_symbol() {
+                            let direct_fill = format!("span_fill_direct_{stem}");
+                            writeln!(
+                                &mut generated,
+                                "    #[link_name = {symbol:?}] fn {direct_fill}(haystack: *const u8, haystack_len: usize, state: *mut NativeIterState, results: *mut AbiResult, capacity: usize, written: *mut usize) -> u32;",
+                            )
+                            .expect("String writes cannot fail");
+                            writeln!(&mut direct_span_fill_rows, "    {direct_fill},")
+                                .expect("String writes cannot fail");
+                            writeln!(
+                                &mut native_fills,
+                                "fn {fill}(haystack: &[u8], state: &mut NativeIterState, output: &mut [core::mem::MaybeUninit<AbiResult>]) -> NativeFillOutcome {{\n    fill_direct_spans({direct_fill}, haystack, state, output)\n}}\n"
+                            )
+                            .expect("String writes cannot fail");
+                        } else {
+                            writeln!(
+                                &mut native_fills,
+                                "#[allow(unsafe_code, reason = \"generated shim calls its exact compiler-produced AOT entry\")]\nfn {fill}(haystack: &[u8], state: &mut NativeIterState, output: &mut [core::mem::MaybeUninit<AbiResult>]) -> NativeFillOutcome {{\n    // SAFETY: this closure invokes the exact compiler-produced Span entry; status 1 initializes result and no argument is retained.\n    unsafe {{\n        fill_native_spans(haystack, state, output, |haystack, start, result| {{\n            {declaration}(haystack.as_ptr(), haystack.len(), start, haystack.len(), result)\n        }})\n    }}\n}}\n"
+                            )
+                            .expect("String writes cannot fail");
+                        }
                         format!("Some({fill})")
                     } else {
                         "None".to_owned()
@@ -543,6 +576,11 @@ fn main() {
         }
     }
     generated.push_str("}\n\n");
+    generated.push_str(
+        "#[cfg(test)]\n#[allow(dead_code, reason = \"the raw direct Span ABI is exercised only by package tests\")]\npub(super) const DIRECT_SPAN_FILL_ENTRIES: &[DirectSpanFill] = &[\n",
+    );
+    generated.push_str(&direct_span_fill_rows);
+    generated.push_str("];\n\n");
     generated.push_str(&native_fills);
     generated.push_str(
         "\n#[allow(unsafe_code, reason = \"generated registry borrows exact immutable program symbols from linked compiler objects\")]\npub(super) const SPECS: &[CompiledSpec] = &[\n",

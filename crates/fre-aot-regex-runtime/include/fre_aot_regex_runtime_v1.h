@@ -109,6 +109,20 @@ typedef uint32_t (*FreAotRegexExclusiveSpanFillV1)(
     size_t *written_out);
 
 /*
+ * Handle-free counterpart for a self-contained direct Span program. State,
+ * result-prefix, empty-progress, and status semantics are identical to
+ * FreAotRegexExclusiveSpanFillV1. haystack_ptr is nonnull even for an empty
+ * haystack and haystack_len is in the signed address domain.
+ */
+typedef uint32_t (*FreAotRegexIndependentSpanFillV1)(
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    FreAotRegexIterStateV1 *state,
+    FreAotRegexResultV1 *results,
+    size_t capacity,
+    size_t *written_out);
+
+/*
  * Additive compiler-produced Exists batch for independent haystacks. Status
  * 0 means every input was processed. processed_out is required and counts
  * initialized output bytes; each initialized byte is exactly 0 or 1. A zero

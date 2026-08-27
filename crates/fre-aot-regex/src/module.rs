@@ -3921,6 +3921,7 @@ pub struct CompiledModule {
     prepared_entry_symbol_index: Option<usize>,
     prepared_span_fill_symbol_index: Option<usize>,
     prepared_exists_batch_symbol_index: Option<usize>,
+    direct_span_fill_symbol_index: Option<usize>,
     direct_exists_batch_symbol_index: Option<usize>,
     direct_exists_batch_surface_seal: Option<NativeDirectExistsBatchSurfaceSeal>,
     direct_exact_singleton_first_candidate: Option<(usize, ExactSingletonFirstCandidateAotReport)>,
@@ -4125,6 +4126,9 @@ const PREPARED_SPAN_FILL_SYMBOL_PREFIX: &str =
     "fre_aot_regex_fill_spans_exclusive_v1_";
 const PREPARED_EXISTS_BATCH_SYMBOL_PREFIX: &str =
     "fre_aot_regex_is_match_batch_exclusive_v1_";
+const DIRECT_SPAN_FILL_SYMBOL_PREFIX: &str = "fre_aot_regex_fill_spans_v1_";
+const DIRECT_SPAN_FILL_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/direct-span-fill-trusted-core-v1\0";
 const DIRECT_EXISTS_BATCH_SYMBOL_PREFIX: &str = "fre_aot_regex_is_match_batch_v1_";
 const DIRECT_EXISTS_BATCH_IDENTITY_DOMAIN: &[u8] =
     b"fre-aot-regex/direct-exists-batch-trusted-full-window-v2\0";
@@ -9846,6 +9850,7 @@ impl CompiledModule {
             prepared_entry_symbol_index,
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
+            direct_span_fill_symbol_index: None,
             direct_exists_batch_symbol_index: None,
             direct_exists_batch_surface_seal: None,
             direct_exact_singleton_first_candidate: None,
@@ -10822,6 +10827,21 @@ impl CompiledModule {
     #[must_use]
     pub fn prepared_exists_batch_symbol(&self) -> Option<&str> {
         self.prepared_exists_batch_symbol_index
+            .and_then(|index| self.symbols.get(index))
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return the handle-free stateful Span-buffer entry, when explicitly
+    /// requested for a self-contained direct Span program.
+    ///
+    /// The returned symbol has the
+    /// `FreAotRegexIndependentSpanFillV1` ABI from `fre-aot-regex-runtime`.
+    /// It validates the raw iterator boundary once per refill and loops over
+    /// the independently authenticated private core of the ordinary entry.
+    /// The ordinary scalar entry and its ABI remain unchanged.
+    #[must_use]
+    pub fn direct_span_fill_symbol(&self) -> Option<&str> {
+        self.direct_span_fill_symbol_index
             .and_then(|index| self.symbols.get(index))
             .map(|symbol| symbol.name.as_str())
     }
@@ -11848,6 +11868,327 @@ impl CompiledModule {
         Ok(Some(self))
     }
 
+
+    /// Append one handle-free stateful Span-fill loop to a fresh,
+    /// self-contained direct Span module.
+    ///
+    /// Every ordinary entry, table, relocation, and trusted-core fact is
+    /// independently re-authenticated before the existing compiler-generated
+    /// prepared fill body is retargeted to that core. Prepared, runtime-backed,
+    /// already-extended, and trusted-core-ineligible modules return `None` or
+    /// fail closed according to whether the surface is absent or
+    /// contradictory.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "surface authentication, wrapper patching, identity, and publication form one failure-atomic transaction"
+    )]
+    pub(crate) fn append_direct_span_fill(
+        mut self,
+        output: OutputContract,
+    ) -> Result<Option<Self>, ObjectError> {
+        if output != OutputContract::Span
+            || self.prepared_entry_symbol_index.is_some()
+            || self.prepared_bulk_strategy.is_some()
+            || self.native_prepared_bulk_search_target.is_some()
+            || self.ordered_nfa_bulk_gate_target.is_some()
+            || self.runtime_symbol_index.is_some()
+            || self.runtime_program_symbol_index.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(trusted_core) = self.native_direct_search_trusted_core else {
+            return Ok(None);
+        };
+        if self.entry_symbol_index != ENTRY_SYMBOL
+            || self.sections.len() != 2
+            || self.symbols.len() != 2
+            || self.native_complete_span_reduce_source.is_some()
+            || self.native_complete_span_reduce_core.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Span fill target is not a fresh canonical module",
+            ));
+        }
+        if self.direct_span_fill_symbol_index.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "direct Span fill was appended more than once",
+            ));
+        }
+        if self.prepared_span_fill_symbol_index.is_some()
+            || self.prepared_exists_batch_symbol_index.is_some()
+            || self.direct_exists_batch_symbol_index.is_some()
+            || self.direct_exists_batch_surface_seal.is_some()
+            || self.direct_exact_singleton_first_candidate.is_some()
+            || self.direct_matching_lf_line_witness.is_some()
+            || self.prepared_count_symbol_index.is_some()
+            || self.prepared_span_sum_symbol_index.is_some()
+            || self.prepared_grep_count_symbol_index.is_some()
+            || !self.prepared_aggregate_exports.is_empty()
+            || self.prepared_aggregate_strategy.is_some()
+            || self.required_prepare_capabilities != 0
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Span fill overlaps another additive surface",
+            ));
+        }
+        let has_unresolved_function_dependency = self
+            .symbols
+            .iter()
+            .enumerate()
+            .any(|(index, symbol)| {
+                symbol.section.is_none()
+                    && symbol.binding == SymbolBinding::Global
+                    && symbol.kind == SymbolKind::Function
+                    && self
+                        .relocations
+                        .iter()
+                        .any(|relocation| relocation.symbol == index)
+            });
+        if has_unresolved_function_dependency {
+            return Ok(None);
+        }
+        if trusted_core.output != OutputContract::Span
+            || trusted_core.entry_contract != NativeDirectSearchEntryContract::PublicCompleteV1
+            || trusted_core.result_abi != NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
+            || trusted_core.landmark != NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Span fill trusted-core contract is incompatible",
+            ));
+        }
+
+        let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("direct Span fill entry index is invalid"),
+        )?;
+        let entry_start = usize::try_from(entry.offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("direct Span fill entry offset"))?;
+        let entry_size = usize::try_from(entry.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("direct Span fill entry size"))?;
+        let entry_end = entry_start
+            .checked_add(entry_size)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Span fill entry extent",
+            ))?;
+        let text = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Span fill module has no text section",
+            ))?;
+        let text_len = text.data.len();
+        if text.name != ".text"
+            || text.kind != SectionKind::Text
+            || text.alignment != NATIVE_TEXT_LINK_ALIGNMENT_BYTES
+            || entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_start != 0
+            || entry_size == 0
+            || entry_end != text_len
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Span fill target is not a fresh complete text function",
+            ));
+        }
+        let program = self
+            .sections
+            .get(PROGRAM_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Span fill module has no program section",
+            ))?;
+        let serialized_program_identity = self.serialized_program_identity.ok_or(
+            ObjectError::InvalidModule("direct Span fill serialized identity is absent"),
+        )?;
+        let program_symbol = self.symbols.get(PROGRAM_SYMBOL).ok_or(
+            ObjectError::InvalidModule("direct Span fill program symbol is absent"),
+        )?;
+        let program_symbol_bytes = usize::try_from(program_symbol.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("direct Span fill program symbol size")
+        })?;
+        let expected_program_name = identity_symbol(
+            PROGRAM_SYMBOL_PREFIX,
+            &serialized_program_identity.sha256,
+        )?;
+        if program.name != ".rodata.fre.regex"
+            || program.kind != SectionKind::ReadOnlyData
+            || program.alignment != 16
+            || program.data.is_empty()
+            || serialized_program_identity.bytes < crate::PROGRAM_HEADER_LEN
+            || program_symbol.name != expected_program_name
+            || program_symbol.binding != SymbolBinding::Local
+            || program_symbol.kind != SymbolKind::Object
+            || program_symbol.section != Some(PROGRAM_SECTION)
+            || program_symbol.offset != 0
+            || program_symbol_bytes != program.data.len()
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Span fill program surface is inconsistent",
+            ));
+        }
+        let native_surface = self.native_direct_search_module_surface_seal.ok_or(
+            ObjectError::InvalidModule("direct Span fill native surface seal is absent"),
+        )?;
+        let relocations_sha256 = exact_finite_selected_end_relocation_digest(&self.relocations)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Span fill relocation digest is absent",
+            ))?;
+        let expected_entry_name =
+            identity_symbol(ENTRY_SYMBOL_PREFIX, &native_surface.native_module_identity)?;
+        if native_surface.target != self.target
+            || native_surface.serialized_program_identity != serialized_program_identity
+            || native_surface.native_data_bytes != program.data.len()
+            || native_surface.native_data_sha256
+                != <[u8; 32]>::from(Sha256::digest(&program.data))
+            || native_surface.relocations_sha256 != relocations_sha256
+            || entry.name != expected_entry_name
+        {
+            return Err(ObjectError::InvalidModule(
+                "direct Span fill native surface changed after authentication",
+            ));
+        }
+        authenticate_native_direct_search_trusted_program_surface(
+            program,
+            &self.symbols,
+            trusted_core,
+        )?;
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &text.data,
+            entry_start,
+            entry_end,
+            &program.data,
+            &self.relocations,
+            trusted_core,
+            OutputContract::Span,
+        )?;
+
+        let entry_name_digest: [u8; 32] = Sha256::digest(entry.name.as_bytes()).into();
+        let wrapper = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_direct_span_fill(trusted_core.prologue)?,
+            Architecture::Aarch64 => lower_aarch64_direct_span_fill(trusted_core.prologue)?,
+        };
+        let alignment_mask = match self.target.architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let code_offset = text_len
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Span fill entry alignment",
+            ))?
+            & !alignment_mask;
+        let final_text_len = code_offset
+            .checked_add(wrapper.code.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Span fill entry extent",
+            ))?;
+
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("direct Span fill text"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(code_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < code_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &wrapper.code)?;
+        let body_call_offset = code_offset
+            .checked_add(wrapper.body_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Span fill body-call offset",
+            ))?;
+        let body_offset = code_offset.checked_add(wrapper.body_offset).ok_or(
+            ObjectError::ArithmeticOverflow("direct Span fill body offset"),
+        )?;
+        let search_call_offset = code_offset
+            .checked_add(wrapper.search_call_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Span fill search-call offset",
+            ))?;
+        let adapter_offset = code_offset.checked_add(wrapper.adapter_offset).ok_or(
+            ObjectError::ArithmeticOverflow("direct Span fill adapter offset"),
+        )?;
+        let core_jump_offset = code_offset
+            .checked_add(wrapper.core_jump_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "direct Span fill core-jump offset",
+            ))?;
+        match self.target.architecture {
+            Architecture::X86_64 => {
+                patch_x86_64_local_call(&mut text, body_call_offset, body_offset)?;
+                patch_x86_64_local_call(&mut text, search_call_offset, adapter_offset)?;
+                patch_x86_64_local_jump(
+                    &mut text,
+                    core_jump_offset,
+                    trusted_core.code_offset,
+                )?;
+            }
+            Architecture::Aarch64 => {
+                patch_aarch64_local_call(&mut text, body_call_offset, body_offset)?;
+                patch_aarch64_local_call(&mut text, search_call_offset, adapter_offset)?;
+                patch_aarch64_local_branch(
+                    &mut text,
+                    core_jump_offset,
+                    trusted_core.code_offset,
+                )?;
+            }
+        }
+
+        let wrapper_bytes = text.get(code_offset..final_text_len).ok_or(
+            ObjectError::InvalidModule("direct Span fill wrapper is outside final text"),
+        )?;
+        let mut fill_identity = Sha256::new();
+        fill_identity.update(DIRECT_SPAN_FILL_IDENTITY_DOMAIN);
+        fill_identity.update(entry_name_digest);
+        fill_identity.update(native_surface.native_module_identity);
+        fill_identity.update(
+            u64::try_from(trusted_core.code_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("direct Span fill identity call target")
+                })?
+                .to_le_bytes(),
+        );
+        fill_identity.update([trusted_core.prologue.identity_tag()]);
+        fill_identity.update(
+            u64::try_from(code_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("direct Span fill identity code offset")
+                })?
+                .to_le_bytes(),
+        );
+        fill_identity.update(wrapper_bytes);
+        let fill_name = identity_symbol(
+            DIRECT_SPAN_FILL_SYMBOL_PREFIX,
+            &<[u8; 32]>::from(fill_identity.finalize()),
+        )?;
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        symbols
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("direct Span fill symbol"))?;
+        let fill_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: fill_name,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: u64::try_from(code_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct Span fill code offset")
+            })?,
+            size: u64::try_from(wrapper.code.len()).map_err(|_| {
+                ObjectError::ArithmeticOverflow("direct Span fill code size")
+            })?,
+        });
+        self.symbols = symbols.into_boxed_slice();
+        self.direct_span_fill_symbol_index = Some(fill_symbol_index);
+        Ok(Some(self))
+    }
 
     /// Append a handle-free independent-haystack Exists loop only to a
     /// complete self-contained direct module. Prepared and runtime-backed
@@ -12978,6 +13319,11 @@ impl CompiledModule {
     ) -> Result<Self, ObjectError> {
         if exports.is_empty() {
             return Ok(self);
+        }
+        if self.direct_span_fill_symbol_index.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "prepared aggregate exports overlap a direct Span fill",
+            ));
         }
         if !self.prepared_aggregate_exports.is_empty()
             || self.prepared_count_symbol_index.is_some()
@@ -17901,6 +18247,17 @@ struct NativeDirectExistsBatchWrapper {
     code: Vec<u8>,
     search_call_offset: usize,
     trampoline_offset: usize,
+    core_jump_offset: usize,
+}
+
+/// Handle-free entry thunk, established Span-fill body, and the private
+/// prepared-search-to-direct-core adapter emitted as one additive text suffix.
+struct NativeDirectSpanFillWrapper {
+    code: Vec<u8>,
+    body_call_offset: usize,
+    body_offset: usize,
+    search_call_offset: usize,
+    adapter_offset: usize,
     core_jump_offset: usize,
 }
 
@@ -37236,6 +37593,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_span_fill_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -37582,6 +37940,7 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_span_fill_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -38110,6 +38469,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_span_fill_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -38278,6 +38638,7 @@ fn native_regex_redux_module(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_span_fill_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -38639,6 +39000,7 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_span_fill_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -38761,6 +39123,7 @@ fn native_weighted_capture_module(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_span_fill_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -39226,6 +39589,7 @@ fn native_rebar_multi_grep_module_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_span_fill_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -39481,6 +39845,7 @@ fn native_rebar_row_scalar_module_v1(
         prepared_entry_symbol_index: None,
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
+        direct_span_fill_symbol_index: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -56598,6 +56963,136 @@ fn lower_x86_64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Obj
     })
 }
 
+/// Compose the established prepared Span-fill loop with a handle-free public
+/// thunk and a private adapter into one authenticated direct-core wrapper.
+///
+/// The fill body owns raw state validation, nullable progress, span
+/// validation, prefix publication, and every return status. Its sole search
+/// call is retargeted to the adapter, which recreates the ordinary entry's
+/// post-validation register/flags state and callee-save frame before jumping
+/// to the authenticated direct Span core.
+fn lower_x86_64_direct_span_fill(
+    prologue: NativeDirectSearchTrustedCorePrologue,
+) -> Result<NativeDirectSpanFillWrapper, ObjectError> {
+    let (save_rbx, save_r12_r13, save_r14_r15) = match prologue {
+        NativeDirectSearchTrustedCorePrologue::X86_64 {
+            save_rbx,
+            save_r12_r13,
+            save_r14_r15,
+        } => (save_rbx, save_r12_r13, save_r14_r15),
+        NativeDirectSearchTrustedCorePrologue::X86_64SelfFramed
+        | NativeDirectSearchTrustedCorePrologue::Aarch64
+        | NativeDirectSearchTrustedCorePrologue::Aarch64SelfFramed => {
+            return Err(ObjectError::InvalidModule(
+                "x86 direct Span fill has an incompatible trusted core",
+            ));
+        }
+    };
+    if save_r14_r15 && !save_r12_r13 {
+        return Err(ObjectError::InvalidModule(
+            "x86 direct Span fill has an impossible save mask",
+        ));
+    }
+
+    let body = lower_x86_64_prepared_span_fill_impl(false, false)?;
+    if body.ordered_nfa_gate_call_offset.is_some()
+        || body.bulk_runtime_fallback_offset.is_some()
+        || body.compatibility_identity_relocation.is_some()
+        || body.identity_relocation.is_some()
+        || body.authenticated_body_offset.is_some()
+        || body.trusted_core.is_some()
+        || body.trusted_core_trampoline_offset.is_some()
+        || body.trusted_core_jump_offset.is_some()
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct Span fill retained an incompatible prepared surface",
+        ));
+    }
+
+    // Direct ABI: (haystack, length, state, results, capacity, written).
+    // Push `written` as the prepared body's seventh argument. At a SysV
+    // function entry RSP is 8 mod 16, so this also aligns the local call.
+    let mut thunk = X86Assembler::new();
+    thunk.instruction(&[0x41, 0x51])?; // push r9
+    thunk.instruction(&[0x4d, 0x89, 0xc1])?; // r9 = capacity
+    thunk.instruction(&[0x49, 0x89, 0xc8])?; // r8 = results
+    thunk.instruction(&[0x48, 0x89, 0xd1])?; // rcx = state
+    thunk.instruction(&[0x48, 0x89, 0xf2])?; // rdx = length
+    thunk.instruction(&[0x48, 0x89, 0xfe])?; // rsi = haystack
+    thunk.instruction(&[0xbf, 1, 0, 0, 0])?; // nonnull synthetic handle
+    thunk.instruction(&[0xe8])?;
+    let body_call = thunk.label()?;
+    thunk.bind(body_call)?;
+    push_bytes(&mut thunk.code, &[0; 4])?;
+    thunk.instruction(&[0x48, 0x83, 0xc4, 0x08])?;
+    thunk.instruction(&[0xc3])?;
+    let finished_thunk = thunk.finish_with_label_offsets()?;
+    let body_call_offset = finished_thunk.label_offset(body_call)?;
+    let mut code = finished_thunk.code;
+
+    while !code.len().is_multiple_of(16) {
+        push_bytes(&mut code, &[0x90])?;
+    }
+    let body_offset = code.len();
+    let search_call_offset = body_offset
+        .checked_add(body.prepared_call_offset)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "direct Span fill search-call offset",
+        ))?;
+    push_bytes(&mut code, &body.code)?;
+
+    while !code.len().is_multiple_of(16) {
+        push_bytes(&mut code, &[0x90])?;
+    }
+    let adapter_offset = code.len();
+    let mut adapter = X86Assembler::new();
+    // Prepared-search ABI:
+    // (handle, haystack, length, start, end, result, private_session).
+    // Direct trusted-core ABI:
+    // (haystack, length, start, end, result).
+    adapter.instruction(&[0x48, 0x89, 0xf7])?; // rdi = haystack
+    adapter.instruction(&[0x48, 0x89, 0xd6])?; // rsi = length
+    adapter.instruction(&[0x48, 0x89, 0xca])?; // rdx = start
+    adapter.instruction(&[0x4c, 0x89, 0xc1])?; // rcx = end
+    adapter.instruction(&[0x4d, 0x89, 0xc8])?; // r8 = result
+    if save_rbx {
+        adapter.instruction(&[0x53])?;
+    }
+    if save_r12_r13 {
+        adapter.instruction(&[0x41, 0x54])?;
+        adapter.instruction(&[0x41, 0x55])?;
+    }
+    if save_r14_r15 {
+        adapter.instruction(&[0x41, 0x56])?;
+        adapter.instruction(&[0x41, 0x57])?;
+    }
+    // The public entry's last pre-core state is EAX=0/ZF=1 after result
+    // initialization. A fill never publishes the current slot on miss, while
+    // the authenticated Span result ABI writes both words on every hit, so
+    // repeating the register/flags effect is sufficient here.
+    adapter.instruction(&[0x31, 0xc0])?;
+    adapter.instruction(&[0xe9])?;
+    let core_jump = adapter.label()?;
+    adapter.bind(core_jump)?;
+    push_bytes(&mut adapter.code, &[0; 4])?;
+    let finished_adapter = adapter.finish_with_label_offsets()?;
+    let core_jump_offset = adapter_offset
+        .checked_add(finished_adapter.label_offset(core_jump)?)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "direct Span fill core-jump offset",
+        ))?;
+    push_bytes(&mut code, &finished_adapter.code)?;
+
+    Ok(NativeDirectSpanFillWrapper {
+        code,
+        body_call_offset,
+        body_offset,
+        search_call_offset,
+        adapter_offset,
+        core_jump_offset,
+    })
+}
+
 fn lower_x86_64_direct_exists_batch(
     prologue: NativeDirectSearchTrustedCorePrologue,
 ) -> Result<NativeDirectExistsBatchWrapper, ObjectError> {
@@ -59596,6 +60091,98 @@ fn lower_aarch64_prepared_exists_batch() -> Result<NativePreparedBulkWrapper, Ob
         trusted_core: None,
         trusted_core_trampoline_offset: None,
         trusted_core_jump_offset: None,
+    })
+}
+
+fn lower_aarch64_direct_span_fill(
+    prologue: NativeDirectSearchTrustedCorePrologue,
+) -> Result<NativeDirectSpanFillWrapper, ObjectError> {
+    if prologue != NativeDirectSearchTrustedCorePrologue::Aarch64 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Span fill has an incompatible trusted core",
+        ));
+    }
+    let body = lower_aarch64_prepared_span_fill_impl(false, false)?;
+    if body.ordered_nfa_gate_call_offset.is_some()
+        || body.bulk_runtime_fallback_offset.is_some()
+        || body.compatibility_identity_relocation.is_some()
+        || body.identity_relocation.is_some()
+        || body.authenticated_body_offset.is_some()
+        || body.trusted_core.is_some()
+        || body.trusted_core_trampoline_offset.is_some()
+        || body.trusted_core_jump_offset.is_some()
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct Span fill retained an incompatible prepared surface",
+        ));
+    }
+
+    // Direct ABI: (haystack, length, state, results, capacity, written).
+    // Save the incoming LR in a naturally aligned one-word frame, then shift
+    // the arguments into the established seven-register prepared-fill ABI.
+    let mut thunk = Aarch64Assembler::new();
+    thunk.instruction(aarch64_sub_x_imm(31, 31, 16)?)?;
+    thunk.instruction(aarch64_store_x(30, 31, 0)?)?;
+    thunk.instruction(aarch64_mov_x(6, 5)?)?;
+    thunk.instruction(aarch64_mov_x(5, 4)?)?;
+    thunk.instruction(aarch64_mov_x(4, 3)?)?;
+    thunk.instruction(aarch64_mov_x(3, 2)?)?;
+    thunk.instruction(aarch64_mov_x(2, 1)?)?;
+    thunk.instruction(aarch64_mov_x(1, 0)?)?;
+    thunk.instruction(aarch64_movz_x(0, 1, 0)?)?;
+    let body_call = thunk.instruction(0x9400_0000)?;
+    thunk.instruction(aarch64_load_x_imm(30, 31, 0)?)?;
+    thunk.instruction(aarch64_add_x_imm(31, 31, 16)?)?;
+    thunk.instruction(0xd65f_03c0)?;
+    let mut thunk_offsets = [body_call];
+    let mut code = thunk.finish_with_offsets(&mut thunk_offsets)?;
+    let body_call_offset = thunk_offsets[0];
+
+    if !code.len().is_multiple_of(4) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Span fill thunk is misaligned",
+        ));
+    }
+    let body_offset = code.len();
+    let search_call_offset = body_offset
+        .checked_add(body.prepared_call_offset)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "direct Span fill search-call offset",
+        ))?;
+    push_bytes(&mut code, &body.code)?;
+
+    if !code.len().is_multiple_of(4) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 direct Span fill body is misaligned",
+        ));
+    }
+    let adapter_offset = code.len();
+    let mut adapter = Aarch64Assembler::new();
+    adapter.instruction(aarch64_mov_x(0, 1)?)?;
+    adapter.instruction(aarch64_mov_x(1, 2)?)?;
+    adapter.instruction(aarch64_mov_x(2, 3)?)?;
+    adapter.instruction(aarch64_mov_x(3, 4)?)?;
+    adapter.instruction(aarch64_mov_x(4, 5)?)?;
+    // Recreate the final flags state left by public argument validation; the
+    // public result-zero stores that follow it do not alter NZCV.
+    adapter.instruction(0xf100_001f)?; // cmp x0, #0
+    let core_jump = adapter.instruction(0x1400_0000)?;
+    let mut adapter_offsets = [core_jump];
+    let adapter_code = adapter.finish_with_offsets(&mut adapter_offsets)?;
+    let core_jump_offset = adapter_offset
+        .checked_add(adapter_offsets[0])
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "direct Span fill core-jump offset",
+        ))?;
+    push_bytes(&mut code, &adapter_code)?;
+
+    Ok(NativeDirectSpanFillWrapper {
+        code,
+        body_call_offset,
+        body_offset,
+        search_call_offset,
+        adapter_offset,
+        core_jump_offset,
     })
 }
 
@@ -88427,6 +89014,229 @@ mod tests {
         let signed_words = (immediate << 38) >> 38;
         let source = i64::try_from(instruction_offset).expect("AArch64 source offset");
         usize::try_from(source + signed_words * 4).expect("AArch64 branch target")
+    }
+
+    #[test]
+    fn direct_span_fill_calls_only_an_authenticated_trusted_core() {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let ordinary = compile(
+                CompileRequest::new("Sherlock Holmes", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile direct Span control");
+            let trusted_core = ordinary
+                .module()
+                .native_direct_search_trusted_core
+                .expect("direct Span trusted core");
+            let appended = ordinary
+                .module()
+                .clone()
+                .append_direct_span_fill(OutputContract::Span)
+                .expect("append direct Span fill")
+                .expect("eligible direct Span fill");
+            let serialized = ordinary
+                .program()
+                .serialize()
+                .expect("serialize direct Span control");
+            assert!(matches!(
+                appended.clone().append_prepared_aggregate_exports(
+                    PreparedAggregateExports::COUNT,
+                    ordinary.program().artifact_identity(),
+                    &serialized,
+                ),
+                Err(ObjectError::InvalidModule(
+                    "prepared aggregate exports overlap a direct Span fill"
+                ))
+            ));
+            let fill_index = appended
+                .direct_span_fill_symbol_index
+                .expect("direct Span-fill symbol index");
+            let fill = &appended.symbols[fill_index];
+            let fill_start = usize::try_from(fill.offset).expect("fill start");
+            let wrapper = match target.architecture {
+                Architecture::X86_64 => lower_x86_64_direct_span_fill(trusted_core.prologue),
+                Architecture::Aarch64 => lower_aarch64_direct_span_fill(trusted_core.prologue),
+            }
+            .expect("lower authenticated Span-fill wrapper shape");
+            assert_eq!(
+                usize::try_from(fill.size).expect("fill size"),
+                wrapper.code.len()
+            );
+            assert!(fill.name.starts_with(DIRECT_SPAN_FILL_SYMBOL_PREFIX));
+            let text = appended.sections[TEXT_SECTION].bytes();
+
+            match target.architecture {
+                Architecture::X86_64 => {
+                    for (call, target) in [
+                        (wrapper.body_call_offset, wrapper.body_offset),
+                        (wrapper.search_call_offset, wrapper.adapter_offset),
+                    ] {
+                        let call = fill_start + call;
+                        assert_eq!(text[call - 1], 0xe8);
+                        let displacement = i64::from(i32::from_le_bytes(
+                            text[call..call + 4]
+                                .try_into()
+                                .expect("x86 call displacement"),
+                        ));
+                        let actual = usize::try_from(
+                            i64::try_from(call + 4).expect("x86 call source") + displacement,
+                        )
+                        .expect("x86 call target");
+                        assert_eq!(actual, fill_start + target);
+                    }
+                    let jump = fill_start + wrapper.core_jump_offset;
+                    assert_eq!(text[jump - 1], 0xe9);
+                    let displacement = i64::from(i32::from_le_bytes(
+                        text[jump..jump + 4]
+                            .try_into()
+                            .expect("x86 core-jump displacement"),
+                    ));
+                    let target = usize::try_from(
+                        i64::try_from(jump + 4).expect("x86 jump source") + displacement,
+                    )
+                    .expect("x86 jump target");
+                    assert_eq!(target, trusted_core.code_offset);
+                }
+                Architecture::Aarch64 => {
+                    assert_eq!(
+                        aarch64_direct_branch_target(
+                            text,
+                            fill_start + wrapper.body_call_offset,
+                        ),
+                        fill_start + wrapper.body_offset,
+                    );
+                    assert_eq!(
+                        aarch64_direct_branch_target(
+                            text,
+                            fill_start + wrapper.search_call_offset,
+                        ),
+                        fill_start + wrapper.adapter_offset,
+                    );
+                    assert_eq!(
+                        aarch64_direct_branch_target(
+                            text,
+                            fill_start + wrapper.core_jump_offset,
+                        ),
+                        trusted_core.code_offset,
+                    );
+                    let adapter = fill_start + wrapper.adapter_offset;
+                    let cmp = fill_start + wrapper.core_jump_offset - 4;
+                    assert_eq!(
+                        text.get(cmp..cmp + 4),
+                        Some(0xf100_001f_u32.to_le_bytes().as_slice()),
+                    );
+                    assert!(cmp >= adapter);
+                }
+            }
+
+            let mut forged_program_name = ordinary.module().clone();
+            forged_program_name.symbols[PROGRAM_SYMBOL].name.push_str("_forged");
+            assert!(forged_program_name
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_entry_index = ordinary.module().clone();
+            let copied_entry = forged_entry_index.symbols[ENTRY_SYMBOL].clone();
+            let mut copied_symbols = forged_entry_index.symbols.into_vec();
+            copied_symbols.push(copied_entry);
+            forged_entry_index.symbols = copied_symbols.into_boxed_slice();
+            forged_entry_index.entry_symbol_index = 2;
+            assert!(forged_entry_index
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_extra_section = ordinary.module().clone();
+            let copied_section = forged_extra_section.sections[PROGRAM_SECTION].clone();
+            let mut copied_sections = forged_extra_section.sections.into_vec();
+            copied_sections.push(copied_section);
+            forged_extra_section.sections = copied_sections.into_boxed_slice();
+            assert!(forged_extra_section
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_text_name = ordinary.module().clone();
+            forged_text_name.sections[TEXT_SECTION].name = ".text.forged";
+            assert!(forged_text_name
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_text_kind = ordinary.module().clone();
+            forged_text_kind.sections[TEXT_SECTION].kind = SectionKind::ReadOnlyData;
+            assert!(forged_text_kind
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_text_alignment = ordinary.module().clone();
+            forged_text_alignment.sections[TEXT_SECTION].alignment = 1;
+            assert!(forged_text_alignment
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_data = ordinary.module().clone();
+            forged_data.sections[PROGRAM_SECTION].data[0] ^= 1;
+            assert!(forged_data
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_relocation = ordinary.module().clone();
+            forged_relocation.relocations[0].addend ^= 1;
+            assert!(forged_relocation
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_entry = ordinary.module().clone();
+            forged_entry.symbols[forged_entry.entry_symbol_index]
+                .name
+                .push_str("_forged");
+            assert!(forged_entry
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_seal = ordinary.module().clone();
+            forged_seal
+                .native_direct_search_module_surface_seal
+                .as_mut()
+                .expect("direct Span seal")
+                .native_data_bytes += 1;
+            assert!(forged_seal
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+        }
+
+        for (save_rbx, save_r12_r13, save_r14_r15) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let wrapper = lower_x86_64_direct_span_fill(
+                NativeDirectSearchTrustedCorePrologue::X86_64 {
+                    save_rbx,
+                    save_r12_r13,
+                    save_r14_r15,
+                },
+            )
+            .expect("valid x86 direct Span-fill save mask");
+            assert!(wrapper.body_offset < wrapper.search_call_offset);
+            assert!(wrapper.search_call_offset < wrapper.adapter_offset);
+            assert!(wrapper.adapter_offset < wrapper.core_jump_offset);
+        }
+        assert!(lower_x86_64_direct_span_fill(
+            NativeDirectSearchTrustedCorePrologue::X86_64 {
+                save_rbx: false,
+                save_r12_r13: false,
+                save_r14_r15: true,
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -134997,6 +135807,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_entry_symbol_index: Some(PREPARED_ENTRY_SYMBOL),
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
+                direct_span_fill_symbol_index: None,
                 direct_exists_batch_symbol_index: None,
                 direct_exists_batch_surface_seal: None,
                 direct_exact_singleton_first_candidate: None,
@@ -135343,6 +136154,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_entry_symbol_index: None,
             prepared_span_fill_symbol_index: None,
             prepared_exists_batch_symbol_index: None,
+            direct_span_fill_symbol_index: None,
             direct_exists_batch_symbol_index: None,
             direct_exists_batch_surface_seal: None,
             direct_exact_singleton_first_candidate: None,

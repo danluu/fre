@@ -104,7 +104,7 @@ pub use dfa::{
 };
 pub use error::{
     CompileError, CompileResource, ExactFiniteGrepCountCompileError,
-    IndependentExistsBatchCompileError, ObjectError,
+    IndependentExistsBatchCompileError, IndependentSpanFillCompileError, ObjectError,
 };
 pub use direct_count_v3::{
     DIRECT_EXACT_SINGLETON_COUNT_AOT_SCHEMA_VERSION,
@@ -1237,6 +1237,29 @@ fn independent_exists_batch_object_outcome(
     }
 }
 
+/// Preserve every additive Span-fill construction failure. Only a
+/// structurally absent `Ok(None)` may retain the ordinary artifact.
+fn independent_span_fill_append_outcome(
+    outcome: Result<Option<CompiledModule>, ObjectError>,
+) -> Result<Option<CompiledModule>, IndependentSpanFillCompileError> {
+    outcome.map_err(|error| CompileError::from(error).into())
+}
+
+/// Once the complete additive module exists, its final numeric object-byte
+/// ceiling alone may retain the byte-identical ordinary artifact.
+fn independent_span_fill_object_outcome(
+    outcome: Result<Vec<u8>, ObjectError>,
+) -> Result<Option<Vec<u8>>, IndependentSpanFillCompileError> {
+    match outcome {
+        Ok(object) => Ok(Some(object)),
+        Err(ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(CompileError::from(error).into()),
+    }
+}
+
 /// Preserve endpoint append failure provenance. Only a structurally absent
 /// `Ok(None)` may retain the completed generic batch incumbent.
 fn independent_exact_singleton_first_candidate_append_outcome(
@@ -1284,7 +1307,7 @@ fn independent_matching_lf_line_witness_object_outcome(
     }
 }
 
-fn install_independent_exists_variant(
+fn install_independent_variant(
     compiled: &mut CompiledRegex,
     module: CompiledModule,
     object: Vec<u8>,
@@ -1319,6 +1342,66 @@ fn install_independent_exists_variant(
     compiled.receipt.object_bytes = object.len();
     compiled.module = module;
     compiled.object = object.into_boxed_slice();
+}
+
+/// Compile a Span program and request one handle-free stateful Span-fill
+/// entry for a self-contained direct object.
+///
+/// The additive entry validates the raw iterator and output boundaries once
+/// per refill, then uses the ordinary entry's independently authenticated
+/// post-validation core for every non-overlapping search. It retains the
+/// established compiler-generated nullable-progress, status, and initialized
+/// prefix semantics. Prepared artifacts already carrying their exclusive
+/// fill entry, runtime-backed artifacts, and direct artifacts without the
+/// required complete core are returned unchanged. The ordinary scalar symbol
+/// and ABI remain unchanged; consumers must inspect
+/// [`CompiledModule::direct_span_fill_symbol`]. The canonical function type
+/// is `FreAotRegexIndependentSpanFillV1` in `fre-aot-regex-runtime`.
+///
+/// Only a final numeric `ObjectBytes` refusal may retain the exact ordinary
+/// artifact after construction. Allocation, backend, and authentication
+/// failures remain terminal.
+///
+/// # Errors
+///
+/// Returns [`IndependentSpanFillCompileError::RequiresSpan`] for another
+/// output contract. Base compilation and every selected additive failure are
+/// returned through [`IndependentSpanFillCompileError::Compile`].
+pub fn compile_with_independent_span_fill(
+    request: CompileRequest,
+) -> Result<CompiledRegex, IndependentSpanFillCompileError> {
+    if request.output != OutputContract::Span {
+        return Err(IndependentSpanFillCompileError::RequiresSpan {
+            actual: request.output,
+        });
+    }
+    let target = request.target;
+    let max_object_bytes = request.limits.max_object_bytes;
+    let mut compiled = compile(request)?;
+    if compiled.module.prepared_span_fill_symbol().is_some()
+        || compiled.module.direct_span_fill_symbol().is_some()
+    {
+        return Ok(compiled);
+    }
+    let module = independent_span_fill_append_outcome(
+        compiled
+            .module
+            .clone()
+            .append_direct_span_fill(OutputContract::Span),
+    )?;
+    let Some(module) = module else {
+        return Ok(compiled);
+    };
+    let Some(object) = independent_span_fill_object_outcome(emit_object(
+        &module,
+        ObjectFormat::for_target(target),
+        max_object_bytes,
+    ))?
+    else {
+        return Ok(compiled);
+    };
+    install_independent_variant(&mut compiled, module, object);
+    Ok(compiled)
 }
 
 /// Compile an Exists program and request one independent-haystack batch
@@ -1488,7 +1571,7 @@ fn compile_with_independent_exists_batch_policy(
         else {
             return Ok(compiled);
         };
-        install_independent_exists_variant(&mut compiled, module, object);
+        install_independent_variant(&mut compiled, module, object);
     }
 
     if !matching_lf_line_witness_requested {
@@ -1523,7 +1606,7 @@ fn compile_with_independent_exists_batch_policy(
     else {
         return Ok(compiled);
     };
-    install_independent_exists_variant(&mut compiled, module, object);
+    install_independent_variant(&mut compiled, module, object);
 
     Ok(compiled)
 }

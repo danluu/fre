@@ -19,7 +19,8 @@ pub use fre_aot_regex_runtime::AotMatch;
 use fre_aot_regex_runtime::{
     FreAotRegexExactSingletonFirstCandidateV1, FreAotRegexExclusiveExistsBatchV1,
     FreAotRegexExclusiveGrepCountV1, FreAotRegexExclusiveHandleV1, FreAotRegexExclusiveSpanFillV1,
-    FreAotRegexHaystackV1, FreAotRegexIndependentExistsBatchV1, FreAotRegexIterStateV1,
+    FreAotRegexHaystackV1, FreAotRegexIndependentExistsBatchV1,
+    FreAotRegexIndependentSpanFillV1, FreAotRegexIterStateV1,
     FreAotRegexMatchingLfLineWitnessV1, FreAotRegexPrepareConfigV3, FreAotRegexResultV1,
     ITER_FINISHED, ITER_HAS_LAST, ITER_KNOWN_FLAGS, ITER_PENDING_EMPTY,
     PREPARE_CAPABILITY_KNOWN_FLAGS, PREPARE_CAPABILITY_ORDERED_NFA_V15, PREPARE_OPERATION_COUNT,
@@ -895,6 +896,7 @@ impl AotHaystack<'_> {
 
 type NativeSearch = unsafe extern "C" fn(*const u8, usize, usize, usize, *mut AbiResult) -> u32;
 type NativeExistsBatch = FreAotRegexIndependentExistsBatchV1;
+type DirectSpanFill = FreAotRegexIndependentSpanFillV1;
 type NativeFill =
     fn(&[u8], &mut NativeIterState, &mut [MaybeUninit<AbiResult>]) -> NativeFillOutcome;
 type PreparedCompatSpanFill = fn(
@@ -1355,15 +1357,24 @@ where
 
 #[allow(
     unsafe_code,
-    reason = "single checked call boundary for a compiler-produced prepared Span-fill entry"
+    reason = "the shared validator reads only the initialized prefix published by the compiler-produced fill"
 )]
-fn fill_prepared_spans(
-    fill: PreparedSpanFill,
-    handle: FreAotRegexExclusiveHandleV1,
+fn fill_compiled_spans<Fill>(
     haystack: &[u8],
     state: &mut NativeIterState,
     output: &mut [MaybeUninit<AbiResult>],
-) -> NativeFillOutcome {
+    fill: Fill,
+) -> NativeFillOutcome
+where
+    Fill: FnOnce(
+        *const u8,
+        usize,
+        *mut NativeIterState,
+        *mut AbiResult,
+        usize,
+        *mut usize,
+    ) -> u32,
+{
     if output.is_empty() {
         state.finish();
         return NativeFillOutcome {
@@ -1373,22 +1384,14 @@ fn fill_prepared_spans(
     }
 
     let mut written = 0;
-    // SAFETY: `PreparedNative` exclusively owns `handle`; the haystack and
-    // state are live for this call; `output` is aligned writable storage for
-    // exactly `output.len()` ABI results. The compiler-produced entry retains
-    // none of these pointers and publishes `written` only after initializing
-    // that prefix.
-    let status = unsafe {
-        fill(
-            handle,
-            haystack.as_ptr(),
-            haystack.len(),
-            state,
-            output.as_mut_ptr().cast::<AbiResult>(),
-            output.len(),
-            &raw mut written,
-        )
-    };
+    let status = fill(
+        haystack.as_ptr(),
+        haystack.len(),
+        state,
+        output.as_mut_ptr().cast::<AbiResult>(),
+        output.len(),
+        &raw mut written,
+    );
     if written > output.len() {
         state.finish();
         return NativeFillOutcome {
@@ -1454,6 +1457,71 @@ fn fill_prepared_spans(
         state.finish();
     }
     NativeFillOutcome { written, error }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "single checked call boundary for a compiler-produced prepared Span-fill entry"
+)]
+fn fill_prepared_spans(
+    fill: PreparedSpanFill,
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack: &[u8],
+    state: &mut NativeIterState,
+    output: &mut [MaybeUninit<AbiResult>],
+) -> NativeFillOutcome {
+    fill_compiled_spans(
+        haystack,
+        state,
+        output,
+        |haystack, haystack_len, state, results, capacity, written| {
+            // SAFETY: `PreparedNative` exclusively owns `handle`; every
+            // pointer/extent comes from the live arguments validated above.
+            unsafe {
+                fill(
+                    handle,
+                    haystack,
+                    haystack_len,
+                    state,
+                    results,
+                    capacity,
+                    written,
+                )
+            }
+        },
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "single checked call boundary for a compiler-produced handle-free Span-fill entry"
+)]
+fn fill_direct_spans(
+    fill: DirectSpanFill,
+    haystack: &[u8],
+    state: &mut NativeIterState,
+    output: &mut [MaybeUninit<AbiResult>],
+) -> NativeFillOutcome {
+    fill_compiled_spans(
+        haystack,
+        state,
+        output,
+        |haystack, haystack_len, state, results, capacity, written| {
+            // SAFETY: every pointer and extent is derived from the live
+            // borrowed arguments. The compiler-produced entry retains none
+            // and initializes exactly the prefix it publishes in `written`.
+            unsafe {
+                fill(
+                    haystack,
+                    haystack_len,
+                    state,
+                    results,
+                    capacity,
+                    written,
+                )
+            }
+        },
+    )
 }
 
 impl AotExactSingletonFirstCandidateFactory {
@@ -2910,6 +2978,7 @@ mod tests {
 
     static SEARCH_CALLS: AtomicUsize = AtomicUsize::new(0);
     static FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DIRECT_SPAN_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_SPAN_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_EXACT_CAPACITY_FILL_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PREPARED_EXISTS_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -3453,6 +3522,135 @@ mod tests {
                 written,
             )
         }
+    }
+
+    unsafe extern "C" fn dense_direct_span_fill(
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        DIRECT_SPAN_FILL_CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            mock_prepared_span_fill(
+                one_byte_search,
+                haystack,
+                haystack_len,
+                state,
+                results,
+                capacity,
+                written,
+            )
+        }
+    }
+
+    unsafe extern "C" fn nullable_direct_span_fill(
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        unsafe {
+            mock_prepared_span_fill(
+                nullable_search,
+                haystack,
+                haystack_len,
+                state,
+                results,
+                capacity,
+                written,
+            )
+        }
+    }
+
+    unsafe extern "C" fn two_then_error_direct_span_fill(
+        haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        unsafe {
+            mock_prepared_span_fill(
+                two_then_error_search,
+                haystack,
+                haystack_len,
+                state,
+                results,
+                capacity,
+                written,
+            )
+        }
+    }
+
+    unsafe extern "C" fn invalid_state_direct_span_fill(
+        _haystack: *const u8,
+        _haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        _capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        unsafe {
+            results.write(AbiResult { start: 0, end: 1 });
+            state.write(NativeIterState {
+                next_start: 1,
+                last_match_end: 0,
+                flags: ITER_HAS_LAST | ITER_PENDING_EMPTY | ITER_FINISHED,
+                reserved: 0,
+            });
+            written.write(1);
+        }
+        0
+    }
+
+    unsafe extern "C" fn overreported_direct_span_fill(
+        _haystack: *const u8,
+        _haystack_len: usize,
+        _state: *mut NativeIterState,
+        _results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        unsafe { written.write(capacity.saturating_add(1)) };
+        1
+    }
+
+    fn dense_direct_fill(
+        haystack: &[u8],
+        state: &mut NativeIterState,
+        output: &mut [MaybeUninit<AbiResult>],
+    ) -> NativeFillOutcome {
+        fill_direct_spans(dense_direct_span_fill, haystack, state, output)
+    }
+
+    fn nullable_direct_fill(
+        haystack: &[u8],
+        state: &mut NativeIterState,
+        output: &mut [MaybeUninit<AbiResult>],
+    ) -> NativeFillOutcome {
+        fill_direct_spans(nullable_direct_span_fill, haystack, state, output)
+    }
+
+    fn two_then_error_direct_fill(
+        haystack: &[u8],
+        state: &mut NativeIterState,
+        output: &mut [MaybeUninit<AbiResult>],
+    ) -> NativeFillOutcome {
+        fill_direct_spans(two_then_error_direct_span_fill, haystack, state, output)
+    }
+
+    fn invalid_state_direct_fill(
+        haystack: &[u8],
+        state: &mut NativeIterState,
+        output: &mut [MaybeUninit<AbiResult>],
+    ) -> NativeFillOutcome {
+        fill_direct_spans(invalid_state_direct_span_fill, haystack, state, output)
     }
 
     unsafe extern "C" fn one_byte_prepared_span_fill(
@@ -5055,6 +5253,7 @@ mod tests {
         for mut matcher in [
             runtime_test_matcher(r"(?-u:.)"),
             native_matcher(one_byte_search, one_byte_fill),
+            native_matcher(one_byte_search, dense_direct_fill),
             prepared_test_matcher(AotOutput::Span, Some(one_byte_prepared_span_fill), None),
         ] {
             assert_eq!(collect(&mut matcher, b"abcde", 2), expected);
@@ -5069,6 +5268,7 @@ mod tests {
         for mut matcher in [
             runtime_test_matcher(""),
             native_matcher(nullable_search, nullable_fill),
+            native_matcher(nullable_search, nullable_direct_fill),
             prepared_test_matcher(AotOutput::Span, Some(nullable_prepared_span_fill), None),
         ] {
             assert_eq!(collect(&mut matcher, b"xyz", 2), nullable_expected);
@@ -5078,7 +5278,7 @@ mod tests {
 
     #[test]
     fn offset_iterator_releases_matcher_after_callback_stop_and_error() {
-        let mut matcher = native_matcher(one_byte_search, one_byte_fill);
+        let mut matcher = native_matcher(one_byte_search, dense_direct_fill);
         {
             let mut matches = matcher
                 .find_iter_at(b"abcde", 2)
@@ -5158,6 +5358,72 @@ mod tests {
     }
 
     #[test]
+    fn direct_iterator_crosses_native_fill_abi_once_per_refill() {
+        DIRECT_SPAN_FILL_CALLS.store(0, Ordering::Relaxed);
+        let haystack = vec![b'a'; NATIVE_SPAN_BUFFER_CAPACITY * 2 + 2];
+        let mut matcher = native_matcher(one_byte_search, dense_direct_fill);
+        let spans = matcher
+            .find_iter(&haystack)
+            .expect("direct Span iterator")
+            .map(|matched| matched.expect("direct native match").range())
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), haystack.len());
+        assert_eq!(spans.first(), Some(&(0..1)));
+        assert_eq!(spans.last(), Some(&((haystack.len() - 1)..haystack.len())));
+        assert_eq!(DIRECT_SPAN_FILL_CALLS.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn direct_span_fill_boundary_fails_closed_before_or_after_one_raw_call() {
+        DIRECT_SPAN_FILL_CALLS.store(0, Ordering::Relaxed);
+        let mut state = NativeIterState::initial_at(0, 1).expect("valid initial state");
+        let mut empty = [];
+        let outcome = fill_direct_spans(
+            dense_direct_span_fill,
+            b"a",
+            &mut state,
+            &mut empty,
+        );
+        assert_eq!(outcome.written, 0);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("empty output buffer"))
+        );
+        assert!(state.finished());
+        assert_eq!(DIRECT_SPAN_FILL_CALLS.load(Ordering::Relaxed), 0);
+
+        let mut state = NativeIterState::initial_at(0, 1).expect("valid initial state");
+        let mut output = [MaybeUninit::uninit(); 1];
+        let outcome = fill_direct_spans(
+            overreported_direct_span_fill,
+            b"a",
+            &mut state,
+            &mut output,
+        );
+        assert_eq!(outcome.written, 0);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("overreported its initialized prefix"))
+        );
+        assert!(state.finished());
+
+        let mut matcher = native_matcher(one_byte_search, invalid_state_direct_fill);
+        let mut matches = matcher.find_iter(b"a").expect("direct Span iterator");
+        assert!(
+            matches
+                .next()
+                .expect("one error")
+                .expect_err("invalid state")
+                .contains("invalid iterator state")
+        );
+        assert!(matches.next().is_none());
+    }
+
+    #[test]
     fn prepared_iterator_exact_capacity_requires_terminal_refill() {
         PREPARED_EXACT_CAPACITY_FILL_CALLS.store(0, Ordering::Relaxed);
         let haystack = vec![b'a'; NATIVE_SPAN_BUFFER_CAPACITY];
@@ -5208,6 +5474,36 @@ mod tests {
             None,
         );
         let mut iteration = prepared.find_iter(b"aaa").expect("prepared iterator");
+        assert_eq!(
+            iteration
+                .next()
+                .expect("first item")
+                .expect("first match")
+                .range(),
+            0..1
+        );
+        assert_eq!(
+            iteration
+                .next()
+                .expect("second item")
+                .expect("second match")
+                .range(),
+            1..2
+        );
+        assert!(
+            iteration
+                .next()
+                .expect("deferred error")
+                .expect_err("status error")
+                .contains("status 2")
+        );
+        assert!(iteration.next().is_none());
+    }
+
+    #[test]
+    fn direct_iterator_yields_initialized_prefix_before_error() {
+        let mut direct = native_matcher(two_then_error_search, two_then_error_direct_fill);
+        let mut iteration = direct.find_iter(b"aaa").expect("direct iterator");
         assert_eq!(
             iteration
                 .next()
@@ -6074,7 +6370,20 @@ mod tests {
                         }
                         AotOutput::Span => {
                             assert!(exists_batch.is_none());
-                            assert!(spec.description.contains("bulk=none"));
+                            match fill {
+                                Some(_) => {
+                                    assert!(
+                                        spec.description.contains("api=direct-span-fill-v1")
+                                    );
+                                    assert!(spec
+                                        .description
+                                        .contains("bulk=native-direct-trusted-core-loop"));
+                                }
+                                None => {
+                                    assert!(spec.description.contains("api=rust-span-fill"));
+                                    assert!(spec.description.contains("bulk=none"));
+                                }
+                            }
                         }
                     }
                 }
@@ -6501,6 +6810,166 @@ mod tests {
             .expect("frozen-loop Exists batch");
         for (index, matched) in outcomes.into_iter().enumerate() {
             assert_eq!(matched, index % 3 == 0);
+        }
+    }
+
+    #[test]
+    fn generated_direct_span_fill_matches_scalar_and_refills_dense_inputs() {
+        const PATTERN: &str = "Sherlock Holmes";
+        if generated::BUILD_VARIANT_POLICY != "all" {
+            return;
+        }
+        if !generated::SPECS
+            .iter()
+            .any(|spec| spec.pattern == PATTERN && !spec.case_insensitive)
+        {
+            // External manifests need not contain the package's public direct
+            // Span-fill fixture.
+            return;
+        }
+        let spec = generated::SPECS
+            .iter()
+            .find(|spec| {
+                spec.mode == AotMode::Optimizing
+                    && spec.output == AotOutput::Span
+                    && spec.pattern == PATTERN
+                    && !spec.case_insensitive
+            })
+            .expect("public direct Span fixture must have an Optimizing Span row");
+        assert!(matches!(
+            spec.backend,
+            BackendFactory::Native {
+                fill: Some(_),
+                exists_batch: None,
+                ..
+            }
+        ));
+        assert!(spec.description.contains("api=direct-span-fill-v1"));
+        assert!(
+            spec.description
+                .contains("bulk=native-direct-trusted-core-loop")
+        );
+
+        let repeats = NATIVE_SPAN_BUFFER_CAPACITY * 2 + 2;
+        let haystack = PATTERN.as_bytes().repeat(repeats);
+        let expected = (0..repeats)
+            .map(|index| {
+                let start = index * PATTERN.len();
+                start..start + PATTERN.len()
+            })
+            .collect::<Vec<_>>();
+        let mut matcher =
+            AotMatcher::new(AotMode::Optimizing, AotOutput::Span, PATTERN, false)
+                .expect("construct public direct Span matcher");
+        let spans = matcher
+            .find_iter(&haystack)
+            .expect("public direct Span iterator")
+            .map(|matched| matched.expect("public direct span").range())
+            .collect::<Vec<_>>();
+        assert_eq!(spans, expected);
+        assert_eq!(
+            matcher
+                .find_at(&haystack, 1)
+                .expect("public scalar offset search")
+                .expect("public scalar offset match")
+                .range(),
+            expected[1]
+        );
+        assert_eq!(
+            matcher
+                .find_iter_at(&haystack, 1)
+                .expect("public direct offset iterator")
+                .map(|matched| matched.expect("public direct offset span").range())
+                .collect::<Vec<_>>(),
+            expected[1..]
+        );
+        assert!(
+            matcher
+                .find_iter_at(&haystack, haystack.len())
+                .expect("public direct EOF iterator")
+                .next()
+                .is_none()
+        );
+        assert!(
+            matcher
+                .find_iter(b"")
+                .expect("public direct empty iterator")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generated_direct_span_fill_raw_abi_validates_and_supports_progress_probes() {
+        for &fill in generated::DIRECT_SPAN_FILL_ENTRIES {
+            let mut state = NativeIterState::initial_at(0, 0).expect("empty initial state");
+            let mut written = usize::MAX;
+            let status = unsafe {
+                fill(
+                    b"".as_ptr(),
+                    0,
+                    &raw mut state,
+                    std::ptr::null_mut(),
+                    0,
+                    &raw mut written,
+                )
+            };
+            assert_eq!(status, 1, "unfinished zero-capacity probe must continue");
+            assert_eq!(written, 0);
+            assert!(!state.finished());
+
+            state.flags = ITER_FINISHED;
+            written = usize::MAX;
+            let status = unsafe {
+                fill(
+                    b"".as_ptr(),
+                    0,
+                    &raw mut state,
+                    std::ptr::null_mut(),
+                    0,
+                    &raw mut written,
+                )
+            };
+            assert_eq!(status, 0, "finished zero-capacity probe must terminate");
+            assert_eq!(written, 0);
+
+            let mut invalid_state = NativeIterState {
+                next_start: 0,
+                last_match_end: 0,
+                flags: 8,
+                reserved: 0,
+            };
+            written = usize::MAX;
+            assert_eq!(
+                unsafe {
+                    fill(
+                        b"".as_ptr(),
+                        0,
+                        &raw mut invalid_state,
+                        std::ptr::null_mut(),
+                        0,
+                        &raw mut written,
+                    )
+                },
+                2,
+                "unknown state flags must fail closed"
+            );
+
+            let mut valid_state = NativeIterState::initial_at(0, 0).expect("empty initial state");
+            assert_eq!(
+                unsafe {
+                    fill(
+                        std::ptr::null(),
+                        0,
+                        &raw mut valid_state,
+                        std::ptr::null_mut(),
+                        0,
+                        &raw mut written,
+                    )
+                },
+                2,
+                "null haystack must fail even at zero length"
+            );
         }
     }
 
