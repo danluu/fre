@@ -17,6 +17,7 @@ pub(super) const MIN_TWO_WAY_LITERAL_BYTES: usize = 33;
 pub(super) const MAX_TWO_WAY_LITERAL_BYTES: usize = 4096;
 const MAX_PAIR_PREFILTER_LITERAL_BYTES: usize = 255;
 const PAIR_PREFILTER_VECTOR_BYTES: u8 = 16;
+const PAIR_PREFILTER_BATCH_BYTES: u8 = 32;
 const PAIR_PREFILTER_ACTIVATION_CONSECUTIVE_FAILURES: u8 = 4;
 const PAIR_PREFILTER_MAX_CANDIDATE_REPORTS: u8 = 2;
 const PAIR_PREFILTER_MAX_FREQUENCY_NUMERATOR: u16 = 32;
@@ -41,6 +42,11 @@ struct PairPrefilterPlan {
     bytes: [u8; 2],
     minimum_vector_remaining_bytes: u16,
     estimated_frequency_numerator: u16,
+}
+
+fn pair_prefilter_minimum_batch_remaining_bytes(plan: PairPrefilterPlan) -> Option<u16> {
+    plan.minimum_vector_remaining_bytes
+        .checked_add(u16::from(PAIR_PREFILTER_VECTOR_BYTES))
 }
 
 #[derive(Clone, Copy)]
@@ -295,22 +301,25 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
     data.try_reserve_exact(literal.len())
         .map_err(|_| ObjectError::Allocation("exact single-literal data"))?;
     data.extend_from_slice(literal);
-    let (code, relocations, emitted_isa, scanner) = match target.architecture {
+    let (code, relocations, trusted_core_offset, emitted_isa, scanner) = match target.architecture {
         Architecture::X86_64 => {
-            let (code, relocations) = lower_x86_64_two_way(plan)?;
+            let (code, relocations, trusted_core_offset) = lower_x86_64_two_way(plan)?;
             (
                 code,
                 relocations,
+                trusted_core_offset,
                 ExactSingleLiteralAotIsa::X86Scalar,
                 StartAccelerator::Scalar,
             )
         }
         Architecture::Aarch64 => {
-            let (code, relocations) = lower_aarch64_two_way(plan, pair_prefilter)?;
+            let (code, relocations, trusted_core_offset) =
+                lower_aarch64_two_way(plan, pair_prefilter)?;
             if pair_prefilter.is_some() {
                 (
                     code,
                     relocations,
+                    trusted_core_offset,
                     ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter,
                     StartAccelerator::Aarch64Asimd,
                 )
@@ -318,15 +327,47 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
                 (
                     code,
                     relocations,
+                    trusted_core_offset,
                     ExactSingleLiteralAotIsa::Aarch64Scalar,
                     StartAccelerator::Scalar,
                 )
             }
         }
     };
+    let entry_code_sha256: [u8; 32] = Sha256::digest(&code).into();
+    let program_sha256: [u8; 32] = Sha256::digest(&data).into();
+    let trusted_core = NativeDirectSearchTrustedCore {
+        code_offset: trusted_core_offset,
+        output: OutputContract::Exists,
+        entry_contract: NativeDirectSearchEntryContract::PublicCompleteV1,
+        result_abi: NativeDirectSearchResultAbi::ExistsStatusOnlyV1,
+        entry_code_sha256,
+        prologue: match target.architecture {
+            Architecture::X86_64 => NativeDirectSearchTrustedCorePrologue::X86_64 {
+                save_rbx: false,
+                save_r12_r13: false,
+                save_r14_r15: false,
+            },
+            Architecture::Aarch64 => NativeDirectSearchTrustedCorePrologue::Aarch64,
+        },
+        landmark: NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+            program_bytes: data.len(),
+            program_sha256,
+        },
+    };
+    authenticate_native_direct_search_trusted_core(
+        target.architecture,
+        &code,
+        0,
+        code.len(),
+        &data,
+        &relocations,
+        trusted_core,
+        OutputContract::Exists,
+    )?;
     let report = ExactSingleLiteralAotReport {
         literal_sha256: Sha256::digest(literal).into(),
-        native_code_sha256: Sha256::digest(&code).into(),
+        native_code_sha256: entry_code_sha256,
         relocations_sha256: relocation_digest(&relocations).ok_or(
             ObjectError::ArithmeticOverflow("Two-Way relocation receipt"),
         )?,
@@ -351,7 +392,7 @@ pub(super) fn lower_optional_exact_single_literal_two_way(
             anchored_prefix_filter_bytes: 0,
             synchronizing_accept_reverse_lowered: false,
             exact_pair_suffix_lowered: false,
-            direct_search_trusted_core: None,
+            direct_search_trusted_core: Some(trusted_core),
             complete_span_reduce_source: None,
         },
         report,
@@ -422,6 +463,19 @@ pub(super) fn report_matches_lowering(
         (Architecture::Aarch64, true) => ExactSingleLiteralAotIsa::Aarch64AsimdPairPrefilter,
         (Architecture::X86_64, true) => return false,
     };
+    let trusted_core_matches = lowering.direct_search_trusted_core.is_some_and(|core| {
+        authenticate_native_direct_search_trusted_core(
+            target.architecture,
+            &lowering.code,
+            0,
+            lowering.code.len(),
+            &lowering.data,
+            &lowering.relocations,
+            core,
+            OutputContract::Exists,
+        )
+        .is_ok()
+    });
     let literal_sha256: [u8; 32] = Sha256::digest(&lowering.data).into();
     let native_code_sha256: [u8; 32] = Sha256::digest(&lowering.code).into();
     report.emitted_isa == expected_isa
@@ -442,6 +496,7 @@ pub(super) fn report_matches_lowering(
         && !lowering.needs_runtime
         && lowering.slow_partial_table.is_none()
         && relocations_match_target(lowering, target)
+        && trusted_core_matches
 }
 
 fn x86_mov_r32_imm(
@@ -472,7 +527,9 @@ fn x86_emit_two_way_byte_compare(assembler: &mut X86Assembler) -> Result<(), Obj
     clippy::too_many_lines,
     reason = "the complete call-free Two-Way control-flow graph is kept in one auditable checked-assembler transaction"
 )]
-fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+fn lower_x86_64_two_way(
+    plan: TwoWayPlan,
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>, usize), ObjectError> {
     let width = plan.literal_len;
     let critical = plan.critical_position;
     let last = width
@@ -489,11 +546,17 @@ fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocati
     let matched = assembler.label()?;
     let no_match = assembler.label()?;
     let invalid = assembler.label()?;
+    let trusted_core = assembler.label()?;
 
     x86_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x49, 0x89, 0x00])?;
     assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
+    // The independent-batch trampoline reproduces the XOR-established RAX
+    // and flags before entering here. It supplies start zero, end equal to
+    // length, and private aligned result storage; this Exists leaf never
+    // consults that storage after the two public-only initialization writes.
+    assembler.bind(trusted_core)?;
     assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
     let program_displacement = assembler.label()?;
     assembler.bind(program_displacement)?;
@@ -587,6 +650,7 @@ fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocati
     x86_finish_native_finite_exists_leaf(&mut assembler, matched, no_match, invalid, false)?;
     let finished = assembler.finish_with_label_offsets()?;
     let program_displacement = finished.label_offset(program_displacement)?;
+    let trusted_core = finished.label_offset(trusted_core)?;
     Ok((
         finished.code,
         vec![ModuleRelocation {
@@ -596,6 +660,7 @@ fn lower_x86_64_two_way(plan: TwoWayPlan) -> Result<(Vec<u8>, Vec<ModuleRelocati
             symbol: PROGRAM_SYMBOL,
             addend: -4,
         }],
+        trusted_core,
     ))
 }
 
@@ -637,7 +702,7 @@ fn aarch64_emit_pair_prefilter_activation_observation(
 fn lower_aarch64_two_way(
     plan: TwoWayPlan,
     pair_prefilter: Option<PairPrefilterPlan>,
-) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+) -> Result<(Vec<u8>, Vec<ModuleRelocation>, usize), ObjectError> {
     let width = u64::from(plan.literal_len);
     let critical = u64::from(plan.critical_position);
     let last = width
@@ -664,6 +729,7 @@ fn lower_aarch64_two_way(
     let matched = assembler.label()?;
     let no_match = assembler.label()?;
     let invalid = assembler.label()?;
+    let trusted_core = assembler.label()?;
     let scalar_candidate = assembler.label()?;
     let warm_scalar_candidate = assembler.label()?;
     let retired_scalar_candidate = assembler.label()?;
@@ -682,7 +748,10 @@ fn lower_aarch64_two_way(
     let pair_labels = if pair_prefilter.is_some() {
         Some((
             assembler.label()?, // retire at the final partial vector
-            assembler.label()?, // pair-vector miss
+            assembler.label()?, // final single-vector scan
+            assembler.label()?, // pair-batch miss
+            assembler.label()?, // final single-vector miss
+            assembler.label()?, // initialize scalar lane refinement
             assembler.label()?, // scalar first-lane refinement
             assembler.label()?, // scalar lane miss
             assembler.label()?, // refined pair candidate
@@ -694,6 +763,11 @@ fn lower_aarch64_two_way(
     aarch64_emit_public_search_abi_validation(&mut assembler, invalid)?;
     assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
     assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
+    // The batch trampoline repeats the public validation's final CMP X0,#0
+    // before entering here and supplies the proved full window plus private
+    // aligned result storage. No later instruction reads the public-only
+    // zeroed result words.
+    assembler.bind(trusted_core)?;
     let program_relocation = aarch64_emit_native_finite_exists_program_base(&mut assembler)?;
     assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
     assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
@@ -711,17 +785,14 @@ fn lower_aarch64_two_way(
     }
 
     if let Some(pair) = pair_prefilter {
-        let (_, _, _, _, _) = pair_labels.ok_or(ObjectError::InvalidModule(
+        let (_, _, _, _, _, _, _, _) = pair_labels.ok_or(ObjectError::InvalidModule(
             "AArch64 pair-prefilter labels are absent",
         ))?;
         // A call that cannot contain one complete pair vector cannot ever use
         // the prefilter. Route it directly to the baseline-equivalent scalar
         // loop before initializing or dispatching any adaptive state.
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(
-            12,
-            pair.minimum_vector_remaining_bytes,
-        )?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes)?)?;
         assembler.branch_cond(AARCH64_LO, retired_search)?;
         assembler.instruction(aarch64_movz_x(16, 0, 0)?)?;
         assembler.instruction(aarch64_movz_x(17, 0, 0)?)?;
@@ -737,7 +808,22 @@ fn lower_aarch64_two_way(
     assembler.instruction(aarch64_and_low_x(8, 8, 63)?)?;
     assembler.instruction(aarch64_lsrv_x(10, 11, 8)?)?;
     assembler.instruction(aarch64_and_low_x(10, 10, 1)?)?;
-    assembler.branch_zero_x(10, byteset_skip)?;
+    if pair_prefilter.is_some() {
+        // A pair-prefilter leaf reaches this initial loop before activation.
+        // Keep its common terminal-byte miss and backedge adjacent instead of
+        // bouncing across the scalar verifier. Pair admission requires a
+        // Large-shift plan, but retain the periodic reset defensively so this
+        // private lowerer remains correct for every internally supplied plan.
+        assembler.branch_nonzero_x(10, scalar_verify)?;
+        assembler.bind(byteset_skip)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
+        if matches!(plan.shift, TwoWayShift::SmallPeriod { .. }) {
+            assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
+        }
+        assembler.branch(search)?;
+    } else {
+        assembler.branch_zero_x(10, byteset_skip)?;
+    }
 
     assembler.bind(scalar_verify)?;
     assembler.instruction(aarch64_mov_x(9, 14)?)?;
@@ -833,12 +919,14 @@ fn lower_aarch64_two_way(
         assembler.branch(vector_search)?;
     }
 
-    assembler.bind(byteset_skip)?;
-    assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
-    if matches!(plan.shift, TwoWayShift::SmallPeriod { .. }) {
-        assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
+    if pair_prefilter.is_none() {
+        assembler.bind(byteset_skip)?;
+        assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
+        if matches!(plan.shift, TwoWayShift::SmallPeriod { .. }) {
+            assembler.instruction(aarch64_movz_x(13, 0, 0)?)?;
+        }
+        assembler.branch(search)?;
     }
-    assembler.branch(search)?;
 
     if pair_prefilter.is_some() {
         assembler.bind(pair_byteset_skip)?;
@@ -847,9 +935,22 @@ fn lower_aarch64_two_way(
     }
 
     if let Some(pair) = pair_prefilter {
-        let (vector_tail, vector_miss, lane, lane_miss, pair_candidate) = pair_labels.ok_or(
-            ObjectError::InvalidModule("AArch64 pair-prefilter labels are absent"),
-        )?;
+        let (
+            vector_tail,
+            single_vector_search,
+            batch_miss,
+            single_vector_miss,
+            lane_start,
+            lane,
+            lane_miss,
+            pair_candidate,
+        ) = pair_labels.ok_or(ObjectError::InvalidModule(
+            "AArch64 pair-prefilter labels are absent",
+        ))?;
+        let minimum_batch_remaining_bytes = pair_prefilter_minimum_batch_remaining_bytes(pair)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "pair-prefilter batch extent",
+            ))?;
         assembler.bind(warm_search)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
         assembler.instruction(aarch64_cmp_x(12, 6)?)?;
@@ -921,9 +1022,10 @@ fn lower_aarch64_two_way(
         assembler.instruction(aarch64_add_x_reg(2, 2, 6)?)?;
         assembler.branch(retired_search)?;
 
-        // This cold tail and the hot guard together occupy the exact seven
-        // words used by the original vector guard. The hot body and every
-        // downstream instruction therefore retain their established address.
+        // This cold tail and the batch guard together occupy the exact seven
+        // words used before the original vector body, so the new hot batch
+        // begins at the established address even though its wider body moves
+        // later cold code.
         // The active scanner may have fewer than `width` bytes left after its
         // last complete vector; recheck that scalar bound before loading the
         // terminal byte in `retired_scalar_candidate`.
@@ -936,13 +1038,44 @@ fn lower_aarch64_two_way(
         // Only active states one and two reach this label: a pair candidate
         // increments the state and leaves this loop, scalar mismatch dispatch
         // rejects the resulting disabled state, and vector misses preserve it.
-        // The vector extent (`width + 15`) also implies the scalar `width`
-        // extent, so neither invariant needs another per-vector comparison.
+        // A complete pair batch needs `width + 31` bytes: each selected offset
+        // is at most `width - 1`, and LDP reads through lane 31. The cold
+        // single-vector tail retains the established `width + 15` boundary.
         assembler.bind(vector_search)?;
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, minimum_batch_remaining_bytes)?)?;
+        assembler.branch_cond(AARCH64_LO, single_vector_search)?;
+
+        assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0]))?)?;
+        assembler.instruction(aarch64_load_pair_q(0, 1, 12, 0)?)?;
+        assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1]))?)?;
+        assembler.instruction(aarch64_load_pair_q(2, 3, 12, 0)?)?;
+        assembler.instruction(aarch64_cmeq_16b(24, 0, 16)?)?;
+        assembler.instruction(aarch64_cmeq_16b(25, 1, 16)?)?;
+        assembler.instruction(aarch64_cmeq_16b(26, 2, 17)?)?;
+        assembler.instruction(aarch64_cmeq_16b(27, 3, 17)?)?;
+        assembler.instruction(aarch64_and_16b(24, 24, 26)?)?;
+        assembler.instruction(aarch64_and_16b(25, 25, 27)?)?;
+        assembler.instruction(aarch64_orr_16b(28, 24, 25)?)?;
+        aarch64_emit_candidate_any(&mut assembler, 28)?;
+        assembler.branch_cond(AARCH64_EQ, batch_miss)?;
+        assembler.instruction(aarch64_movz_x(0, u16::from(PAIR_PREFILTER_BATCH_BYTES), 0)?)?;
+        assembler.branch(lane_start)?;
+
+        assembler.bind(batch_miss)?;
+        assembler.instruction(aarch64_add_x_imm(
+            2,
+            2,
+            u16::from(PAIR_PREFILTER_BATCH_BYTES),
+        )?)?;
+        assembler.branch(vector_search)?;
+
+        // A 16-byte vector covers the only partial batch worth retaining.
+        // Its miss leaves fewer than 16 searchable lanes, so it converges
+        // directly on the scalar retirement tail instead of retrying a batch.
+        assembler.bind(single_vector_search)?;
         assembler.instruction(aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes)?)?;
         assembler.branch_cond(AARCH64_LO, vector_tail)?;
-
         assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0]))?)?;
         assembler.instruction(aarch64_load_q(0, 12)?)?;
         assembler.instruction(aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1]))?)?;
@@ -951,8 +1084,14 @@ fn lower_aarch64_two_way(
         assembler.instruction(aarch64_cmeq_16b(1, 1, 17)?)?;
         assembler.instruction(aarch64_and_16b(24, 24, 1)?)?;
         aarch64_emit_candidate_any(&mut assembler, 24)?;
-        assembler.branch_cond(AARCH64_EQ, vector_miss)?;
+        assembler.branch_cond(AARCH64_EQ, single_vector_miss)?;
+        assembler.instruction(aarch64_movz_x(
+            0,
+            u16::from(PAIR_PREFILTER_VECTOR_BYTES),
+            0,
+        )?)?;
 
+        assembler.bind(lane_start)?;
         assembler.instruction(aarch64_movz_x(12, 0, 0)?)?;
         assembler.bind(lane)?;
         assembler.instruction(aarch64_add_x_reg(9, 2, 12)?)?;
@@ -964,19 +1103,22 @@ fn lower_aarch64_two_way(
         assembler.branch_cond(AARCH64_EQ, pair_candidate)?;
         assembler.bind(lane_miss)?;
         assembler.instruction(aarch64_add_x_imm(12, 12, 1)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(
-            12,
-            u16::from(PAIR_PREFILTER_VECTOR_BYTES),
-        )?)?;
+        assembler.instruction(aarch64_cmp_x(12, 0)?)?;
         assembler.branch_cond(AARCH64_LO, lane)?;
+        // The vector reduction and scalar refinement are exact copies of the
+        // same bytes, so exhaustion is unreachable for a valid immutable
+        // haystack. Retain a bounded forward-progress edge for robustness.
+        assembler.instruction(aarch64_add_x_reg(2, 2, 0)?)?;
+        assembler.branch(vector_search)?;
 
-        assembler.bind(vector_miss)?;
+        assembler.bind(single_vector_miss)?;
         assembler.instruction(aarch64_add_x_imm(
             2,
             2,
             u16::from(PAIR_PREFILTER_VECTOR_BYTES),
         )?)?;
-        assembler.branch(vector_search)?;
+        assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+        assembler.branch(vector_tail)?;
 
         assembler.bind(pair_candidate)?;
         assembler.instruction(aarch64_mov_x(2, 9)?)?;
@@ -1001,10 +1143,39 @@ fn lower_aarch64_two_way(
     }
 
     aarch64_finish_native_finite_exists_leaf(&mut assembler, matched, no_match, invalid)?;
-    aarch64_finish_native_finite_exists_with_optional_program_relocation(
-        assembler,
-        Some(program_relocation),
-    )
+    let (program_page, program_page_offset) = program_relocation;
+    let mut relocation_offsets = [program_page, program_page_offset];
+    let (code, trusted_core) =
+        assembler.finish_with_offsets_and_label(&mut relocation_offsets, Some(trusted_core))?;
+    let trusted_core = trusted_core.ok_or(ObjectError::InvalidModule(
+        "AArch64 Two-Way trusted core label is absent",
+    ))?;
+    Ok((
+        code,
+        vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[0],
+                    "AArch64 Two-Way ADRP relocation offset",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[1],
+                    "AArch64 Two-Way ADD relocation offset",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+        ],
+        trusted_core,
+    ))
 }
 
 #[cfg(test)]
@@ -1112,6 +1283,10 @@ struct PairPrefilterModelStats {
     consecutive_failures: usize,
     candidate_reports: usize,
     vector_windows: usize,
+    batch_windows: usize,
+    single_vector_windows: usize,
+    last_candidate_lane: Option<usize>,
+    last_candidate_scan_bytes: usize,
     retired: bool,
 }
 
@@ -1145,16 +1320,27 @@ fn pair_prefilter_find_counted(
         }
         if active {
             stats.vector_windows += 1;
-            let lane = (0..usize::from(PAIR_PREFILTER_VECTOR_BYTES)).find(|&lane| {
+            let remaining = haystack.len() - position;
+            let scan_bytes =
+                if remaining >= usize::from(pair_prefilter_minimum_batch_remaining_bytes(pair)?) {
+                    stats.batch_windows += 1;
+                    usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                } else {
+                    stats.single_vector_windows += 1;
+                    usize::from(PAIR_PREFILTER_VECTOR_BYTES)
+                };
+            let lane = (0..scan_bytes).find(|&lane| {
                 haystack[position + lane + usize::from(pair.offsets[0])] == pair.bytes[0]
                     && haystack[position + lane + usize::from(pair.offsets[1])] == pair.bytes[1]
             });
             let Some(lane) = lane else {
-                position += usize::from(PAIR_PREFILTER_VECTOR_BYTES);
+                position += scan_bytes;
                 continue;
             };
             position += lane;
             stats.candidate_reports += 1;
+            stats.last_candidate_lane = Some(lane);
+            stats.last_candidate_scan_bytes = scan_bytes;
         }
         if plan.approximate_byteset & (1_u64 << (haystack[position + width - 1] % 64)) == 0 {
             if !active && !stats.retired {
@@ -1394,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_pair_vector_extent_partitions_every_tail_boundary() {
+    fn packed_pair_hybrid_extents_partition_every_tail_boundary() {
         let target = Target::aarch64_macos()
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
             .expect("ASIMD target");
@@ -1411,14 +1597,32 @@ mod tests {
             assert!(pair.offsets.contains(&last_pair_offset));
 
             let vector_extent = usize::from(pair.minimum_vector_remaining_bytes);
+            let batch_extent = usize::from(
+                pair_prefilter_minimum_batch_remaining_bytes(pair).expect("bounded batch extent"),
+            );
             assert_eq!(
                 vector_extent,
                 width + usize::from(PAIR_PREFILTER_VECTOR_BYTES) - 1
             );
-            for remaining in 0..=vector_extent + usize::from(PAIR_PREFILTER_VECTOR_BYTES) {
+            assert_eq!(
+                batch_extent,
+                width + usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1,
+            );
+            for remaining in 0..=batch_extent + usize::from(PAIR_PREFILTER_BATCH_BYTES) {
                 let scalar_candidate_is_safe = remaining >= width;
                 let vector_candidate_is_safe = remaining >= vector_extent;
-                if vector_candidate_is_safe {
+                let batch_candidate_is_safe = remaining >= batch_extent;
+                if batch_candidate_is_safe {
+                    assert!(vector_candidate_is_safe);
+                    assert!(scalar_candidate_is_safe);
+                    for &offset in &pair.offsets {
+                        assert!(
+                            usize::from(offset) + usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                                <= remaining,
+                        );
+                    }
+                    assert!(width + usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1 <= remaining);
+                } else if vector_candidate_is_safe {
                     assert!(scalar_candidate_is_safe);
                     for &offset in &pair.offsets {
                         assert!(
@@ -1426,6 +1630,7 @@ mod tests {
                                 <= remaining,
                         );
                     }
+                    assert!((vector_extent..batch_extent).contains(&remaining));
                 } else if scalar_candidate_is_safe {
                     assert!((width..vector_extent).contains(&remaining));
                 } else {
@@ -1440,42 +1645,97 @@ mod tests {
                 usize::from(last_pair_offset) + usize::from(PAIR_PREFILTER_VECTOR_BYTES)
                     <= vector_extent,
             );
+            assert!(
+                usize::from(last_pair_offset) + usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                    > batch_extent - 1,
+            );
+            assert!(
+                usize::from(last_pair_offset) + usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                    <= batch_extent,
+            );
         }
     }
 
     #[test]
-    fn asimd_pair_prefilter_emits_exact_vector_and_first_lane_primitives() {
+    fn asimd_pair_prefilter_emits_exact_batch_tail_and_lane_cfg() {
         let literal = format!("{}c", "ab".repeat(31));
         let plan = derive_two_way_plan(literal.as_bytes()).expect("derive ASIMD plan");
         let pair = select_pair_prefilter(literal.as_bytes()).expect("select ASIMD pair");
-        let (code, _) = lower_aarch64_two_way(plan, Some(pair)).expect("lower ASIMD pair");
+        let minimum_batch_remaining_bytes =
+            pair_prefilter_minimum_batch_remaining_bytes(pair).expect("batch extent");
+        let (code, _, _) = lower_aarch64_two_way(plan, Some(pair)).expect("lower ASIMD pair");
         let words = code
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes(word.try_into().expect("instruction word")))
             .collect::<Vec<_>>();
-        let vector = [
+        let primary_filter = [
+            aarch64_load_byte_reg(8, 2, 7).expect("primary terminal byte"),
+            aarch64_and_low_x(8, 8, 63).expect("primary terminal modulo"),
+            aarch64_lsrv_x(10, 11, 8).expect("primary membership shift"),
+            aarch64_and_low_x(10, 10, 1).expect("primary membership bit"),
+        ];
+        let primary_candidate = words
+            .windows(primary_filter.len())
+            .position(|window| window == primary_filter)
+            .expect("primary scalar candidate");
+        let primary_search = primary_candidate
+            .checked_sub(3)
+            .expect("primary search precedes candidate");
+        assert_eq!(
+            words[primary_search],
+            aarch64_sub_x_reg(12, 3, 2).expect("primary remaining bytes"),
+        );
+        assert_eq!(
+            words[primary_search + 1],
+            aarch64_cmp_x(12, 6).expect("primary width bound"),
+        );
+        let primary_membership = primary_candidate + primary_filter.len();
+        assert_eq!(
+            words[primary_membership] & 0xff00_001f,
+            0xb500_000a,
+            "pair primary membership must use CBNZ X10",
+        );
+        assert_eq!(
+            aarch64_relative_target(primary_membership, words[primary_membership], 19, 5,),
+            primary_membership + 3,
+        );
+        assert_eq!(
+            words[primary_membership + 1],
+            aarch64_add_x_reg(2, 2, 6).expect("local primary miss advance"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&words, primary_membership + 2),
+            primary_search,
+        );
+        assert_eq!(
+            words[primary_membership + 3],
+            aarch64_mov_x(9, 14).expect("primary scalar verifier"),
+        );
+        let batch = [
             aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0])).expect("first address"),
-            aarch64_load_q(0, 12).expect("first vector load"),
+            aarch64_load_pair_q(0, 1, 12, 0).expect("first pair load"),
             aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1])).expect("second address"),
-            aarch64_load_q(1, 12).expect("second vector load"),
-            aarch64_cmeq_16b(24, 0, 16).expect("first equality"),
-            aarch64_cmeq_16b(1, 1, 17).expect("second equality"),
-            aarch64_and_16b(24, 24, 1).expect("pair intersection"),
-            aarch64_umaxv_16b(7, 24).expect("candidate reduction"),
+            aarch64_load_pair_q(2, 3, 12, 0).expect("second pair load"),
+            aarch64_cmeq_16b(24, 0, 16).expect("first block first equality"),
+            aarch64_cmeq_16b(25, 1, 16).expect("second block first equality"),
+            aarch64_cmeq_16b(26, 2, 17).expect("first block second equality"),
+            aarch64_cmeq_16b(27, 3, 17).expect("second block second equality"),
+            aarch64_and_16b(24, 24, 26).expect("first block intersection"),
+            aarch64_and_16b(25, 25, 27).expect("second block intersection"),
+            aarch64_orr_16b(28, 24, 25).expect("batch union"),
+            aarch64_umaxv_16b(7, 28).expect("candidate reduction"),
             aarch64_umov_b0(12, 7).expect("candidate scalar"),
             aarch64_cmp_w_zero(12).expect("candidate test"),
         ];
-        let vector_body = words
-            .windows(vector.len())
-            .position(|window| window == vector)
-            .expect("vector body");
-        // These are the pre-change code size and vector-body address. The
-        // guard hoist must not perturb either one.
-        assert_eq!(words.len(), 176);
-        assert_eq!(vector_body, 135);
+        let batch_body = words
+            .windows(batch.len())
+            .position(|window| window == batch)
+            .expect("batch body");
+        assert_eq!(words.len(), 201);
+        assert_eq!(batch_body, 135);
 
-        let vector_tail = vector_body - 7;
-        let vector_search = vector_body - 3;
+        let vector_tail = batch_body - 7;
+        let vector_search = batch_body - 3;
         let disabled_state = u16::from(
             PAIR_PREFILTER_MAX_CANDIDATE_REPORTS
                 .checked_add(1)
@@ -1507,10 +1767,124 @@ mod tests {
         );
         assert_eq!(
             words[vector_search + 1],
-            aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes).expect("hot vector extent"),
+            aarch64_cmp_x_imm(12, minimum_batch_remaining_bytes).expect("hot batch extent"),
+        );
+        let single_vector_search =
+            aarch64_conditional_target(&words, vector_search + 2, AARCH64_LO);
+
+        let batch_candidate_branch = batch_body + batch.len();
+        let batch_miss = aarch64_conditional_target(&words, batch_candidate_branch, AARCH64_EQ);
+        assert_eq!(
+            words[batch_candidate_branch + 1],
+            aarch64_movz_x(0, u16::from(PAIR_PREFILTER_BATCH_BYTES), 0).expect("batch lane limit"),
+        );
+        let lane_start = aarch64_unconditional_target(&words, batch_candidate_branch + 2);
+        assert_eq!(
+            words[batch_miss],
+            aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_BATCH_BYTES))
+                .expect("batch miss advance"),
         );
         assert_eq!(
-            aarch64_conditional_target(&words, vector_search + 2, AARCH64_LO),
+            aarch64_unconditional_target(&words, batch_miss + 1),
+            vector_search,
+        );
+        assert_eq!(batch_candidate_branch + 1 - vector_search + 2, 20);
+        assert_eq!(single_vector_search, batch_miss + 2);
+
+        assert_eq!(
+            words[single_vector_search],
+            aarch64_cmp_x_imm(12, pair.minimum_vector_remaining_bytes)
+                .expect("single-vector extent"),
+        );
+        assert_eq!(
+            aarch64_conditional_target(&words, single_vector_search + 1, AARCH64_LO),
+            vector_tail,
+        );
+        let single = [
+            aarch64_add_x_imm(12, 2, u16::from(pair.offsets[0])).expect("single first address"),
+            aarch64_load_q(0, 12).expect("single first load"),
+            aarch64_add_x_imm(12, 2, u16::from(pair.offsets[1])).expect("single second address"),
+            aarch64_load_q(1, 12).expect("single second load"),
+            aarch64_cmeq_16b(24, 0, 16).expect("single first equality"),
+            aarch64_cmeq_16b(1, 1, 17).expect("single second equality"),
+            aarch64_and_16b(24, 24, 1).expect("single pair intersection"),
+            aarch64_umaxv_16b(7, 24).expect("single candidate reduction"),
+            aarch64_umov_b0(12, 7).expect("single candidate scalar"),
+            aarch64_cmp_w_zero(12).expect("single candidate test"),
+        ];
+        let single_body = single_vector_search + 2;
+        assert_eq!(&words[single_body..single_body + single.len()], &single);
+        let single_candidate_branch = single_body + single.len();
+        let single_vector_miss =
+            aarch64_conditional_target(&words, single_candidate_branch, AARCH64_EQ);
+        assert_eq!(
+            words[single_candidate_branch + 1],
+            aarch64_movz_x(0, u16::from(PAIR_PREFILTER_VECTOR_BYTES), 0)
+                .expect("single lane limit"),
+        );
+        assert_eq!(lane_start, single_candidate_branch + 2);
+        assert_eq!(
+            words[lane_start],
+            aarch64_movz_x(12, 0, 0).expect("lane zero"),
+        );
+
+        let lane = lane_start + 1;
+        assert_eq!(
+            words[lane],
+            aarch64_add_x_reg(9, 2, 12).expect("lane address"),
+        );
+        assert_eq!(
+            words[lane + 1],
+            aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[0])).expect("first lane byte"),
+        );
+        assert_eq!(
+            words[lane + 2],
+            aarch64_cmp_w_imm(8, u16::from(pair.bytes[0])).expect("first lane compare"),
+        );
+        assert_eq!(
+            aarch64_conditional_target(&words, lane + 3, AARCH64_NE),
+            lane + 7,
+        );
+        assert_eq!(
+            words[lane + 4],
+            aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[1])).expect("second lane byte"),
+        );
+        assert_eq!(
+            words[lane + 5],
+            aarch64_cmp_w_imm(8, u16::from(pair.bytes[1])).expect("second lane compare"),
+        );
+        assert_eq!(
+            words[lane + 7],
+            aarch64_add_x_imm(12, 12, 1).expect("next lane"),
+        );
+        assert_eq!(
+            words[lane + 8],
+            aarch64_cmp_x(12, 0).expect("dynamic lane limit"),
+        );
+        assert_eq!(
+            aarch64_conditional_target(&words, lane + 9, AARCH64_LO),
+            lane,
+        );
+        assert_eq!(
+            words[lane + 10],
+            aarch64_add_x_reg(2, 2, 0).expect("defensive lane exhaustion"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&words, lane + 11),
+            vector_search,
+        );
+        assert_eq!(single_vector_miss, lane + 12);
+        assert_eq!(
+            words[single_vector_miss],
+            aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_VECTOR_BYTES))
+                .expect("single-vector miss advance"),
+        );
+        assert_eq!(
+            words[single_vector_miss + 1],
+            aarch64_sub_x_reg(12, 3, 2).expect("remaining scalar tail"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&words, single_vector_miss + 2),
             vector_tail,
         );
 
@@ -1524,29 +1898,16 @@ mod tests {
         assert_eq!(state_comparisons.len(), 1);
         assert!(state_comparisons[0] < vector_tail);
 
-        let candidate_branch = vector_body + vector.len();
-        let vector_miss = aarch64_conditional_target(&words, candidate_branch, AARCH64_EQ);
+        let pair_candidate = aarch64_conditional_target(&words, lane + 6, AARCH64_EQ);
+        assert_eq!(pair_candidate, single_vector_miss + 3);
         assert_eq!(
-            words[vector_miss],
-            aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_VECTOR_BYTES))
-                .expect("vector miss advance"),
+            words[pair_candidate],
+            aarch64_mov_x(2, 9).expect("refined candidate position"),
         );
         assert_eq!(
-            aarch64_unconditional_target(&words, vector_miss + 1),
-            vector_search,
+            words[pair_candidate + 1],
+            aarch64_add_x_imm(16, 16, 1).expect("candidate report"),
         );
-        assert_eq!(candidate_branch + 1 - vector_search + 2, 16);
-
-        let pair_candidate = words
-            .windows(2)
-            .position(|window| {
-                window
-                    == [
-                        aarch64_mov_x(2, 9).expect("refined candidate position"),
-                        aarch64_add_x_imm(16, 16, 1).expect("candidate report"),
-                    ]
-            })
-            .expect("pair candidate block");
         let pair_scalar = aarch64_unconditional_target(&words, pair_candidate + 2);
         assert_eq!(pair_scalar, pair_candidate + 5);
         assert_eq!(
@@ -1562,21 +1923,6 @@ mod tests {
             aarch64_load_byte_reg(8, 2, 7).expect("pair terminal byte"),
         );
 
-        let scalar_lane = [
-            aarch64_add_x_reg(9, 2, 12).expect("lane address"),
-            aarch64_load_byte_imm(8, 9, u16::from(pair.offsets[0])).expect("first lane byte"),
-            aarch64_cmp_w_imm(8, u16::from(pair.bytes[0])).expect("first lane compare"),
-        ];
-        assert!(
-            words
-                .windows(scalar_lane.len())
-                .any(|window| window == scalar_lane),
-        );
-        assert!(
-            words.contains(
-                &aarch64_cmp_x_imm(16, disabled_state).expect("candidate budget comparison"),
-            ),
-        );
         assert!(
             words.contains(
                 &aarch64_cmp_x_imm(
@@ -1586,18 +1932,39 @@ mod tests {
                 .expect("adaptive warm-up threshold")
             )
         );
-        assert!(
-            words.contains(
-                &aarch64_add_x_imm(2, 2, u16::from(PAIR_PREFILTER_VECTOR_BYTES),)
-                    .expect("vector miss advance")
-            )
-        );
-
-        let (scalar, _) = lower_aarch64_two_way(plan, None).expect("lower scalar control");
+        let (scalar, _, _) = lower_aarch64_two_way(plan, None).expect("lower scalar control");
         assert!(!scalar.windows(4).any(|bytes| {
             u32::from_le_bytes(bytes.try_into().expect("scalar word"))
                 == aarch64_movi_16b(16, pair.bytes[0]).expect("first splat")
         }));
+        let scalar_words = scalar
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("scalar instruction word")))
+            .collect::<Vec<_>>();
+        let scalar_candidate = scalar_words
+            .windows(primary_filter.len())
+            .position(|window| window == primary_filter)
+            .expect("scalar-control primary candidate");
+        let scalar_search = scalar_candidate
+            .checked_sub(3)
+            .expect("scalar-control search precedes candidate");
+        let scalar_membership = scalar_candidate + primary_filter.len();
+        assert_eq!(
+            scalar_words[scalar_membership] & 0xff00_001f,
+            0xb400_000a,
+            "non-pair primary membership must retain CBZ X10",
+        );
+        let scalar_skip =
+            aarch64_relative_target(scalar_membership, scalar_words[scalar_membership], 19, 5);
+        assert!(scalar_skip > scalar_membership + 3);
+        assert_eq!(
+            scalar_words[scalar_skip],
+            aarch64_add_x_reg(2, 2, 6).expect("scalar-control miss advance"),
+        );
+        assert_eq!(
+            aarch64_unconditional_target(&scalar_words, scalar_skip + 1),
+            scalar_search,
+        );
     }
 
     #[test]
@@ -1622,18 +1989,13 @@ mod tests {
         let mut stats = PairPrefilterModelStats::default();
         let scalar_skip_haystack = vec![b'~'; 64 * 1024];
         assert_eq!(
-            pair_prefilter_find_counted(
-                plan,
-                pair,
-                &scalar_skip_haystack,
-                &needle,
-                &mut stats,
-            ),
+            pair_prefilter_find_counted(plan, pair, &scalar_skip_haystack, &needle, &mut stats,),
             None,
         );
         assert_eq!(stats, PairPrefilterModelStats::default());
-        for lane in 0_usize..16 {
-            let mut haystack = vec![b'!'; needle.len() + 15];
+        for lane in 0_usize..usize::from(PAIR_PREFILTER_BATCH_BYTES) {
+            let mut haystack =
+                vec![b'!'; needle.len() + usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1];
             haystack[lane..lane + needle.len()].copy_from_slice(&needle);
             let mut stats = PairPrefilterModelStats::default();
             assert_eq!(
@@ -1667,6 +2029,7 @@ mod tests {
         for _ in 0..8 {
             adaptive_haystack.extend_from_slice(&low_progress_candidate);
         }
+        let adaptive_prefix = adaptive_haystack.clone();
         for _ in 0..=usize::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS) {
             adaptive_haystack.extend_from_slice(&large_shift_candidate);
         }
@@ -1687,6 +2050,32 @@ mod tests {
             usize::from(PAIR_PREFILTER_MAX_CANDIDATE_REPORTS),
         );
         assert!(stats.retired);
+
+        let mut covered_batch_lanes = vec![false; usize::from(PAIR_PREFILTER_BATCH_BYTES)];
+        for padding in 0..usize::from(PAIR_PREFILTER_BATCH_BYTES) * 4 {
+            let mut haystack = adaptive_prefix.clone();
+            haystack.extend(std::iter::repeat_n(b'!', padding));
+            haystack.extend_from_slice(&needle);
+            haystack.extend(std::iter::repeat_n(
+                b'!',
+                usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1,
+            ));
+            let expected = adaptive_prefix.len() + padding;
+            let mut stats = PairPrefilterModelStats::default();
+            assert_eq!(
+                pair_prefilter_find_counted(plan, pair, &haystack, &needle, &mut stats),
+                Some(expected),
+            );
+            if stats.last_candidate_scan_bytes == usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                && let Some(lane) = stats.last_candidate_lane
+            {
+                covered_batch_lanes[lane] = true;
+            }
+        }
+        assert!(
+            covered_batch_lanes.into_iter().all(std::convert::identity),
+            "generated adaptive fixtures did not cover every pair-batch lane",
+        );
     }
 
     #[test]
@@ -1698,13 +2087,14 @@ mod tests {
         assert!(derive_two_way_plan(&vec![b'x'; MAX_TWO_WAY_LITERAL_BYTES + 1]).is_none());
         for target in [Target::x86_64_linux(), Target::aarch64_macos()] {
             let plan = derive_two_way_plan(literal).expect("derive plan");
-            let (code, relocations) = match target.architecture {
+            let (code, relocations, trusted_core) = match target.architecture {
                 Architecture::X86_64 => lower_x86_64_two_way(plan).expect("x86 lowering"),
                 Architecture::Aarch64 => {
                     lower_aarch64_two_way(plan, None).expect("AArch64 lowering")
                 }
             };
             assert!(!code.is_empty());
+            assert!(trusted_core < code.len());
             assert_eq!(
                 relocations.len(),
                 if target.architecture == Architecture::X86_64 {
@@ -1777,6 +2167,141 @@ mod tests {
             assert!(!report_matches_lowering(&bad, &lowering, target));
             lowering.code[0] ^= 1;
             assert!(!report_matches_lowering(&report, &lowering, target));
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-target transaction covers opt-in publication, resource fallback, and every private receipt input"
+    )]
+    fn exact_single_literal_two_way_trusted_batch_core_is_opt_in_and_tamper_evident() {
+        let pattern = "abababababababababababababababababababababababababababababababc";
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let request = CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists);
+            let ordinary = compile(request.clone()).expect("compile ordinary Two-Way leaf");
+            assert!(ordinary.receipt().exact_single_literal_aot.is_some());
+            assert!(ordinary.module().direct_exists_batch_symbol().is_none());
+            let core = ordinary
+                .module()
+                .native_direct_search_trusted_core
+                .expect("Two-Way trusted core receipt");
+            assert!(matches!(
+                core.landmark,
+                NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+                    program_bytes,
+                    ..
+                } if program_bytes == pattern.len()
+            ));
+            authenticate_native_direct_search_trusted_core(
+                target.architecture,
+                ordinary.module().sections[TEXT_SECTION].bytes(),
+                0,
+                ordinary.module().sections[TEXT_SECTION].bytes().len(),
+                ordinary.module().sections[PROGRAM_SECTION].bytes(),
+                ordinary.module().relocations.as_ref(),
+                core,
+                OutputContract::Exists,
+            )
+            .expect("authenticate exact Two-Way trusted core");
+
+            let batched = crate::compile_with_independent_exists_batch(request.clone())
+                .expect("append Two-Way independent Exists batch");
+            assert!(batched.module().direct_exists_batch_symbol().is_some());
+            assert_eq!(
+                batched.module().direct_exists_batch_strategy(),
+                Some(DirectExistsBatchStrategy::NativeOrdinaryEntryLoop),
+            );
+            assert!(batched.module().prepared_exists_batch_symbol().is_none());
+            assert!(batched.module().required_runtime_symbols().next().is_none());
+            let ordinary_text = ordinary.module().sections[TEXT_SECTION].bytes();
+            let batched_text = batched.module().sections[TEXT_SECTION].bytes();
+            assert_eq!(
+                batched_text.get(..ordinary_text.len()),
+                Some(ordinary_text),
+                "additive batch changed the public Two-Way entry",
+            );
+            assert_eq!(
+                batched.module().sections[PROGRAM_SECTION].bytes(),
+                ordinary.module().sections[PROGRAM_SECTION].bytes(),
+            );
+
+            let mut limits = crate::CompileLimitsV1::default();
+            limits.max_object_bytes = ordinary.object().len();
+            let capped =
+                crate::compile_with_independent_exists_batch(request.clone().limits(limits))
+                    .expect("optional Two-Way batch object-cap decline");
+            assert_eq!(capped.object(), ordinary.object());
+            assert_eq!(capped.module(), ordinary.module());
+            assert!(capped.module().direct_exists_batch_symbol().is_none());
+
+            let assert_rejected = |module: CompiledModule| {
+                assert!(matches!(
+                    module.append_direct_exists_batch(OutputContract::Exists),
+                    Err(ObjectError::InvalidModule(
+                        "direct search trusted core contract is inconsistent"
+                            | "direct search trusted core entry identity is inconsistent"
+                            | "direct search trusted core program surface is inconsistent"
+                            | "direct search trusted core landmark is malformed"
+                    ))
+                ));
+            };
+
+            let mut wrong_family = ordinary.module().clone();
+            let mut forged_core = core;
+            forged_core.landmark = NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1;
+            wrong_family.native_direct_search_trusted_core = Some(forged_core);
+            assert_rejected(wrong_family);
+
+            let mut wrong_program = ordinary.module().clone();
+            let mut forged_core = core;
+            let NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+                program_bytes,
+                mut program_sha256,
+            } = forged_core.landmark
+            else {
+                panic!("expected Two-Way core family");
+            };
+            program_sha256[0] ^= 1;
+            forged_core.landmark =
+                NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+                    program_bytes,
+                    program_sha256,
+                };
+            wrong_program.native_direct_search_trusted_core = Some(forged_core);
+            assert_rejected(wrong_program);
+
+            let mut wrong_text = ordinary.module().clone();
+            wrong_text.sections[TEXT_SECTION].data[core.code_offset] ^= 1;
+            let mut forged_core = core;
+            forged_core.entry_code_sha256 =
+                Sha256::digest(wrong_text.sections[TEXT_SECTION].bytes()).into();
+            wrong_text.native_direct_search_trusted_core = Some(forged_core);
+            assert_rejected(wrong_text);
+
+            let mut wrong_data = ordinary.module().clone();
+            wrong_data.sections[PROGRAM_SECTION].data[0] ^= 1;
+            assert_rejected(wrong_data);
+
+            let mut wrong_relocation = ordinary.module().clone();
+            wrong_relocation.relocations[0].offset =
+                wrong_relocation.relocations[0].offset.saturating_add(4);
+            assert_rejected(wrong_relocation);
+
+            let mut wrong_symbol = ordinary.module().clone();
+            wrong_symbol.symbols[PROGRAM_SYMBOL].size = 0;
+            assert_rejected(wrong_symbol);
+
+            let mut wrong_section = ordinary.module().clone();
+            wrong_section.sections[PROGRAM_SECTION].alignment = 1;
+            assert_rejected(wrong_section);
         }
     }
 
@@ -1890,7 +2415,7 @@ mod tests {
             .native_finite_exists_choice_view()
             .expect("scalar Choice");
         let plan = derive_two_way_plan(pattern.as_bytes()).expect("scalar plan");
-        let (expected_code, expected_relocations) =
+        let (expected_code, expected_relocations, _) =
             lower_aarch64_two_way(plan, None).expect("canonical scalar lowering");
         let (actual, _) =
             lower_optional_exact_single_literal_two_way(choice, scalar_target, usize::MAX)
@@ -1997,11 +2522,23 @@ mod tests {
             std::process::id(),
         ));
         fs::create_dir(&directory).expect("create linker directory");
-        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n");
-        let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\ntypedef struct { const uint8_t *ptr; size_t len; } H;\n",
+        );
+        let mut calls = String::from("int main(void){size_t r[2],p;uint32_t s;uint8_t m[64];\n");
         let mut objects = Vec::new();
         for (case, pattern) in patterns.iter().enumerate() {
-            let compiled = compile_two_way(pattern, target, OutputContract::Exists);
+            let compiled = crate::compile_with_independent_exists_batch(
+                CompileRequest::new(*pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .expect("compile linked Two-Way batch leaf");
+            assert!(compiled.receipt().exact_single_literal_aot.is_some());
+            let batch_symbol = compiled
+                .module()
+                .direct_exists_batch_symbol()
+                .expect("linked Two-Way direct batch symbol");
             let needle = pattern.as_bytes();
             let mut haystacks = vec![
                 [vec![b'!'; 20], needle.to_vec(), vec![b'?']].concat(),
@@ -2022,6 +2559,46 @@ mod tests {
                 }
                 budget_haystack.extend_from_slice(needle);
                 haystacks.push(budget_haystack);
+
+                if target.architecture == Architecture::Aarch64 {
+                    let plan = derive_two_way_plan(needle).expect("linked pair plan");
+                    let pair = derive_pair_prefilter(needle, plan, target)
+                        .expect("linked ASIMD pair plan");
+                    let mut adaptive_prefix = Vec::new();
+                    for _ in 0..8 {
+                        adaptive_prefix.extend_from_slice(&low_progress_candidate);
+                    }
+                    let mut lane_haystacks = vec![None; usize::from(PAIR_PREFILTER_BATCH_BYTES)];
+                    for padding in 0..usize::from(PAIR_PREFILTER_BATCH_BYTES) * 4 {
+                        let mut haystack = adaptive_prefix.clone();
+                        haystack.extend(std::iter::repeat_n(b'!', padding));
+                        haystack.extend_from_slice(needle);
+                        haystack.extend(std::iter::repeat_n(
+                            b'!',
+                            usize::from(PAIR_PREFILTER_BATCH_BYTES) - 1,
+                        ));
+                        let mut stats = PairPrefilterModelStats::default();
+                        let expected = adaptive_prefix.len() + padding;
+                        assert_eq!(
+                            pair_prefilter_find_counted(plan, pair, &haystack, needle, &mut stats,),
+                            Some(expected),
+                        );
+                        if stats.last_candidate_scan_bytes
+                            == usize::from(PAIR_PREFILTER_BATCH_BYTES)
+                            && let Some(lane) = stats.last_candidate_lane
+                            && lane_haystacks[lane].is_none()
+                        {
+                            lane_haystacks[lane] = Some(haystack);
+                        }
+                    }
+                    haystacks.extend(lane_haystacks.into_iter().enumerate().map(
+                        |(lane, haystack)| {
+                            haystack.unwrap_or_else(|| {
+                                panic!("linked adaptive fixture missed pair-batch lane {lane}")
+                            })
+                        },
+                    ));
+                }
             }
             let symbol = compiled.module().entry_symbol();
             writeln!(
@@ -2029,9 +2606,16 @@ mod tests {
                 "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
             )
             .expect("write declaration");
+            writeln!(
+                source,
+                "extern uint32_t {batch_symbol}(const H*,size_t,uint8_t*,size_t*);"
+            )
+            .expect("write batch declaration");
             let object = directory.join(format!("case{case}.o"));
             fs::write(&object, compiled.object()).expect("write object");
             objects.push(object);
+            let mut batch_names = Vec::new();
+            let mut batch_expected = Vec::new();
             for (haystack_index, haystack) in haystacks.iter().enumerate() {
                 let name = format!("h{case}_{haystack_index}");
                 let bytes = haystack
@@ -2041,6 +2625,14 @@ mod tests {
                     .join(",");
                 writeln!(source, "static const unsigned char {name}[]={{{bytes}}};")
                     .expect("write haystack");
+                let MatchResult::Exists(expected) = compiled
+                    .search(haystack, SearchWindow::new(0, haystack.len()))
+                    .expect("portable full-haystack batch result")
+                else {
+                    panic!("unexpected output contract");
+                };
+                batch_names.push(name.clone());
+                batch_expected.push(u8::from(expected));
                 let windows: Box<dyn Iterator<Item = (usize, usize)>> =
                     if haystack_index == 0 {
                         Box::new((0..=haystack.len()).flat_map(|start| {
@@ -2074,6 +2666,44 @@ mod tests {
                     .expect("write differential call");
                 }
             }
+            let descriptors = batch_names
+                .iter()
+                .map(|name| format!("{{{name},sizeof({name})}}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const H d{case}[]={{{descriptors}}};")
+                .expect("write batch descriptors");
+            let first_name = &batch_names[0];
+            let second_name = &batch_names[1];
+            let bad_descriptors = format!(
+                "{{{first_name},sizeof({first_name})}},{{NULL,0}},{{{second_name},sizeof({second_name})}}"
+            );
+            writeln!(source, "static const H bad{case}[]={{{bad_descriptors}}};")
+                .expect("write late-invalid batch descriptors");
+            write!(
+                calls,
+                "p=99;s={batch_symbol}(d{case},{},m,&p);if(s!=0||p!={}",
+                batch_names.len(),
+                batch_names.len(),
+            )
+            .expect("write batch call");
+            for (index, expected) in batch_expected.iter().enumerate() {
+                write!(calls, "||m[{index}]!={expected}").expect("write batch expectation");
+            }
+            writeln!(calls, ")return {};", 70 + case).expect("finish batch call");
+            writeln!(
+                calls,
+                "m[0]=77;m[1]=78;m[2]=79;p=99;s={batch_symbol}(bad{case},3,m,&p);if(s!=2||p!=1||m[0]!={}||m[1]!=78||m[2]!=79)return {};",
+                batch_expected[0],
+                80 + case,
+            )
+            .expect("write late-invalid batch transaction");
+            writeln!(
+                calls,
+                "p=99;s={batch_symbol}(NULL,0,NULL,&p);if(s!=0||p!=0)return {};",
+                90 + case,
+            )
+            .expect("write empty batch call");
             writeln!(
                 calls,
                 "r[0]=91;r[1]=92;s={symbol}((const unsigned char*)\"x\",1,1,0,r);if(s!=2||r[0]!=91||r[1]!=92)return {};",

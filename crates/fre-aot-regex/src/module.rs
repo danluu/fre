@@ -1397,11 +1397,12 @@ struct NativeDfaEmission {
     direct_search_trusted_core: Option<NativeDirectSearchTrustedCore>,
 }
 
-/// Local entry into an ordinary direct DFA after its public raw-argument
+/// Local entry into a complete direct search after its public raw-argument
 /// checks and result initialization. An additive wrapper may enter this body
-/// only after proving the same facts and authenticating the exact output
-/// contract. On x86-64, the wrapper must also reproduce this entry's precise
-/// callee-save prologue before entering the shared body.
+/// only after proving the same facts and authenticating the exact output,
+/// program, relocation, and body-family contracts. On x86-64, the wrapper
+/// must also reproduce this entry's precise callee-save prologue before
+/// entering the shared body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeDirectSearchTrustedCore {
     code_offset: usize,
@@ -1410,6 +1411,7 @@ struct NativeDirectSearchTrustedCore {
     result_abi: NativeDirectSearchResultAbi,
     entry_code_sha256: [u8; 32],
     prologue: NativeDirectSearchTrustedCorePrologue,
+    landmark: NativeDirectSearchTrustedCoreLandmark,
 }
 
 /// Exact selected-layout receipt from which an aggregate-only complete Span
@@ -1656,6 +1658,19 @@ enum NativeDirectSearchTrustedCorePrologue {
     Aarch64,
 }
 
+/// Exact post-validation body family admitted behind an additive direct
+/// wrapper. The family is authenticated separately from the public entry
+/// digest: an offset that happens to name another valid instruction sequence
+/// must not change the private entry ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDirectSearchTrustedCoreLandmark {
+    CompleteDfaV1,
+    ExactSingleLiteralTwoWayV1 {
+        program_bytes: usize,
+        program_sha256: [u8; 32],
+    },
+}
+
 impl NativeDirectSearchTrustedCorePrologue {
     fn identity_tag(self) -> u8 {
         match self {
@@ -1673,11 +1688,18 @@ impl NativeDirectSearchTrustedCorePrologue {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "entry, program, relocation, ABI, and body-family identities are one closed authentication boundary"
+)]
 fn authenticate_native_direct_search_trusted_core(
     architecture: Architecture,
     text: &[u8],
     entry_start: usize,
     entry_end: usize,
+    program: &[u8],
+    relocations: &[ModuleRelocation],
     core: NativeDirectSearchTrustedCore,
     expected_output: OutputContract,
 ) -> Result<(), ObjectError> {
@@ -1727,12 +1749,12 @@ fn authenticate_native_direct_search_trusted_core(
             "direct search trusted core has an impossible x86 save mask",
         ));
     }
-    let landmark_matches = match architecture {
-        Architecture::X86_64 => {
+    let landmark_matches = match (architecture, core.landmark) {
+        (Architecture::X86_64, NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1) => {
             text.get(core.code_offset..core.code_offset.saturating_add(6))
                 == Some([0x48, 0x89, 0xd6, 0x4c, 0x8d, 0x0d].as_slice())
         }
-        Architecture::Aarch64 => {
+        (Architecture::Aarch64, NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1) => {
             let end = core.code_offset.saturating_add(12);
             let mut landmark = [0_u8; 12];
             landmark[..4].copy_from_slice(&aarch64_mov_x(9, 2)?.to_le_bytes());
@@ -1740,10 +1762,128 @@ fn authenticate_native_direct_search_trusted_core(
             landmark[8..].copy_from_slice(&aarch64_add_x_imm(5, 5, 0)?.to_le_bytes());
             text.get(core.code_offset..end) == Some(landmark.as_slice())
         }
+        (
+            Architecture::X86_64,
+            NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+                program_bytes,
+                program_sha256,
+            },
+        ) => {
+            let relocation_offset = core.code_offset.checked_add(3).ok_or(
+                ObjectError::ArithmeticOverflow("x86 Two-Way core relocation offset"),
+            )?;
+            let expected_relocations = [ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: u64::try_from(relocation_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("x86 Two-Way core relocation offset")
+                })?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PROGRAM_SYMBOL,
+                addend: -4,
+            }];
+            core.output == OutputContract::Exists
+                && core.result_abi == NativeDirectSearchResultAbi::ExistsStatusOnlyV1
+                && core.prologue
+                    == (NativeDirectSearchTrustedCorePrologue::X86_64 {
+                        save_rbx: false,
+                        save_r12_r13: false,
+                        save_r14_r15: false,
+                    })
+                && program_bytes == program.len()
+                && program_bytes != 0
+                && <[u8; 32]>::from(Sha256::digest(program)) == program_sha256
+                && relocations == expected_relocations.as_slice()
+                && text.get(core.code_offset..core.code_offset.saturating_add(3))
+                    == Some([0x4c, 0x8d, 0x0d].as_slice())
+                && text.get(
+                    core.code_offset.saturating_add(7)..core.code_offset.saturating_add(13),
+                ) == Some([0x48, 0x01, 0xfa, 0x48, 0x01, 0xf9].as_slice())
+        }
+        (
+            Architecture::Aarch64,
+            NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+                program_bytes,
+                program_sha256,
+            },
+        ) => {
+            let second_relocation_offset = core.code_offset.checked_add(4).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 Two-Way core relocation offset"),
+            )?;
+            let expected_relocations = [
+                ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: u64::try_from(core.code_offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("AArch64 Two-Way core relocation offset")
+                    })?,
+                    kind: RelocationKind::Aarch64Page21,
+                    symbol: PROGRAM_SYMBOL,
+                    addend: 0,
+                },
+                ModuleRelocation {
+                    section: TEXT_SECTION,
+                    offset: u64::try_from(second_relocation_offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("AArch64 Two-Way core relocation offset")
+                    })?,
+                    kind: RelocationKind::Aarch64PageOff12,
+                    symbol: PROGRAM_SYMBOL,
+                    addend: 0,
+                },
+            ];
+            let mut landmark = [0_u8; 16];
+            landmark[..4].copy_from_slice(&0x9000_0005_u32.to_le_bytes());
+            landmark[4..8].copy_from_slice(&aarch64_add_x_imm(5, 5, 0)?.to_le_bytes());
+            landmark[8..12].copy_from_slice(&aarch64_add_x_reg(2, 0, 2)?.to_le_bytes());
+            landmark[12..].copy_from_slice(&aarch64_add_x_reg(3, 0, 3)?.to_le_bytes());
+            core.output == OutputContract::Exists
+                && core.result_abi == NativeDirectSearchResultAbi::ExistsStatusOnlyV1
+                && core.prologue == NativeDirectSearchTrustedCorePrologue::Aarch64
+                && program_bytes == program.len()
+                && program_bytes != 0
+                && <[u8; 32]>::from(Sha256::digest(program)) == program_sha256
+                && relocations == expected_relocations.as_slice()
+                && text.get(core.code_offset..core.code_offset.saturating_add(16))
+                    == Some(landmark.as_slice())
+        }
     };
     if !landmark_matches {
         return Err(ObjectError::InvalidModule(
             "direct search trusted core landmark is malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn authenticate_native_direct_search_trusted_program_surface(
+    program: &ModuleSection,
+    symbols: &[ModuleSymbol],
+    core: NativeDirectSearchTrustedCore,
+) -> Result<(), ObjectError> {
+    let NativeDirectSearchTrustedCoreLandmark::ExactSingleLiteralTwoWayV1 {
+        program_bytes,
+        program_sha256,
+    } = core.landmark
+    else {
+        return Ok(());
+    };
+    let symbol = symbols.get(PROGRAM_SYMBOL).ok_or(ObjectError::InvalidModule(
+        "direct search trusted core program symbol is absent",
+    ))?;
+    let symbol_size = usize::try_from(symbol.size).map_err(|_| {
+        ObjectError::ArithmeticOverflow("direct search trusted core program symbol size")
+    })?;
+    if program.name != ".rodata.fre.regex"
+        || program.kind != SectionKind::ReadOnlyData
+        || program.alignment != 16
+        || symbol.binding != SymbolBinding::Local
+        || symbol.kind != SymbolKind::Object
+        || symbol.section != Some(PROGRAM_SECTION)
+        || symbol.offset != 0
+        || symbol_size != program_bytes
+        || symbol_size != program.data.len()
+        || <[u8; 32]>::from(Sha256::digest(program.data.as_ref())) != program_sha256
+    {
+        return Err(ObjectError::InvalidModule(
+            "direct search trusted core program surface is inconsistent",
         ));
     }
     Ok(())
@@ -2080,15 +2220,6 @@ impl CompiledModule {
                 "complete Span reducer entry is not a complete text function",
             ));
         }
-        authenticate_native_direct_search_trusted_core(
-            self.target.architecture,
-            text,
-            entry_start,
-            entry_end,
-            trusted_core,
-            OutputContract::Span,
-        )?;
-
         let program = self.symbols.get(PROGRAM_SYMBOL).ok_or(
             ObjectError::InvalidModule("complete Span reducer program symbol is absent"),
         )?;
@@ -2128,6 +2259,16 @@ impl CompiledModule {
                 "complete Span reducer program identity is inconsistent",
             ));
         }
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            text,
+            entry_start,
+            entry_end,
+            program_data,
+            &self.relocations,
+            trusted_core,
+            OutputContract::Span,
+        )?;
 
         let regenerated = match self.target.architecture {
             Architecture::X86_64 => {
@@ -2152,6 +2293,8 @@ impl CompiledModule {
             &regenerated.code,
             0,
             regenerated.code.len(),
+            program_data,
+            &regenerated.relocations,
             regenerated_core,
             OutputContract::Span,
         )?;
@@ -2163,6 +2306,7 @@ impl CompiledModule {
             || regenerated_core.result_abi != trusted_core.result_abi
             || regenerated_core.entry_code_sha256 != trusted_core.entry_code_sha256
             || regenerated_core.prologue != trusted_core.prologue
+            || regenerated_core.landmark != trusted_core.landmark
         {
             return Err(ObjectError::InvalidModule(
                 "complete Span reducer public entry regeneration disagrees",
@@ -9114,11 +9258,24 @@ impl CompiledModule {
                 "direct Exists batch target is not a complete text function",
             ));
         }
+        let program_section = self
+            .sections
+            .get(PROGRAM_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "direct Exists batch module has no program section",
+            ))?;
+        authenticate_native_direct_search_trusted_program_surface(
+            program_section,
+            &self.symbols,
+            trusted_core,
+        )?;
         authenticate_native_direct_search_trusted_core(
             self.target.architecture,
             &self.sections[TEXT_SECTION].data,
             entry_start,
             entry_end,
+            program_section.data.as_ref(),
+            &self.relocations,
             trusted_core,
             OutputContract::Exists,
         )?;
@@ -9466,6 +9623,14 @@ impl CompiledModule {
                         &self.sections[TEXT_SECTION].data,
                         entry_start,
                         entry_end,
+                        self.sections
+                            .get(PROGRAM_SECTION)
+                            .ok_or(ObjectError::InvalidModule(
+                                "direct Span aggregate module has no program section",
+                            ))?
+                            .data
+                            .as_ref(),
+                        &self.relocations,
                         core,
                         OutputContract::Span,
                     )?;
@@ -48058,6 +48223,7 @@ fn lower_x86_64_dfa_with_entry_contract(
                         || retains_teddy_candidates,
                     save_r14_r15: uses_seeded_reverse,
                 },
+                landmark: NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
             }
         }),
     })
@@ -72645,6 +72811,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 },
                 entry_code_sha256,
                 prologue: NativeDirectSearchTrustedCorePrologue::Aarch64,
+                landmark: NativeDirectSearchTrustedCoreLandmark::CompleteDfaV1,
             }
         }),
     })
