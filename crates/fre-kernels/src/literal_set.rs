@@ -2449,6 +2449,29 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         if self.end - at < minimum_bytes {
             return true;
         }
+        let already_prepared = roots.is_some();
+        if !already_prepared {
+            // The construction marker proves that leaving the start state is
+            // exact root membership. Preserve the incumbent DFA on a cold,
+            // immediately dense source without first reconstructing the whole
+            // classifier; a sparse initial pair still prepares it once below.
+            let anchored = Anchored::No;
+            if self
+                .automaton
+                .next_state(anchored, self.start_state, self.haystack[at])
+                != self.start_state
+            {
+                return true;
+            }
+            if self
+                .automaton
+                .next_state(anchored, self.start_state, self.haystack[at + 1])
+                != self.start_state
+            {
+                self.restart = at + 1;
+                return true;
+            }
+        }
         let roots = roots.get_or_insert_with(|| {
             let roots = direct_dfa_ascii_root_set(self.automaton, self.start_state)
                 .expect("the construction-sealed sparse ASCII root remains exact");
@@ -2456,12 +2479,14 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
             ordinary_direct_probe::record_root_ascii_preparation();
             AsciiByteSetClassifier::new(roots)
         });
-        if roots.set().contains(self.haystack[at]) {
-            return true;
-        }
-        if roots.set().contains(self.haystack[at + 1]) {
-            self.restart = at + 1;
-            return true;
+        if already_prepared {
+            if roots.set().contains(self.haystack[at]) {
+                return true;
+            }
+            if roots.set().contains(self.haystack[at + 1]) {
+                self.restart = at + 1;
+                return true;
+            }
         }
         let remaining = &self.haystack[at..self.end];
         let Some(relative) = find_direct_dfa_ascii_root_after_initial_miss(roots, remaining) else {
@@ -9806,6 +9831,25 @@ mod tests {
             ordinary_direct_probe::root_ascii_preparation_transitions(),
             0,
         );
+
+        // A cold source whose first post-prefix byte is an exact root keeps
+        // the incumbent scanner without reconstructing the full root set.
+        // The alternating separator prevents the repeated-root test patterns
+        // from accepting while preserving dense root evidence.
+        let cold_dense = [ROOT_ASCII_24[0], b'!'].repeat(
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_ASCII_MIN_BYTES) / 2,
+        );
+        assert_eq!(
+            ordinary.find_window_value(&cold_dense, Window::full(&cold_dense)),
+            Ok(None),
+        );
+        assert_eq!(
+            prepared.find_window_value(&cold_dense, Window::full(&cold_dense)),
+            Ok(None),
+        );
+        assert!(prepared.prepared_ascii_root.is_none());
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
 
         let long_suffix = ORDINARY_ROOT_ASCII_MIN_BYTES;
         let long_miss = vec![
