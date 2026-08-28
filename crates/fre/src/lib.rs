@@ -26092,6 +26092,17 @@ impl<'r> PortableOrdinarySession<'r> {
         }
     }
 
+    /// Whether this session can count matching LF-delimited lines after the
+    /// embedding independently authenticates that no literal consumes LF.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn supports_compact_matching_lf_line_count(&self) -> bool {
+        matches!(
+            &self.plan,
+            PortableOrdinarySessionPlan::LiteralSetCompact { .. }
+        )
+    }
+
     /// Count LF-delimited lines containing at least one selected match.
     ///
     /// This report-free projection is available only for the compact literal
