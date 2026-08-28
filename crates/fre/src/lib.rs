@@ -19477,15 +19477,15 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from)
             }
-            Self::Native(regex)
+            Self::Native(regex) => {
                 if let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan
                     && plan.boundary_semantics()
-                        == LiteralClassRunLiteralBoundarySemantics::Unguarded =>
-            {
-                ordinary_literal_class_run_find_at_value(plan, haystack, start)
-            }
-            Self::Native(regex) => {
-                regex.find_window_value(haystack, window, SearchLimits::unlimited())
+                        == LiteralClassRunLiteralBoundarySemantics::Unguarded
+                {
+                    ordinary_literal_class_run_find_at_value(plan, haystack, start)
+                } else {
+                    regex.find_window_value(haystack, window, SearchLimits::unlimited())
+                }
             }
         }
     }
@@ -51124,7 +51124,11 @@ mod tests {
                     Ok(expected),
                     "pattern={pattern:?}, start={start}",
                 );
-                assert_eq!(super::ordinary_literal_class_run_find_at_probe::calls(), 1);
+                assert_eq!(
+                    super::ordinary_literal_class_run_find_at_probe::calls(),
+                    usize::from(start != 0),
+                    "the established zero-origin Native route bypasses the ranged class-run helper",
+                );
             }
 
             super::ordinary_literal_class_run_find_at_probe::reset();
