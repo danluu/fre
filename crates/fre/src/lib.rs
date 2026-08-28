@@ -26191,22 +26191,22 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::ExactLiteral { .. }
                 | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { .. }
                 | PortableOrdinarySessionPlan::PackedLiteralSet { .. }
-                | PortableOrdinarySessionPlan::LiteralSetDfa { .. }
-                | PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa { .. }
                 | PortableOrdinarySessionPlan::LiteralSetCompact { .. }
-                | PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii { .. }
         )
     }
 
     /// Count LF-delimited lines containing at least one selected match.
     ///
-    /// The compact literal owner retains its specialized direct scanner. Other
-    /// positive exact-literal and literal-set owners select only the first
+    /// The compact literal owner retains its specialized direct scanner.
+    /// Positive exact-literal and packed-literal owners select only the first
     /// accepting endpoint, then use the authenticated LF boundary to skip the
     /// rest of that matching line. No route reconstructs a selected span for
-    /// this operation. The embedding must supply its independently retained
-    /// proof that LF is absent from every literal. Unsupported calls and calls
-    /// without that proof return `Ok(None)` before inspecting `haystack`.
+    /// this operation. DFA owners deliberately remain unsupported and retain
+    /// their established per-line paths.
+    /// The embedding must supply its independently retained proof that LF is
+    /// absent from every literal. Unsupported calls and calls without that
+    /// proof return `Ok(None)` before inspecting `haystack` or changing retained
+    /// route state.
     #[doc(hidden)]
     #[inline(never)]
     pub fn count_matching_lf_lines(
@@ -26239,65 +26239,6 @@ impl<'r> PortableOrdinarySession<'r> {
                     |start| {
                         executor
                             .selected_end_window_value(
-                                haystack,
-                                LiteralWindow::new(start, haystack.len()),
-                            )
-                            .map_err(SearchError::from)
-                    },
-                )
-                .map(Some)
-            }
-            PortableOrdinarySessionPlan::LiteralSetDfa {
-                executor,
-                ascii_engine,
-            }
-            | PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
-                executor,
-                ascii_engine,
-            } => {
-                if let Some(engine) = ascii_engine.get_or_bind(*executor) {
-                    count_ordinary_matching_lf_lines_by_first_acceptance(
-                        haystack,
-                        |start| {
-                            engine
-                                .first_acceptance_window_value(
-                                    haystack,
-                                    LiteralWindow::new(start, haystack.len()),
-                                )
-                                .map_err(SearchError::from)
-                        },
-                    )
-                    .map(Some)
-                } else {
-                    count_ordinary_matching_lf_lines_by_first_acceptance(
-                        haystack,
-                        |start| {
-                            executor
-                                .first_acceptance_window_value(
-                                    haystack,
-                                    LiteralWindow::new(start, haystack.len()),
-                                )
-                                .map_err(SearchError::from)
-                        },
-                    )
-                    .map(Some)
-                }
-            }
-            PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
-                executor,
-                direct_next,
-            } => {
-                // This aggregate has its own line-boundary skip policy. It
-                // consumes a prior operation's recommendation but neither
-                // spends an adaptive probe nor publishes an intermediate-hit
-                // recommendation into the next unrelated operation.
-                *direct_next = false;
-                let ordinary = executor.ordinary_executor();
-                count_ordinary_matching_lf_lines_by_first_acceptance(
-                    haystack,
-                    |start| {
-                        ordinary
-                            .first_acceptance_window_value(
                                 haystack,
                                 LiteralWindow::new(start, haystack.len()),
                             )
@@ -52246,28 +52187,6 @@ mod tests {
             Ok(Some(3)),
         );
 
-        let nonuniform = PortableBuilder::new("b|abc|ab")
-            .unicode(false)
-            .limits(BuildLimits {
-                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
-                    max_patterns: 0,
-                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
-                },
-                ..BuildLimits::default()
-            })
-            .build()
-            .unwrap();
-        assert_eq!(nonuniform.build_report().plan, PlanKind::LiteralSetDfa);
-        let mut nonuniform = nonuniform.ordinary_session().unwrap();
-        assert!(nonuniform.supports_matching_lf_line_count());
-        assert_eq!(
-            nonuniform.count_matching_lf_lines(
-                b"abcabc\nx\nb b\n\nab",
-                true,
-            ),
-            Ok(Some(3)),
-        );
-
         let unsupported = PortableBuilder::new("a+z")
             .unicode(false)
             .plan_selection(PlanSelection::ForceK0)
@@ -52322,21 +52241,14 @@ mod tests {
             .unicode(false)
             .build()
             .unwrap();
-        let dfa = PortableBuilder::new("ab|ba|aa")
+        let packed = PortableBuilder::new("ab|ba|aa")
             .unicode(false)
-            .limits(BuildLimits {
-                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
-                    max_patterns: 0,
-                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
-                },
-                ..BuildLimits::default()
-            })
             .build()
             .unwrap();
-        assert_eq!(dfa.build_report().plan, PlanKind::LiteralSetDfa);
+        assert_eq!(packed.build_report().plan, PlanKind::PackedLiteralSet);
 
         let sources = sources(5);
-        for regex in [&exact, &dfa] {
+        for regex in [&exact, &packed] {
             let mut ordinary = regex.ordinary_session().unwrap();
             assert!(ordinary.supports_matching_lf_line_count());
             for haystack in &sources {
@@ -52351,7 +52263,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_uniform_matching_line_count_has_explicit_route_state() {
+    fn ordinary_dfa_matching_line_count_declines_before_input_and_state() {
         fn direct_next(session: &super::PortableOrdinarySession<'_>) -> bool {
             let super::PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
                 direct_next,
@@ -52373,34 +52285,101 @@ mod tests {
             .unwrap();
         assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
         let mut ordinary = regex.ordinary_session().unwrap();
-        assert!(ordinary.supports_matching_lf_line_count());
+        assert!(!ordinary.supports_matching_lf_line_count());
 
         assert_eq!(ordinary.first_acceptance_at(b"p000zz", 0), Ok(Some(4)));
         assert!(direct_next(&ordinary));
         assert_eq!(
-            ordinary.count_matching_lf_lines(b"p001\np128", false),
+            ordinary.count_matching_lf_lines(b"p001\np128", true),
             Ok(None),
         );
         assert!(
             direct_next(&ordinary),
-            "a pre-execution proof decline preserves prior route evidence",
+            "an unsupported aggregate preserves prior uniform route evidence",
         );
-        assert_eq!(
-            ordinary.count_matching_lf_lines(b"p001p002\nmiss\np128", true),
-            Ok(Some(2)),
-        );
-        assert!(!direct_next(&ordinary));
 
-        assert_eq!(ordinary.first_acceptance_at(b"p003zz", 0), Ok(Some(4)));
-        assert!(direct_next(&ordinary));
+        let nonuniform = PortableBuilder::new("b|abc|ab")
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(nonuniform.build_report().plan, PlanKind::LiteralSetDfa);
+        let mut nonuniform = nonuniform.ordinary_session().unwrap();
+        assert!(matches!(
+            &nonuniform.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                ..
+            }
+        ));
+        super::literal_set_dfa_ordinary_engine_bind_probe::reset();
+        assert!(!nonuniform.supports_matching_lf_line_count());
         assert_eq!(
-            ordinary.count_matching_lf_lines(b"miss\nstill-miss", true),
-            Ok(Some(0)),
+            nonuniform.count_matching_lf_lines(b"abcabc\nx\nb b\n\nab", true),
+            Ok(None),
         );
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
         assert!(
-            !direct_next(&ordinary),
-            "an aggregate miss cannot leak a recommendation to the next input",
+            matches!(
+                &nonuniform.plan,
+                super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                    ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                    ..
+                }
+            ),
+            "an unsupported aggregate cannot settle the lazy DFA sidecar",
         );
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let narrow_source = [
+                "0", "2", "4", "6", "8", "A", "C", "E", "G", "I", "a", "c", "e", "g",
+                "i", "k",
+            ]
+            .into_iter()
+            .flat_map(|root| (4_usize..=20).map(move |width| root.repeat(width)))
+            .collect::<Vec<_>>()
+            .join("|");
+            let narrow = PortableBuilder::new(&narrow_source)
+                .unicode(false)
+                .limits(BuildLimits {
+                    packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                        max_patterns: 0,
+                        ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                    },
+                    ..BuildLimits::default()
+                })
+                .build()
+                .unwrap();
+            let mut narrow = narrow.ordinary_session().unwrap();
+            assert!(matches!(
+                &narrow.plan,
+                super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                    ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                    ..
+                }
+            ));
+            super::literal_set_dfa_ordinary_engine_bind_probe::reset();
+            assert!(!narrow.supports_matching_lf_line_count());
+            assert_eq!(
+                narrow.count_matching_lf_lines(b"!!!!AAAA!!!!\nmiss", true),
+                Ok(None),
+            );
+            assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
+            assert!(matches!(
+                &narrow.plan,
+                super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                    ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
