@@ -7221,18 +7221,16 @@ mod tests {
         assert_eq!((result.start, result.end), (PATTERN.len(), PATTERN.len() * 2));
     }
 
-    #[test]
-    fn generated_continuous_span_fill_matches_trusted_core_generic_state_for_state() {
-        const PATTERN: &str = "Sherlock Holmes";
-        let Some(fill) = generated::PUBLIC_CONTINUOUS_SPAN_FILL_ENTRY else {
-            return;
-        };
+    fn assert_continuous_span_fill_matches_trusted_core_generic_state_for_state(
+        pattern: &str,
+        fill: DirectSpanFill,
+    ) {
         let spec = generated::SPECS
             .iter()
             .find(|spec| {
                 spec.mode == AotMode::Optimizing
                     && spec.output == AotOutput::Span
-                    && spec.pattern == PATTERN
+                    && spec.pattern == pattern
                     && !spec.case_insensitive
             })
             .expect("public continuous Span fixture");
@@ -7240,11 +7238,13 @@ mod tests {
             BackendFactory::Native { search, .. } => search,
             _ => panic!("public continuous Span fixture lost its direct ordinary entry"),
         };
-        let dense = PATTERN.as_bytes().repeat(7);
-        let exact_capacity = PATTERN.as_bytes().repeat(2);
-        let mut repeated_near_miss = b"k Holmes".to_vec();
-        repeated_near_miss.extend_from_slice(&b"Xherlock Holmes".repeat(257));
-        repeated_near_miss.extend_from_slice(PATTERN.as_bytes());
+        let literal = pattern.as_bytes();
+        let dense = literal.repeat(7);
+        let exact_capacity = literal.repeat(2);
+        let mut false_survivor = literal.to_vec();
+        false_survivor[0] ^= 1;
+        let mut repeated_near_miss = false_survivor.repeat(257);
+        repeated_near_miss.extend_from_slice(literal);
         let scenarios = [
             (
                 dense.as_slice(),
@@ -7328,6 +7328,28 @@ mod tests {
                 assert!(refills > 2, "dense differential must cross multiple refills");
             }
         }
+    }
+
+    #[test]
+    fn generated_continuous_span_fill_matches_trusted_core_generic_state_for_state() {
+        let Some(fill) = generated::PUBLIC_CONTINUOUS_SPAN_FILL_ENTRY else {
+            return;
+        };
+        assert_continuous_span_fill_matches_trusted_core_generic_state_for_state(
+            "Sherlock Holmes",
+            fill,
+        );
+    }
+
+    #[test]
+    fn generated_long_continuous_span_fill_matches_trusted_core_generic_state_for_state() {
+        let Some(fill) = generated::PUBLIC_LONG_CONTINUOUS_SPAN_FILL_ENTRY else {
+            return;
+        };
+        assert_continuous_span_fill_matches_trusted_core_generic_state_for_state(
+            "Шерлок Холмс",
+            fill,
+        );
     }
 
     #[test]

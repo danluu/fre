@@ -938,6 +938,75 @@ fn independent_span_fill_preserves_generic_incumbent_on_ineligible_and_candidate
 }
 
 #[test]
+fn independent_span_fill_long_singleton_cap_restores_exact_generic_incumbent() {
+    const PATTERN: &str = "abcdefghijklmnopqrstuvwxyzABCDEF";
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let request = CompileRequest::new(PATTERN, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span);
+        let ordinary = compile(request.clone()).expect("long exact Span incumbent");
+        let generic_module = ordinary
+            .module()
+            .clone()
+            .append_direct_span_fill(OutputContract::Span)
+            .expect("authenticate long generic direct fill")
+            .expect("long generic direct fill eligibility");
+        let generic_object = emit_object(
+            &generic_module,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit long generic direct fill");
+        assert_eq!(
+            generic_module.direct_span_fill_strategy(),
+            Some(DirectSpanFillStrategy::NativeTrustedCoreLoopV1),
+        );
+        let candidate = compile_with_independent_span_fill(request.clone())
+            .expect("uncapped long continuous fill");
+        assert_eq!(
+            candidate.module().direct_span_fill_strategy(),
+            Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1),
+        );
+        assert!(candidate.object().len() > generic_object.len());
+
+        let object_limit = generic_object.len();
+        assert_eq!(
+            emit_object(
+                &generic_module,
+                ObjectFormat::for_target(target),
+                object_limit,
+            )
+            .expect("exact generic incumbent fits its final object ceiling"),
+            generic_object,
+        );
+        let candidate_error = emit_object(
+            candidate.module(),
+            ObjectFormat::for_target(target),
+            object_limit,
+        )
+        .expect_err("long continuous candidate must exceed the incumbent ceiling");
+        assert!(matches!(
+            &candidate_error,
+            ObjectError::Resource {
+                resource: CompileResource::ObjectBytes,
+                limit,
+                required,
+            } if *limit == object_limit && *required == candidate.object().len()
+        ));
+        assert!(
+            independent_span_fill_object_outcome(Err(candidate_error))
+                .expect("final numeric ObjectBytes decline is non-terminal")
+                .is_none(),
+        );
+    }
+}
+
+#[test]
 fn independent_span_fill_exact_width_selection_and_context_declines_are_transactional() {
     let target = Target::x86_64_linux();
     for pattern in [

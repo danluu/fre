@@ -4444,6 +4444,14 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits_and_policy(
         .native_exact_singleton_count_literal()
         .is_some()
         .then(|| module::complete_span_reduce_recipe_scope(false));
+    // This accessor returns bytes only after the finite-language sidecar has
+    // authenticated a one-row, nonempty exact language against this Span
+    // program's artifact identity and output contract.
+    let _complete_span_fill_exact_singleton =
+        module::complete_span_fill_exact_singleton_scope(
+            program.native_exact_singleton_count_literal(),
+            program.artifact_identity(),
+        );
     let (module, object) = if native_compile_policy == NativeFiniteCompilePolicy::WideFiniteOnly {
         if mode != CompileMode::Optimizing || is_lower_state_rescue {
             return Err(CompileError::InternalInvariant(

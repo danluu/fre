@@ -132,6 +132,7 @@ fn main() {
     let mut native_fills = String::new();
     let mut direct_span_fill_rows = String::new();
     let mut public_continuous_span_fill_entry = None;
+    let mut public_long_continuous_span_fill_entry = None;
     let mut rows = String::new();
     let mut grep_count_rows = String::new();
     let mut grep_count_admitted = 0_usize;
@@ -406,11 +407,19 @@ fn main() {
                             );
                             if continuous
                                 && mode == CompileMode::Optimizing
-                                && pattern.source == "Sherlock Holmes"
                                 && !pattern.case_insensitive
-                                && public_continuous_span_fill_entry.is_none()
                             {
-                                public_continuous_span_fill_entry = Some(direct_fill.clone());
+                                if pattern.source == "Sherlock Holmes"
+                                    && public_continuous_span_fill_entry.is_none()
+                                {
+                                    public_continuous_span_fill_entry = Some(direct_fill.clone());
+                                }
+                                if pattern.source == "Шерлок Холмс"
+                                    && public_long_continuous_span_fill_entry.is_none()
+                                {
+                                    public_long_continuous_span_fill_entry =
+                                        Some(direct_fill.clone());
+                                }
                             }
                             writeln!(
                                 &mut direct_span_fill_rows,
@@ -603,6 +612,13 @@ fn main() {
     writeln!(
         &mut generated,
         "#[cfg(test)]\npub(super) const PUBLIC_CONTINUOUS_SPAN_FILL_ENTRY: Option<DirectSpanFill> = {public_continuous_span_fill_entry};\n",
+    )
+    .expect("String writes cannot fail");
+    let public_long_continuous_span_fill_entry = public_long_continuous_span_fill_entry
+        .map_or_else(|| "None".to_owned(), |entry| format!("Some({entry})"));
+    writeln!(
+        &mut generated,
+        "#[cfg(test)]\npub(super) const PUBLIC_LONG_CONTINUOUS_SPAN_FILL_ENTRY: Option<DirectSpanFill> = {public_long_continuous_span_fill_entry};\n",
     )
     .expect("String writes cannot fail");
     generated.push_str(

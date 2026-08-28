@@ -847,12 +847,21 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             NativeCompleteSpanFillExactVerifier::Block16(block) => {
                 aarch64_emit_prefix_block(assembler, block, rejected)?;
             }
+            NativeCompleteSpanFillExactVerifier::LongSingleton {
+                witness,
+                source_artifact_identity,
+            } => {
+                aarch64_emit_complete_span_fill_long_singleton(
+                    assembler,
+                    witness,
+                    source_artifact_identity,
+                    rejected,
+                )?;
+            }
         }
-        aarch64_emit_exact_prefix_match(
+        aarch64_emit_complete_span_fill_exact_match(
             assembler,
             verifier.full_width,
-            OutputContract::Span,
-            true,
             matched,
         )?;
         assembler.bind(rejected)?;

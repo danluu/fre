@@ -1718,6 +1718,124 @@ struct NativeCompleteSpanReduceSource {
     aarch64_sve_suffix_kind: Option<Aarch64SveFilterKind>,
     program_bytes: usize,
     program_sha256: [u8; 32],
+    /// Compiler-private exact singleton used only to replace seeded-reverse
+    /// verification after the unchanged suffix scanner finds a survivor.
+    fill_exact_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    /// Independently preserved identity of the semantic source program. The
+    /// selector authenticates the receipt against this value rather than an
+    /// identity supplied by the receipt itself.
+    fill_source_artifact_identity: Option<[u8; 32]>,
+}
+
+const COMPLETE_SPAN_FILL_LONG_EXACT_MIN_BYTES: usize = 17;
+const COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES: usize = 32;
+const COMPLETE_SPAN_FILL_EXACT_SINGLETON_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/complete-span-fill-exact-singleton/v1\0";
+
+/// Fixed-capacity copy of one independently authenticated finite-language
+/// singleton. The seal binds its bytes and length to the serialized program
+/// identity supplied by the source-fact sidecar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCompleteSpanFillExactSingletonWitness {
+    bytes: [u8; COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES],
+    length: u8,
+    seal: [u8; 32],
+}
+
+impl NativeCompleteSpanFillExactSingletonWitness {
+    fn bind(literal: &[u8], artifact_identity: [u8; 32]) -> Option<Self> {
+        if !(COMPLETE_SPAN_FILL_LONG_EXACT_MIN_BYTES
+            ..=COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES)
+            .contains(&literal.len())
+            || artifact_identity == [0; 32]
+        {
+            return None;
+        }
+        let length = u8::try_from(literal.len()).ok()?;
+        let mut bytes = [0_u8; COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES];
+        bytes[..literal.len()].copy_from_slice(literal);
+        let seal = Self::seal_for(bytes, length, artifact_identity);
+        Some(Self { bytes, length, seal })
+    }
+
+    fn seal_for(
+        bytes: [u8; COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES],
+        length: u8,
+        artifact_identity: [u8; 32],
+    ) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(COMPLETE_SPAN_FILL_EXACT_SINGLETON_IDENTITY_DOMAIN);
+        digest.update(artifact_identity);
+        digest.update([length]);
+        digest.update(bytes);
+        digest.finalize().into()
+    }
+
+    fn authenticates(self, artifact_identity: [u8; 32]) -> bool {
+        let length = usize::from(self.length);
+        (COMPLETE_SPAN_FILL_LONG_EXACT_MIN_BYTES
+            ..=COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES)
+            .contains(&length)
+            && artifact_identity != [0; 32]
+            && self.bytes[length..].iter().all(|&byte| byte == 0)
+            && self.seal == Self::seal_for(self.bytes, self.length, artifact_identity)
+    }
+
+    const fn width(self) -> u8 {
+        self.length
+    }
+
+    const fn compare_count(self) -> u8 {
+        if self.length <= 24 { 3 } else { 4 }
+    }
+
+    const fn compare_offset(self, index: u8) -> Option<u8> {
+        match (self.compare_count(), index) {
+            (_, 0) => Some(0),
+            (_, 1) => Some(8),
+            (3, 2) => Some(self.length - 8),
+            (4, 2) => Some(16),
+            (4, 3) => Some(self.length - 8),
+            _ => None,
+        }
+    }
+
+    fn qword(self, offset: u8) -> Option<u64> {
+        let start = usize::from(offset);
+        let end = start.checked_add(8)?;
+        if end > usize::from(self.length) {
+            return None;
+        }
+        Some(u64::from_le_bytes(
+            self.bytes.get(start..end)?.try_into().ok()?,
+        ))
+    }
+}
+
+/// Keeps the source-fact artifact identity separate from both the literal
+/// witness and the native data-section identity used to authenticate the
+/// retained module recipe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCompleteSpanFillExactSingletonReceipt {
+    witness: NativeCompleteSpanFillExactSingletonWitness,
+    artifact_identity: [u8; 32],
+}
+
+impl NativeCompleteSpanFillExactSingletonReceipt {
+    fn bind(literal: &[u8], artifact_identity: [u8; 32]) -> Option<Self> {
+        Some(Self {
+            witness: NativeCompleteSpanFillExactSingletonWitness::bind(
+                literal,
+                artifact_identity,
+            )?,
+            artifact_identity,
+        })
+    }
+
+    fn authenticates(self, expected_artifact_identity: [u8; 32]) -> bool {
+        self.artifact_identity == expected_artifact_identity
+            && self.witness.authenticates(expected_artifact_identity)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1956,6 +2074,11 @@ std::thread_local! {
         const { std::cell::Cell::new(false) };
     static COMPLETE_SPAN_FILL_RECIPE_ENABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static COMPLETE_SPAN_FILL_EXACT_SINGLETON:
+        std::cell::Cell<Option<NativeCompleteSpanFillExactSingletonReceipt>> =
+        const { std::cell::Cell::new(None) };
+    static COMPLETE_SPAN_FILL_SOURCE_ARTIFACT_IDENTITY:
+        std::cell::Cell<Option<[u8; 32]>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) struct CompleteSpanReduceRecipeScope {
@@ -2031,6 +2154,56 @@ pub(crate) fn complete_span_fill_recipe_scope(requested: bool) -> CompleteSpanFi
 
 fn complete_span_fill_recipe_enabled() -> bool {
     COMPLETE_SPAN_FILL_RECIPE_ENABLED.with(std::cell::Cell::get)
+}
+
+pub(crate) struct CompleteSpanFillExactSingletonScope {
+    previous: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    previous_source_artifact_identity: Option<[u8; 32]>,
+}
+
+impl Drop for CompleteSpanFillExactSingletonScope {
+    fn drop(&mut self) {
+        COMPLETE_SPAN_FILL_EXACT_SINGLETON.with(|witness| {
+            witness.set(self.previous);
+        });
+        COMPLETE_SPAN_FILL_SOURCE_ARTIFACT_IDENTITY.with(|identity| {
+            identity.set(self.previous_source_artifact_identity);
+        });
+    }
+}
+
+/// Bind one re-authenticated finite-language singleton to the current
+/// lowering transaction. `None` deliberately clears an enclosing value so a
+/// nested non-singleton compile cannot inherit stale bytes.
+pub(crate) fn complete_span_fill_exact_singleton_scope(
+    literal: Option<&[u8]>,
+    artifact_identity: [u8; 32],
+) -> CompleteSpanFillExactSingletonScope {
+    let current = literal.and_then(|literal| {
+        NativeCompleteSpanFillExactSingletonReceipt::bind(literal, artifact_identity)
+    });
+    let previous = COMPLETE_SPAN_FILL_EXACT_SINGLETON.with(|witness| {
+        witness.replace(current)
+    });
+    let source_artifact_identity = (artifact_identity != [0; 32]).then_some(artifact_identity);
+    let previous_source_artifact_identity =
+        COMPLETE_SPAN_FILL_SOURCE_ARTIFACT_IDENTITY.with(|identity| {
+            identity.replace(source_artifact_identity)
+        });
+    CompleteSpanFillExactSingletonScope {
+        previous,
+        previous_source_artifact_identity,
+    }
+}
+
+fn complete_span_fill_exact_singleton()
+    -> Option<NativeCompleteSpanFillExactSingletonReceipt>
+{
+    COMPLETE_SPAN_FILL_EXACT_SINGLETON.with(std::cell::Cell::get)
+}
+
+fn complete_span_fill_source_artifact_identity() -> Option<[u8; 32]> {
+    COMPLETE_SPAN_FILL_SOURCE_ARTIFACT_IDENTITY.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -12272,19 +12445,27 @@ impl CompiledModule {
         text_len: usize,
     ) -> Result<Option<Self>, ObjectError> {
         let emission = match self.target.architecture {
-            Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
-                source.layout,
-                self.target.features,
-                NativeDfaEntryContract::CompleteSpanFillV1,
-            )?,
-            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
-                source.layout,
-                self.target.features,
-                self.target.operating_system,
-                source.aarch64_sve_filter_plan,
-                source.aarch64_sve_suffix_kind,
-                NativeDfaEntryContract::CompleteSpanFillV1,
-            )?,
+            Architecture::X86_64 => {
+                lower_x86_64_dfa_with_entry_contract_and_long_singleton(
+                    source.layout,
+                    self.target.features,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                    source.fill_exact_singleton,
+                    source.fill_source_artifact_identity,
+                )?
+            }
+            Architecture::Aarch64 => {
+                lower_aarch64_dfa_with_entry_contract_suffix_kind_and_long_singleton(
+                    source.layout,
+                    self.target.features,
+                    self.target.operating_system,
+                    source.aarch64_sve_filter_plan,
+                    source.aarch64_sve_suffix_kind,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                    source.fill_exact_singleton,
+                    source.fill_source_artifact_identity,
+                )?
+            }
         };
         if emission.code.is_empty()
             || emission.semantic_call_instructions != 0
@@ -29498,16 +29679,23 @@ struct NativeDfaLayout {
 /// Allocation-free exact verifier for one suffix-scanner survivor in the
 /// compiler-private continuous Span-fill entry.
 ///
-/// All variants are derived solely from the already authenticated exact
-/// product facts. The scalar plans carry every byte of a 1..=15-byte
+/// The short and word variants are derived solely from the already
+/// authenticated exact product facts. Their scalar plans carry every byte of
+/// a 1..=15-byte
 /// singleton product as immediates. The block plan is admitted only when all
 /// sixteen graph lanes are singleton and its existing serialized expected
-/// block therefore describes the complete language.
+/// block therefore describes the complete language. The long variant carries
+/// a separately authenticated finite-language singleton and the independent
+/// serialized-program identity used to authenticate it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeCompleteSpanFillExactVerifier {
     Short(prefix_block::ExactPrefixShortPlan),
     Words(prefix_block::ExactPrefixWordPlan),
     Block16(NativePrefixBlockGuard),
+    LongSingleton {
+        witness: NativeCompleteSpanFillExactSingletonWitness,
+        source_artifact_identity: [u8; 32],
+    },
 }
 
 impl NativeCompleteSpanFillExactVerifier {
@@ -29516,6 +29704,7 @@ impl NativeCompleteSpanFillExactVerifier {
             Self::Short(short) => short.width(),
             Self::Words(words) => words.width(),
             Self::Block16(_) => 16,
+            Self::LongSingleton { witness, .. } => witness.width(),
         }
     }
 }
@@ -29648,16 +29837,24 @@ fn derive_complete_span_fill_exact_verifier(
     entry_contract: NativeDfaEntryContract,
     allow_block16: bool,
 ) -> Result<Option<NativeCompleteSpanFillExactVerifier>, ObjectError> {
+    derive_complete_span_fill_exact_verifier_with_long_singleton(
+        layout,
+        entry_contract,
+        allow_block16,
+        None,
+        None,
+    )
+}
+
+fn derive_complete_span_fill_exact_verifier_with_long_singleton(
+    layout: NativeDfaLayout,
+    entry_contract: NativeDfaEntryContract,
+    allow_block16: bool,
+    long_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    source_artifact_identity: Option<[u8; 32]>,
+) -> Result<Option<NativeCompleteSpanFillExactVerifier>, ObjectError> {
     if !entry_contract.complete_span_fill() {
         return Ok(None);
-    }
-    let Some(width) = layout.exact_prefix_match_width else {
-        return Ok(None);
-    };
-    if layout.exact_span_width != Some(u64::from(width)) {
-        return Err(ObjectError::InvalidModule(
-            "continuous Span-fill exact verifier disagrees with match width",
-        ));
     }
     if layout.complete_span_fill_exact_short.is_some()
         && complete_span_fill_short_plan(layout).is_none()
@@ -29666,42 +29863,62 @@ fn derive_complete_span_fill_exact_verifier(
             "continuous Span-fill exact short receipt is malformed",
         ));
     }
-    if let Some(short) = complete_span_fill_short_plan(layout) {
-        if !(1..=7).contains(&width)
-            || short.width() != width
-            || !short.is_canonical()
-            || layout.exact_prefix_words.is_some()
-            || layout.prefix_block.is_some()
-        {
+    if let Some(width) = layout.exact_prefix_match_width {
+        if layout.exact_span_width != Some(u64::from(width)) {
             return Err(ObjectError::InvalidModule(
-                "continuous Span-fill exact short verifier is inconsistent",
+                "continuous Span-fill exact verifier disagrees with match width",
             ));
         }
-        return Ok(Some(NativeCompleteSpanFillExactVerifier::Short(short)));
-    }
-    if let Some(words) = layout.exact_prefix_words {
-        if !(8..16).contains(&width)
-            || words.width() != width
-            || layout.prefix_block.is_some()
-        {
-            return Err(ObjectError::InvalidModule(
-                "continuous Span-fill exact word verifier is inconsistent",
-            ));
+        if let Some(short) = complete_span_fill_short_plan(layout) {
+            if !(1..=7).contains(&width)
+                || short.width() != width
+                || !short.is_canonical()
+                || layout.exact_prefix_words.is_some()
+                || layout.prefix_block.is_some()
+            {
+                return Err(ObjectError::InvalidModule(
+                    "continuous Span-fill exact short verifier is inconsistent",
+                ));
+            }
+            return Ok(Some(NativeCompleteSpanFillExactVerifier::Short(short)));
         }
-        return Ok(Some(NativeCompleteSpanFillExactVerifier::Words(words)));
-    }
-    if width == 16 && allow_block16 {
-        let Some(block) = layout.prefix_block else {
-            return Ok(None);
-        };
-        if block.lane_mask != u16::MAX {
-            return Ok(None);
+        if let Some(words) = layout.exact_prefix_words {
+            if !(8..16).contains(&width)
+                || words.width() != width
+                || layout.prefix_block.is_some()
+            {
+                return Err(ObjectError::InvalidModule(
+                    "continuous Span-fill exact word verifier is inconsistent",
+                ));
+            }
+            return Ok(Some(NativeCompleteSpanFillExactVerifier::Words(words)));
         }
-        return Ok(Some(NativeCompleteSpanFillExactVerifier::Block16(
-            block,
-        )));
+        if width == 16 && allow_block16 {
+            let Some(block) = layout.prefix_block else {
+                return Ok(None);
+            };
+            if block.lane_mask != u16::MAX {
+                return Ok(None);
+            }
+            return Ok(Some(NativeCompleteSpanFillExactVerifier::Block16(
+                block,
+            )));
+        }
     }
-    Ok(None)
+    let (Some(receipt), Some(source_artifact_identity)) =
+        (long_singleton, source_artifact_identity)
+    else {
+        return Ok(None);
+    };
+    if !receipt.authenticates(source_artifact_identity)
+        || layout.exact_span_width != Some(u64::from(receipt.witness.width()))
+    {
+        return Ok(None);
+    }
+    Ok(Some(NativeCompleteSpanFillExactVerifier::LongSingleton {
+        witness: receipt.witness,
+        source_artifact_identity,
+    }))
 }
 
 fn select_complete_span_fill_suffix_verifier(
@@ -29723,21 +29940,30 @@ fn select_complete_span_fill_suffix_verifier(
             complete_span_fill_short_plan(layout).is_none()
                 && layout.exact_prefix_words == Some(words)
                 && layout.prefix_block.is_none()
+                && layout.exact_prefix_match_width == Some(width)
                 && (8..16).contains(&width)
         }
         NativeCompleteSpanFillExactVerifier::Block16(block) => {
             complete_span_fill_short_plan(layout).is_none()
                 && layout.exact_prefix_words.is_none()
                 && layout.prefix_block == Some(block)
+                && layout.exact_prefix_match_width == Some(width)
                 && block.lane_mask == u16::MAX
                 && width == 16
+        }
+        NativeCompleteSpanFillExactVerifier::LongSingleton {
+            witness,
+            source_artifact_identity,
+        } => {
+            (17..=32).contains(&width)
+                && witness.width() == width
+                && witness.authenticates(source_artifact_identity)
         }
     };
     if layout.output != OutputContract::Span
         || layout.initial_pending
         || layout.partial.is_some()
         || layout.exact_span_width != Some(u64::from(width))
-        || layout.exact_prefix_match_width != Some(width)
         || !verifier_matches_layout
         || !matches!(suffix.reverse_seed, NativeSuffixReverseSeed::AcceptBoundary)
         || reverse.boundary_offset != suffix.minimum_width
@@ -31927,6 +32153,12 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_pair_registe
                     .flatten(),
                 program_bytes: data.len(),
                 program_sha256: Sha256::digest(&data).into(),
+                fill_exact_singleton: fill_recipe
+                    .then(complete_span_fill_exact_singleton)
+                    .flatten(),
+                fill_source_artifact_identity: fill_recipe
+                    .then(complete_span_fill_source_artifact_identity)
+                    .flatten(),
             },
         )?)
     } else {
@@ -49134,17 +49366,17 @@ fn x86_emit_exact_span_start(assembler: &mut X86Assembler, width: u64) -> Result
     Ok(())
 }
 
-fn x86_emit_exact_prefix_match(
+fn x86_emit_verified_match(
     assembler: &mut X86Assembler,
     width: u8,
     output: OutputContract,
     register_outcome: bool,
     matched: X86Label,
+    maximum_width: usize,
+    invalid_width: &'static str,
 ) -> Result<(), ObjectError> {
-    if width == 0 || usize::from(width) > MAX_ANCHORED_PREFIX_BYTES {
-        return Err(ObjectError::InvalidModule(
-            "invalid x86 exact-prefix match width",
-        ));
+    if width == 0 || usize::from(width) > maximum_width {
+        return Err(ObjectError::InvalidModule(invalid_width));
     }
     if output != OutputContract::Exists {
         assembler.instruction(&[0x48, 0x8d, 0x42, width])?; // end = candidate + width
@@ -49173,6 +49405,40 @@ fn x86_emit_exact_prefix_match(
         assembler.branch(&[0xe9], matched)?;
     }
     Ok(())
+}
+
+fn x86_emit_exact_prefix_match(
+    assembler: &mut X86Assembler,
+    width: u8,
+    output: OutputContract,
+    register_outcome: bool,
+    matched: X86Label,
+) -> Result<(), ObjectError> {
+    x86_emit_verified_match(
+        assembler,
+        width,
+        output,
+        register_outcome,
+        matched,
+        MAX_ANCHORED_PREFIX_BYTES,
+        "invalid x86 exact-prefix match width",
+    )
+}
+
+fn x86_emit_complete_span_fill_exact_match(
+    assembler: &mut X86Assembler,
+    width: u8,
+    matched: X86Label,
+) -> Result<(), ObjectError> {
+    x86_emit_verified_match(
+        assembler,
+        width,
+        OutputContract::Span,
+        true,
+        matched,
+        COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES,
+        "invalid x86 continuous Span-fill exact match width",
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51181,12 +51447,21 @@ fn x86_emit_seeded_reverse_prepass(
             NativeCompleteSpanFillExactVerifier::Block16(block) => {
                 x86_emit_prefix_block(assembler, block, kind, rejected)?;
             }
+            NativeCompleteSpanFillExactVerifier::LongSingleton {
+                witness,
+                source_artifact_identity,
+            } => {
+                x86_emit_complete_span_fill_long_singleton(
+                    assembler,
+                    witness,
+                    source_artifact_identity,
+                    rejected,
+                )?;
+            }
         }
-        x86_emit_exact_prefix_match(
+        x86_emit_complete_span_fill_exact_match(
             assembler,
             verifier.full_width,
-            OutputContract::Span,
-            true,
             matched,
         )?;
         assembler.bind(rejected)?;
@@ -52514,6 +52789,44 @@ fn x86_emit_exact_prefix_short(
     Ok(())
 }
 
+fn x86_emit_complete_span_fill_long_singleton(
+    assembler: &mut X86Assembler,
+    witness: NativeCompleteSpanFillExactSingletonWitness,
+    source_artifact_identity: [u8; 32],
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    if !witness.authenticates(source_artifact_identity)
+        || !(3..=4).contains(&witness.compare_count())
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 continuous Span-fill long singleton is malformed",
+        ));
+    }
+    for index in 0..witness.compare_count() {
+        let offset = witness.compare_offset(index).ok_or(
+            ObjectError::InvalidModule(
+                "x86 continuous Span-fill long singleton offset is absent",
+            ),
+        )?;
+        let expected = witness.qword(offset).ok_or(
+            ObjectError::InvalidModule(
+                "x86 continuous Span-fill long singleton word is out of bounds",
+            ),
+        )?;
+        let mut constant = [0_u8; 10];
+        constant[..2].copy_from_slice(&[0x48, 0xb8]); // movabs rax, expected
+        constant[2..].copy_from_slice(&expected.to_le_bytes());
+        assembler.instruction(&constant)?;
+        if offset == 0 {
+            assembler.instruction(&[0x48, 0x39, 0x04, 0x17])?; // cmp [rdi+rdx], rax
+        } else {
+            assembler.instruction(&[0x48, 0x39, 0x44, 0x17, offset])?;
+        }
+        assembler.branch(&[0x0f, 0x85], failed)?;
+    }
+    Ok(())
+}
+
 fn x86_emit_prefix_guard_path(
     assembler: &mut X86Assembler,
     layout: NativeDfaLayout,
@@ -52993,6 +53306,27 @@ fn lower_x86_64_dfa_with_entry_contract(
     features: FeatureSet,
     entry_contract: NativeDfaEntryContract,
 ) -> Result<NativeDfaEmission, ObjectError> {
+    lower_x86_64_dfa_with_entry_contract_and_long_singleton(
+        layout,
+        features,
+        entry_contract,
+        None,
+        None,
+    )
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_lines,
+    reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
+)]
+fn lower_x86_64_dfa_with_entry_contract_and_long_singleton(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+    entry_contract: NativeDfaEntryContract,
+    long_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    source_artifact_identity: Option<[u8; 32]>,
+) -> Result<NativeDfaEmission, ObjectError> {
     if layout.complete_span_fill_exact_short.is_some() && !entry_contract.complete_span_fill() {
         return Err(ObjectError::InvalidModule(
             "x86 authenticated exact-short receipt escaped its private entry",
@@ -53036,7 +53370,13 @@ fn lower_x86_64_dfa_with_entry_contract(
         ));
     }
     let complete_span_fill_verifier =
-        derive_complete_span_fill_exact_verifier(layout, entry_contract, true)?;
+        derive_complete_span_fill_exact_verifier_with_long_singleton(
+            layout,
+            entry_contract,
+            true,
+            long_singleton,
+            source_artifact_identity,
+        )?;
     let mut assembler = X86Assembler::new();
     let register_outcome = entry_contract.register_outcome();
     let fixed_candidate = entry_contract.fixed_candidate();
@@ -71956,22 +72296,50 @@ fn aarch64_load_x_imm(destination: u8, base: u8, byte_offset: u16) -> Result<u32
         | aarch64_reg(destination, 0)?)
 }
 
-/// Unscaled 64-bit load for the deliberately overlapping exact-prefix tail.
-/// Its compiler plan limits the positive displacement to `0..=7`.
-fn aarch64_load_x_unscaled(
+fn aarch64_load_x_unscaled_with_limit(
     destination: u8,
     base: u8,
     byte_offset: u8,
+    maximum_offset: u8,
+    invalid_offset: &'static str,
 ) -> Result<u32, ObjectError> {
-    if byte_offset > 7 {
-        return Err(ObjectError::InvalidModule(
-            "AArch64 exact-prefix word offset",
-        ));
+    if byte_offset > maximum_offset {
+        return Err(ObjectError::InvalidModule(invalid_offset));
     }
     Ok(0xf840_0000
         | (u32::from(byte_offset) << 12)
         | aarch64_reg(base, 5)?
         | aarch64_reg(destination, 0)?)
+}
+
+/// Unscaled load for the established 8..=15-byte overlapping word verifier.
+fn aarch64_load_x_unscaled(
+    destination: u8,
+    base: u8,
+    byte_offset: u8,
+) -> Result<u32, ObjectError> {
+    aarch64_load_x_unscaled_with_limit(
+        destination,
+        base,
+        byte_offset,
+        7,
+        "AArch64 exact-prefix word offset",
+    )
+}
+
+/// Unscaled load for the separately authenticated 17..=32-byte verifier.
+fn aarch64_load_x_unscaled_long_singleton(
+    destination: u8,
+    base: u8,
+    byte_offset: u8,
+) -> Result<u32, ObjectError> {
+    aarch64_load_x_unscaled_with_limit(
+        destination,
+        base,
+        byte_offset,
+        24,
+        "AArch64 continuous Span-fill long-singleton offset",
+    )
 }
 
 fn aarch64_load_pair_x(
@@ -72317,6 +72685,39 @@ fn aarch64_emit_exact_prefix_short(
                 "AArch64 exact-prefix short width is malformed",
             ));
         }
+    }
+    Ok(())
+}
+
+fn aarch64_emit_complete_span_fill_long_singleton(
+    assembler: &mut Aarch64Assembler,
+    witness: NativeCompleteSpanFillExactSingletonWitness,
+    source_artifact_identity: [u8; 32],
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if !witness.authenticates(source_artifact_identity)
+        || !(3..=4).contains(&witness.compare_count())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 continuous Span-fill long singleton is malformed",
+        ));
+    }
+    assembler.instruction(aarch64_add_x_reg(12, 0, 2)?)?;
+    for index in 0..witness.compare_count() {
+        let offset = witness.compare_offset(index).ok_or(
+            ObjectError::InvalidModule(
+                "AArch64 continuous Span-fill long singleton offset is absent",
+            ),
+        )?;
+        let expected = witness.qword(offset).ok_or(
+            ObjectError::InvalidModule(
+                "AArch64 continuous Span-fill long singleton word is out of bounds",
+            ),
+        )?;
+        assembler.instruction(aarch64_load_x_unscaled_long_singleton(8, 12, offset)?)?;
+        aarch64_load_u64_constant(assembler, 10, expected)?;
+        assembler.instruction(aarch64_cmp_x(8, 10)?)?;
+        assembler.branch_cond(AARCH64_NE, failed)?;
     }
     Ok(())
 }
@@ -72758,17 +73159,17 @@ fn aarch64_emit_exact_span_start(
     Ok(())
 }
 
-fn aarch64_emit_exact_prefix_match(
+fn aarch64_emit_verified_match(
     assembler: &mut Aarch64Assembler,
     width: u8,
     output: OutputContract,
     register_outcome: bool,
     matched: Aarch64Label,
+    maximum_width: usize,
+    invalid_width: &'static str,
 ) -> Result<(), ObjectError> {
-    if width == 0 || usize::from(width) > MAX_ANCHORED_PREFIX_BYTES {
-        return Err(ObjectError::InvalidModule(
-            "invalid AArch64 exact-prefix match width",
-        ));
+    if width == 0 || usize::from(width) > maximum_width {
+        return Err(ObjectError::InvalidModule(invalid_width));
     }
     if output != OutputContract::Exists {
         if register_outcome {
@@ -72795,6 +73196,40 @@ fn aarch64_emit_exact_prefix_match(
         assembler.branch(matched)?;
     }
     Ok(())
+}
+
+fn aarch64_emit_exact_prefix_match(
+    assembler: &mut Aarch64Assembler,
+    width: u8,
+    output: OutputContract,
+    register_outcome: bool,
+    matched: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_emit_verified_match(
+        assembler,
+        width,
+        output,
+        register_outcome,
+        matched,
+        MAX_ANCHORED_PREFIX_BYTES,
+        "invalid AArch64 exact-prefix match width",
+    )
+}
+
+fn aarch64_emit_complete_span_fill_exact_match(
+    assembler: &mut Aarch64Assembler,
+    width: u8,
+    matched: Aarch64Label,
+) -> Result<(), ObjectError> {
+    aarch64_emit_verified_match(
+        assembler,
+        width,
+        OutputContract::Span,
+        true,
+        matched,
+        COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES,
+        "invalid AArch64 continuous Span-fill exact match width",
+    )
 }
 
 fn aarch64_set_table_address(
@@ -79465,7 +79900,67 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     clippy::too_many_lines,
     reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
 )]
+fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_long_singleton(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    sve_suffix_kind: Option<Aarch64SveFilterKind>,
+    entry_contract: NativeDfaEntryContract,
+    long_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    source_artifact_identity: Option<[u8; 32]>,
+) -> Result<NativeDfaEmission, ObjectError> {
+    lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy_and_long_singleton(
+        layout,
+        features,
+        operating_system,
+        sve_filter_plan,
+        sve_suffix_kind,
+        entry_contract,
+        true,
+        true,
+        long_singleton,
+        source_artifact_identity,
+    )
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
+)]
 fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
+    layout: NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    sve_suffix_kind: Option<Aarch64SveFilterKind>,
+    entry_contract: NativeDfaEntryContract,
+    allow_persistent_pair_registers: bool,
+    allow_complete_pair_relation_batch: bool,
+) -> Result<NativeDfaEmission, ObjectError> {
+    lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy_and_long_singleton(
+        layout,
+        features,
+        operating_system,
+        sve_filter_plan,
+        sve_suffix_kind,
+        entry_contract,
+        allow_persistent_pair_registers,
+        allow_complete_pair_relation_batch,
+        None,
+        None,
+    )
+}
+
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the specialized forward/reverse control-flow graph is kept contiguous for auditing"
+)]
+fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy_and_long_singleton(
     mut layout: NativeDfaLayout,
     features: FeatureSet,
     operating_system: OperatingSystem,
@@ -79474,6 +79969,8 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
     entry_contract: NativeDfaEntryContract,
     allow_persistent_pair_registers: bool,
     allow_complete_pair_relation_batch: bool,
+    long_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    source_artifact_identity: Option<[u8; 32]>,
 ) -> Result<NativeDfaEmission, ObjectError> {
     if layout.complete_span_fill_exact_short.is_some() && !entry_contract.complete_span_fill() {
         return Err(ObjectError::InvalidModule(
@@ -79526,11 +80023,14 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
             "AArch64 exact-pair suffix retained an SVE scanner receipt",
         ));
     }
-    let complete_span_fill_verifier = derive_complete_span_fill_exact_verifier(
-        layout,
-        entry_contract,
-        features.has(CpuFeature::Aarch64Asimd),
-    )?;
+    let complete_span_fill_verifier =
+        derive_complete_span_fill_exact_verifier_with_long_singleton(
+            layout,
+            entry_contract,
+            features.has(CpuFeature::Aarch64Asimd),
+            long_singleton,
+            source_artifact_identity,
+        )?;
     let mut assembler = Aarch64Assembler::new();
     let register_outcome = entry_contract.register_outcome();
     let fixed_candidate = entry_contract.fixed_candidate();
@@ -91694,6 +92194,367 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
             String::from_utf8_lossy(&executed.stderr),
         );
         fs::remove_dir_all(&directory).expect("remove exact-short link directory");
+    }
+
+    #[test]
+    fn continuous_span_fill_long_singleton_is_authenticated_cross_isa() {
+        const PREFIX: &str = "abcdefghijklmnopqrstuvwx";
+        let aarch64_asimd = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("valid AArch64 ASIMD target");
+        for target in [Target::x86_64_linux(), aarch64_asimd] {
+            for width in COMPLETE_SPAN_FILL_LONG_EXACT_MIN_BYTES
+                ..=COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES
+            {
+                let pattern = format!("{}01234567", &PREFIX[..width - 8]);
+                let request = CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span);
+                let ordinary = compile(request.clone()).expect("compile ordinary long singleton");
+                let recipe_scope = complete_span_fill_recipe_scope(true);
+                let scoped = compile(request).expect("compile continuous long singleton");
+                drop(recipe_scope);
+                let source = *scoped
+                    .module()
+                    .native_complete_span_reduce_source
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("missing width-{width} continuous source"));
+                assert_eq!(
+                    scoped
+                        .module()
+                        .clone()
+                        .without_complete_span_fill_source()
+                        .expect("strip optional long continuous source"),
+                    *ordinary.module(),
+                );
+                let receipt = source.fill_exact_singleton.unwrap_or_else(|| {
+                    panic!("missing width-{width} exact singleton for {target:?}")
+                });
+                let source_artifact_identity = source
+                    .fill_source_artifact_identity
+                    .unwrap_or_else(|| panic!("missing width-{width} source identity"));
+                assert!(receipt.authenticates(source_artifact_identity));
+                let witness = receipt.witness;
+                assert_eq!(usize::from(witness.width()), width);
+                assert_eq!(witness.compare_count(), if width <= 24 { 3 } else { 4 });
+                let mut covered = [false; COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES];
+                for index in 0..witness.compare_count() {
+                    let offset = witness.compare_offset(index).expect("compare offset");
+                    assert!(witness.qword(offset).is_some());
+                    for byte in &mut covered[usize::from(offset)..usize::from(offset) + 8] {
+                        *byte = true;
+                    }
+                }
+                assert!(covered[..width].iter().all(|&byte| byte));
+                assert!(covered[width..].iter().all(|&byte| !byte));
+
+                assert!(derive_complete_span_fill_exact_verifier(
+                    source.layout,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                    true,
+                )
+                .expect("missing sidecar is a valid decline")
+                .is_none());
+                assert!(derive_complete_span_fill_exact_verifier_with_long_singleton(
+                    source.layout,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                    true,
+                    Some(receipt),
+                    None,
+                )
+                .expect("missing source identity is a valid decline")
+                .is_none());
+                assert!(derive_complete_span_fill_exact_verifier_with_long_singleton(
+                    source.layout,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                    true,
+                    None,
+                    Some(source_artifact_identity),
+                )
+                .expect("missing singleton receipt is a valid decline")
+                .is_none());
+                let verifier = derive_complete_span_fill_exact_verifier_with_long_singleton(
+                    source.layout,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                    true,
+                    Some(receipt),
+                    Some(source_artifact_identity),
+                )
+                .expect("authenticate long verifier")
+                .expect("eligible long verifier");
+                assert_eq!(
+                    verifier,
+                    NativeCompleteSpanFillExactVerifier::LongSingleton {
+                        witness,
+                        source_artifact_identity,
+                    },
+                );
+                let mut swapped_receipt = receipt;
+                swapped_receipt.artifact_identity[0] ^= 1;
+                assert!(derive_complete_span_fill_exact_verifier_with_long_singleton(
+                    source.layout,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                    true,
+                    Some(swapped_receipt),
+                    Some(source_artifact_identity),
+                )
+                .expect("swapped identity is a valid decline")
+                .is_none());
+                let foreign_identity = [0xa5; 32];
+                let foreign_literal = vec![b'Z'; width];
+                let foreign_receipt = NativeCompleteSpanFillExactSingletonReceipt::bind(
+                    &foreign_literal,
+                    foreign_identity,
+                )
+                .expect("same-width foreign receipt");
+                assert!(foreign_receipt.authenticates(foreign_identity));
+                assert!(derive_complete_span_fill_exact_verifier_with_long_singleton(
+                    source.layout,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                    true,
+                    Some(foreign_receipt),
+                    Some(source_artifact_identity),
+                )
+                .expect("foreign receipt is a valid decline")
+                .is_none());
+
+                let suffix = source.layout.suffix_filter.expect("suffix scanner");
+                let Some(reverse) = source.layout.seeded_reverse else {
+                    panic!("missing width-{width} seeded-reverse proof for {target:?}");
+                };
+                let scalar_filter = suffix
+                    .exact_pair_filter
+                    .is_none()
+                    .then_some(suffix.vector_filter.or(suffix.scalar_filter))
+                    .flatten();
+                let maximum_filter_offset = suffix.exact_pair_filter.map_or_else(
+                    || scalar_filter.map_or(
+                        suffix.filter.scan_offset,
+                        NativeVectorFilter::max_scan_offset,
+                    ),
+                    |_| 1,
+                );
+                let maximum_scan_offset = maximum_filter_offset
+                    .max(reverse.boundary_offset.saturating_sub(1));
+                let selected = select_complete_span_fill_suffix_verifier(
+                    source.layout,
+                    suffix,
+                    reverse,
+                    verifier,
+                    maximum_scan_offset,
+                )
+                .expect("valid long geometry")
+                .expect("selected long geometry");
+                assert_eq!(usize::from(selected.full_width), width);
+                assert_eq!(
+                    selected.candidate_backtrack,
+                    u8::try_from(width).expect("bounded width") - suffix.minimum_width,
+                );
+                let mut wrong_backtrack = suffix;
+                wrong_backtrack.restart = NativeSuffixRestart::Bounded {
+                    backtrack: u64::from(selected.candidate_backtrack) + 1,
+                };
+                assert!(select_complete_span_fill_suffix_verifier(
+                    source.layout,
+                    wrong_backtrack,
+                    reverse,
+                    verifier,
+                    maximum_scan_offset,
+                )
+                .expect("wrong displacement is a valid decline")
+                .is_none());
+
+                let (incumbent, specialized, declined) = match target.architecture {
+                    Architecture::X86_64 => (
+                        lower_x86_64_dfa_with_entry_contract(
+                            source.layout,
+                            target.features,
+                            NativeDfaEntryContract::CompleteSpanFillV1,
+                        ),
+                        lower_x86_64_dfa_with_entry_contract_and_long_singleton(
+                            source.layout,
+                            target.features,
+                            NativeDfaEntryContract::CompleteSpanFillV1,
+                            Some(receipt),
+                            Some(source_artifact_identity),
+                        ),
+                        lower_x86_64_dfa_with_entry_contract_and_long_singleton(
+                            source.layout,
+                            target.features,
+                            NativeDfaEntryContract::CompleteSpanFillV1,
+                            Some(foreign_receipt),
+                            Some(source_artifact_identity),
+                        ),
+                    ),
+                    Architecture::Aarch64 => (
+                        lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                            source.layout,
+                            target.features,
+                            target.operating_system,
+                            source.aarch64_sve_filter_plan,
+                            source.aarch64_sve_suffix_kind,
+                            NativeDfaEntryContract::CompleteSpanFillV1,
+                        ),
+                        lower_aarch64_dfa_with_entry_contract_suffix_kind_and_long_singleton(
+                            source.layout,
+                            target.features,
+                            target.operating_system,
+                            source.aarch64_sve_filter_plan,
+                            source.aarch64_sve_suffix_kind,
+                            NativeDfaEntryContract::CompleteSpanFillV1,
+                            Some(receipt),
+                            Some(source_artifact_identity),
+                        ),
+                        lower_aarch64_dfa_with_entry_contract_suffix_kind_and_long_singleton(
+                            source.layout,
+                            target.features,
+                            target.operating_system,
+                            source.aarch64_sve_filter_plan,
+                            source.aarch64_sve_suffix_kind,
+                            NativeDfaEntryContract::CompleteSpanFillV1,
+                            Some(foreign_receipt),
+                            Some(source_artifact_identity),
+                        ),
+                    ),
+                };
+                let incumbent = incumbent.expect("lower seeded-reverse incumbent");
+                let specialized = specialized.expect("lower long specialization");
+                let declined = declined.expect("mismatch retains incumbent");
+                assert_ne!(specialized.code, incumbent.code);
+                assert_eq!(specialized.relocations, incumbent.relocations);
+                assert_eq!(specialized.semantic_call_instructions, 0);
+                assert_eq!(declined.code, incumbent.code);
+                assert_eq!(declined.relocations, incumbent.relocations);
+                assert_eq!(
+                    declined.semantic_call_instructions,
+                    incumbent.semantic_call_instructions,
+                );
+                assert_eq!(declined.scanner, incumbent.scanner);
+                assert_eq!(declined.suffix_scanner, incumbent.suffix_scanner);
+                assert_eq!(declined.conjunction, incumbent.conjunction);
+                assert_eq!(
+                    declined.direct_search_trusted_core,
+                    incumbent.direct_search_trusted_core,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_span_fill_long_singleton_scope_is_forgery_safe_and_nested() {
+        const FIRST: &[u8] = b"abcdefghijklmnopq";
+        const SECOND: &[u8] = b"qrstuvwxyzABCDEFG";
+        let first_identity = [0x31; 32];
+        let second_identity = [0x52; 32];
+        assert!(complete_span_fill_exact_singleton().is_none());
+        assert!(
+            NativeCompleteSpanFillExactSingletonWitness::bind(&FIRST[..16], first_identity)
+                .is_none()
+        );
+        assert!(
+            NativeCompleteSpanFillExactSingletonWitness::bind(&[b'x'; 33], first_identity)
+                .is_none()
+        );
+        assert!(
+            NativeCompleteSpanFillExactSingletonWitness::bind(FIRST, [0; 32]).is_none()
+        );
+
+        let first_scope =
+            complete_span_fill_exact_singleton_scope(Some(FIRST), first_identity);
+        let first = complete_span_fill_exact_singleton().expect("outer witness");
+        assert_eq!(
+            complete_span_fill_source_artifact_identity(),
+            Some(first_identity),
+        );
+        assert!(first.authenticates(first_identity));
+        assert_ne!(first.artifact_identity, second_identity);
+        let mut forged = first;
+        forged.witness.bytes[0] ^= 1;
+        assert!(!forged.authenticates(first_identity));
+        forged = first;
+        forged.witness.seal[0] ^= 1;
+        assert!(!forged.authenticates(first_identity));
+        forged = first;
+        forged.witness.bytes[31] = 1;
+        forged.witness.seal = NativeCompleteSpanFillExactSingletonWitness::seal_for(
+            forged.witness.bytes,
+            forged.witness.length,
+            first_identity,
+        );
+        assert!(!forged.authenticates(first_identity));
+        {
+            let clear = complete_span_fill_exact_singleton_scope(None, first_identity);
+            assert!(complete_span_fill_exact_singleton().is_none());
+            assert_eq!(
+                complete_span_fill_source_artifact_identity(),
+                Some(first_identity),
+            );
+            drop(clear);
+        }
+        assert_eq!(complete_span_fill_exact_singleton(), Some(first));
+        {
+            let second_scope =
+                complete_span_fill_exact_singleton_scope(Some(SECOND), second_identity);
+            let second = complete_span_fill_exact_singleton().expect("nested witness");
+            assert_eq!(
+                complete_span_fill_source_artifact_identity(),
+                Some(second_identity),
+            );
+            assert!(second.authenticates(second_identity));
+            assert!(!second.authenticates(first_identity));
+            assert_ne!(second, first);
+            drop(second_scope);
+        }
+        assert_eq!(complete_span_fill_exact_singleton(), Some(first));
+        assert_eq!(
+            complete_span_fill_source_artifact_identity(),
+            Some(first_identity),
+        );
+        drop(first_scope);
+        assert!(complete_span_fill_exact_singleton().is_none());
+        assert!(complete_span_fill_source_artifact_identity().is_none());
+
+        let request = CompileRequest::new(
+            "(?:abcdefghijklmnopq|ABCDEFGHIJKLMNOPQ)",
+            Target::x86_64_linux(),
+        )
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::Span);
+        let ordinary = compile(request.clone()).expect("non-singleton control");
+        let stale_scope = complete_span_fill_exact_singleton_scope(
+            Some(FIRST),
+            ordinary.program().artifact_identity(),
+        );
+        let stale = complete_span_fill_exact_singleton().expect("stale outer witness");
+        let recipe_scope = complete_span_fill_recipe_scope(true);
+        let scoped = compile(request).expect("non-singleton nested compile");
+        drop(recipe_scope);
+        let source = scoped
+            .module()
+            .native_complete_span_reduce_source
+            .as_deref()
+            .expect("non-singleton continuous source");
+        assert!(source.fill_exact_singleton.is_none());
+        assert_eq!(
+            source.fill_source_artifact_identity,
+            Some(ordinary.program().artifact_identity()),
+        );
+        assert_eq!(complete_span_fill_exact_singleton(), Some(stale));
+        assert_eq!(
+            complete_span_fill_source_artifact_identity(),
+            Some(ordinary.program().artifact_identity()),
+        );
+        assert_eq!(
+            scoped
+                .module()
+                .clone()
+                .without_complete_span_fill_source()
+                .expect("strip non-singleton source"),
+            *ordinary.module(),
+        );
+        drop(stale_scope);
+        assert!(complete_span_fill_exact_singleton().is_none());
+        assert!(complete_span_fill_source_artifact_identity().is_none());
     }
 
     #[test]
