@@ -14893,6 +14893,9 @@ impl PortableRegex {
             PortablePlan::FixedPredicateWord64(plan) => {
                 PortableOrdinarySessionPlan::FixedPredicateWord64 { plan }
             }
+            PortablePlan::LineDomainByteAtoms(plan) => {
+                PortableOrdinarySessionPlan::LineDomainByteAtoms { plan }
+            }
             PortablePlan::K0(k0) => {
                 let positive =
                     matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0);
@@ -19044,6 +19047,13 @@ enum PortableOrdinarySessionPlan<'a> {
     /// without a second compact-canonical discriminant check.
     FixedPredicateWord64 {
         plan: &'a FixedPredicateWord64Plan,
+    },
+    /// Appended so every incumbent ordinary-session variant retains its
+    /// established discriminant. Binding the immutable line-domain owner once
+    /// avoids redispatching through both compact and native plan enums on each
+    /// grep line.
+    LineDomainByteAtoms {
+        plan: &'a line_domain_byte_atoms::OwnedPlan,
     },
 }
 
@@ -25618,6 +25628,13 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
                 ordinary_fixed_predicate_is_match_at_value(plan, haystack, start)
             }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { plan } => plan
+                .is_match_window_value(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(session) => session
                 .shortest_match_at_value(haystack, start)
                 .map(|endpoint| endpoint.is_some()),
@@ -25706,6 +25723,13 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
                 ordinary_fixed_predicate_first_acceptance_at_value(plan, haystack, start)
             }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { plan } => plan
+                .first_end_window_value(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(session) => {
                 session.shortest_match_at_value(haystack, start)
             }
@@ -25830,6 +25854,13 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
                 ordinary_fixed_predicate_find_at_value(plan, haystack, start)
             }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { plan } => plan
+                .find_window_value(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex))
                 if start == 0 =>
             {
@@ -26009,6 +26040,21 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
                 PortableOrdinaryCanonical::FixedPredicateWord64(plan)
                     .try_visit_spans_at(haystack, start, visitor)
+            }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { plan } => {
+                let cursor = plan.search_cursor(haystack);
+                try_visit_ordinary_spans_at(
+                    haystack.len(),
+                    start,
+                    |search_start| {
+                        cursor
+                            .find_at_value(search_start, SearchLimits::unlimited())
+                            .map_err(|error| {
+                                PortableFindIterError::Search(SearchError::from(error))
+                            })
+                    },
+                    visitor,
+                )
             }
             PortableOrdinarySessionPlan::Canonical(session) => {
                 session.try_visit_spans_at(haystack, start, visitor)
@@ -26324,6 +26370,7 @@ impl<'r> PortableOrdinarySession<'r> {
             PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
                 count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start)
             }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { .. } => Ok(None),
             PortableOrdinarySessionPlan::Canonical(
                 PortableOrdinaryCanonical::FixedPredicateWord64(plan),
             ) => count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start),
@@ -49657,6 +49704,24 @@ mod tests {
                 super::PortableOrdinaryCanonical::Native(bound_regex)
             ) if core::ptr::eq(*bound_regex, &reverse_inner_union)
         ));
+
+        let line = PortableBuilder::new(r"(?m)^(?-u:[\x00\xE1])$")
+            .build()
+            .unwrap();
+        assert_eq!(line.build_report().plan, PlanKind::LineDomainByteAtoms);
+        let PortablePlan::LineDomainByteAtoms(line_plan) = &line.plan else {
+            unreachable!("line-domain fixture changed plan")
+        };
+        let line_session = line.ordinary_session().unwrap();
+        assert!(matches!(
+            &line_session.plan,
+            super::PortableOrdinarySessionPlan::LineDomainByteAtoms { plan: bound }
+                if core::ptr::eq(*bound, line_plan.as_ref())
+        ));
+        assert_eq!(
+            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>(),
+            2 * core::mem::size_of::<usize>(),
+        );
     }
 
     #[test]
@@ -49686,6 +49751,9 @@ mod tests {
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::ReverseInner(_),
                 ) => "canonical-reverse-inner",
+                super::PortableOrdinarySessionPlan::LineDomainByteAtoms { .. } => {
+                    "line-domain-byte-atoms"
+                }
                 super::PortableOrdinarySessionPlan::RequiredLiteral { .. } => {
                     "required-literal"
                 }
@@ -49935,10 +50003,21 @@ mod tests {
             "literal-set-compact",
             0,
         );
+
+        let line = PortableBuilder::new(r"(?m)^(?-u:[A-Z][a-z]{2,8})$")
+            .build()
+            .unwrap();
+        check(
+            "line-domain byte atoms",
+            &line,
+            b"Ada\nno\nGrace\n",
+            "line-domain-byte-atoms",
+            0,
+        );
     }
 
     #[test]
-    fn ordinary_session_full_is_match_native_routes_match_offset_zero_exhaustively() {
+    fn ordinary_session_full_is_match_routes_match_offset_zero_exhaustively() {
         fn sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
             let mut sources = vec![Vec::new()];
             let mut level = vec![Vec::new()];
@@ -49983,12 +50062,23 @@ mod tests {
             let baseline = regex::bytes::Regex::new(pattern).unwrap();
             let mut actual = regex.ordinary_session().unwrap();
             let mut legacy = regex.ordinary_session().unwrap();
-            assert!(matches!(
-                &actual.plan,
-                super::PortableOrdinarySessionPlan::Canonical(
-                    super::PortableOrdinaryCanonical::Native(bound)
-                ) if core::ptr::eq(*bound, &regex)
-            ));
+            if expected_plan == PlanKind::LineDomainByteAtoms {
+                let PortablePlan::LineDomainByteAtoms(line_plan) = &regex.plan else {
+                    unreachable!("line-domain fixture changed plan")
+                };
+                assert!(matches!(
+                    &actual.plan,
+                    super::PortableOrdinarySessionPlan::LineDomainByteAtoms { plan: bound }
+                        if core::ptr::eq(*bound, line_plan.as_ref())
+                ));
+            } else {
+                assert!(matches!(
+                    &actual.plan,
+                    super::PortableOrdinarySessionPlan::Canonical(
+                        super::PortableOrdinaryCanonical::Native(bound)
+                    ) if core::ptr::eq(*bound, &regex)
+                ));
+            }
 
             for haystack in &haystacks {
                 let expected = baseline.is_match(haystack);
@@ -50096,12 +50186,6 @@ mod tests {
         assert_eq!(scalar.build_report().plan, PlanKind::UnicodeScalarRun);
         check_native("unicode scalar", &scalar, "!αβ!".as_bytes(), 1);
 
-        let line = PortableBuilder::new(r"(?m)^(?-u:[\x00\xE1])$")
-            .build()
-            .unwrap();
-        assert_eq!(line.build_report().plan, PlanKind::LineDomainByteAtoms);
-        check_native("line atoms", &line, b"a\n\xE1\n", 1);
-
         for (label, regex, haystack) in [
             (
                 "canonical exact",
@@ -50142,7 +50226,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_session_native_zero_span_matches_oracle_exhaustively() {
+    fn ordinary_session_bound_zero_span_matches_oracle_exhaustively() {
         fn sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
             let mut sources = vec![Vec::new()];
             let mut level = vec![Vec::new()];
@@ -50188,12 +50272,23 @@ mod tests {
             assert_eq!(regex.build_report().plan, expected_plan, "pattern={pattern:?}");
             let baseline = regex::bytes::Regex::new(pattern).unwrap();
             let mut ordinary = regex.ordinary_session().unwrap();
-            assert!(matches!(
-                &ordinary.plan,
-                super::PortableOrdinarySessionPlan::Canonical(
-                    super::PortableOrdinaryCanonical::Native(bound)
-                ) if core::ptr::eq(*bound, &regex)
-            ));
+            if expected_plan == PlanKind::LineDomainByteAtoms {
+                let PortablePlan::LineDomainByteAtoms(line_plan) = &regex.plan else {
+                    unreachable!("line-domain fixture changed plan")
+                };
+                assert!(matches!(
+                    &ordinary.plan,
+                    super::PortableOrdinarySessionPlan::LineDomainByteAtoms { plan: bound }
+                        if core::ptr::eq(*bound, line_plan.as_ref())
+                ));
+            } else {
+                assert!(matches!(
+                    &ordinary.plan,
+                    super::PortableOrdinarySessionPlan::Canonical(
+                        super::PortableOrdinaryCanonical::Native(bound)
+                    ) if core::ptr::eq(*bound, &regex)
+                ));
+            }
 
             for haystack in &haystacks {
                 for start in 0..=haystack.len() {
@@ -50209,6 +50304,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ordinary_line_domain_binding_preserves_public_operations_and_count_decline() {
+        let pattern = r"(?m)^(?-u:[A-Z][a-z]{2,8})$";
+        let regex = PortableBuilder::new(pattern).build().unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LineDomainByteAtoms);
+        let baseline = regex::bytes::Regex::new(pattern).unwrap();
+        let haystack = b"Ada\nno\nGrace\nABCD\n\xE1\nEve\n";
+        let mut ordinary = regex.ordinary_session().unwrap();
+
+        assert_eq!(ordinary.is_match(haystack), Ok(baseline.is_match(haystack)));
+        for start in 0..=haystack.len() {
+            assert_eq!(
+                ordinary.is_match_at(haystack, start),
+                Ok(baseline.is_match_at(haystack, start)),
+                "existence start={start}",
+            );
+            assert_eq!(
+                ordinary.first_acceptance_at(haystack, start),
+                Ok(baseline.shortest_match_at(haystack, start)),
+                "endpoint start={start}",
+            );
+            assert_eq!(
+                ordinary.find_at(haystack, start),
+                Ok(baseline.find_at(haystack, start).map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                })),
+                "span start={start}",
+            );
+
+            let mut expected = Vec::new();
+            let mut cursor = start;
+            while let Some(matched) = baseline.find_at(haystack, cursor) {
+                expected.push(Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+                cursor = matched.end();
+            }
+            let mut actual = Vec::new();
+            assert_eq!(
+                ordinary.try_visit_spans_at(haystack, start, |matched| {
+                    actual.push(matched);
+                    Ok::<bool, ()>(true)
+                }),
+                Ok(Ok(())),
+                "visit start={start}",
+            );
+            assert_eq!(actual, expected, "visit spans start={start}");
+            assert_eq!(
+                ordinary.count_positive_width_selected_ends_at(haystack, start),
+                Ok(None),
+                "unsupported count start={start}",
+            );
+        }
+
+        let invalid = haystack.len() + 1;
+        assert!(matches!(
+            ordinary.find_at(haystack, invalid),
+            Err(SearchError::LineDomainByteAtoms(
+                fre_kernels::LineDomainByteAtomsSearchError::InvalidWindow
+            ))
+        ));
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, invalid),
+            Ok(None),
+            "unsupported count declines before validating the source window",
+        );
     }
 
     #[test]
