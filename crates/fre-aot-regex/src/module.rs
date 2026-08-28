@@ -1563,6 +1563,9 @@ struct Aarch64FiniteExistsExactPlan {
 struct NativeDfaEmission {
     code: Vec<u8>,
     relocations: Vec<ModuleRelocation>,
+    /// Calls present at target instruction boundaries before final branch
+    /// relaxation. Continuous fill authentication requires this to be zero.
+    semantic_call_instructions: u8,
     scanner: Option<NativeScannerEmission>,
     suffix_scanner: Option<NativeScannerEmission>,
     conjunction: Option<NativeVectorConjunctionEmission>,
@@ -1709,6 +1712,7 @@ struct NativeDirectSearchLfLineCursor {
 /// extent are authenticated independently before this recipe is consumed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeCompleteSpanReduceSource {
+    purpose: NativeCompleteSpanSourcePurpose,
     layout: NativeDfaLayout,
     aarch64_sve_filter_plan: Option<Aarch64SveFilterPlan>,
     aarch64_sve_suffix_kind: Option<Aarch64SveFilterKind>,
@@ -1716,8 +1720,17 @@ struct NativeCompleteSpanReduceSource {
     program_sha256: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeCompleteSpanSourcePurpose {
+    Reduce,
+    DirectFillExactNonemptyV1,
+}
+
 const COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE: &str =
     "complete Span reducer source";
+#[cfg(test)]
+const CONTINUOUS_SPAN_FILL_APPEND_ALLOCATION_SITE: &str =
+    "continuous Span fill append";
 const MATCHING_LF_LINE_WITNESS_TRACKING_ALLOCATION_SITE: &str =
     "matching-LF-line final-edge tracking";
 const MATCHING_LF_LINE_WITNESS_TRACKING_INVALID_SITE: &str =
@@ -1941,6 +1954,8 @@ fn with_matching_lf_line_witness_recipe<T>(run: impl FnOnce() -> T) -> T {
 std::thread_local! {
     static COMPLETE_SPAN_REDUCE_RECIPE_ENABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static COMPLETE_SPAN_FILL_RECIPE_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 pub(crate) struct CompleteSpanReduceRecipeScope {
@@ -1993,6 +2008,29 @@ pub(crate) fn complete_span_reduce_recipe_scope(
 
 fn complete_span_reduce_recipe_enabled() -> bool {
     COMPLETE_SPAN_REDUCE_RECIPE_ENABLED.with(std::cell::Cell::get)
+}
+
+pub(crate) struct CompleteSpanFillRecipeScope {
+    previous: bool,
+}
+
+impl Drop for CompleteSpanFillRecipeScope {
+    fn drop(&mut self) {
+        COMPLETE_SPAN_FILL_RECIPE_ENABLED.with(|enabled| {
+            enabled.set(self.previous);
+        });
+    }
+}
+
+pub(crate) fn complete_span_fill_recipe_scope(requested: bool) -> CompleteSpanFillRecipeScope {
+    let previous = COMPLETE_SPAN_FILL_RECIPE_ENABLED.with(|enabled| {
+        enabled.replace(requested)
+    });
+    CompleteSpanFillRecipeScope { previous }
+}
+
+fn complete_span_fill_recipe_enabled() -> bool {
+    COMPLETE_SPAN_FILL_RECIPE_ENABLED.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2112,6 +2150,69 @@ fn allocate_complete_span_reduce_source(
         }
     }
     complete_span_reduce_source_allocation(try_box_preserve(source))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CONTINUOUS_SPAN_FILL_APPEND_ALLOCATION_INJECTION: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct ContinuousSpanFillAppendAllocationInjection;
+
+#[cfg(test)]
+impl ContinuousSpanFillAppendAllocationInjection {
+    fn arm() -> Self {
+        CONTINUOUS_SPAN_FILL_APPEND_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.replace(1),
+                0,
+                "continuous Span fill append allocation injection was already armed",
+            );
+        });
+        Self
+    }
+
+    fn assert_failed_once(&self) {
+        CONTINUOUS_SPAN_FILL_APPEND_ALLOCATION_INJECTION.with(|state| {
+            assert_eq!(
+                state.get(),
+                2,
+                "continuous Span fill append allocation injection was not consumed exactly once",
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for ContinuousSpanFillAppendAllocationInjection {
+    fn drop(&mut self) {
+        CONTINUOUS_SPAN_FILL_APPEND_ALLOCATION_INJECTION.with(|state| state.set(0));
+    }
+}
+
+#[cfg(test)]
+fn with_continuous_span_fill_append_allocation_failure<T>(run: impl FnOnce() -> T) -> T {
+    let injection = ContinuousSpanFillAppendAllocationInjection::arm();
+    let result = run();
+    injection.assert_failed_once();
+    result
+}
+
+#[cfg(test)]
+fn inject_continuous_span_fill_append_allocation_failure() -> Result<(), ObjectError> {
+    CONTINUOUS_SPAN_FILL_APPEND_ALLOCATION_INJECTION.with(|state| match state.get() {
+        0 => Ok(()),
+        1 => {
+            state.set(2);
+            Err(ObjectError::Allocation(
+                CONTINUOUS_SPAN_FILL_APPEND_ALLOCATION_SITE,
+            ))
+        }
+        2 => panic!("continuous Span fill append retried after terminal allocation failure"),
+        _ => unreachable!("invalid continuous Span fill append allocation injection state"),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3202,6 +3303,11 @@ enum NativeDfaEntryContract {
     /// returns both Count and SpanSum in a private two-word result and never
     /// publishes a partial match.
     CompleteSpanReduceCoreV1,
+    /// Handle-free stateful refill entry regenerated from an independently
+    /// authenticated exact-width, nonnullable complete Span DFA. Match
+    /// results remain in registers until this entry publishes one initialized
+    /// output prefix; no per-match search ABI boundary is crossed.
+    CompleteSpanFillV1,
 }
 
 impl NativeDfaEntryContract {
@@ -3215,11 +3321,20 @@ impl NativeDfaEntryContract {
             Self::PreparedPartialCore
                 | Self::PreparedPartialPropagatedStartCore
                 | Self::CompleteSpanReduceCoreV1
+                | Self::CompleteSpanFillV1
         )
     }
 
     const fn complete_span_reduce(self) -> bool {
         matches!(self, Self::CompleteSpanReduceCoreV1)
+    }
+
+    const fn complete_span_fill(self) -> bool {
+        matches!(self, Self::CompleteSpanFillV1)
+    }
+
+    const fn complete_span_iteration(self) -> bool {
+        self.complete_span_reduce() || self.complete_span_fill()
     }
 
     const fn propagates_partial_span_window_start(self) -> bool {
@@ -3236,7 +3351,8 @@ impl NativeDfaEntryContract {
             Self::Public
             | Self::PreparedPartialCore
             | Self::PreparedPartialPropagatedStartCore
-            | Self::CompleteSpanReduceCoreV1 => None,
+            | Self::CompleteSpanReduceCoreV1
+            | Self::CompleteSpanFillV1 => None,
         }
     }
 }
@@ -3313,7 +3429,10 @@ impl CompiledModule {
         let Some(source) = self.native_complete_span_reduce_source.as_deref() else {
             return Ok(None);
         };
-        if source.layout.output != OutputContract::Span || source.layout.partial.is_some() {
+        if source.purpose != NativeCompleteSpanSourcePurpose::Reduce
+            || source.layout.output != OutputContract::Span
+            || source.layout.partial.is_some()
+        {
             return Err(ObjectError::InvalidModule(
                 "complete Span reducer source has an incompatible layout",
             ));
@@ -3508,6 +3627,7 @@ impl CompiledModule {
             )?,
         };
         if emission.code.is_empty()
+            || emission.semantic_call_instructions != 0
             || emission.direct_search_trusted_core.is_some()
             || emission
                 .relocations
@@ -3536,6 +3656,199 @@ impl CompiledModule {
                 result_abi: NativeCompleteSpanReduceResultAbi::CountAndSpanSumU64V1,
             },
         }))
+    }
+
+    /// Authenticate the compiler-private exact-nonempty refill recipe against
+    /// the selected public entry before regenerating any additive text.
+    fn authenticate_complete_span_fill_source(
+        &self,
+        trusted_core: NativeDirectSearchTrustedCore,
+    ) -> Result<Option<NativeCompleteSpanReduceSource>, ObjectError> {
+        let Some(source) = self.native_complete_span_reduce_source.as_deref() else {
+            return Ok(None);
+        };
+        if source.purpose != NativeCompleteSpanSourcePurpose::DirectFillExactNonemptyV1
+            || source.layout.output != OutputContract::Span
+            || source.layout.partial.is_some()
+            || source.layout.initial_pending
+            || !matches!(source.layout.exact_span_width, Some(width) if width != 0)
+        {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span fill source has an incompatible proof",
+            ));
+        }
+        if self.target.architecture == Architecture::X86_64
+            && (source.aarch64_sve_filter_plan.is_some()
+                || source.aarch64_sve_suffix_kind.is_some())
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 continuous Span fill source retained an AArch64 plan",
+            ));
+        }
+
+        let entry = self.symbols.get(self.entry_symbol_index).ok_or(
+            ObjectError::InvalidModule("continuous Span fill entry index is invalid"),
+        )?;
+        let entry_start = usize::try_from(entry.offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("continuous Span fill entry offset"))?;
+        let entry_size = usize::try_from(entry.size)
+            .map_err(|_| ObjectError::ArithmeticOverflow("continuous Span fill entry size"))?;
+        let entry_end = entry_start
+            .checked_add(entry_size)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "continuous Span fill entry extent",
+            ))?;
+        let text = self
+            .sections
+            .get(TEXT_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "continuous Span fill module has no text section",
+            ))?
+            .data
+            .as_ref();
+        if entry.binding != SymbolBinding::Global
+            || entry.kind != SymbolKind::Function
+            || entry.section != Some(TEXT_SECTION)
+            || entry_size == 0
+            || entry_end > text.len()
+        {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span fill entry is not a complete text function",
+            ));
+        }
+        let program = self.symbols.get(PROGRAM_SYMBOL).ok_or(
+            ObjectError::InvalidModule("continuous Span fill program symbol is absent"),
+        )?;
+        let program_offset = usize::try_from(program.offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("continuous Span fill program offset")
+        })?;
+        let program_size = usize::try_from(program.size).map_err(|_| {
+            ObjectError::ArithmeticOverflow("continuous Span fill program size")
+        })?;
+        let program_data = self
+            .sections
+            .get(PROGRAM_SECTION)
+            .ok_or(ObjectError::InvalidModule(
+                "continuous Span fill module has no program section",
+            ))?
+            .data
+            .as_ref();
+        let program_end = program_offset.checked_add(program_size).ok_or(
+            ObjectError::ArithmeticOverflow("continuous Span fill program extent"),
+        )?;
+        if program.binding != SymbolBinding::Local
+            || program.kind != SymbolKind::Object
+            || program.section != Some(PROGRAM_SECTION)
+            || program_offset != 0
+            || program_size != source.program_bytes
+            || program_end != program_data.len()
+            || Sha256::digest(
+                program_data
+                    .get(program_offset..program_end)
+                    .ok_or(ObjectError::InvalidModule(
+                        "continuous Span fill program extent is outside data",
+                    ))?,
+            )
+            .as_slice()
+                != source.program_sha256
+        {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span fill program identity is inconsistent",
+            ));
+        }
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            text,
+            entry_start,
+            entry_end,
+            program_data,
+            &self.relocations,
+            trusted_core,
+            OutputContract::Span,
+        )?;
+
+        let regenerated = match self.target.architecture {
+            Architecture::X86_64 => {
+                lower_x86_64_dfa_with_emission(source.layout, self.target.features)?
+            }
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                source.layout,
+                self.target.features,
+                self.target.operating_system,
+                source.aarch64_sve_filter_plan,
+                source.aarch64_sve_suffix_kind,
+                NativeDfaEntryContract::Public,
+            )?,
+        };
+        let regenerated_core = regenerated.direct_search_trusted_core.ok_or(
+            ObjectError::InvalidModule(
+                "regenerated public Span fill omitted its trusted-core receipt",
+            ),
+        )?;
+        authenticate_native_direct_search_trusted_core(
+            self.target.architecture,
+            &regenerated.code,
+            0,
+            regenerated.code.len(),
+            program_data,
+            &regenerated.relocations,
+            regenerated_core,
+            OutputContract::Span,
+        )?;
+        if regenerated.code.as_slice() != &text[entry_start..entry_end]
+            || regenerated_core.code_offset.checked_add(entry_start)
+                != Some(trusted_core.code_offset)
+            || regenerated_core.output != trusted_core.output
+            || regenerated_core.entry_contract != trusted_core.entry_contract
+            || regenerated_core.result_abi != trusted_core.result_abi
+            || regenerated_core.entry_code_sha256 != trusted_core.entry_code_sha256
+            || regenerated_core.prologue != trusted_core.prologue
+            || regenerated_core.landmark != trusted_core.landmark
+        {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span fill public entry regeneration disagrees",
+            ));
+        }
+        let entry_start_u64 = u64::try_from(entry_start).map_err(|_| {
+            ObjectError::ArithmeticOverflow("continuous Span fill relocation base")
+        })?;
+        let entry_end_u64 = u64::try_from(entry_end).map_err(|_| {
+            ObjectError::ArithmeticOverflow("continuous Span fill relocation extent")
+        })?;
+        let mut actual_relocations = self.relocations.iter().filter(|relocation| {
+            relocation.section == TEXT_SECTION
+                && (entry_start_u64..entry_end_u64).contains(&relocation.offset)
+        });
+        for expected in &regenerated.relocations {
+            if expected.section != TEXT_SECTION || expected.symbol != PROGRAM_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "regenerated public Span fill has an unexpected relocation",
+                ));
+            }
+            let actual = actual_relocations.next().ok_or(ObjectError::InvalidModule(
+                "continuous Span fill public entry lost a relocation",
+            ))?;
+            if actual.section != expected.section
+                || actual.offset != expected.offset.checked_add(entry_start_u64).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "continuous Span fill relocation offset",
+                    ),
+                )?
+                || actual.kind != expected.kind
+                || actual.symbol != expected.symbol
+                || actual.addend != expected.addend
+            {
+                return Err(ObjectError::InvalidModule(
+                    "continuous Span fill public relocation regeneration disagrees",
+                ));
+            }
+        }
+        if actual_relocations.next().is_some() {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span fill public entry has an extra relocation",
+            ));
+        }
+        Ok(Some(*source))
     }
 }
 
@@ -3717,6 +4030,17 @@ pub enum DirectExistsBatchStrategy {
     /// one correlated SIMD scan and exact positives tail-enter the retained
     /// DFA.
     NativeTeddyTrustedCoreV1,
+}
+
+/// Implementation selected behind a handle-free direct Span-fill symbol.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DirectSpanFillStrategy {
+    /// The generic compiler-produced iterator calls the independently
+    /// authenticated ordinary trusted core once per logical match.
+    NativeTrustedCoreLoopV1,
+    /// One regenerated exact-nonempty complete-DFA entry keeps scan state in
+    /// native code and publishes a bounded non-overlap span prefix directly.
+    NativeContinuousCompleteDfaV1,
 }
 
 /// Implementation selected behind an exact-singleton first-candidate symbol.
@@ -3922,6 +4246,7 @@ pub struct CompiledModule {
     prepared_span_fill_symbol_index: Option<usize>,
     prepared_exists_batch_symbol_index: Option<usize>,
     direct_span_fill_symbol_index: Option<usize>,
+    direct_span_fill_strategy: Option<DirectSpanFillStrategy>,
     direct_exists_batch_symbol_index: Option<usize>,
     direct_exists_batch_surface_seal: Option<NativeDirectExistsBatchSurfaceSeal>,
     direct_exact_singleton_first_candidate: Option<(usize, ExactSingletonFirstCandidateAotReport)>,
@@ -9851,6 +10176,7 @@ impl CompiledModule {
             prepared_span_fill_symbol_index,
             prepared_exists_batch_symbol_index,
             direct_span_fill_symbol_index: None,
+            direct_span_fill_strategy: None,
             direct_exists_batch_symbol_index: None,
             direct_exists_batch_surface_seal: None,
             direct_exact_singleton_first_candidate: None,
@@ -10836,14 +11162,28 @@ impl CompiledModule {
     ///
     /// The returned symbol has the
     /// `FreAotRegexIndependentSpanFillV1` ABI from `fre-aot-regex-runtime`.
-    /// It validates the raw iterator boundary once per refill and loops over
-    /// the independently authenticated private core of the ordinary entry.
-    /// The ordinary scalar entry and its ABI remain unchanged.
+    /// It validates the raw iterator boundary once per refill. Depending on
+    /// [`Self::direct_span_fill_strategy`], it either loops over the
+    /// independently authenticated private core of the ordinary entry or
+    /// inlines an independently authenticated complete DFA. The ordinary
+    /// scalar entry and its ABI remain unchanged.
     #[must_use]
     pub fn direct_span_fill_symbol(&self) -> Option<&str> {
         self.direct_span_fill_symbol_index
             .and_then(|index| self.symbols.get(index))
             .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return how the handle-free direct Span-fill symbol executes.
+    #[must_use]
+    pub const fn direct_span_fill_strategy(&self) -> Option<DirectSpanFillStrategy> {
+        match (
+            self.direct_span_fill_symbol_index,
+            self.direct_span_fill_strategy,
+        ) {
+            (Some(_), strategy) => strategy,
+            (None, _) => None,
+        }
     }
 
     /// Return the handle-free independent-haystack Exists batch entry.
@@ -11069,8 +11409,25 @@ impl CompiledModule {
     }
 
     #[cfg(test)]
-    pub(crate) const fn has_complete_span_reduce_source_for_test(&self) -> bool {
-        self.native_complete_span_reduce_source.is_some()
+    pub(crate) fn has_complete_span_reduce_source_for_test(&self) -> bool {
+        matches!(
+            self.native_complete_span_reduce_source.as_deref(),
+            Some(source) if source.purpose == NativeCompleteSpanSourcePurpose::Reduce
+        )
+    }
+
+    pub(crate) fn has_complete_span_fill_source(&self) -> bool {
+        matches!(
+            self.native_complete_span_reduce_source.as_deref(),
+            Some(source)
+                if source.purpose
+                    == NativeCompleteSpanSourcePurpose::DirectFillExactNonemptyV1
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_complete_span_fill_source_for_test(&self) -> bool {
+        self.has_complete_span_fill_source()
     }
 
     #[cfg(test)]
@@ -11148,7 +11505,8 @@ impl CompiledModule {
                     && core.result_abi
                         == NativeDirectSearchResultAbi::SpanMatchedWritesBothV1
                     && source.layout.output == OutputContract::Span
-                    && source.layout.partial.is_none() =>
+                    && source.layout.partial.is_none()
+                    && source.purpose == NativeCompleteSpanSourcePurpose::Reduce =>
             {
                 self.native_complete_span_reduce_source = None;
                 Ok(self)
@@ -11156,6 +11514,33 @@ impl CompiledModule {
             (None, None) => Ok(self),
             _ => Err(ObjectError::InvalidModule(
                 "complete Span reducer fallback has an inconsistent receipt",
+            )),
+        }
+    }
+
+    /// Remove only the optional exact-nonempty continuous-fill recipe. This
+    /// reconstructs the byte-identical generic trusted-core fill incumbent
+    /// before the candidate is lowered, so any candidate-only numeric decline
+    /// can retain that full incumbent without retrying after a failure.
+    pub(crate) fn without_complete_span_fill_source(mut self) -> Result<Self, ObjectError> {
+        match (
+            self.native_complete_span_reduce_source.as_deref(),
+            self.native_complete_span_reduce_core,
+        ) {
+            (Some(source), None)
+                if source.purpose
+                    == NativeCompleteSpanSourcePurpose::DirectFillExactNonemptyV1
+                    && source.layout.output == OutputContract::Span
+                    && source.layout.partial.is_none()
+                    && !source.layout.initial_pending
+                    && matches!(source.layout.exact_span_width, Some(width) if width != 0) =>
+            {
+                self.native_complete_span_reduce_source = None;
+                Ok(self)
+            }
+            (None, None) => Ok(self),
+            _ => Err(ObjectError::InvalidModule(
+                "continuous Span fill fallback has an inconsistent recipe",
             )),
         }
     }
@@ -11869,6 +12254,153 @@ impl CompiledModule {
     }
 
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "authenticated lowering, relocation, identity, and publication are one failure-atomic transaction"
+    )]
+    fn append_continuous_complete_dfa_span_fill(
+        mut self,
+        source: NativeCompleteSpanReduceSource,
+        trusted_core: NativeDirectSearchTrustedCore,
+        native_surface: NativeDirectSearchModuleSurfaceSeal,
+        entry_name_digest: [u8; 32],
+        text_len: usize,
+    ) -> Result<Option<Self>, ObjectError> {
+        let emission = match self.target.architecture {
+            Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                source.layout,
+                self.target.features,
+                NativeDfaEntryContract::CompleteSpanFillV1,
+            )?,
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                source.layout,
+                self.target.features,
+                self.target.operating_system,
+                source.aarch64_sve_filter_plan,
+                source.aarch64_sve_suffix_kind,
+                NativeDfaEntryContract::CompleteSpanFillV1,
+            )?,
+        };
+        if emission.code.is_empty()
+            || emission.semantic_call_instructions != 0
+            || emission.direct_search_trusted_core.is_some()
+            || emission.relocations.iter().any(|relocation| {
+                relocation.section != TEXT_SECTION || relocation.symbol != PROGRAM_SYMBOL
+            })
+        {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span fill emission is inconsistent",
+            ));
+        }
+        let emission_relocations_sha256 =
+            exact_finite_selected_end_relocation_digest(&emission.relocations).ok_or(
+                ObjectError::InvalidModule("continuous Span fill relocation digest is absent"),
+            )?;
+        let alignment_mask = match self.target.architecture {
+            Architecture::X86_64 => 15,
+            Architecture::Aarch64 => 3,
+        };
+        let code_offset = text_len
+            .checked_add(alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "continuous Span fill entry alignment",
+            ))?
+            & !alignment_mask;
+        let final_text_len = code_offset.checked_add(emission.code.len()).ok_or(
+            ObjectError::ArithmeticOverflow("continuous Span fill entry extent"),
+        )?;
+
+        #[cfg(test)]
+        inject_continuous_span_fill_append_allocation_failure()?;
+
+        let mut sections = std::mem::take(&mut self.sections).into_vec();
+        let mut text = std::mem::take(&mut sections[TEXT_SECTION].data).into_vec();
+        text.try_reserve_exact(final_text_len.saturating_sub(text.len()))
+            .map_err(|_| ObjectError::Allocation("continuous Span fill text"))?;
+        match self.target.architecture {
+            Architecture::X86_64 => text.resize(code_offset, 0x90),
+            Architecture::Aarch64 => {
+                while text.len() < code_offset {
+                    push_bytes(&mut text, &0xd503_201f_u32.to_le_bytes())?;
+                }
+            }
+        }
+        push_bytes(&mut text, &emission.code)?;
+
+        let mut relocations = std::mem::take(&mut self.relocations).into_vec();
+        relocations
+            .try_reserve_exact(emission.relocations.len())
+            .map_err(|_| ObjectError::Allocation("continuous Span fill relocations"))?;
+        let relocation_base = u64::try_from(code_offset).map_err(|_| {
+            ObjectError::ArithmeticOverflow("continuous Span fill relocation base")
+        })?;
+        for mut relocation in emission.relocations {
+            relocation.offset = relocation.offset.checked_add(relocation_base).ok_or(
+                ObjectError::ArithmeticOverflow("continuous Span fill relocation offset"),
+            )?;
+            relocations.push(relocation);
+        }
+
+        let continuous_bytes = text.get(code_offset..final_text_len).ok_or(
+            ObjectError::InvalidModule("continuous Span fill body is outside final text"),
+        )?;
+        let continuous_code_size = continuous_bytes.len();
+        let exact_width = source.layout.exact_span_width.ok_or(
+            ObjectError::InvalidModule("continuous Span fill lost its exact-width proof"),
+        )?;
+        let mut fill_identity = Sha256::new();
+        fill_identity.update(DIRECT_SPAN_FILL_IDENTITY_DOMAIN);
+        fill_identity.update([2]);
+        fill_identity.update(entry_name_digest);
+        fill_identity.update(native_surface.native_module_identity);
+        fill_identity.update(trusted_core.entry_code_sha256);
+        fill_identity.update(source.program_sha256);
+        fill_identity.update(exact_width.to_le_bytes());
+        fill_identity.update(
+            u64::try_from(code_offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "continuous Span fill identity code offset",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        fill_identity.update(emission_relocations_sha256);
+        fill_identity.update(continuous_bytes);
+        let fill_name = identity_symbol(
+            DIRECT_SPAN_FILL_SYMBOL_PREFIX,
+            &<[u8; 32]>::from(fill_identity.finalize()),
+        )?;
+
+        sections[TEXT_SECTION].data = text.into_boxed_slice();
+        self.sections = sections.into_boxed_slice();
+        self.relocations = relocations.into_boxed_slice();
+
+        let mut symbols = std::mem::take(&mut self.symbols).into_vec();
+        symbols
+            .try_reserve_exact(1)
+            .map_err(|_| ObjectError::Allocation("continuous Span fill symbol"))?;
+        let fill_symbol_index = symbols.len();
+        symbols.push(ModuleSymbol {
+            name: fill_name,
+            binding: SymbolBinding::Global,
+            kind: SymbolKind::Function,
+            section: Some(TEXT_SECTION),
+            offset: relocation_base,
+            size: u64::try_from(continuous_code_size).map_err(|_| {
+                ObjectError::ArithmeticOverflow("continuous Span fill code size")
+            })?,
+        });
+        self.symbols = symbols.into_boxed_slice();
+        self.native_complete_span_reduce_source = None;
+        self.direct_span_fill_symbol_index = Some(fill_symbol_index);
+        self.direct_span_fill_strategy = Some(
+            DirectSpanFillStrategy::NativeContinuousCompleteDfaV1,
+        );
+        Ok(Some(self))
+    }
+
     /// Append one handle-free stateful Span-fill loop to a fresh,
     /// self-contained direct Span module.
     ///
@@ -11902,7 +12434,6 @@ impl CompiledModule {
         if self.entry_symbol_index != ENTRY_SYMBOL
             || self.sections.len() != 2
             || self.symbols.len() != 2
-            || self.native_complete_span_reduce_source.is_some()
             || self.native_complete_span_reduce_core.is_some()
         {
             return Err(ObjectError::InvalidModule(
@@ -12063,6 +12594,15 @@ impl CompiledModule {
         )?;
 
         let entry_name_digest: [u8; 32] = Sha256::digest(entry.name.as_bytes()).into();
+        if let Some(source) = self.authenticate_complete_span_fill_source(trusted_core)? {
+            return self.append_continuous_complete_dfa_span_fill(
+                source,
+                trusted_core,
+                native_surface,
+                entry_name_digest,
+                text_len,
+            );
+        }
         let wrapper = match self.target.architecture {
             Architecture::X86_64 => lower_x86_64_direct_span_fill(trusted_core.prologue)?,
             Architecture::Aarch64 => lower_aarch64_direct_span_fill(trusted_core.prologue)?,
@@ -12187,6 +12727,8 @@ impl CompiledModule {
         });
         self.symbols = symbols.into_boxed_slice();
         self.direct_span_fill_symbol_index = Some(fill_symbol_index);
+        self.direct_span_fill_strategy =
+            Some(DirectSpanFillStrategy::NativeTrustedCoreLoopV1);
         Ok(Some(self))
     }
 
@@ -14273,6 +14815,7 @@ impl CompiledModule {
                 ),
             )?;
             if self.native_complete_span_reduce_core.is_some()
+                || source.purpose != NativeCompleteSpanSourcePurpose::Reduce
                 || source.program_bytes != pending.core.program_bytes
                 || source.program_sha256 != pending.core.program_sha256
                 || trusted_core.entry_code_sha256 != pending.core.public_entry_sha256
@@ -30921,14 +31464,14 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
         });
     }
     if entry_contract.register_outcome()
-        && !entry_contract.complete_span_reduce()
+        && !entry_contract.complete_span_iteration()
         && layout.partial.is_none()
     {
         return Err(ObjectError::InvalidModule(
             "trusted prepared core has no partial continuation layout",
         ));
     }
-    if entry_contract.complete_span_reduce()
+    if entry_contract.complete_span_iteration()
         && (layout.output != OutputContract::Span || layout.partial.is_some())
     {
         return Err(ObjectError::InvalidModule(
@@ -30954,7 +31497,8 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
             NativeDfaEntryContract::ExactAbsoluteAnchored { .. }
             | NativeDfaEntryContract::PreparedPartialCore
             | NativeDfaEntryContract::PreparedPartialPropagatedStartCore
-            | NativeDfaEntryContract::CompleteSpanReduceCoreV1 => {
+            | NativeDfaEntryContract::CompleteSpanReduceCoreV1
+            | NativeDfaEntryContract::CompleteSpanFillV1 => {
                 lower_x86_64_dfa_with_entry_contract(layout, target.features, entry_contract)?
             }
         },
@@ -31014,11 +31558,22 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
     // allocation is not a speculative scanner attempt: if refused, every
     // optional classifier must propagate the distinct site unchanged instead
     // of entering a fresh fallback transaction.
-    let complete_span_reduce_source = if complete_span_reduce_recipe_enabled()
+    let reduce_recipe = complete_span_reduce_recipe_enabled()
+        && entry_contract == NativeDfaEntryContract::Public
+        && layout.output == OutputContract::Span
+        && layout.partial.is_none();
+    let fill_recipe = complete_span_fill_recipe_enabled()
         && entry_contract == NativeDfaEntryContract::Public
         && layout.output == OutputContract::Span
         && layout.partial.is_none()
-    {
+        && !layout.initial_pending
+        && matches!(layout.exact_span_width, Some(width) if width != 0);
+    if reduce_recipe && fill_recipe {
+        return Err(ObjectError::InvalidModule(
+            "complete Span source was requested for two endpoints",
+        ));
+    }
+    let complete_span_reduce_source = if reduce_recipe || fill_recipe {
         emission.direct_search_trusted_core.as_ref().ok_or(
             ObjectError::InvalidModule(
                 "complete public Span DFA did not publish its trusted core",
@@ -31026,6 +31581,11 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
         )?;
         Some(allocate_complete_span_reduce_source(
             NativeCompleteSpanReduceSource {
+                purpose: if fill_recipe {
+                    NativeCompleteSpanSourcePurpose::DirectFillExactNonemptyV1
+                } else {
+                    NativeCompleteSpanSourcePurpose::Reduce
+                },
                 layout,
                 aarch64_sve_filter_plan: (target.architecture == Architecture::Aarch64)
                     .then_some(sve_filter_plan)
@@ -37594,6 +38154,7 @@ pub(crate) fn lower_native_regex_set_exact64_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_span_fill_symbol_index: None,
+        direct_span_fill_strategy: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -37941,6 +38502,7 @@ pub(crate) fn lower_native_regex_set_graph_exists_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_span_fill_symbol_index: None,
+        direct_span_fill_strategy: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -38470,6 +39032,7 @@ pub(crate) fn lower_native_regex_set_exact64_first_any_aarch64_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_span_fill_symbol_index: None,
+        direct_span_fill_strategy: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -38639,6 +39202,7 @@ fn native_regex_redux_module(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_span_fill_symbol_index: None,
+        direct_span_fill_strategy: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -39001,6 +39565,7 @@ pub(crate) fn lower_linked_prepared_row_uniform_capture_reducer(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_span_fill_symbol_index: None,
+        direct_span_fill_strategy: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -39124,6 +39689,7 @@ fn native_weighted_capture_module(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_span_fill_symbol_index: None,
+        direct_span_fill_strategy: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -39590,6 +40156,7 @@ fn native_rebar_multi_grep_module_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_span_fill_symbol_index: None,
+        direct_span_fill_strategy: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -39846,6 +40413,7 @@ fn native_rebar_row_scalar_module_v1(
         prepared_span_fill_symbol_index: None,
         prepared_exists_batch_symbol_index: None,
         direct_span_fill_symbol_index: None,
+        direct_span_fill_strategy: None,
         direct_exists_batch_symbol_index: None,
         direct_exists_batch_surface_seal: None,
         direct_exact_singleton_first_candidate: None,
@@ -40075,6 +40643,32 @@ struct X86Assembler {
     fixups: Vec<X86Fixup>,
     instruction_offsets: Vec<usize>,
     track_lf_line_success: bool,
+}
+
+fn x86_instruction_is_call(code: &[u8], offset: usize) -> bool {
+    let mut cursor = offset;
+    let opcode = loop {
+        let Some(opcode) = code.get(cursor).copied() else {
+            return false;
+        };
+        if matches!(
+            opcode,
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+                | 0x40..=0x4f
+        ) {
+            cursor += 1;
+            continue;
+        }
+        break opcode;
+    };
+    if matches!(opcode, 0xe8 | 0x9a) {
+        return true;
+    }
+    if opcode != 0xff {
+        return false;
+    }
+    code.get(cursor + 1)
+        .is_some_and(|modrm| matches!(modrm & 0x38, 0x10 | 0x18))
 }
 
 struct NativeCaptureMaterializerLowering {
@@ -51681,6 +52275,194 @@ fn x86_emit_start_filter_range_vector_test(
     x86_emit_candidate_nonzero(assembler, X86CandidateMask::Avx512K4)
 }
 
+const X86_COMPLETE_SPAN_FILL_FRAME_BYTES: u8 = 64;
+
+/// Validate and initialize the handle-free refill ABI, then enter one exact
+/// complete-DFA search at the caller-owned iterator cursor. All source and
+/// output pointers remain stack-resident while the DFA owns caller-saved
+/// registers. A structurally valid pending-empty state is honored even though
+/// this exact-nonempty artifact can never publish one itself.
+fn x86_emit_complete_span_fill_prologue(
+    assembler: &mut X86Assembler,
+    restart: X86Label,
+    done: X86Label,
+    raw_invalid: X86Label,
+) -> Result<(), ObjectError> {
+    let validate_state = assembler.label()?;
+    let no_pending_rule = assembler.label()?;
+    let has_last_rule = assembler.label()?;
+    let state_valid = assembler.label()?;
+    let no_pending_progress = assembler.label()?;
+    let zero_capacity = assembler.label()?;
+    let unfinished_probe = assembler.label()?;
+    let finished = assembler.label()?;
+
+    // Direct ABI: RDI haystack, RSI length, RDX state, RCX results,
+    // R8 capacity, R9 written. The generated DFA makes no calls.
+    assembler.instruction(&[0x48, 0x83, 0xec, X86_COMPLETE_SPAN_FILL_FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x14, 0x24])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x08])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x10])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x20, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x28])?;
+
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], raw_invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x88], raw_invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], raw_invalid)?;
+    assembler.instruction(&[0xf6, 0xc2, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], raw_invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+    let mut maximum_capacity = vec![0x49, 0xba];
+    maximum_capacity.extend_from_slice(&(isize::MAX as u64 / 16).to_le_bytes());
+    assembler.instruction(&maximum_capacity)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x87], raw_invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], validate_state)?;
+    assembler.instruction(&[0x48, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], raw_invalid)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+
+    assembler.bind(validate_state)?;
+    assembler.instruction(&[0x83, 0x7a, 0x14, 0x00])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+    assembler.instruction(&[0x8b, 0x42, 0x10])?;
+    assembler.instruction(&[0x41, 0x89, 0xc2])?;
+    assembler.instruction(&[0x41, 0x83, 0xe2, 0x07])?;
+    assembler.instruction(&[0x44, 0x39, 0xd0])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x12])?;
+    assembler.instruction(&[0x49, 0x39, 0xf2])?;
+    assembler.branch(&[0x0f, 0x87], raw_invalid)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x5a, 0x08])?;
+    assembler.instruction(&[0x49, 0x39, 0xf3])?;
+    assembler.branch(&[0x0f, 0x87], raw_invalid)?;
+    assembler.instruction(&[0xa8, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], no_pending_rule)?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x84], raw_invalid)?;
+    assembler.instruction(&[0x4d, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+    assembler.bind(no_pending_rule)?;
+    assembler.instruction(&[0xa8, 0x01])?;
+    assembler.branch(&[0x0f, 0x85], has_last_rule)?;
+    assembler.instruction(&[0x4d, 0x85, 0xdb])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+    assembler.branch(&[0xe9], state_valid)?;
+    assembler.bind(has_last_rule)?;
+    assembler.instruction(&[0x4d, 0x39, 0xda])?;
+    assembler.branch(&[0x0f, 0x82], raw_invalid)?;
+    assembler.instruction(&[0xa8, 0x04])?;
+    assembler.branch(&[0x0f, 0x84], state_valid)?;
+    assembler.instruction(&[0xa8, 0x02])?;
+    assembler.branch(&[0x0f, 0x85], raw_invalid)?;
+
+    assembler.bind(state_valid)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0xc7, 0x00, 0, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x10, 0])?;
+    assembler.branch(&[0x0f, 0x84], zero_capacity)?;
+    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+    assembler.instruction(&[0x8b, 0x48, 0x10])?;
+    assembler.instruction(&[0xf6, 0xc1, 0x04])?;
+    assembler.branch(&[0x0f, 0x85], finished)?;
+    assembler.instruction(&[0xf6, 0xc1, 0x02])?;
+    assembler.branch(&[0x0f, 0x84], no_pending_progress)?;
+    assembler.instruction(&[0x83, 0xe1, 0xfd])?;
+    assembler.instruction(&[0x89, 0x48, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x10])?;
+    assembler.instruction(&[0x48, 0x3b, 0x54, 0x24, 0x28])?;
+    assembler.branch(&[0x0f, 0x84], finished)?;
+    assembler.instruction(&[0x48, 0x83, 0x00, 0x01])?;
+    assembler.bind(no_pending_progress)?;
+    assembler.instruction(&[0x48, 0x8b, 0x10])?;
+    assembler.branch(&[0xe9], restart)?;
+
+    assembler.bind(zero_capacity)?;
+    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+    assembler.instruction(&[0xf6, 0x40, 0x10, 0x04])?;
+    assembler.branch(&[0x0f, 0x84], unfinished_probe)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], done)?;
+    assembler.bind(unfinished_probe)?;
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.branch(&[0xe9], done)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(&[0x8b, 0x48, 0x10])?;
+    assembler.instruction(&[0x83, 0xe1, 0x01])?;
+    assembler.instruction(&[0x83, 0xc9, 0x04])?;
+    assembler.instruction(&[0x89, 0x48, 0x10])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.branch(&[0xe9], done)?;
+    Ok(())
+}
+
+fn x86_emit_complete_span_fill_match(
+    assembler: &mut X86Assembler,
+    exact_width: u64,
+    restart: X86Label,
+    full: X86Label,
+    invalid_result: X86Label,
+    done: X86Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x49, 0x39, 0xf2])?;
+    assembler.branch(&[0x0f, 0x82], invalid_result)?;
+    assembler.instruction(&[0x4d, 0x39, 0xd3])?;
+    assembler.branch(&[0x0f, 0x82], invalid_result)?;
+    assembler.instruction(&[0x49, 0x39, 0xcb])?;
+    assembler.branch(&[0x0f, 0x87], invalid_result)?;
+    assembler.instruction(&[0x4c, 0x89, 0xd8])?;
+    assembler.instruction(&[0x4c, 0x29, 0xd0])?;
+    let mut width = vec![0x48, 0xb9];
+    width.extend_from_slice(&exact_width.to_le_bytes());
+    assembler.instruction(&width)?;
+    assembler.instruction(&[0x48, 0x39, 0xc8])?;
+    assembler.branch(&[0x0f, 0x85], invalid_result)?;
+
+    assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+    assembler.instruction(&[0x4c, 0x89, 0x18])?;
+    assembler.instruction(&[0x4c, 0x89, 0x58, 0x08])?;
+    assembler.instruction(&[0xc7, 0x40, 0x10, 1, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x08])?;
+    assembler.instruction(&[0x4c, 0x89, 0x10])?;
+    assembler.instruction(&[0x4c, 0x89, 0x58, 0x08])?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x83, 0x44, 0x24, 0x20, 0x01])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x89, 0x08])?;
+    assembler.instruction(&[0x48, 0x3b, 0x4c, 0x24, 0x10])?;
+    assembler.branch(&[0x0f, 0x84], full)?;
+    assembler.instruction(&[0x4c, 0x89, 0xda])?;
+    assembler.branch(&[0xe9], restart)?;
+
+    assembler.bind(full)?;
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.branch(&[0xe9], done)?;
+    assembler.bind(invalid_result)?;
+    assembler.instruction(&[0x48, 0x8b, 0x14, 0x24])?;
+    assembler.instruction(&[0x8b, 0x42, 0x10])?;
+    assembler.instruction(&[0x83, 0xe0, 0x01])?;
+    assembler.instruction(&[0x83, 0xc8, 0x04])?;
+    assembler.instruction(&[0x89, 0x42, 0x10])?;
+    assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    assembler.branch(&[0xe9], done)?;
+    Ok(())
+}
+
 #[allow(
     clippy::large_types_passed_by_value,
     clippy::too_many_lines,
@@ -51729,11 +52511,19 @@ fn lower_x86_64_dfa_with_entry_contract(
             "x86 fixed candidate retained a moving Teddy scanner",
         ));
     }
-    if entry_contract.complete_span_reduce()
+    if entry_contract.complete_span_iteration()
         && (layout.output != OutputContract::Span || layout.partial.is_some())
     {
         return Err(ObjectError::InvalidModule(
             "x86 complete Span reducer core has an incompatible layout",
+        ));
+    }
+    if entry_contract.complete_span_fill()
+        && (layout.initial_pending
+            || !matches!(layout.exact_span_width, Some(width) if width != 0))
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 continuous Span fill has no exact nonempty layout proof",
         ));
     }
     let mut assembler = X86Assembler::new();
@@ -51777,7 +52567,7 @@ fn lower_x86_64_dfa_with_entry_contract(
     let reverse_finish = assembler.label()?;
     let exact_start_probe_failed = assembler.label()?;
     let complete_restart = entry_contract
-        .complete_span_reduce()
+        .complete_span_iteration()
         .then(|| assembler.label())
         .transpose()?;
     let complete_loop_head = entry_contract
@@ -51797,7 +52587,15 @@ fn lower_x86_64_dfa_with_entry_contract(
         .then(|| assembler.label())
         .transpose()?;
     let complete_invalid_result = entry_contract
-        .complete_span_reduce()
+        .complete_span_iteration()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_fill_full = entry_contract
+        .complete_span_fill()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_fill_raw_invalid = entry_contract
+        .complete_span_fill()
         .then(|| assembler.label())
         .transpose()?;
 
@@ -51932,6 +52730,13 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 24])?;
         assembler.instruction(&[0x89, 0x44, 0x24, 32])?;
         assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 40])?;
+    } else if entry_contract.complete_span_fill() {
+        x86_emit_complete_span_fill_prologue(
+            &mut assembler,
+            complete_restart.expect("continuous Span fill restart label"),
+            done,
+            complete_fill_raw_invalid.expect("continuous Span fill raw-invalid label"),
+        )?;
     }
 
     if entry_contract.validates_public_args() {
@@ -52778,12 +53583,31 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x49, 0x89, 0x40, 8])?;
         assembler.instruction(&[0x31, 0xc0])?;
         assembler.branch(&[0xe9], done)?;
+    } else if entry_contract.complete_span_fill() {
+        assembler.instruction(&[0x48, 0x8b, 0x14, 0x24])?;
+        assembler.instruction(&[0x8b, 0x42, 0x10])?;
+        assembler.instruction(&[0x83, 0xe0, 0x01])?;
+        assembler.instruction(&[0x83, 0xc8, 0x04])?;
+        assembler.instruction(&[0x89, 0x42, 0x10])?;
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.branch(&[0xe9], done)?;
     } else {
         assembler.instruction(&[0x31, 0xc0])?;
         assembler.branch(&[0xe9], done)?;
     }
     assembler.bind(matched)?;
-    if let (
+    if entry_contract.complete_span_fill() {
+        x86_emit_complete_span_fill_match(
+            &mut assembler,
+            layout
+                .exact_span_width
+                .expect("continuous Span fill exact-width proof"),
+            complete_restart.expect("continuous Span fill restart label"),
+            complete_fill_full.expect("continuous Span fill full label"),
+            complete_invalid_result.expect("continuous Span fill invalid-result label"),
+            done,
+        )?;
+    } else if let (
         Some(restart),
         Some(loop_head),
         Some(nonempty),
@@ -52860,11 +53684,32 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&status)?;
         assembler.branch(&[0xe9], done)?;
     }
+    if let Some(raw_invalid) = complete_fill_raw_invalid {
+        assembler.bind(raw_invalid)?;
+        assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+        assembler.branch(&[0xe9], done)?;
+    }
     assembler.bind(invalid)?;
-    assembler.instruction(&[0xb8, 0x02, 0x00, 0x00, 0x00])?;
+    if entry_contract.complete_span_fill() {
+        assembler.instruction(&[0x48, 0x8b, 0x14, 0x24])?;
+        assembler.instruction(&[0x8b, 0x42, 0x10])?;
+        assembler.instruction(&[0x83, 0xe0, 0x01])?;
+        assembler.instruction(&[0x83, 0xc8, 0x04])?;
+        assembler.instruction(&[0x89, 0x42, 0x10])?;
+        assembler.instruction(&[0xb8, 3, 0, 0, 0])?;
+    } else {
+        assembler.instruction(&[0xb8, 0x02, 0x00, 0x00, 0x00])?;
+    }
     assembler.bind(done)?;
     if entry_contract.complete_span_reduce() {
         assembler.instruction(&[0x48, 0x83, 0xc4, 48])?;
+    } else if entry_contract.complete_span_fill() {
+        assembler.instruction(&[
+            0x48,
+            0x83,
+            0xc4,
+            X86_COMPLETE_SPAN_FILL_FRAME_BYTES,
+        ])?;
     }
     if uses_seeded_reverse {
         assembler.instruction(&[0x41, 0x5f])?; // pop r15
@@ -52892,6 +53737,20 @@ fn lower_x86_64_dfa_with_entry_contract(
     } else {
         None
     };
+
+    let semantic_call_instructions = u8::try_from(
+        assembler
+            .instruction_offsets
+            .iter()
+            .filter(|&&offset| x86_instruction_is_call(&assembler.code, offset))
+            .count(),
+    )
+    .map_err(|_| ObjectError::ArithmeticOverflow("x86 semantic call count"))?;
+    if entry_contract.complete_span_fill() && semantic_call_instructions != 0 {
+        return Err(ObjectError::InvalidModule(
+            "continuous x86 Span fill contains a call instruction",
+        ));
+    }
 
     let mut finished = if track_matching_lf_line {
         finish_matching_lf_line_witness_tracking(|| {
@@ -53005,6 +53864,7 @@ fn lower_x86_64_dfa_with_entry_contract(
     Ok(NativeDfaEmission {
         code,
         relocations,
+        semantic_call_instructions,
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
@@ -77745,6 +78605,178 @@ fn lower_aarch64_dfa_for_operating_system_with_emission(
     )
 }
 
+const AARCH64_COMPLETE_SPAN_FILL_FRAME_BYTES: u16 = 64;
+
+fn aarch64_emit_complete_span_fill_prologue(
+    assembler: &mut Aarch64Assembler,
+    restart: Aarch64Label,
+    done: Aarch64Label,
+    raw_invalid: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let validate_state = assembler.label()?;
+    let no_pending_rule = assembler.label()?;
+    let has_last_rule = assembler.label()?;
+    let state_valid = assembler.label()?;
+    let no_pending_progress = assembler.label()?;
+    let zero_capacity = assembler.label()?;
+    let unfinished_probe = assembler.label()?;
+    let finished = assembler.label()?;
+
+    // Direct ABI: X0 haystack, X1 length, X2 state, X3 results,
+    // X4 capacity, X5 written. The regenerated complete DFA makes no calls.
+    assembler.instruction(aarch64_sub_x_imm(
+        31,
+        31,
+        AARCH64_COMPLETE_SPAN_FILL_FRAME_BYTES,
+    )?)?;
+    assembler.instruction(aarch64_store_x(2, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(3, 31, 8)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, 16)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, 24)?)?;
+    assembler.instruction(aarch64_store_x(31, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(1, 31, 40)?)?;
+
+    assembler.branch_zero_x(0, raw_invalid)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, raw_invalid)?;
+    assembler.branch_zero_x(2, raw_invalid)?;
+    assembler.instruction(aarch64_and_low_x(8, 2, 3)?)?;
+    assembler.branch_nonzero_x(8, raw_invalid)?;
+    assembler.branch_zero_x(5, raw_invalid)?;
+    assembler.instruction(aarch64_and_low_x(8, 5, 3)?)?;
+    assembler.branch_nonzero_x(8, raw_invalid)?;
+    aarch64_load_u64_constant(assembler, 8, isize::MAX as u64 / 16)?;
+    assembler.instruction(aarch64_cmp_x(4, 8)?)?;
+    assembler.branch_cond(AARCH64_HI, raw_invalid)?;
+    assembler.branch_zero_x(4, validate_state)?;
+    assembler.branch_zero_x(3, raw_invalid)?;
+    assembler.instruction(aarch64_and_low_x(8, 3, 3)?)?;
+    assembler.branch_nonzero_x(8, raw_invalid)?;
+
+    assembler.bind(validate_state)?;
+    assembler.instruction(aarch64_load_w_imm(7, 2, 20)?)?;
+    assembler.branch_nonzero_w(7, raw_invalid)?;
+    assembler.instruction(aarch64_load_w_imm(7, 2, 16)?)?;
+    assembler.instruction(aarch64_and_low_w(8, 7, 3)?)?;
+    assembler.instruction(aarch64_cmp_w(7, 8)?)?;
+    assembler.branch_cond(AARCH64_NE, raw_invalid)?;
+    assembler.instruction(aarch64_load_x_imm(8, 2, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, raw_invalid)?;
+    assembler.instruction(aarch64_load_x_imm(9, 2, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, raw_invalid)?;
+    assembler.branch_bit_clear_w(7, 1, no_pending_rule)?;
+    assembler.branch_bit_clear_w(7, 0, raw_invalid)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, raw_invalid)?;
+    assembler.bind(no_pending_rule)?;
+    assembler.branch_bit_set_w(7, 0, has_last_rule)?;
+    assembler.branch_nonzero_x(8, raw_invalid)?;
+    assembler.branch_nonzero_x(9, raw_invalid)?;
+    assembler.branch(state_valid)?;
+    assembler.bind(has_last_rule)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+    assembler.branch_cond(AARCH64_LO, raw_invalid)?;
+    assembler.branch_bit_clear_w(7, 2, state_valid)?;
+    assembler.branch_bit_set_w(7, 1, raw_invalid)?;
+
+    assembler.bind(state_valid)?;
+    assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
+    assembler.branch_zero_x(4, zero_capacity)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(7, 8, 16)?)?;
+    assembler.branch_bit_set_w(7, 2, finished)?;
+    assembler.branch_bit_clear_w(7, 1, no_pending_progress)?;
+    assembler.instruction(aarch64_and_low_w(7, 7, 1)?)?;
+    assembler.instruction(aarch64_store_w(7, 8, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(9, 8, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(10, 31, 40)?)?;
+    assembler.instruction(aarch64_cmp_x(9, 10)?)?;
+    assembler.branch_cond(AARCH64_EQ, finished)?;
+    assembler.instruction(aarch64_add_x_imm(9, 9, 1)?)?;
+    assembler.instruction(aarch64_store_x(9, 8, 0)?)?;
+    assembler.bind(no_pending_progress)?;
+    assembler.instruction(aarch64_load_x_imm(2, 8, 0)?)?;
+    assembler.branch(restart)?;
+
+    assembler.bind(zero_capacity)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(7, 8, 16)?)?;
+    assembler.branch_bit_clear_w(7, 2, unfinished_probe)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(done)?;
+    assembler.bind(unfinished_probe)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(done)?;
+
+    assembler.bind(finished)?;
+    assembler.instruction(aarch64_load_w_imm(7, 8, 16)?)?;
+    assembler.instruction(aarch64_and_low_w(7, 7, 1)?)?;
+    assembler.instruction(aarch64_movz_w(9, 4)?)?;
+    assembler.instruction(aarch64_orr_w(7, 7, 9)?)?;
+    assembler.instruction(aarch64_store_w(7, 8, 16)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.branch(done)?;
+    Ok(())
+}
+
+fn aarch64_emit_complete_span_fill_match(
+    assembler: &mut Aarch64Assembler,
+    exact_width: u64,
+    restart: Aarch64Label,
+    full: Aarch64Label,
+    invalid_result: Aarch64Label,
+    done: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
+    assembler.instruction(aarch64_cmp_x(6, 9)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_result)?;
+    assembler.instruction(aarch64_cmp_x(7, 6)?)?;
+    assembler.branch_cond(AARCH64_LO, invalid_result)?;
+    assembler.instruction(aarch64_cmp_x(7, 3)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid_result)?;
+    assembler.instruction(aarch64_sub_x_reg(8, 7, 6)?)?;
+    aarch64_load_u64_constant(assembler, 10, exact_width)?;
+    assembler.instruction(aarch64_cmp_x(8, 10)?)?;
+    assembler.branch_cond(AARCH64_NE, invalid_result)?;
+
+    assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(7, 8, 0)?)?;
+    assembler.instruction(aarch64_store_x(7, 8, 8)?)?;
+    assembler.instruction(aarch64_movz_w(10, 1)?)?;
+    assembler.instruction(aarch64_store_w(10, 8, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 8)?)?;
+    assembler.instruction(aarch64_store_x(6, 8, 0)?)?;
+    assembler.instruction(aarch64_store_x(7, 8, 8)?)?;
+    assembler.instruction(aarch64_add_x_imm(8, 8, 16)?)?;
+    assembler.instruction(aarch64_store_x(8, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(10, 31, 32)?)?;
+    assembler.instruction(aarch64_add_x_imm(10, 10, 1)?)?;
+    assembler.instruction(aarch64_store_x(10, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 24)?)?;
+    assembler.instruction(aarch64_store_x(10, 8, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 16)?)?;
+    assembler.instruction(aarch64_cmp_x(10, 8)?)?;
+    assembler.branch_cond(AARCH64_EQ, full)?;
+    assembler.instruction(aarch64_mov_x(2, 7)?)?;
+    assembler.branch(restart)?;
+
+    assembler.bind(full)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.branch(done)?;
+    assembler.bind(invalid_result)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+    assembler.instruction(aarch64_load_w_imm(7, 8, 16)?)?;
+    assembler.instruction(aarch64_and_low_w(7, 7, 1)?)?;
+    assembler.instruction(aarch64_movz_w(10, 4)?)?;
+    assembler.instruction(aarch64_orr_w(7, 7, 10)?)?;
+    assembler.instruction(aarch64_store_w(7, 8, 16)?)?;
+    assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    assembler.branch(done)?;
+    Ok(())
+}
+
 #[allow(
     clippy::large_types_passed_by_value,
     clippy::too_many_lines,
@@ -77808,11 +78840,19 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
             "AArch64 fixed candidate retained a moving Teddy scanner",
         ));
     }
-    if entry_contract.complete_span_reduce()
+    if entry_contract.complete_span_iteration()
         && (layout.output != OutputContract::Span || layout.partial.is_some())
     {
         return Err(ObjectError::InvalidModule(
             "AArch64 complete Span reducer core has an incompatible layout",
+        ));
+    }
+    if entry_contract.complete_span_fill()
+        && (layout.initial_pending
+            || !matches!(layout.exact_span_width, Some(width) if width != 0))
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 continuous Span fill has no exact nonempty layout proof",
         ));
     }
     if sve_suffix_kind.is_some()
@@ -77869,7 +78909,7 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
     let reverse_finish = assembler.label()?;
     let exact_start_probe_failed = assembler.label()?;
     let complete_restart = entry_contract
-        .complete_span_reduce()
+        .complete_span_iteration()
         .then(|| assembler.label())
         .transpose()?;
     let complete_loop_head = entry_contract
@@ -77889,7 +78929,15 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
         .then(|| assembler.label())
         .transpose()?;
     let complete_invalid_result = entry_contract
-        .complete_span_reduce()
+        .complete_span_iteration()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_fill_full = entry_contract
+        .complete_span_fill()
+        .then(|| assembler.label())
+        .transpose()?;
+    let complete_fill_raw_invalid = entry_contract
+        .complete_span_fill()
         .then(|| assembler.label())
         .transpose()?;
 
@@ -77904,6 +78952,13 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
         // Keep the semantic full-haystack end independent of every scanner
         // scratch register and reload it at restart and result validation.
         assembler.instruction(aarch64_store_x(3, 31, 40)?)?;
+    } else if entry_contract.complete_span_fill() {
+        aarch64_emit_complete_span_fill_prologue(
+            &mut assembler,
+            complete_restart.expect("continuous Span fill restart label"),
+            done,
+            complete_fill_raw_invalid.expect("continuous Span fill raw-invalid label"),
+        )?;
     }
 
     if entry_contract.validates_public_args() {
@@ -79135,12 +80190,32 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
         assembler.instruction(aarch64_store_x(10, 8, 8)?)?;
         assembler.instruction(aarch64_movz_w(0, 0)?)?;
         assembler.branch(done)?;
+    } else if entry_contract.complete_span_fill() {
+        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+        assembler.instruction(aarch64_load_w_imm(7, 8, 16)?)?;
+        assembler.instruction(aarch64_and_low_w(7, 7, 1)?)?;
+        assembler.instruction(aarch64_movz_w(10, 4)?)?;
+        assembler.instruction(aarch64_orr_w(7, 7, 10)?)?;
+        assembler.instruction(aarch64_store_w(7, 8, 16)?)?;
+        assembler.instruction(aarch64_movz_w(0, 0)?)?;
+        assembler.branch(done)?;
     } else {
         assembler.instruction(aarch64_movz_w(0, 0)?)?;
         assembler.branch(done)?;
     }
     assembler.bind(matched)?;
-    if let (
+    if entry_contract.complete_span_fill() {
+        aarch64_emit_complete_span_fill_match(
+            &mut assembler,
+            layout
+                .exact_span_width
+                .expect("continuous Span fill exact-width proof"),
+            complete_restart.expect("continuous Span fill restart label"),
+            complete_fill_full.expect("continuous Span fill full label"),
+            complete_invalid_result.expect("continuous Span fill invalid-result label"),
+            done,
+        )?;
+    } else if let (
         Some(restart),
         Some(loop_head),
         Some(nonempty),
@@ -79220,13 +80295,53 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
         )?)?;
         assembler.branch(done)?;
     }
+    if let Some(raw_invalid) = complete_fill_raw_invalid {
+        assembler.bind(raw_invalid)?;
+        assembler.instruction(aarch64_movz_w(0, 2)?)?;
+        assembler.branch(done)?;
+    }
     assembler.bind(invalid)?;
-    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    if entry_contract.complete_span_fill() {
+        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+        assembler.instruction(aarch64_load_w_imm(7, 8, 16)?)?;
+        assembler.instruction(aarch64_and_low_w(7, 7, 1)?)?;
+        assembler.instruction(aarch64_movz_w(10, 4)?)?;
+        assembler.instruction(aarch64_orr_w(7, 7, 10)?)?;
+        assembler.instruction(aarch64_store_w(7, 8, 16)?)?;
+        assembler.instruction(aarch64_movz_w(0, 3)?)?;
+    } else {
+        assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    }
     assembler.bind(done)?;
     if entry_contract.complete_span_reduce() {
         assembler.instruction(aarch64_add_x_imm(31, 31, 48)?)?;
+    } else if entry_contract.complete_span_fill() {
+        assembler.instruction(aarch64_add_x_imm(
+            31,
+            31,
+            AARCH64_COMPLETE_SPAN_FILL_FRAME_BYTES,
+        )?)?;
     }
     assembler.instruction(0xd65f_03c0)?;
+
+    let semantic_call_instructions = u8::try_from(
+        assembler
+            .code
+            .chunks_exact(4)
+            .filter(|bytes| {
+                let word =
+                    u32::from_le_bytes((*bytes).try_into().expect("one AArch64 instruction"));
+                word & 0xfc00_0000 == 0x9400_0000
+                    || word & 0xffff_fc1f == 0xd63f_0000
+            })
+            .count(),
+    )
+    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 semantic call count"))?;
+    if entry_contract.complete_span_fill() && semantic_call_instructions != 0 {
+        return Err(ObjectError::InvalidModule(
+            "continuous AArch64 Span fill contains a call instruction",
+        ));
+    }
 
     let mut relocation_offsets = [table_page, table_page_offset];
     let (code, matching_lf_line_cursor) = if track_matching_lf_line {
@@ -79340,6 +80455,7 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
     Ok(NativeDfaEmission {
         code,
         relocations,
+        semantic_call_instructions,
         scanner: scanner_emission,
         suffix_scanner,
         conjunction,
@@ -88781,7 +89897,8 @@ mod tests {
     use crate::{
         CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, DeterminizeLimits, EngineKind,
         MatchResult, NativeSlowPartialQuotientDisposition, ObjectFormat, SearchWindow,
-        SlowAotLimits, compile, compile_with_prepared_aggregate_exports, emit_object,
+        SlowAotLimits, compile, compile_with_independent_span_fill,
+        compile_with_prepared_aggregate_exports, emit_object,
     };
     use crate::ordered_nfa_native::{
         ORDERED_NFA_OBJECT_V2_FLAG_ORDERED_EDGE_DISPATCH, ORDERED_NFA_OBJECT_V2_MAGIC,
@@ -89014,6 +90131,214 @@ mod tests {
         let signed_words = (immediate << 38) >> 38;
         let source = i64::try_from(instruction_offset).expect("AArch64 source offset");
         usize::try_from(source + signed_words * 4).expect("AArch64 branch target")
+    }
+
+    #[test]
+    fn continuous_span_fill_is_exact_nonempty_authenticated_and_call_free_on_both_isas() {
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let recipe_scope = complete_span_fill_recipe_scope(true);
+            let ordinary = compile(
+                CompileRequest::new("Sherlock Holmes", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile exact-nonempty direct Span recipe");
+            drop(recipe_scope);
+            assert!(ordinary.module().has_complete_span_fill_source_for_test());
+            let source = *ordinary
+                .module()
+                .native_complete_span_reduce_source
+                .as_deref()
+                .expect("continuous Span fill source");
+            let emission = match target.architecture {
+                Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                    source.layout,
+                    target.features,
+                    NativeDfaEntryContract::CompleteSpanFillV1,
+                ),
+                Architecture::Aarch64 => {
+                    lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                        source.layout,
+                        target.features,
+                        target.operating_system,
+                        source.aarch64_sve_filter_plan,
+                        source.aarch64_sve_suffix_kind,
+                        NativeDfaEntryContract::CompleteSpanFillV1,
+                    )
+                }
+            }
+            .expect("lower continuous Span fill");
+            assert_eq!(emission.semantic_call_instructions, 0);
+            assert!(emission.direct_search_trusted_core.is_none());
+            assert!(emission.relocations.iter().all(|relocation| {
+                relocation.section == TEXT_SECTION
+                    && relocation.symbol == PROGRAM_SYMBOL
+                    && matches!(
+                        (target.architecture, relocation.kind),
+                        (Architecture::X86_64, RelocationKind::X86PcRelative32)
+                            | (
+                                Architecture::Aarch64,
+                                RelocationKind::Aarch64Page21
+                                    | RelocationKind::Aarch64PageOff12
+                            )
+                    )
+            }));
+            if target.architecture == Architecture::Aarch64 {
+                assert!(emission.code.chunks_exact(4).all(|bytes| {
+                    u32::from_le_bytes(bytes.try_into().expect("AArch64 instruction"))
+                        & 0xfc00_0000
+                        != 0x9400_0000
+                }));
+            }
+
+            let appended = ordinary
+                .module()
+                .clone()
+                .append_direct_span_fill(OutputContract::Span)
+                .expect("append continuous Span fill")
+                .expect("continuous Span fill eligibility");
+            assert_eq!(
+                appended.direct_span_fill_strategy(),
+                Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1),
+            );
+            assert!(!appended.has_complete_span_fill_source_for_test());
+            let fill_index = appended
+                .direct_span_fill_symbol_index
+                .expect("continuous Span fill symbol");
+            let fill = &appended.symbols[fill_index];
+            let fill_start = usize::try_from(fill.offset).expect("fill start");
+            let fill_size = usize::try_from(fill.size).expect("fill size");
+            assert_eq!(fill_size, emission.code.len());
+            assert_eq!(
+                appended.sections[TEXT_SECTION]
+                    .bytes()
+                    .get(fill_start..fill_start + fill_size),
+                Some(emission.code.as_slice()),
+            );
+            let fill_start_u64 = u64::try_from(fill_start).expect("fill relocation base");
+            let appended_fill_relocations = appended
+                .relocations
+                .iter()
+                .filter(|relocation| {
+                    (fill_start_u64..fill_start_u64 + fill.size).contains(&relocation.offset)
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            let expected_fill_relocations = emission
+                .relocations
+                .iter()
+                .map(|relocation| ModuleRelocation {
+                    offset: relocation.offset + fill_start_u64,
+                    ..*relocation
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(appended_fill_relocations, expected_fill_relocations);
+
+            let generic = ordinary
+                .module()
+                .clone()
+                .without_complete_span_fill_source()
+                .expect("strip continuous recipe")
+                .append_direct_span_fill(OutputContract::Span)
+                .expect("append generic incumbent")
+                .expect("generic direct fill eligibility");
+            assert_eq!(
+                generic.direct_span_fill_strategy(),
+                Some(DirectSpanFillStrategy::NativeTrustedCoreLoopV1),
+            );
+
+            let mut forged = ordinary.module().clone();
+            forged
+                .native_complete_span_reduce_source
+                .as_mut()
+                .expect("continuous recipe")
+                .program_sha256[0] ^= 1;
+            assert!(forged
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_public_entry = ordinary.module().clone();
+            forged_public_entry.sections[TEXT_SECTION].data[0] ^= 1;
+            assert!(forged_public_entry
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_relocation = ordinary.module().clone();
+            forged_relocation.relocations[0].addend ^= 1;
+            assert!(forged_relocation
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+
+            let mut forged_trusted_core = ordinary.module().clone();
+            forged_trusted_core
+                .native_direct_search_trusted_core
+                .as_mut()
+                .expect("continuous trusted core")
+                .entry_code_sha256[0] ^= 1;
+            assert!(forged_trusted_core
+                .append_direct_span_fill(OutputContract::Span)
+                .is_err());
+        }
+
+        for pattern in ["", "Sherlock Holmes+"] {
+            let recipe_scope = complete_span_fill_recipe_scope(true);
+            let compiled = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile continuous Span fill exclusion");
+            drop(recipe_scope);
+            assert!(
+                !compiled.module().has_complete_span_fill_source_for_test(),
+                "ineligible continuous fill recipe for {pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn continuous_span_fill_source_allocation_failure_is_terminal() {
+        let error = with_complete_span_reduce_source_allocation_failure(|| {
+            compile_with_independent_span_fill(
+                CompileRequest::new("Sherlock Holmes", Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+        })
+        .expect_err("continuous source allocation failure must be terminal");
+        assert!(matches!(
+            error,
+            crate::IndependentSpanFillCompileError::Compile(
+                crate::CompileError::Object(ObjectError::Allocation(
+                    COMPLETE_SPAN_REDUCE_SOURCE_ALLOCATION_SITE
+                ))
+            )
+        ));
+    }
+
+    #[test]
+    fn continuous_span_fill_candidate_append_allocation_failure_is_terminal() {
+        let error = with_continuous_span_fill_append_allocation_failure(|| {
+            compile_with_independent_span_fill(
+                CompileRequest::new("Sherlock Holmes", Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+        })
+        .expect_err("continuous append allocation failure must escape its generic incumbent");
+        assert!(matches!(
+            error,
+            crate::IndependentSpanFillCompileError::Compile(
+                crate::CompileError::Object(ObjectError::Allocation(
+                    CONTINUOUS_SPAN_FILL_APPEND_ALLOCATION_SITE
+                ))
+            )
+        ));
     }
 
     #[test]
@@ -135808,6 +137133,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 prepared_span_fill_symbol_index: None,
                 prepared_exists_batch_symbol_index: None,
                 direct_span_fill_symbol_index: None,
+                direct_span_fill_strategy: None,
                 direct_exists_batch_symbol_index: None,
                 direct_exists_batch_surface_seal: None,
                 direct_exact_singleton_first_candidate: None,
@@ -136155,6 +137481,7 @@ int main(void){{int status=run_short_admission();if(status!=0)return status;stat
             prepared_span_fill_symbol_index: None,
             prepared_exists_batch_symbol_index: None,
             direct_span_fill_symbol_index: None,
+            direct_span_fill_strategy: None,
             direct_exists_batch_symbol_index: None,
             direct_exists_batch_surface_seal: None,
             direct_exact_singleton_first_candidate: None,

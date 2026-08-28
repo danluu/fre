@@ -3589,6 +3589,30 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn two_then_status3_direct_span_fill(
+        _haystack: *const u8,
+        haystack_len: usize,
+        state: *mut NativeIterState,
+        results: *mut AbiResult,
+        capacity: usize,
+        written: *mut usize,
+    ) -> u32 {
+        assert!(haystack_len >= 2);
+        assert!(capacity >= 2);
+        unsafe {
+            results.write(AbiResult { start: 0, end: 1 });
+            results.add(1).write(AbiResult { start: 1, end: 2 });
+            state.write(NativeIterState {
+                next_start: 2,
+                last_match_end: 2,
+                flags: ITER_HAS_LAST | ITER_FINISHED,
+                reserved: 0,
+            });
+            written.write(2);
+        }
+        3
+    }
+
     unsafe extern "C" fn invalid_state_direct_span_fill(
         _haystack: *const u8,
         _haystack_len: usize,
@@ -3644,6 +3668,14 @@ mod tests {
         output: &mut [MaybeUninit<AbiResult>],
     ) -> NativeFillOutcome {
         fill_direct_spans(two_then_error_direct_span_fill, haystack, state, output)
+    }
+
+    fn two_then_status3_direct_fill(
+        haystack: &[u8],
+        state: &mut NativeIterState,
+        output: &mut [MaybeUninit<AbiResult>],
+    ) -> NativeFillOutcome {
+        fill_direct_spans(two_then_status3_direct_span_fill, haystack, state, output)
     }
 
     fn invalid_state_direct_fill(
@@ -5535,6 +5567,33 @@ mod tests {
                 .contains("status 2")
         );
         assert!(iteration.next().is_none());
+
+        let mut direct = native_matcher(one_byte_search, two_then_status3_direct_fill);
+        let mut iteration = direct.find_iter(b"aaa").expect("direct status-3 iterator");
+        assert_eq!(
+            iteration
+                .next()
+                .expect("first status-3 prefix item")
+                .expect("first status-3 prefix match")
+                .range(),
+            0..1
+        );
+        assert_eq!(
+            iteration
+                .next()
+                .expect("second status-3 prefix item")
+                .expect("second status-3 prefix match")
+                .range(),
+            1..2
+        );
+        assert!(
+            iteration
+                .next()
+                .expect("deferred status-3 error")
+                .expect_err("status-3 failure")
+                .contains("status 3")
+        );
+        assert!(iteration.next().is_none());
     }
 
     #[test]
@@ -6384,9 +6443,13 @@ mod tests {
                                 spec.description.contains("api=rust-span-fill");
                             assert_ne!(direct_fill, rust_fill);
                             if direct_fill {
-                                assert!(spec
+                                let generic = spec
                                     .description
-                                    .contains("bulk=native-direct-trusted-core-loop"));
+                                    .contains("bulk=native-direct-trusted-core-loop");
+                                let continuous = spec
+                                    .description
+                                    .contains("bulk=native-continuous-complete-dfa-fill-v1");
+                                assert_ne!(generic, continuous);
                             } else {
                                 assert!(spec.description.contains("bulk=none"));
                             }
@@ -6853,7 +6916,7 @@ mod tests {
         assert!(spec.description.contains("api=direct-span-fill-v1"));
         assert!(
             spec.description
-                .contains("bulk=native-direct-trusted-core-loop")
+                .contains("bulk=native-continuous-complete-dfa-fill-v1")
         );
 
         let repeats = NATIVE_SPAN_BUFFER_CAPACITY * 2 + 2;
@@ -6907,7 +6970,7 @@ mod tests {
 
     #[test]
     fn generated_direct_span_fill_raw_abi_validates_and_supports_progress_probes() {
-        for &fill in generated::DIRECT_SPAN_FILL_ENTRIES {
+        for &(fill, _) in generated::DIRECT_SPAN_FILL_ENTRIES {
             let mut state = NativeIterState::initial_at(0, 0).expect("empty initial state");
             let mut written = usize::MAX;
             let status = unsafe {
@@ -6938,6 +7001,46 @@ mod tests {
             };
             assert_eq!(status, 0, "finished zero-capacity probe must terminate");
             assert_eq!(written, 0);
+
+            let mut pending = NativeIterState {
+                next_start: 0,
+                last_match_end: 0,
+                flags: ITER_HAS_LAST | ITER_PENDING_EMPTY,
+                reserved: 0,
+            };
+            let pending_before_probe = pending;
+            written = usize::MAX;
+            let status = unsafe {
+                fill(
+                    b"".as_ptr(),
+                    0,
+                    &raw mut pending,
+                    std::ptr::null_mut(),
+                    0,
+                    &raw mut written,
+                )
+            };
+            assert_eq!(status, 1, "zero capacity must not consume pending progress");
+            assert_eq!(written, 0);
+            assert_eq!(pending, pending_before_probe);
+
+            let mut pending_output = MaybeUninit::<AbiResult>::uninit();
+            written = usize::MAX;
+            let status = unsafe {
+                fill(
+                    b"".as_ptr(),
+                    0,
+                    &raw mut pending,
+                    pending_output.as_mut_ptr(),
+                    1,
+                    &raw mut written,
+                )
+            };
+            assert_eq!(status, 0, "pending progress at EOF must finish");
+            assert_eq!(written, 0);
+            assert!(pending.has_last_match());
+            assert!(!pending.pending_empty_progress());
+            assert!(pending.finished());
 
             let mut invalid_state = NativeIterState {
                 next_start: 0,
@@ -6976,6 +7079,245 @@ mod tests {
                 2,
                 "null haystack must fail even at zero length"
             );
+        }
+    }
+
+    #[test]
+    fn generated_continuous_exact_span_fill_raw_abi_refills_and_resumes() {
+        const PATTERN: &[u8] = b"Sherlock Holmes";
+        let Some(fill) = generated::PUBLIC_CONTINUOUS_SPAN_FILL_ENTRY else {
+            return;
+        };
+
+        let exact_capacity_haystack = PATTERN.repeat(2);
+        let mut state = NativeIterState::initial_at(0, exact_capacity_haystack.len())
+            .expect("exact-capacity initial state");
+        let mut output = [MaybeUninit::<AbiResult>::uninit(); 2];
+        let mut written = usize::MAX;
+        let status = unsafe {
+            fill(
+                exact_capacity_haystack.as_ptr(),
+                exact_capacity_haystack.len(),
+                &raw mut state,
+                output.as_mut_ptr().cast::<AbiResult>(),
+                output.len(),
+                &raw mut written,
+            )
+        };
+        assert_eq!(status, 1, "an exact-capacity prefix requires a terminal probe");
+        assert_eq!(written, output.len());
+        assert!(!state.finished());
+        for (index, slot) in output.iter().enumerate() {
+            let result = unsafe { slot.assume_init_ref() };
+            let start = index * PATTERN.len();
+            assert_eq!((result.start, result.end), (start, start + PATTERN.len()));
+        }
+        written = usize::MAX;
+        let status = unsafe {
+            fill(
+                exact_capacity_haystack.as_ptr(),
+                exact_capacity_haystack.len(),
+                &raw mut state,
+                output.as_mut_ptr().cast::<AbiResult>(),
+                output.len(),
+                &raw mut written,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(written, 0);
+        assert!(state.finished());
+
+        let dense_repeats = 7;
+        let dense_haystack = PATTERN.repeat(dense_repeats);
+        let sentinel = AbiResult {
+            start: usize::MAX - 1,
+            end: usize::MAX,
+        };
+        let mut state = NativeIterState::initial_at(0, dense_haystack.len())
+            .expect("dense initial state");
+        let mut spans = Vec::new();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            let mut output = [MaybeUninit::new(sentinel); 2];
+            written = usize::MAX;
+            let status = unsafe {
+                fill(
+                    dense_haystack.as_ptr(),
+                    dense_haystack.len(),
+                    &raw mut state,
+                    output.as_mut_ptr().cast::<AbiResult>(),
+                    output.len(),
+                    &raw mut written,
+                )
+            };
+            assert!(written <= output.len());
+            for slot in &output[..written] {
+                let result = unsafe { slot.assume_init_ref() };
+                spans.push(result.start..result.end);
+            }
+            for slot in &output[written..] {
+                assert_eq!(unsafe { slot.assume_init_ref() }, &sentinel);
+            }
+            if status == 0 {
+                assert!(state.finished());
+                break;
+            }
+            assert_eq!(status, 1);
+            assert_eq!(written, output.len());
+            assert!(!state.finished());
+        }
+        assert!(calls > 2, "dense exact fixture must exercise multiple refills");
+        assert_eq!(
+            spans,
+            (0..dense_repeats)
+                .map(|index| {
+                    let start = index * PATTERN.len();
+                    start..start + PATTERN.len()
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let mut state = NativeIterState::initial_at(1, dense_haystack.len())
+            .expect("positive-offset state");
+        let mut output = [MaybeUninit::<AbiResult>::uninit(); 1];
+        written = usize::MAX;
+        let status = unsafe {
+            fill(
+                dense_haystack.as_ptr(),
+                dense_haystack.len(),
+                &raw mut state,
+                output.as_mut_ptr().cast::<AbiResult>(),
+                output.len(),
+                &raw mut written,
+            )
+        };
+        assert_eq!(status, 1);
+        assert_eq!(written, 1);
+        let result = unsafe { output[0].assume_init_ref() };
+        assert_eq!((result.start, result.end), (PATTERN.len(), PATTERN.len() * 2));
+
+        let mut state = NativeIterState {
+            next_start: 0,
+            last_match_end: 0,
+            flags: ITER_HAS_LAST | ITER_PENDING_EMPTY,
+            reserved: 0,
+        };
+        written = usize::MAX;
+        let status = unsafe {
+            fill(
+                dense_haystack.as_ptr(),
+                dense_haystack.len(),
+                &raw mut state,
+                output.as_mut_ptr().cast::<AbiResult>(),
+                output.len(),
+                &raw mut written,
+            )
+        };
+        assert_eq!(status, 1);
+        assert_eq!(written, 1);
+        assert!(!state.pending_empty_progress());
+        let result = unsafe { output[0].assume_init_ref() };
+        assert_eq!((result.start, result.end), (PATTERN.len(), PATTERN.len() * 2));
+    }
+
+    #[test]
+    fn generated_continuous_span_fill_matches_trusted_core_generic_state_for_state() {
+        const PATTERN: &str = "Sherlock Holmes";
+        let Some(fill) = generated::PUBLIC_CONTINUOUS_SPAN_FILL_ENTRY else {
+            return;
+        };
+        let spec = generated::SPECS
+            .iter()
+            .find(|spec| {
+                spec.mode == AotMode::Optimizing
+                    && spec.output == AotOutput::Span
+                    && spec.pattern == PATTERN
+                    && !spec.case_insensitive
+            })
+            .expect("public continuous Span fixture");
+        let search = match spec.backend {
+            BackendFactory::Native { search, .. } => search,
+            _ => panic!("public continuous Span fixture lost its direct ordinary entry"),
+        };
+        let dense = PATTERN.as_bytes().repeat(7);
+        let exact_capacity = PATTERN.as_bytes().repeat(2);
+        let scenarios = [
+            (
+                dense.as_slice(),
+                NativeIterState::initial_at(0, dense.len()).expect("dense initial state"),
+                2,
+            ),
+            (
+                dense.as_slice(),
+                NativeIterState::initial_at(1, dense.len()).expect("offset initial state"),
+                3,
+            ),
+            (
+                dense.as_slice(),
+                NativeIterState {
+                    next_start: 0,
+                    last_match_end: 0,
+                    flags: ITER_HAS_LAST | ITER_PENDING_EMPTY,
+                    reserved: 0,
+                },
+                2,
+            ),
+            (
+                exact_capacity.as_slice(),
+                NativeIterState::initial_at(0, exact_capacity.len())
+                    .expect("exact-capacity initial state"),
+                2,
+            ),
+        ];
+        for (haystack, initial, capacity) in scenarios {
+            let mut continuous_state = initial;
+            let mut generic_state = initial;
+            let mut refills = 0;
+            loop {
+                refills += 1;
+                assert!(refills <= 16, "Span-fill differential did not terminate");
+                let mut continuous_output = vec![MaybeUninit::<AbiResult>::uninit(); capacity];
+                let mut generic_output = vec![MaybeUninit::<AbiResult>::uninit(); capacity];
+                let continuous = fill_direct_spans(
+                    fill,
+                    haystack,
+                    &mut continuous_state,
+                    &mut continuous_output,
+                );
+                let generic = unsafe {
+                    fill_native_spans(
+                        haystack,
+                        &mut generic_state,
+                        &mut generic_output,
+                        |haystack, start, result| {
+                            search(
+                                haystack.as_ptr(),
+                                haystack.len(),
+                                start,
+                                haystack.len(),
+                                result,
+                            )
+                        },
+                    )
+                };
+                assert_eq!(continuous.written, generic.written);
+                assert_eq!(continuous.error, generic.error);
+                assert_eq!(continuous_state, generic_state);
+                for index in 0..continuous.written {
+                    assert_eq!(
+                        unsafe { continuous_output[index].assume_init_ref() },
+                        unsafe { generic_output[index].assume_init_ref() },
+                    );
+                }
+                if continuous.error.is_some() || continuous_state.finished() {
+                    break;
+                }
+                assert_eq!(continuous.written, capacity);
+            }
+            if capacity == 2 && haystack.len() == dense.len() && initial.next_start == 0 {
+                assert!(refills > 2, "dense differential must cross multiple refills");
+            }
         }
     }
 

@@ -12,10 +12,10 @@ use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage,
     DeterminizeLimits, EngineKind, EngineSelectionReason, EntryAbi,
-    ExactFiniteGrepCountCompileError, FeatureSet, IndependentExistsBatchCompileError,
-    IndependentSpanFillCompileError,
-    PreparedAggregateExports, PreparedAggregateStrategy,
-    PreparedBulkStrategy, DirectExistsBatchStrategy, PREPARED_CAPABILITY_ORDERED_NFA_V15,
+    DirectExistsBatchStrategy, DirectSpanFillStrategy, ExactFiniteGrepCountCompileError,
+    FeatureSet, IndependentExistsBatchCompileError, IndependentSpanFillCompileError,
+    PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
     ObjectError, ObjectFormat, SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target,
     compile,
@@ -763,6 +763,10 @@ fn independent_span_fill_is_opt_in_authenticated_and_resource_atomic() {
             .direct_span_fill_symbol()
             .expect("handle-free direct Span-fill symbol");
         assert!(symbol.starts_with("fre_aot_regex_fill_spans_v1_"));
+        assert_eq!(
+            filled.module().direct_span_fill_strategy(),
+            Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1),
+        );
         assert!(filled.module().prepared_span_fill_symbol().is_none());
         assert!(filled.module().required_runtime_symbols().next().is_none());
         assert_eq!(filled.receipt().passes, ordinary.receipt().passes);
@@ -860,6 +864,147 @@ fn independent_span_fill_is_opt_in_authenticated_and_resource_atomic() {
     assert_eq!(requested_fast.object(), ordinary_fast.object());
     assert_eq!(requested_fast.module(), ordinary_fast.module());
     assert_eq!(requested_fast.receipt(), ordinary_fast.receipt());
+}
+
+#[test]
+fn independent_span_fill_preserves_generic_incumbent_on_ineligible_and_candidate_cap() {
+    for target in [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+    ] {
+        let request = CompileRequest::new("Sherlock Holmes+", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span);
+        let ordinary = compile(request.clone()).expect("variable-width direct Span artifact");
+        let generic_module = ordinary
+            .module()
+            .clone()
+            .append_direct_span_fill(OutputContract::Span)
+            .expect("authenticate generic direct fill")
+            .expect("variable-width direct fill eligibility");
+        let generic_object = emit_object(
+            &generic_module,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit generic direct fill");
+        let requested = compile_with_independent_span_fill(request)
+            .expect("variable-width generic direct fill");
+        assert_eq!(
+            requested.module().direct_span_fill_strategy(),
+            Some(DirectSpanFillStrategy::NativeTrustedCoreLoopV1),
+        );
+        assert_eq!(requested.module(), &generic_module);
+        assert_eq!(requested.object(), generic_object);
+    }
+
+    let target = Target::x86_64_linux();
+    let request = CompileRequest::new("Sherlock Holmes", target)
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::Span);
+    let ordinary = compile(request.clone()).expect("exact direct Span artifact");
+    let generic_module = ordinary
+        .module()
+        .clone()
+        .append_direct_span_fill(OutputContract::Span)
+        .expect("authenticate generic direct fill")
+        .expect("generic direct fill eligibility");
+    let generic_object = emit_object(
+        &generic_module,
+        ObjectFormat::for_target(target),
+        usize::MAX,
+    )
+    .expect("emit generic direct fill");
+    let candidate = compile_with_independent_span_fill(request.clone())
+        .expect("uncapped continuous direct fill");
+    assert_eq!(
+        candidate.module().direct_span_fill_strategy(),
+        Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1),
+    );
+    assert!(candidate.object().len() > generic_object.len());
+
+    let mut limits = CompileLimitsV1::default();
+    limits.max_object_bytes = generic_object.len();
+    let capped = compile_with_independent_span_fill(request.limits(limits))
+        .expect("continuous candidate ObjectBytes decline");
+    assert_eq!(
+        capped.module().direct_span_fill_strategy(),
+        Some(DirectSpanFillStrategy::NativeTrustedCoreLoopV1),
+    );
+    assert_eq!(capped.module(), &generic_module);
+    assert_eq!(capped.object(), generic_object);
+}
+
+#[test]
+fn independent_span_fill_exact_width_selection_and_context_declines_are_transactional() {
+    let target = Target::x86_64_linux();
+    for pattern in [
+        "(?:Sherlock|Moriarty)",
+        "x",
+        "^Sherlock$",
+        r"\bSherlock\b",
+    ] {
+        let request = CompileRequest::new(pattern, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span);
+        let ordinary = compile(request.clone()).expect("ordinary exact-width control");
+
+        let recipe_scope = crate::module::complete_span_fill_recipe_scope(true);
+        let scoped = compile(request.clone()).expect("recipe-scoped exact-width control");
+        drop(recipe_scope);
+        let has_candidate = scoped
+            .module()
+            .has_complete_span_fill_source_for_test();
+        let stripped = scoped
+            .module()
+            .clone()
+            .without_complete_span_fill_source()
+            .expect("strip optional continuous recipe");
+        assert_eq!(
+            &stripped,
+            ordinary.module(),
+            "recipe stripping changed the pre-feature module for {pattern:?}",
+        );
+
+        if pattern == "(?:Sherlock|Moriarty)"
+            && ordinary.module().direct_span_trusted_core_offset().is_some()
+        {
+            assert!(
+                has_candidate,
+                "same-width finite language with a complete trusted core must select"
+            );
+        }
+
+        let generic_module = ordinary
+            .module()
+            .clone()
+            .append_direct_span_fill(OutputContract::Span)
+            .expect("authenticate generic exact-width control");
+        let requested = compile_with_independent_span_fill(request)
+            .expect("compile transactional exact-width endpoint");
+        if has_candidate {
+            assert_eq!(
+                requested.module().direct_span_fill_strategy(),
+                Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1),
+                "eligible exact-width route did not select for {pattern:?}",
+            );
+        } else if let Some(generic_module) = generic_module {
+            let generic_object = emit_object(
+                &generic_module,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit generic exact-width control");
+            assert_eq!(requested.module(), &generic_module);
+            assert_eq!(requested.object(), generic_object);
+        } else {
+            assert_eq!(requested.module(), ordinary.module());
+            assert_eq!(requested.object(), ordinary.object());
+            assert_eq!(requested.receipt(), ordinary.receipt());
+        }
+    }
 }
 
 #[test]

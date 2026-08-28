@@ -142,8 +142,9 @@ pub use module::{
     MatchingLfLineWitnessExactFiniteLanguageV1, MatchingLfLineWitnessSemantics,
     MatchingLfLineWitnessStrategy, ModuleRelocation, ModuleSection, ModuleSymbol, OperatingSystem,
     OrderedFiniteLanguageAotReport, OrderedFiniteRootScannerReport,
-    PREPARED_CAPABILITY_ORDERED_NFA_V15, PreparedAggregateExports, PreparedAggregateStrategy,
-    PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits, SlowAotReport,
+    PREPARED_CAPABILITY_ORDERED_NFA_V15, DirectSpanFillStrategy, PreparedAggregateExports,
+    PreparedAggregateStrategy, PreparedBulkStrategy, RelocationKind, SectionKind, SlowAotLimits,
+    SlowAotReport,
     SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
@@ -1348,19 +1349,24 @@ fn install_independent_variant(
 /// entry for a self-contained direct object.
 ///
 /// The additive entry validates the raw iterator and output boundaries once
-/// per refill, then uses the ordinary entry's independently authenticated
-/// post-validation core for every non-overlapping search. It retains the
-/// established compiler-generated nullable-progress, status, and initialized
-/// prefix semantics. Prepared artifacts already carrying their exclusive
+/// per refill. Its generic route uses the ordinary entry's independently
+/// authenticated post-validation core for every non-overlapping search. An
+/// exact-width nonnullable complete DFA may instead regenerate one
+/// authenticated continuous native loop that keeps scan state across matches
+/// and publishes the same initialized non-overlap prefix without crossing a
+/// per-match search ABI. Both routes retain the established nullable-progress
+/// and status semantics, including structurally valid caller-supplied pending
+/// state. Prepared artifacts already carrying their exclusive
 /// fill entry, runtime-backed artifacts, and direct artifacts without the
 /// required complete core are returned unchanged. The ordinary scalar symbol
 /// and ABI remain unchanged; consumers must inspect
 /// [`CompiledModule::direct_span_fill_symbol`]. The canonical function type
 /// is `FreAotRegexIndependentSpanFillV1` in `fre-aot-regex-runtime`.
 ///
-/// Only a final numeric `ObjectBytes` refusal may retain the exact ordinary
-/// artifact after construction. Allocation, backend, and authentication
-/// failures remain terminal.
+/// The generic trusted-core entry is constructed first and remains the full
+/// incumbent for any numeric continuous-candidate decline. Only a final
+/// numeric `ObjectBytes` refusal may retain the preceding exact artifact.
+/// Allocation, backend, and authentication failures remain terminal.
 ///
 /// # Errors
 ///
@@ -1377,30 +1383,54 @@ pub fn compile_with_independent_span_fill(
     }
     let target = request.target;
     let max_object_bytes = request.limits.max_object_bytes;
+    let recipe_scope = module::complete_span_fill_recipe_scope(
+        request.mode == CompileMode::Optimizing,
+    );
     let mut compiled = compile(request)?;
+    drop(recipe_scope);
     if compiled.module.prepared_span_fill_symbol().is_some()
         || compiled.module.direct_span_fill_symbol().is_some()
     {
         return Ok(compiled);
     }
-    let module = independent_span_fill_append_outcome(
-        compiled
-            .module
-            .clone()
-            .append_direct_span_fill(OutputContract::Span),
-    )?;
-    let Some(module) = module else {
+    let candidate_source = compiled.module.clone();
+    let has_continuous_candidate = candidate_source.has_complete_span_fill_source();
+
+    let generic_base = candidate_source
+        .clone()
+        .without_complete_span_fill_source()
+        .map_err(CompileError::from)?;
+    compiled.module = generic_base.clone();
+    if let Some(generic_module) = independent_span_fill_append_outcome(
+        generic_base.append_direct_span_fill(OutputContract::Span),
+    )? {
+        if let Some(generic_object) = independent_span_fill_object_outcome(emit_object(
+            &generic_module,
+            ObjectFormat::for_target(target),
+            max_object_bytes,
+        ))? {
+            install_independent_variant(&mut compiled, generic_module, generic_object);
+        }
+    }
+
+    if !has_continuous_candidate {
         return Ok(compiled);
-    };
-    let Some(object) = independent_span_fill_object_outcome(emit_object(
-        &module,
+    }
+    let candidate_module = independent_span_fill_append_outcome(
+        candidate_source.append_direct_span_fill(OutputContract::Span),
+    )?
+    .ok_or_else(|| {
+        CompileError::from(ObjectError::InvalidModule(
+            "continuous Span fill recipe declined its authenticated endpoint",
+        ))
+    })?;
+    if let Some(candidate_object) = independent_span_fill_object_outcome(emit_object(
+        &candidate_module,
         ObjectFormat::for_target(target),
         max_object_bytes,
-    ))?
-    else {
-        return Ok(compiled);
-    };
-    install_independent_variant(&mut compiled, module, object);
+    ))? {
+        install_independent_variant(&mut compiled, candidate_module, candidate_object);
+    }
     Ok(compiled)
 }
 

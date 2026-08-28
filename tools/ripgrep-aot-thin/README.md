@@ -62,20 +62,22 @@ variant. Unset, empty, or `all` retains the default four-variant registry.
 
 For an Optimizing/Span artifact backed by a freshly lowered, authenticated
 complete native DFA, the build may add a handle-free
-`direct-span-fill-v1` entry. The entry reuses the compiler's prepared
-Span-iteration loop but dispatches each search directly to the authenticated
-trusted core, so one ABI call refills the adapter's bounded span buffer. Its
-registry description reports
-`bulk=native-direct-trusted-core-loop`. This is a trusted-core loop, not a
-single continuous DFA scan: it preserves the ordinary non-overlapping and
-nullable-match progression by starting a new trusted-core search for each
-match.
+`direct-span-fill-v1` entry. The generic entry reuses the compiler's prepared
+Span-iteration loop and dispatches each search directly to the authenticated
+trusted core, reporting `bulk=native-direct-trusted-core-loop`. For an
+independently authenticated exact-width, nonnullable complete DFA, the
+compiler may instead regenerate a call-free continuous fill entry. It retains
+DFA scan state within native code across matches, publishes the same bounded
+non-overlap prefix, and reports
+`bulk=native-continuous-complete-dfa-fill-v1`. Caller-supplied valid pending
+state and all iterator status/progress rules remain unchanged.
 
 The compiler accepts this additive route only for a fresh direct Span module
 whose target, serialized program, program/text sections, entry symbol, native
-bytes, relocations, and trusted core all re-authenticate. A structural decline
-leaves the existing scalar adapter route unchanged; allocator, object, and
-authentication errors remain terminal. The safe adapter validates the
+bytes, relocations, and trusted core all re-authenticate. The generic fill is
+constructed first and remains authoritative on a numeric continuous-candidate
+decline; allocator, backend, and authentication errors remain terminal. The
+safe adapter validates the
 returned initialized prefix and iterator state before publishing spans, and
 continues to surface a native error only after any valid prefix from that
 refill has been consumed.

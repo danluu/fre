@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fre_aot_regex::{
-    Architecture, CompileMode, CompileRequest, EngineKind, EngineSelectionReason,
-    IndependentExistsBatchCompileError, OperatingSystem, OutputContract, PreparedBulkStrategy,
-    PreparedAggregateExports, PreparedAggregateStrategy, StartAccelerator, Target, compile,
+    Architecture, CompileMode, CompileRequest, DirectSpanFillStrategy, EngineKind,
+    EngineSelectionReason, IndependentExistsBatchCompileError, OperatingSystem, OutputContract,
+    PreparedAggregateExports, PreparedAggregateStrategy, PreparedBulkStrategy, StartAccelerator,
+    Target, compile,
     compile_with_exact_finite_selected_end_grep_count,
     compile_with_independent_exists_batch,
     compile_with_independent_matching_lf_line_witness,
@@ -130,6 +131,7 @@ fn main() {
     );
     let mut native_fills = String::new();
     let mut direct_span_fill_rows = String::new();
+    let mut public_continuous_span_fill_entry = None;
     let mut rows = String::new();
     let mut grep_count_rows = String::new();
     let mut grep_count_admitted = 0_usize;
@@ -266,11 +268,16 @@ fn main() {
                     None if compiled.module().direct_exists_batch_symbol().is_some() => {
                         "native-direct-trusted-full-window-loop"
                     }
-                    None if compiled.module().direct_span_fill_symbol().is_some() => {
-                        "native-direct-trusted-core-loop"
-                    }
-                    None if has_prepared_entry => "compatibility",
-                    None => "none",
+                    None => match compiled.module().direct_span_fill_strategy() {
+                        Some(DirectSpanFillStrategy::NativeTrustedCoreLoopV1) => {
+                            "native-direct-trusted-core-loop"
+                        }
+                        Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1) => {
+                            "native-continuous-complete-dfa-fill-v1"
+                        }
+                        None if has_prepared_entry => "compatibility",
+                        None => "none",
+                    },
                 };
                 let description = format!(
                     "mode={mode_name},route={route},api={batch_api},bulk={bulk},engine={},reason={},accelerator={},target={}-{},features={:#x},states={},dfa_states={}",
@@ -393,8 +400,23 @@ fn main() {
                                 "    #[link_name = {symbol:?}] fn {direct_fill}(haystack: *const u8, haystack_len: usize, state: *mut NativeIterState, results: *mut AbiResult, capacity: usize, written: *mut usize) -> u32;",
                             )
                             .expect("String writes cannot fail");
-                            writeln!(&mut direct_span_fill_rows, "    {direct_fill},")
-                                .expect("String writes cannot fail");
+                            let continuous = matches!(
+                                compiled.module().direct_span_fill_strategy(),
+                                Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1)
+                            );
+                            if continuous
+                                && mode == CompileMode::Optimizing
+                                && pattern.source == "Sherlock Holmes"
+                                && !pattern.case_insensitive
+                                && public_continuous_span_fill_entry.is_none()
+                            {
+                                public_continuous_span_fill_entry = Some(direct_fill.clone());
+                            }
+                            writeln!(
+                                &mut direct_span_fill_rows,
+                                "    ({direct_fill}, {continuous}),"
+                            )
+                            .expect("String writes cannot fail");
                             writeln!(
                                 &mut native_fills,
                                 "fn {fill}(haystack: &[u8], state: &mut NativeIterState, output: &mut [core::mem::MaybeUninit<AbiResult>]) -> NativeFillOutcome {{\n    fill_direct_spans({direct_fill}, haystack, state, output)\n}}\n"
@@ -576,8 +598,15 @@ fn main() {
         }
     }
     generated.push_str("}\n\n");
+    let public_continuous_span_fill_entry = public_continuous_span_fill_entry
+        .map_or_else(|| "None".to_owned(), |entry| format!("Some({entry})"));
+    writeln!(
+        &mut generated,
+        "#[cfg(test)]\npub(super) const PUBLIC_CONTINUOUS_SPAN_FILL_ENTRY: Option<DirectSpanFill> = {public_continuous_span_fill_entry};\n",
+    )
+    .expect("String writes cannot fail");
     generated.push_str(
-        "#[cfg(test)]\n#[allow(dead_code, reason = \"the raw direct Span ABI is exercised only by package tests\")]\npub(super) const DIRECT_SPAN_FILL_ENTRIES: &[DirectSpanFill] = &[\n",
+        "#[cfg(test)]\n#[allow(dead_code, reason = \"the raw direct Span ABI and authenticated continuous strategy are exercised only by package tests\")]\npub(super) const DIRECT_SPAN_FILL_ENTRIES: &[(DirectSpanFill, bool)] = &[\n",
     );
     generated.push_str(&direct_span_fill_rows);
     generated.push_str("];\n\n");
