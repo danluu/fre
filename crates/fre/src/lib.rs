@@ -6883,6 +6883,63 @@ fn append_ripgrep_literal_source<const META_REJECTED: bool>(
     }
 }
 
+#[inline(always)]
+fn append_ripgrep_fixed_escape_free_literal(
+    source: &mut String,
+    text: &str,
+) {
+    // Authentication has already established non-emptiness. Decode only the
+    // first scalar to reproduce the pinned HIR printer's grouping decision.
+    let grouped = text
+        .chars()
+        .next()
+        .is_some_and(|first| first.len_utf8() < text.len());
+    if grouped {
+        source.push_str("(?:");
+    }
+    source.push_str(text);
+    if grouped {
+        source.push(')');
+    }
+}
+
+/// Publish the typed fixed-string source after authentication proved that no
+/// literal contains a regex metacharacter.
+///
+/// Keep this complete second pass out of the shared construction body. The
+/// incumbent serializer remains unchanged for every mixed or escaped set,
+/// while the admitted path copies each already-validated UTF-8 string without
+/// decoding all of its scalars again in `regex_syntax::escape_into`.
+#[cold]
+#[inline(never)]
+fn build_ripgrep_fixed_escape_free_source<'literal, Literal, LiteralAt>(
+    pattern_count: usize,
+    literal_at: &LiteralAt,
+    source_bytes: usize,
+) -> Option<String>
+where
+    Literal: RipgrepStandardLiteral<'literal>,
+    LiteralAt: Fn(usize) -> Option<Literal>,
+{
+    let mut source = String::with_capacity(source_bytes);
+    if pattern_count >= 2 {
+        source.push_str("(?:");
+        for index in 0..pattern_count {
+            if index != 0 {
+                source.push('|');
+            }
+            let text = literal_at(index)?.text()?;
+            append_ripgrep_fixed_escape_free_literal(&mut source, text);
+        }
+        source.push(')');
+    } else {
+        let text = literal_at(0)?.text()?;
+        append_ripgrep_fixed_escape_free_literal(&mut source, text);
+    }
+    debug_assert_eq!(source.len(), source_bytes);
+    Some(source)
+}
+
 /// Validate the facts unique to ripgrep's typed literal handoff and report
 /// whether the literal needs the pinned HIR Printer's non-capturing group.
 ///
@@ -7077,6 +7134,11 @@ where
 
     let mut literal_bytes = 0_u64;
     let mut minimum_match_bytes = usize::MAX;
+    // Only the census-carrying fixed-string seam may consume this fact. Its
+    // mandatory validation already classifies every metacharacter while
+    // deriving the exact escaped-source envelope.
+    let mut typed_fixed_escape_free =
+        COLLECT_BYTE_CENSUS && !REJECT_META_CHARACTERS;
     let mut source_bytes = if pattern_count >= 2 {
         // The pinned HIR Printer wraps every alternation in `(?:...)` and
         // places one `|` between branches. Since `hir_nodes` is the branch
@@ -7171,6 +7233,7 @@ where
         if !within_source_and_work(escaped_source_bytes, next_literal_bytes) {
             return None;
         }
+        typed_fixed_escape_free &= escapes == 0;
         literal_bytes = next_literal_bytes;
         source_bytes = escaped_source_bytes;
     }
@@ -7186,27 +7249,36 @@ where
         .checked_add(literal_bytes)?;
     debug_assert!(within_source_and_work(source_bytes, literal_bytes));
 
-    let mut source = String::with_capacity(source_bytes_usize);
-    if pattern_count >= 2 {
-        source.push_str("(?:");
-        for index in 0..pattern_count {
-            if index != 0 {
-                source.push('|');
+    let source = if typed_fixed_escape_free {
+        build_ripgrep_fixed_escape_free_source::<Literal, _>(
+            pattern_count,
+            &literal_at,
+            source_bytes_usize,
+        )?
+    } else {
+        let mut source = String::with_capacity(source_bytes_usize);
+        if pattern_count >= 2 {
+            source.push_str("(?:");
+            for index in 0..pattern_count {
+                if index != 0 {
+                    source.push('|');
+                }
+                let text = literal_at(index)?.text()?;
+                append_ripgrep_literal_source::<REJECT_META_CHARACTERS>(
+                    &mut source,
+                    text,
+                );
             }
-            let text = literal_at(index)?.text()?;
+            source.push(')');
+        } else {
+            let text = literal_at(0)?.text()?;
             append_ripgrep_literal_source::<REJECT_META_CHARACTERS>(
                 &mut source,
                 text,
             );
         }
-        source.push(')');
-    } else {
-        let text = literal_at(0)?.text()?;
-        append_ripgrep_literal_source::<REJECT_META_CHARACTERS>(
-            &mut source,
-            text,
-        );
-    }
+        source
+    };
     debug_assert_eq!(source.len(), source_bytes_usize);
 
     Some((
@@ -32681,6 +32753,66 @@ mod tests {
                 )
                 .expect("resource refusal completes")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn ripgrep_fixed_typed_source_reuses_authenticated_escape_fact() {
+        let plain_patterns = ["literal000", "éliteral001"];
+        let (plain, _census) =
+            super::ripgrep_standard_literal_context_from_with_census::<_, _, false>(
+                plain_patterns.len(),
+                |index| plain_patterns.get(index).copied(),
+                BuildLimits::default(),
+                usize::MAX,
+                None,
+            )
+            .expect("escape-free fixed strings are authenticated");
+        let expected_plain_source = "(?:(?:literal000)|(?:éliteral001))";
+        assert_eq!(&*plain.source, expected_plain_source);
+        for (source_limit, admitted) in [
+            (expected_plain_source.len(), true),
+            (expected_plain_source.len() - 1, false),
+        ] {
+            assert_eq!(
+                super::ripgrep_standard_literal_context_from_with_census::<_, _, false>(
+                    plain_patterns.len(),
+                    |index| plain_patterns.get(index).copied(),
+                    BuildLimits::default(),
+                    source_limit,
+                    None,
+                )
+                .is_some(),
+                admitted,
+                "source_limit={source_limit}",
+            );
+        }
+
+        let mixed_width = ["é", "literal001"];
+        let (mixed_width, _census) =
+            super::ripgrep_standard_literal_context_from_with_census::<_, _, false>(
+                mixed_width.len(),
+                |index| mixed_width.get(index).copied(),
+                BuildLimits::default(),
+                usize::MAX,
+                None,
+            )
+            .expect("mixed-width fixed strings are authenticated");
+        assert_eq!(&*mixed_width.source, "(?:é|(?:literal001))");
+
+        let escaped = ["literal000", ".*éliteral001"];
+        let (escaped, _census) =
+            super::ripgrep_standard_literal_context_from_with_census::<_, _, false>(
+                escaped.len(),
+                |index| escaped.get(index).copied(),
+                BuildLimits::default(),
+                usize::MAX,
+                None,
+            )
+            .expect("fixed strings with metacharacters are authenticated");
+        assert_eq!(
+            &*escaped.source,
+            r"(?:(?:literal000)|(?:\.\*éliteral001))",
         );
     }
 
