@@ -63,6 +63,7 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     use_asimd_batch: bool,
     use_exact_asimd_lane: bool,
     layout: NativeDfaLayout,
+    complete_span_fill_verifier: Option<NativeCompleteSpanFillExactVerifier>,
     no_match: Aarch64Label,
     matched: Aarch64Label,
 ) -> Result<(), ObjectError> {
@@ -197,6 +198,18 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
     // An Accept seed starts at base + minimum_width. Requiring the last byte
     // before that boundary to be in-bounds makes every reverse load safe.
     let maximum_scan_offset = maximum_filter_offset.max(reverse.boundary_offset.saturating_sub(1));
+    let complete_span_fill_verifier = complete_span_fill_verifier
+        .map(|verifier| {
+            select_complete_span_fill_suffix_verifier(
+                layout,
+                suffix,
+                reverse,
+                verifier,
+                maximum_scan_offset,
+            )
+        })
+        .transpose()?
+        .flatten();
     let exact_pair_primary_cold_filter =
         aarch64_exact_pair_primary_cold_filter(suffix, use_asimd, use_asimd_batch)?;
     let exact_pair_primary_vector = exact_pair_primary_cold_filter
@@ -807,6 +820,42 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
 
     assembler.bind(candidate)?;
     assembler.instruction(aarch64_add_x_imm(REVERSE_NEXT_BASE, 2, 1)?)?;
+    if let Some(verifier) = complete_span_fill_verifier {
+        let rejected = assembler.label()?;
+        if verifier.candidate_backtrack != 0 {
+            assembler.instruction(aarch64_cmp_x(2, 9)?)?;
+            assembler.branch_cond(AARCH64_LO, rejected)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 2, 9)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(
+                12,
+                u16::from(verifier.candidate_backtrack),
+            )?)?;
+            assembler.branch_cond(AARCH64_LO, rejected)?;
+            assembler.instruction(aarch64_sub_x_imm(
+                2,
+                2,
+                u16::from(verifier.candidate_backtrack),
+            )?)?;
+        }
+        match verifier.exact {
+            NativeCompleteSpanFillExactVerifier::Words(words) => {
+                aarch64_emit_exact_prefix_words(assembler, words, rejected)?;
+            }
+            NativeCompleteSpanFillExactVerifier::Block16(block) => {
+                aarch64_emit_prefix_block(assembler, block, rejected)?;
+            }
+        }
+        aarch64_emit_exact_prefix_match(
+            assembler,
+            verifier.full_width,
+            OutputContract::Span,
+            true,
+            matched,
+        )?;
+        assembler.bind(rejected)?;
+        assembler.instruction(aarch64_mov_x(2, REVERSE_NEXT_BASE)?)?;
+        assembler.branch(vector)?;
+    }
     if reverse.boundary_offset == 0 {
         assembler.instruction(aarch64_mov_x(REVERSE_CURSOR, 2)?)?;
     } else {
@@ -1013,6 +1062,7 @@ mod tests {
             use_asimd_batch,
             true,
             layout,
+            None,
             no_match,
             matched,
         )

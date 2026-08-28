@@ -7242,6 +7242,9 @@ mod tests {
         };
         let dense = PATTERN.as_bytes().repeat(7);
         let exact_capacity = PATTERN.as_bytes().repeat(2);
+        let mut repeated_near_miss = b"k Holmes".to_vec();
+        repeated_near_miss.extend_from_slice(&b"Xherlock Holmes".repeat(257));
+        repeated_near_miss.extend_from_slice(PATTERN.as_bytes());
         let scenarios = [
             (
                 dense.as_slice(),
@@ -7267,6 +7270,12 @@ mod tests {
                 exact_capacity.as_slice(),
                 NativeIterState::initial_at(0, exact_capacity.len())
                     .expect("exact-capacity initial state"),
+                2,
+            ),
+            (
+                repeated_near_miss.as_slice(),
+                NativeIterState::initial_at(0, repeated_near_miss.len())
+                    .expect("near-miss initial state"),
                 2,
             ),
         ];
