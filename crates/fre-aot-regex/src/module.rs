@@ -29462,6 +29462,9 @@ struct NativeDfaLayout {
     /// product is exactly the language. A successful prefix guard may return
     /// without replaying these bytes through the scalar DFA.
     exact_prefix_match_width: Option<u8>,
+    /// Compiler-only constants for an exact 8..=15-byte moving-candidate
+    /// verifier. They never enter target data or consume its allocation cap.
+    exact_prefix_words: Option<prefix_block::ExactPrefixWordPlan>,
     output: OutputContract,
     start_filter: Option<NativeStartFilter>,
     exact_start_byte_set: Option<NativeExactByteSet>,
@@ -29509,6 +29512,7 @@ impl NativeDfaLayout {
         self.prefix_filter.is_some()
             || self.prefix_relation.is_some()
             || self.prefix_block.is_some()
+            || self.exact_prefix_words.is_some()
             || self.exact_prefix_match_width.is_some()
     }
 
@@ -29518,6 +29522,13 @@ impl NativeDfaLayout {
         {
             return Err(ObjectError::InvalidModule(
                 "exact-prefix width disagrees with prefix guard",
+            ));
+        }
+        if let Some(words) = self.exact_prefix_words
+            && self.exact_prefix_match_width != Some(words.width())
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact-prefix words disagree with product width",
             ));
         }
         let predicate_bytes = self
@@ -31393,6 +31404,38 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
     allow_persistent_pair_registers: bool,
     allow_complete_pair_relation_batch: bool,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_data_limit_optional_receipt_pair_register_and_exact_word_policy(
+        view,
+        target,
+        entry_contract,
+        max_native_data_bytes,
+        allow_synchronizing_accept_reverse,
+        allow_exact_pair,
+        receipt_policy,
+        allow_complete_pair_relation_handoff,
+        allow_persistent_pair_registers,
+        allow_complete_pair_relation_batch,
+        true,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test-only exact-word ablation preserves every incumbent lowering policy"
+)]
+fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_pair_register_and_exact_word_policy(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+    allow_synchronizing_accept_reverse: bool,
+    allow_exact_pair: bool,
+    receipt_policy: NativeExactFiniteExistsCompleteDfaReceiptPolicy,
+    allow_complete_pair_relation_handoff: bool,
+    allow_persistent_pair_registers: bool,
+    allow_complete_pair_relation_batch: bool,
+    allow_exact_prefix_words: bool,
+) -> Result<Option<NativeLowering>, ObjectError> {
     let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
         .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
         .min(max_native_data_bytes);
@@ -31409,6 +31452,9 @@ fn lower_native_dfa_with_entry_contract_data_limit_optional_receipt_and_pair_reg
                 && entry_contract == NativeDfaEntryContract::Public,
             allow_exact_pair && entry_contract == NativeDfaEntryContract::Public,
         )?;
+    if !allow_exact_prefix_words {
+        layout.exact_prefix_words = None;
+    }
     if (!allow_complete_pair_relation_handoff
         || entry_contract != NativeDfaEntryContract::Public)
         && let Some(reverse) = layout.seeded_reverse.as_mut()
@@ -33837,6 +33883,9 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             "native exact-product scanner does not verify every selective column",
         ));
     }
+    let exact_prefix_words = exact_prefix_match_width.and_then(|width| {
+        prefix_block::derive_exact_words(view.anchored_prefix.sets(), width)
+    });
     // The proof sees exactly the completed rows exposed by either a complete
     // or retained partial view. A transition to an incomplete frontier lies
     // outside that extent, so `derive` declines instead of manufacturing a
@@ -34934,6 +34983,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             partial: partial_layout,
             exact_span_width,
             exact_prefix_match_width,
+            exact_prefix_words,
             output: view.output,
             start_filter,
             exact_start_byte_set,
@@ -52022,6 +52072,37 @@ fn x86_emit_prefix_block(
     Ok(())
 }
 
+fn x86_emit_exact_prefix_words(
+    assembler: &mut X86Assembler,
+    words: prefix_block::ExactPrefixWordPlan,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    if !(8..16).contains(&words.width())
+        || words.trailing_offset() != words.width() - 8
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-prefix word plan is malformed",
+        ));
+    }
+    let mut compare = |offset: u8, expected: u64| -> Result<(), ObjectError> {
+        let mut constant = vec![0x48, 0xb8]; // movabs rax, expected
+        constant.extend_from_slice(&expected.to_le_bytes());
+        assembler.instruction(&constant)?;
+        if offset == 0 {
+            assembler.instruction(&[0x48, 0x39, 0x04, 0x17])?; // cmp [rdi+rdx], rax
+        } else {
+            assembler.instruction(&[0x48, 0x39, 0x44, 0x17, offset])?;
+        }
+        assembler.branch(&[0x0f, 0x85], failed)?;
+        Ok(())
+    };
+    compare(0, words.first())?;
+    if words.width() > 8 {
+        compare(words.trailing_offset(), words.trailing())?;
+    }
+    Ok(())
+}
+
 fn x86_emit_prefix_guard_path(
     assembler: &mut X86Assembler,
     layout: NativeDfaLayout,
@@ -52037,6 +52118,18 @@ fn x86_emit_prefix_guard_path(
         assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
         assembler.instruction(&[0x48, 0x83, 0xf8, guaranteed_bytes])?;
         assembler.branch(&[0x0f, 0x82], terminal_bound_failed)?;
+    }
+    if let Some(words) = layout.exact_prefix_words {
+        if layout.exact_prefix_match_width != Some(words.width())
+            || layout.prefix_block.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 exact-prefix words have an incompatible layout",
+            ));
+        }
+        x86_emit_exact_prefix_words(assembler, words, predicate_failed)?;
+        assembler.branch(&[0xe9], prefix_verified)?;
+        return Ok(());
     }
     if let Some(relation) = layout.prefix_relation
         && vector_coverage.is_none_or(|coverage| !coverage.relation)
@@ -71437,6 +71530,24 @@ fn aarch64_load_x_imm(destination: u8, base: u8, byte_offset: u16) -> Result<u32
         | aarch64_reg(destination, 0)?)
 }
 
+/// Unscaled 64-bit load for the deliberately overlapping exact-prefix tail.
+/// Its compiler plan limits the positive displacement to `0..=7`.
+fn aarch64_load_x_unscaled(
+    destination: u8,
+    base: u8,
+    byte_offset: u8,
+) -> Result<u32, ObjectError> {
+    if byte_offset > 7 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-prefix word offset",
+        ));
+    }
+    Ok(0xf840_0000
+        | (u32::from(byte_offset) << 12)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_load_pair_x(
     first: u8,
     second: u8,
@@ -71678,6 +71789,33 @@ fn aarch64_emit_prefix_block(
     Ok(())
 }
 
+fn aarch64_emit_exact_prefix_words(
+    assembler: &mut Aarch64Assembler,
+    words: prefix_block::ExactPrefixWordPlan,
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if !(8..16).contains(&words.width())
+        || words.trailing_offset() != words.width() - 8
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-prefix word plan is malformed",
+        ));
+    }
+    assembler.instruction(aarch64_add_x_reg(12, 0, 2)?)?;
+    let mut compare = |offset: u8, expected: u64| -> Result<(), ObjectError> {
+        assembler.instruction(aarch64_load_x_unscaled(8, 12, offset)?)?;
+        aarch64_load_u64_constant(assembler, 10, expected)?;
+        assembler.instruction(aarch64_cmp_x(8, 10)?)?;
+        assembler.branch_cond(AARCH64_NE, failed)?;
+        Ok(())
+    };
+    compare(0, words.first())?;
+    if words.width() > 8 {
+        compare(words.trailing_offset(), words.trailing())?;
+    }
+    Ok(())
+}
+
 fn aarch64_emit_prefix_guard_path(
     assembler: &mut Aarch64Assembler,
     layout: NativeDfaLayout,
@@ -71692,6 +71830,18 @@ fn aarch64_emit_prefix_guard_path(
         assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
         assembler.instruction(aarch64_cmp_x_imm(12, u16::from(guaranteed_bytes))?)?;
         assembler.branch_cond(AARCH64_LO, terminal_bound_failed)?;
+    }
+    if let Some(words) = layout.exact_prefix_words {
+        if layout.exact_prefix_match_width != Some(words.width())
+            || layout.prefix_block.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 exact-prefix words have an incompatible layout",
+            ));
+        }
+        aarch64_emit_exact_prefix_words(assembler, words, predicate_failed)?;
+        assembler.branch(prefix_verified)?;
+        return Ok(());
     }
     if let Some(relation) = layout.prefix_relation
         && vector_coverage.is_none_or(|coverage| !coverage.relation)
@@ -96163,6 +96313,7 @@ mod tests {
             partial: Some(partial),
             exact_span_width: (output == OutputContract::Span).then_some(1),
             exact_prefix_match_width: None,
+            exact_prefix_words: None,
             output,
             start_filter: None,
             exact_start_byte_set: None,
@@ -96415,6 +96566,7 @@ mod tests {
             partial: Some(partial),
             exact_span_width: None,
             exact_prefix_match_width: None,
+            exact_prefix_words: None,
             output: OutputContract::SelectedEnd,
             start_filter: None,
             exact_start_byte_set: None,
@@ -96596,6 +96748,7 @@ mod tests {
             partial: Some(partial),
             exact_span_width: (output == OutputContract::Span).then_some(1),
             exact_prefix_match_width: None,
+            exact_prefix_words: None,
             output,
             start_filter: None,
             exact_start_byte_set: None,
@@ -96756,6 +96909,7 @@ mod tests {
             partial: Some(partial),
             exact_span_width: (output == OutputContract::Span).then_some(1),
             exact_prefix_match_width: None,
+            exact_prefix_words: None,
             output,
             start_filter: None,
             exact_start_byte_set: None,
@@ -107621,19 +107775,22 @@ mod tests {
                 .expect("host ASIMD target")
         };
         let mut cases = vec![
-            ("a", generated_byte_strings(b"ax\xff", 3)),
-            ("[ab]x", generated_byte_strings(b"abxy", 3)),
+            ("a".to_owned(), generated_byte_strings(b"ax\xff", 3)),
+            ("[ab]x".to_owned(), generated_byte_strings(b"abxy", 3)),
             (
-                "(?:ab|cb)(?:d|e)",
+                "(?:ab|cb)(?:d|e)".to_owned(),
                 generated_byte_strings(b"abcdex", 3),
             ),
-            ("[ab][01]Z", generated_byte_strings(b"ab01Zx", 3)),
             (
-                r"(?-u:[ACEGIKMOQ])(?-u:[\x00-\xff])",
+                "[ab][01]Z".to_owned(),
+                generated_byte_strings(b"ab01Zx", 3),
+            ),
+            (
+                r"(?-u:[ACEGIKMOQ])(?-u:[\x00-\xff])".to_owned(),
                 generated_byte_strings(&[b'A', b'C', b'Q', b'x', 0, u8::MAX], 3),
             ),
             (
-                r"(?-u:[\x00-\x40])(?-u:[\x80-\xff])",
+                r"(?-u:[\x00-\x40])(?-u:[\x80-\xff])".to_owned(),
                 generated_byte_strings(&[0, 0x20, 0x40, 0x41, 0x80, 0xff], 3),
             ),
         ];
@@ -107649,20 +107806,29 @@ mod tests {
             .collect::<Vec<_>>();
         deterministic[117..133].copy_from_slice(b"abcdefghijklmnop");
         width_sixteen.push(deterministic);
-        cases.push(("abcdefghijklmnop", width_sixteen));
-        let mut width_nine = vec![
-            Vec::new(),
-            b"\x01abcdefgh".to_vec(),
-            b"x\x01abcdefghy".to_vec(),
-            b"\x01abcxefgh".to_vec(),
-            b"\x01abcdefg\x01abcdefgh".to_vec(),
-        ];
-        let mut sparse = vec![b'x'; 257];
-        sparse[63..72].copy_from_slice(b"\x01abcdefgh");
-        sparse[129] = 1;
-        sparse[130..138].copy_from_slice(b"abcxefgh");
-        width_nine.push(sparse);
-        cases.push((r"(?-u:\x01)abcdefgh", width_nine));
+        cases.push(("abcdefghijklmnop".to_owned(), width_sixteen));
+
+        const EXACT_WORD_ALPHABET: &str = "abcdefghijklmno";
+        for width in 8_usize..16 {
+            let literal = EXACT_WORD_ALPHABET.as_bytes()[..width].to_vec();
+            let mut haystacks = vec![Vec::new(), literal.clone()];
+
+            let mut exact_at_tail = vec![b'x'];
+            exact_at_tail.extend_from_slice(&literal);
+            haystacks.push(exact_at_tail);
+
+            for wrong_position in 0..width {
+                let mut independently_wrong = literal.clone();
+                independently_wrong[wrong_position] = b'Z';
+                haystacks.push(independently_wrong);
+            }
+
+            let mut decoy_then_hit = literal.clone();
+            decoy_then_hit[width / 2] = b'Z';
+            decoy_then_hit.extend_from_slice(&literal);
+            haystacks.push(decoy_then_hit);
+            cases.push((EXACT_WORD_ALPHABET[..width].to_owned(), haystacks));
+        }
 
         let directory = std::env::temp_dir().join(format!(
             "fre-aot-no-row-exact-product-{}",
@@ -107680,10 +107846,10 @@ mod tests {
                 OutputContract::SelectedEnd,
                 OutputContract::Span,
             ] {
-                let compiled = no_row_exact_product_resource_fallback(pattern, output, target);
+                let compiled = no_row_exact_product_resource_fallback(&pattern, output, target);
                 assert!(compiled.module().required_runtime_symbol().is_none());
                 let reference = compile(
-                    CompileRequest::new(pattern, target)
+                    CompileRequest::new(&pattern, target)
                         .mode(CompileMode::Fast)
                         .output(output),
                 )
@@ -107763,15 +107929,29 @@ mod tests {
         } else {
             "cc"
         };
-        let status = Command::new(compiler)
-            .arg("-O0")
+        let mut command = Command::new(compiler);
+        command.arg("-O0");
+        let linker_architecture = match target.architecture {
+            Architecture::X86_64 => "x86_64",
+            Architecture::Aarch64 => "arm64",
+        };
+        if cfg!(target_os = "macos") {
+            // The shell can run under Rosetta while rustc targets arm64. Make
+            // clang link the generated object's ISA instead of its process
+            // architecture.
+            command.arg("-arch").arg(linker_architecture);
+        }
+        let status = command
             .arg(&c_path)
             .args(&objects)
             .arg("-o")
             .arg(&executable)
             .status()
             .expect("invoke host C compiler");
-        assert!(status.success());
+        assert!(
+            status.success(),
+            "host C linker failed for {linker_architecture} target {target:?}"
+        );
         let output = Command::new(&executable)
             .output()
             .expect("execute exact-product native differential");
@@ -131888,6 +132068,7 @@ int main(void){{
         .1;
         let bare_seed = NativeDfaLayout {
             exact_prefix_match_width: None,
+            exact_prefix_words: None,
             start_filter: None,
             exact_start_byte_set: None,
             exact_start_storage: None,
@@ -132236,6 +132417,7 @@ int main(void){{
             );
             let bare_layout = NativeDfaLayout {
                 exact_prefix_match_width: None,
+                exact_prefix_words: None,
                 start_filter: None,
                 exact_start_byte_set: None,
                 exact_start_storage: None,
@@ -132583,6 +132765,7 @@ int main(void){{
                     if kind.needs_vzeroupper() {
                         let bare_sparse = NativeDfaLayout {
                             exact_prefix_match_width: None,
+                            exact_prefix_words: None,
                             start_filter: None,
                             exact_start_byte_set: None,
                             exact_start_storage: None,
@@ -157395,6 +157578,415 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn exact_short_prefix_words_replace_moving_scalar_guards_cross_isa() {
+        const ALPHABET: &str = "abcdefghijklmno";
+        let layout_for = |pattern: &str, architecture| {
+            let compiled = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            build_native_dfa_table_for_architecture(
+                compiled.program().native_dfa_view().unwrap(),
+                architecture,
+            )
+            .unwrap()
+        };
+
+        for width in 8_usize..16 {
+            let pattern = &ALPHABET[..width];
+            let width_u8 = u8::try_from(width).unwrap();
+            for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                let (_, layout) = layout_for(pattern, architecture);
+                let words = layout
+                    .exact_prefix_words
+                    .unwrap_or_else(|| panic!("missing width-{width} {architecture:?} words"));
+                assert_eq!(layout.exact_prefix_match_width, Some(width_u8));
+                assert_eq!(words.width(), width_u8);
+                assert_eq!(usize::from(words.trailing_offset()), width - 8);
+                assert!(layout.prefix_block.is_none());
+
+                let mut scalar = layout;
+                scalar.exact_prefix_words = None;
+
+                match architecture {
+                    Architecture::X86_64 => {
+                        let selected = lower_x86_64_dfa(layout, FeatureSet::EMPTY).unwrap().0;
+                        let incumbent = lower_x86_64_dfa(scalar, FeatureSet::EMPTY).unwrap().0;
+                        assert!(selected.len() <= incumbent.len(), "width {width}");
+
+                        let mut guard = X86Assembler::new();
+                        let failed = guard.label().unwrap();
+                        let terminal = guard.label().unwrap();
+                        let verified = guard.label().unwrap();
+                        x86_emit_prefix_guard_path(
+                            &mut guard,
+                            layout,
+                            X86StartFilterKind::Sse2,
+                            None,
+                            failed,
+                            terminal,
+                            verified,
+                        )
+                        .unwrap();
+                        guard.bind(failed).unwrap();
+                        guard.instruction(&[0x90]).unwrap();
+                        guard.bind(terminal).unwrap();
+                        guard.instruction(&[0x90]).unwrap();
+                        guard.bind(verified).unwrap();
+                        guard.instruction(&[0xc3]).unwrap();
+                        let guard = guard.finish().unwrap();
+                        assert!(guard.windows(4).any(|bytes| {
+                            bytes == [0x48, 0x39, 0x04, 0x17]
+                        }));
+                        if width > 8 {
+                            assert!(guard.windows(5).any(|bytes| {
+                                bytes == [
+                                    0x48,
+                                    0x39,
+                                    0x44,
+                                    0x17,
+                                    u8::try_from(width - 8).unwrap(),
+                                ]
+                            }));
+                        }
+                        assert!(!guard.windows(4).any(|bytes| {
+                            bytes == [0x0f, 0xb6, 0x04, 0x17]
+                        }));
+                        assert!(!guard.windows(4).any(|bytes| {
+                            bytes[..3] == [0x0f, 0xb6, 0x44]
+                        }));
+
+                        let mut start = X86Assembler::new();
+                        let start_failed = start.label().unwrap();
+                        let start_matched = start.label().unwrap();
+                        x86_emit_exact_start_probe(
+                            &mut start,
+                            layout,
+                            X86StartFilterKind::Sse2,
+                            false,
+                            false,
+                            start_failed,
+                            start_matched,
+                        )
+                        .unwrap();
+                        start.bind(start_failed).unwrap();
+                        start.instruction(&[0x90]).unwrap();
+                        start.bind(start_matched).unwrap();
+                        start.instruction(&[0xc3]).unwrap();
+                        let start = start.finish().unwrap();
+                        assert!(!start.windows(4).any(|bytes| {
+                            bytes == [0x48, 0x39, 0x04, 0x17]
+                        }));
+                        assert!(start.windows(4).any(|bytes| {
+                            bytes == [0x0f, 0xb6, 0x04, 0x17]
+                                || bytes[..3] == [0x0f, 0xb6, 0x44]
+                        }));
+                    }
+                    Architecture::Aarch64 => {
+                        let selected = lower_aarch64_dfa(layout, FeatureSet::EMPTY).unwrap().0;
+                        let incumbent = lower_aarch64_dfa(scalar, FeatureSet::EMPTY).unwrap().0;
+                        assert!(selected.len() <= incumbent.len(), "width {width}");
+                        let selected_words = selected
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>();
+                        assert!(selected_words.contains(
+                            &aarch64_load_x_unscaled(8, 12, 0).unwrap()
+                        ));
+
+                        let mut guard = Aarch64Assembler::new();
+                        let failed = guard.label().unwrap();
+                        let terminal = guard.label().unwrap();
+                        let verified = guard.label().unwrap();
+                        aarch64_emit_prefix_guard_path(
+                            &mut guard,
+                            layout,
+                            false,
+                            None,
+                            failed,
+                            terminal,
+                            verified,
+                        )
+                        .unwrap();
+                        guard.bind(failed).unwrap();
+                        guard.instruction(0xd503_201f).unwrap();
+                        guard.bind(terminal).unwrap();
+                        guard.instruction(0xd503_201f).unwrap();
+                        guard.bind(verified).unwrap();
+                        guard.instruction(0xd65f_03c0).unwrap();
+                        let guard = guard.finish().unwrap();
+                        let guard_words = guard
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>();
+                        assert!(guard_words.contains(
+                            &aarch64_load_x_unscaled(8, 12, 0).unwrap()
+                        ));
+                        if width > 8 {
+                            assert!(guard_words.contains(
+                                &aarch64_load_x_unscaled(
+                                    8,
+                                    12,
+                                    u8::try_from(width - 8).unwrap(),
+                                )
+                                .unwrap()
+                            ));
+                        }
+                        assert!(!(0..width).any(|position| {
+                            guard_words.contains(
+                                &aarch64_load_byte_imm(
+                                    8,
+                                    12,
+                                    u16::try_from(position).unwrap(),
+                                )
+                                .unwrap(),
+                            )
+                        }));
+
+                        let mut start = Aarch64Assembler::new();
+                        let start_failed = start.label().unwrap();
+                        let start_matched = start.label().unwrap();
+                        aarch64_emit_exact_start_probe(
+                            &mut start,
+                            layout,
+                            false,
+                            false,
+                            false,
+                            start_failed,
+                            start_matched,
+                        )
+                        .unwrap();
+                        start.bind(start_failed).unwrap();
+                        start.instruction(0xd503_201f).unwrap();
+                        start.bind(start_matched).unwrap();
+                        start.instruction(0xd65f_03c0).unwrap();
+                        let start_words = start
+                            .finish()
+                            .unwrap()
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>();
+                        assert!(!start_words.contains(
+                            &aarch64_load_x_unscaled(8, 12, 0).unwrap()
+                        ));
+                        assert!((0..width).any(|position| {
+                            start_words.contains(
+                                &aarch64_load_byte_imm(
+                                    8,
+                                    12,
+                                    u16::try_from(position).unwrap(),
+                                )
+                                .unwrap(),
+                            )
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_short_prefix_words_preserve_data_and_fit_scalar_object_ceiling() {
+        const ALPHABET: &str = "abcdefghijklmno";
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ];
+        for target in targets {
+            for width in 8_usize..16 {
+                let pattern = &ALPHABET[..width];
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::Span),
+                )
+                .unwrap();
+                let view = compiled.program().native_dfa_view().unwrap();
+                let lower = |allow_exact_prefix_words, maximum_native_data_bytes| {
+                    lower_native_dfa_with_entry_contract_data_limit_optional_receipt_pair_register_and_exact_word_policy(
+                        view,
+                        target,
+                        NativeDfaEntryContract::Public,
+                        maximum_native_data_bytes,
+                        true,
+                        true,
+                        NativeExactFiniteExistsCompleteDfaReceiptPolicy::None,
+                        true,
+                        true,
+                        true,
+                        allow_exact_prefix_words,
+                    )
+                };
+
+                let selected_lowering = lower(true, usize::MAX)
+                    .unwrap()
+                    .expect("exact short product native lowering");
+                let incumbent_lowering = lower(false, usize::MAX)
+                    .unwrap()
+                    .expect("scalar exact short product native lowering");
+                assert_eq!(
+                    selected_lowering.data, incumbent_lowering.data,
+                    "compiler-only word constants changed width-{width} {target:?} program data"
+                );
+                assert!(
+                    selected_lowering.code.len() <= incumbent_lowering.code.len(),
+                    "width {width} {target:?}"
+                );
+                let selected_data_bytes = selected_lowering.data.len();
+                for data_limit in [
+                    0,
+                    selected_data_bytes.checked_sub(1).unwrap(),
+                    selected_data_bytes,
+                    usize::MAX,
+                ] {
+                    match (lower(true, data_limit), lower(false, data_limit)) {
+                        (Ok(Some(selected)), Ok(Some(incumbent))) => {
+                            assert_eq!(
+                                selected.data, incumbent.data,
+                                "width {width} {target:?} ProgramBytes {data_limit} data"
+                            );
+                            assert!(
+                                selected.code.len() <= incumbent.code.len(),
+                                "width {width} {target:?} ProgramBytes {data_limit} text"
+                            );
+                        }
+                        (Ok(None), Ok(None)) => {}
+                        (Err(selected_error), Err(incumbent_error)) => {
+                            assert_eq!(
+                                selected_error, incumbent_error,
+                                "width {width} {target:?} ProgramBytes {data_limit} error"
+                            );
+                        }
+                        _ => panic!(
+                            "width {width} {target:?} ProgramBytes {data_limit} changed the lowering outcome kind"
+                        ),
+                    }
+                }
+
+                let module = |lowering| {
+                    CompiledModule::lower_serialized_with_prelowered(
+                        compiled.program().serialize().unwrap(),
+                        Some(lowering),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        target,
+                    )
+                    .unwrap()
+                };
+                let selected = module(selected_lowering);
+                let incumbent = module(incumbent_lowering);
+                assert_eq!(
+                    selected.sections[PROGRAM_SECTION].data,
+                    incumbent.sections[PROGRAM_SECTION].data,
+                    "width {width} {target:?} module program data"
+                );
+                assert!(
+                    selected.sections[TEXT_SECTION].data.len()
+                        <= incumbent.sections[TEXT_SECTION].data.len(),
+                    "width {width} {target:?} text"
+                );
+
+                let format = ObjectFormat::for_target(target);
+                let selected_object = emit_object(&selected, format, usize::MAX).unwrap();
+                let incumbent_object = emit_object(&incumbent, format, usize::MAX).unwrap();
+                assert!(
+                    selected_object.len() <= incumbent_object.len(),
+                    "width {width} {target:?}"
+                );
+                assert_eq!(
+                    emit_object(&selected, format, incumbent_object.len()).unwrap(),
+                    selected_object,
+                    "width {width} {target:?} scalar ObjectBytes ceiling"
+                );
+
+                let selected_cap = selected_object.len().checked_sub(1).unwrap();
+                assert_eq!(
+                    emit_object(&selected, format, selected_cap).unwrap_err(),
+                    ObjectError::Resource {
+                        resource: crate::CompileResource::ObjectBytes,
+                        limit: selected_cap,
+                        required: selected_object.len(),
+                    },
+                    "width {width} {target:?} selected cap-minus-one error"
+                );
+
+                let incumbent_cap = incumbent_object.len().checked_sub(1).unwrap();
+                let measured = emit_object(&selected, format, incumbent_cap);
+                if selected_object.len() <= incumbent_cap {
+                    assert_eq!(measured.unwrap(), selected_object, "width {width} {target:?}");
+                } else {
+                    assert_eq!(
+                        measured.unwrap_err(),
+                        ObjectError::Resource {
+                            resource: crate::CompileResource::ObjectBytes,
+                            limit: incumbent_cap,
+                            required: selected_object.len(),
+                        },
+                        "width {width} {target:?} scalar cap-minus-one error"
+                    );
+                }
+            }
+
+            for (pattern, reason) in [
+                ("abcdefg", "width seven"),
+                ("abcdefghijklmnop", "width sixteen"),
+                ("[ab]cdefghi", "non-singleton width eight"),
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::Span),
+                )
+                .unwrap();
+                let view = compiled.program().native_dfa_view().unwrap();
+                let (_, layout) =
+                    build_native_dfa_table_for_architecture(view, target.architecture).unwrap();
+                assert!(layout.exact_prefix_words.is_none(), "{reason} {target:?}");
+                let lower = |allow_exact_prefix_words| {
+                    lower_native_dfa_with_entry_contract_data_limit_optional_receipt_pair_register_and_exact_word_policy(
+                        view,
+                        target,
+                        NativeDfaEntryContract::Public,
+                        usize::MAX,
+                        true,
+                        true,
+                        NativeExactFiniteExistsCompleteDfaReceiptPolicy::None,
+                        true,
+                        true,
+                        true,
+                        allow_exact_prefix_words,
+                    )
+                    .unwrap()
+                    .expect("noneligible exact-word policy lowering")
+                };
+                let selected = lower(true);
+                let incumbent = lower(false);
+                assert_eq!(selected.data, incumbent.data, "{reason} {target:?} data");
+                assert_eq!(selected.code, incumbent.code, "{reason} {target:?} code");
+            }
+        }
+    }
+
+    #[test]
     fn exact_prefix_product_proof_accepts_only_complete_uncorrelated_products() {
         let compile_view = |pattern: &str| {
             compile(
@@ -158982,6 +159574,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             partial: None,
             exact_span_width: None,
             exact_prefix_match_width: None,
+            exact_prefix_words: None,
             output: OutputContract::SelectedEnd,
             start_filter: None,
             exact_start_byte_set: None,
@@ -161326,6 +161919,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             partial: None,
             exact_span_width: None,
             exact_prefix_match_width: None,
+            exact_prefix_words: None,
             output: OutputContract::Span,
             start_filter: None,
             exact_start_byte_set: None,
@@ -161524,6 +162118,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             partial: None,
             exact_span_width: None,
             exact_prefix_match_width: None,
+            exact_prefix_words: None,
             output: OutputContract::Exists,
             start_filter: Some(start_filter),
             exact_start_byte_set: None,

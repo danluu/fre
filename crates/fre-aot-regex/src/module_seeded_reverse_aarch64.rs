@@ -994,6 +994,7 @@ mod tests {
             prefix_filter: None,
             prefix_relation: None,
             prefix_block: None,
+            exact_prefix_words: None,
             prefix_fast_forward: None,
         };
         (layout, suffix, reverse)

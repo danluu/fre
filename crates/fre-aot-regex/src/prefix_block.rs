@@ -25,6 +25,41 @@ pub(crate) struct PrefixBlockPlan {
     lane_mask: u16,
 }
 
+/// Two in-bounds machine words that cover one exact 8..=15-byte product.
+///
+/// The first word covers bytes `0..8`. For widths above eight, the trailing
+/// word starts at `width - 8`, so it covers every remaining byte without
+/// reading past the semantic match extent. These constants stay in compiler
+/// layout state and are never appended to the frozen program image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactPrefixWordPlan {
+    width: u8,
+    first: u64,
+    trailing: u64,
+}
+
+impl ExactPrefixWordPlan {
+    #[must_use]
+    pub(crate) const fn width(self) -> u8 {
+        self.width
+    }
+
+    #[must_use]
+    pub(crate) const fn first(self) -> u64 {
+        self.first
+    }
+
+    #[must_use]
+    pub(crate) const fn trailing(self) -> u64 {
+        self.trailing
+    }
+
+    #[must_use]
+    pub(crate) const fn trailing_offset(self) -> u8 {
+        self.width - 8
+    }
+}
+
 impl PrefixBlockPlan {
     #[must_use]
     pub(crate) const fn expected(self) -> [u8; PREFIX_BLOCK_BYTES] {
@@ -100,6 +135,36 @@ pub(crate) fn derive(sets: &[AnchoredByteSet]) -> Option<PrefixBlockPlan> {
     })
 }
 
+/// Derive an allocation-free exact-word verifier from graph byte sets.
+///
+/// Every graph layer must be a singleton and the supplied width must describe
+/// the complete set slice. Widths below eight cannot amortize a word compare;
+/// width sixteen already has the established vector block representation.
+#[must_use]
+pub(crate) fn derive_exact_words(
+    sets: &[AnchoredByteSet],
+    width: u8,
+) -> Option<ExactPrefixWordPlan> {
+    let width = usize::from(width);
+    if !(8..PREFIX_BLOCK_BYTES).contains(&width) || sets.len() != width {
+        return None;
+    }
+    let mut bytes = [0_u8; PREFIX_BLOCK_BYTES - 1];
+    for (slot, &set) in bytes[..width].iter_mut().zip(sets) {
+        *slot = singleton(set)?;
+    }
+    let trailing_offset = width.checked_sub(8)?;
+    Some(ExactPrefixWordPlan {
+        width: u8::try_from(width).ok()?,
+        first: u64::from_le_bytes(bytes[..8].try_into().ok()?),
+        trailing: u64::from_le_bytes(
+            bytes[trailing_offset..trailing_offset + 8]
+                .try_into()
+                .ok()?,
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +221,43 @@ mod tests {
             sets[lane] = singleton;
         }
         assert!(derive(&sets).is_none());
+    }
+
+    #[test]
+    fn exact_words_require_complete_singleton_widths_eight_through_fifteen() {
+        let singleton = set(&[b'q']);
+        for width in 8_usize..16 {
+            let plan = derive_exact_words(&vec![singleton; width], u8::try_from(width).unwrap())
+                .expect("eligible exact word plan");
+            assert_eq!(usize::from(plan.width()), width);
+            assert_eq!(usize::from(plan.trailing_offset()), width - 8);
+        }
+        assert!(derive_exact_words(&[singleton; 7], 7).is_none());
+        assert!(derive_exact_words(&[singleton; 16], 16).is_none());
+        assert!(derive_exact_words(&[singleton; 9], 8).is_none());
+
+        let mut non_singleton = [singleton; 15];
+        non_singleton[14] = set(&[b'q', b'r']);
+        assert!(derive_exact_words(&non_singleton, 15).is_none());
+    }
+
+    #[test]
+    fn exact_words_cover_every_byte_with_expected_little_endian_constants() {
+        let sets =
+            core::array::from_fn::<_, 15, _>(|index| set(&[b'a' + u8::try_from(index).unwrap()]));
+        for width in 8_usize..16 {
+            let plan = derive_exact_words(&sets[..width], u8::try_from(width).unwrap()).unwrap();
+            assert_eq!(plan.first().to_le_bytes(), *b"abcdefgh");
+            let trailing = plan.trailing().to_le_bytes();
+            let expected_trailing =
+                core::array::from_fn(|index| b'a' + u8::try_from(width - 8 + index).unwrap());
+            assert_eq!(trailing, expected_trailing,);
+            let mut covered = [false; 15];
+            covered[..8].fill(true);
+            covered[width - 8..width].fill(true);
+            assert!(covered[..width].iter().all(|covered| *covered));
+            assert!(covered[width..].iter().all(|covered| !*covered));
+        }
     }
 
     #[test]
