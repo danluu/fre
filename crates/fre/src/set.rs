@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// Stable schema for portable regex-set construction and execution reports.
-pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 7;
+pub const PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION: u32 = 8;
 
 /// Stable schema for reusable regex-set session construction reports.
 pub const PORTABLE_REGEX_SET_SESSION_SCHEMA_VERSION: u32 = 1;
@@ -33,7 +33,7 @@ pub struct PortableRegexSetBuildLimits {
     /// when only the optional sidecar exceeds the residual budget.
     pub max_persistent_bytes: usize,
     /// Complete per-pattern construction limits. For byte sets, the nested
-    /// `literal_set` limits also bound the optional set-wide fused suffix
+    /// `literal_set` limits also bound the optional set-wide fused
     /// existence sidecar. Text sets do not construct that sidecar.
     pub pattern: BuildLimits,
 }
@@ -64,13 +64,20 @@ pub struct PortableRegexSetBuildReport {
     /// Sum of constituent matcher plan storage. The optional fused existence
     /// sidecar is reported separately below.
     pub plan_storage_bytes: usize,
-    /// Complete construction receipt for the optional exact-literal suffix
-    /// existence sidecar. Its pattern and byte counts exclude source-order
-    /// constituent zero. `None` records either structural ineligibility or a
-    /// fail-open construction/resource refusal.
+    /// Complete construction receipt for the optional fused exact-literal
+    /// existence sidecar. Its pattern and byte counts cover the source IDs
+    /// beginning at `fused_literal_set_source_id_offset`. `None`
+    /// records either structural ineligibility or a fail-open
+    /// construction/resource refusal.
     pub fused_literal_set_build: Option<LiteralSetBuildAccounting>,
+    /// Source ID represented by fused-plan-local ID zero. `Some(0)` means the
+    /// sidecar covers every constituent directly. `Some(1)` preserves a
+    /// uniform Standard suffix when a differently sized source ID zero would
+    /// otherwise remove its all-ID mask capability. `None` means no sidecar
+    /// was retained.
+    pub fused_literal_set_source_id_offset: Option<usize>,
     /// Kernel-reported logical plan payload bytes for the optional
-    /// exact-literal suffix existence sidecar. Zero means construction
+    /// fused exact-literal existence sidecar. Zero means construction
     /// declined or the set shape was ineligible; this is not an
     /// allocator-footprint measurement.
     pub fused_literal_set_storage_bytes: usize,
@@ -526,6 +533,9 @@ impl<'a> PortableRegexSetBuilder<'a> {
         let fused_literal_set_build = fused_literal_set
             .as_ref()
             .map(|fused| fused.plan.build_accounting());
+        let fused_literal_set_source_id_offset = fused_literal_set
+            .as_ref()
+            .map(|fused| fused.source_id_offset);
         let fused_literal_set_storage_bytes =
             fused_literal_set_build.map_or(0, |build| build.persistent_bytes);
         let charged_persistent_bytes = checked_add(
@@ -546,6 +556,7 @@ impl<'a> PortableRegexSetBuilder<'a> {
             capture_name_storage_bytes,
             plan_storage_bytes,
             fused_literal_set_build,
+            fused_literal_set_source_id_offset,
             fused_literal_set_storage_bytes,
             charged_persistent_bytes,
         };
@@ -570,6 +581,7 @@ pub struct PortableRegexSet {
 struct FusedExactLiteralExists {
     plan: LiteralSetPlan,
     origin_first_bytes: [u64; 4],
+    source_id_offset: usize,
 }
 
 impl FusedExactLiteralExists {
@@ -811,15 +823,17 @@ impl PortableRegexSet {
     /// or constituent execution reports.
     ///
     /// This operation deliberately has unlimited execution resources. Sets
-    /// that retained an all-positive exact-literal suffix sidecar may use a
-    /// leading-byte-gated origin probe, then search pattern zero independently
-    /// and use the sidecar after those misses. Short inputs whose leading byte
-    /// could begin a literal retain source-ordered constituent execution.
+    /// that retained an all-positive exact-literal sidecar may use a
+    /// leading-byte-gated origin probe, then search every pattern in one
+    /// aggregate scan. A differently sized ID zero may retain the prior
+    /// ID-zero-plus-uniform-suffix route so the suffix keeps its all-ID mask
+    /// capability. Short inputs whose leading byte could begin a literal
+    /// retain source-ordered constituent execution.
     /// Ranged and accounted APIs execute their independent constituents. An
     /// eligible start-zero session value call may reuse this exact unlimited
     /// route. The unlimited caller-buffer all-ID route may use the same sidecar
-    /// either to collect every suffix ID in one bounded DFA scan or, when that
-    /// capability is ineligible, to certify that no suffix ID can match. Use
+    /// either to collect every source ID in one bounded DFA scan or, when that
+    /// capability is ineligible, to certify that no pattern can match. Use
     /// [`Self::is_match`] when finite work, scratch, or pattern-count limits
     /// must be enforced.
     #[inline(always)]
@@ -838,31 +852,34 @@ impl PortableRegexSet {
             if origin_may_match {
                 for regex in &self.regexes {
                     let PortablePlan::ExactLiteral(literal) = &regex.plan else {
-                        unreachable!("the fused suffix admits only exact literals");
+                        unreachable!("the fused sidecar admits only exact literals");
                     };
                     if haystack.starts_with(literal.needle()) {
                         return Ok(true);
                     }
                 }
             }
-            let first = is_match_window_value_unlimited(
-                &self.regexes[0],
-                haystack,
-                SearchWindow::new(0, haystack.len()),
-            )
-            .map_err(|source| PortableRegexSetExecutionError::Pattern {
-                index: 0,
-                total_work_before: 0,
-                remaining_total_work: u64::MAX,
-                source,
-            })?;
-            if first {
-                return Ok(true);
+            if fused.source_id_offset == 1 {
+                let first = is_match_window_value_unlimited(
+                    &self.regexes[0],
+                    haystack,
+                    SearchWindow::new(0, haystack.len()),
+                )
+                .map_err(|source| PortableRegexSetExecutionError::Pattern {
+                    index: 0,
+                    total_work_before: 0,
+                    remaining_total_work: u64::MAX,
+                    source,
+                })?;
+                if first {
+                    return Ok(true);
+                }
             }
+            debug_assert!(fused.source_id_offset <= 1);
             let executor = fused
                 .plan
                 .ordinary_executor()
-                .expect("the fused suffix plan retains only positive exact literals");
+                .expect("the fused plan retains only positive exact literals");
             return Ok(executor
                 .exists_window_value(haystack, LiteralWindow::full(haystack))
                 .expect("a complete-haystack fused literal-set window is valid"));
@@ -1113,11 +1130,11 @@ impl PortableRegexSet {
     /// Every positive exact-literal constituent uses its retained ordinary
     /// existence capability on the unlimited path. Empty literals and all
     /// other plans retain the general value facade. An eligible exact-literal
-    /// set on a long complete-haystack search executes ID zero once, then may
-    /// collect every matching suffix ID in one bounded DFA scan. If that
-    /// capability is ineligible, the fused suffix remains a negative
-    /// certificate: a certified miss avoids all remaining constituent
-    /// searches, while a possible suffix match retains the source-ID loop.
+    /// set on a long complete-haystack search may collect every matching
+    /// source ID in one bounded DFA scan. If that capability is ineligible,
+    /// the fused sidecar remains a negative certificate after ID zero misses:
+    /// a certified miss avoids all remaining constituent searches, while a
+    /// possible match retains the source-ID loop.
     ///
     /// # Errors
     ///
@@ -1192,25 +1209,30 @@ impl PortableRegexSet {
         window: SearchWindow,
         fused: &FusedExactLiteralExists,
     ) -> Result<bool, PortableRegexSetExecutionError> {
-        let first = is_match_window_value_unlimited(&self.regexes[0], haystack, window).map_err(
-            |source| PortableRegexSetExecutionError::Pattern {
-                index: 0,
-                total_work_before: 0,
-                remaining_total_work: u64::MAX,
-                source,
-            },
-        )?;
-        let mut any = first;
-        if first {
-            match_flags[0] = true;
-        }
+        debug_assert!(fused.source_id_offset <= 1);
+        let first = if fused.source_id_offset == 1 {
+            Some(
+                is_match_window_value_unlimited(&self.regexes[0], haystack, window).map_err(
+                    |source| PortableRegexSetExecutionError::Pattern {
+                        index: 0,
+                        total_work_before: 0,
+                        remaining_total_work: u64::MAX,
+                        source,
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
 
-        // The fused plan stores source IDs 1..K as local IDs 0..K-1. Its
-        // bounded Standard capability can therefore collapse every duplicate
-        // and overlapping acceptance into one word, which maps back to source
-        // IDs with a single shift. The direct kernel follows the DFA's own
-        // prefilter restarts, so a zero mask is also the existing exact suffix
-        // miss certificate. Other constructions retain the incumbent loop.
+        // The preferred full plan stores every source ID directly. A
+        // compatibility suffix preserves its local-to-source offset when a
+        // differently sized ID zero would otherwise remove the Standard mask
+        // capability. Either bounded plan can collapse every duplicate and
+        // overlapping acceptance into one word. The direct kernel follows the
+        // DFA's own prefilter restarts, so a zero mask is also an exact
+        // set-wide miss certificate. Other constructions retain the incumbent
+        // loop below.
         if self.regexes.len() <= u64::BITS as usize
             && fused.plan.build_accounting().minimum_pattern_bytes
                 >= FUSED_LITERAL_SET_ALL_ID_MASK_MIN_PATTERN_BYTES
@@ -1218,14 +1240,24 @@ impl PortableRegexSet {
                 window.end().saturating_sub(window.start()),
             ) >= FUSED_LITERAL_SET_ALL_ID_MASK_MIN_WORK
             && let Some(executor) = fused.plan.ordinary_executor()
-            && let Ok(Some(suffix_mask)) = executor
+            && let Ok(Some(plan_mask)) = executor
                 .pattern_id_mask_window_value(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                 )
         {
-            debug_assert_eq!(suffix_mask >> (self.regexes.len() - 1), 0);
-            let mut source_mask = (suffix_mask << 1) | u64::from(first);
+            debug_assert_eq!(
+                fused.plan.build_accounting().patterns + fused.source_id_offset,
+                self.regexes.len(),
+            );
+            let mut source_mask = plan_mask
+                .checked_shl(u32::try_from(fused.source_id_offset).unwrap_or(u32::MAX))
+                .unwrap_or(0)
+                | u64::from(first.unwrap_or(false));
+            let unused_mask = u64::MAX
+                .checked_shl(u32::try_from(self.regexes.len()).unwrap_or(u32::MAX))
+                .unwrap_or(0);
+            debug_assert_eq!(source_mask & unused_mask, 0);
             let any = source_mask != 0;
             while source_mask != 0 {
                 let index = source_mask.trailing_zeros() as usize;
@@ -1235,8 +1267,24 @@ impl PortableRegexSet {
             return Ok(any);
         }
 
+        let first = match first {
+            Some(first) => first,
+            None => is_match_window_value_unlimited(&self.regexes[0], haystack, window).map_err(
+                |source| PortableRegexSetExecutionError::Pattern {
+                    index: 0,
+                    total_work_before: 0,
+                    remaining_total_work: u64::MAX,
+                    source,
+                },
+            )?,
+        };
+        let mut any = first;
+        if first {
+            match_flags[0] = true;
+        }
+
         if !first {
-            let suffix_may_match = fused.plan.ordinary_executor().and_then(|executor| {
+            let set_may_match = fused.plan.ordinary_executor().and_then(|executor| {
                 executor
                     .exists_window_value(
                         haystack,
@@ -1244,7 +1292,7 @@ impl PortableRegexSet {
                     )
                     .ok()
             });
-            if suffix_may_match == Some(false) {
+            if set_may_match == Some(false) {
                 return Ok(false);
             }
         }
@@ -2577,7 +2625,7 @@ const fn set_value_route_is_unlimited(limits: PortableRegexSetRunLimits) -> bool
 // fused route at every length.
 const FUSED_LITERAL_SET_ORIGIN_PROBE_MIN_BYTES: usize = 128;
 
-// A possible suffix hit pays for the certificate and then retains the
+// A possible set-wide hit pays for the certificate and then retains the
 // constituent ID loop. Keep that speculative extra scan off short inputs;
 // the stable all-ID gap is on long haystacks where a global miss replaces K
 // independent passes.
@@ -2625,15 +2673,16 @@ fn try_build_fused_exact_literal_exists(
     let PortablePlan::ExactLiteral(first) = &regexes[0].plan else {
         return None;
     };
-    if first.needle().is_empty() {
+    let first_needle = first.needle();
+    if first_needle.is_empty() {
         return None;
     }
     let mut origin_first_bytes = [0_u64; 4];
-    record_first_byte(&mut origin_first_bytes, first.needle()[0]);
-    let suffix = &regexes[1..];
+    record_first_byte(&mut origin_first_bytes, first_needle[0]);
     let mut needles = Vec::new();
-    needles.try_reserve_exact(suffix.len()).ok()?;
-    for regex in suffix {
+    needles.try_reserve_exact(regexes.len()).ok()?;
+    needles.push(first_needle);
+    for regex in &regexes[1..] {
         let PortablePlan::ExactLiteral(literal) = &regex.plan else {
             return None;
         };
@@ -2644,11 +2693,17 @@ fn try_build_fused_exact_literal_exists(
         record_first_byte(&mut origin_first_bytes, needle[0]);
         needles.push(needle);
     }
+    let suffix_width = needles[1].len();
+    let uniform_suffix = needles[1..]
+        .iter()
+        .all(|needle| needle.len() == suffix_width);
+    let source_id_offset = usize::from(uniform_suffix && first_needle.len() != suffix_width);
     limits.max_persistent_bytes = limits.max_persistent_bytes.min(remaining_persistent_bytes);
-    let plan = LiteralSetPlan::new_stable_borrowed(&needles, limits).ok()?;
+    let plan = LiteralSetPlan::new_stable_borrowed(&needles[source_id_offset..], limits).ok()?;
     Some(FusedExactLiteralExists {
         plan,
         origin_first_bytes,
+        source_id_offset,
     })
 }
 
@@ -2778,9 +2833,9 @@ mod tests {
         suffix[192..202].copy_from_slice(PATTERNS[7].as_bytes());
 
         for (haystack, expected_calls) in [
-            (absent.as_slice(), 1_usize),
-            (first.as_slice(), 1_usize),
-            (suffix.as_slice(), 1_usize),
+            (absent.as_slice(), 0_usize),
+            (first.as_slice(), 0_usize),
+            (suffix.as_slice(), 0_usize),
         ] {
             let mut expected = [false; 10];
             expected[8] = true;
@@ -2903,7 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_output_mask_maps_suffix_duplicates_overlaps_and_high_source_id() {
+    fn fused_output_mask_maps_source_duplicates_overlaps_and_high_source_id() {
         let patterns = [
             "zzzzzzzz",
             "abababab",
@@ -2915,10 +2970,10 @@ mod tests {
             "dddddddd",
         ];
         let set = PortableRegexSet::new(patterns).expect("uniform fused exact-literal set");
-        let fused = set.fused_literal_set.as_ref().expect("fused suffix");
+        let fused = set.fused_literal_set.as_ref().expect("fused sidecar");
         let mut haystack = vec![b'x'; 128];
         haystack[63..72].copy_from_slice(b"ababababa");
-        let suffix_mask = fused
+        let source_mask = fused
             .plan
             .ordinary_executor()
             .unwrap()
@@ -2928,7 +2983,7 @@ mod tests {
             )
             .unwrap()
             .expect("bounded Standard mask");
-        assert_eq!(suffix_mask, 0b111);
+        assert_eq!(source_mask, 0b1110);
 
         let mut direct_haystack = vec![b'x'; 512];
         direct_haystack[255..264].copy_from_slice(b"ababababa");
@@ -2955,6 +3010,47 @@ mod tests {
             .unwrap();
         assert_eq!(actual_any, expected_any);
         assert_eq!(actual, expected);
+        assert_eq!(fused_exact_ordinary_probe::calls(), 0);
+
+        let preserved_suffix_patterns = [
+            "origin000",
+            "qz000001",
+            "qz000002",
+            "qz000003",
+            "qz000004",
+            "qz000005",
+            "qz000006",
+            "qz000007",
+        ];
+        let preserved_suffix = PortableRegexSet::new(preserved_suffix_patterns)
+            .expect("different-width origin preserves a uniform suffix");
+        let preserved_fused = preserved_suffix
+            .fused_literal_set
+            .as_ref()
+            .expect("uniform suffix sidecar");
+        assert_eq!(preserved_fused.source_id_offset, 1);
+        assert_eq!(preserved_fused.plan.build_accounting().patterns, 7);
+        assert_eq!(
+            preserved_suffix
+                .build_report()
+                .fused_literal_set_source_id_offset,
+            Some(1),
+        );
+        let mut preserved_haystack = vec![b'x'; 512];
+        preserved_haystack[504..].copy_from_slice(preserved_suffix_patterns[7].as_bytes());
+        let mut preserved_flags = [false; 8];
+        fused_exact_ordinary_probe::reset();
+        assert!(
+            preserved_suffix
+                .matches_read_at_value(
+                    &mut preserved_flags,
+                    &preserved_haystack,
+                    0,
+                    PortableRegexSetRunLimits::unlimited(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(preserved_flags, core::array::from_fn(|index| index == 7));
         assert_eq!(fused_exact_ordinary_probe::calls(), 1);
 
         let narrow_patterns = ["aa"; 8];
@@ -3001,6 +3097,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             [63],
         );
-        assert_eq!(fused_exact_ordinary_probe::calls(), 1);
+        assert_eq!(fused_exact_ordinary_probe::calls(), 0);
+
+        let over_word_patterns = (0..65)
+            .map(|index| format!("qw{index:06}"))
+            .collect::<Vec<_>>();
+        let over_word = PortableRegexSet::new(over_word_patterns.iter())
+            .expect("65-pattern fused set retains its constituent fallback");
+        let mut over_word_haystack = vec![b'x'; 128];
+        over_word_haystack[120..].copy_from_slice(over_word_patterns[64].as_bytes());
+        let mut over_word_flags = [false; 65];
+        fused_exact_ordinary_probe::reset();
+        assert!(
+            over_word
+                .matches_read_at_value(
+                    &mut over_word_flags,
+                    &over_word_haystack,
+                    0,
+                    PortableRegexSetRunLimits::unlimited(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            over_word_flags
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &matched)| matched.then_some(index))
+                .collect::<Vec<_>>(),
+            [64],
+        );
+        assert_eq!(fused_exact_ordinary_probe::calls(), over_word_patterns.len());
     }
 }
