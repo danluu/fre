@@ -3671,6 +3671,7 @@ impl CompiledModule {
             || source.layout.output != OutputContract::Span
             || source.layout.partial.is_some()
             || source.layout.initial_pending
+            || source.layout.complete_span_fill_exact_short.is_some()
             || !matches!(source.layout.exact_span_width, Some(width) if width != 0)
         {
             return Err(ObjectError::InvalidModule(
@@ -3848,7 +3849,10 @@ impl CompiledModule {
                 "continuous Span fill public entry has an extra relocation",
             ));
         }
-        Ok(Some(*source))
+        let mut authenticated = *source;
+        authenticated.layout.complete_span_fill_exact_short =
+            derive_authenticated_complete_span_fill_short_plan(source.layout, program_data);
+        Ok(Some(authenticated))
     }
 }
 
@@ -29465,6 +29469,11 @@ struct NativeDfaLayout {
     /// Compiler-only constants for an exact 8..=15-byte moving-candidate
     /// verifier. They never enter target data or consume its allocation cap.
     exact_prefix_words: Option<prefix_block::ExactPrefixWordPlan>,
+    /// Exact 1..=7-byte verifier installed only on the compiler-private copy
+    /// after the public entry and complete program-data hash authenticate.
+    /// Ordinary lowering always retains `None`, so this cannot perturb its
+    /// scanner, fallback, data image, or object identity.
+    complete_span_fill_exact_short: Option<prefix_block::ExactPrefixShortPlan>,
     output: OutputContract,
     start_filter: Option<NativeStartFilter>,
     exact_start_byte_set: Option<NativeExactByteSet>,
@@ -29489,13 +29498,14 @@ struct NativeDfaLayout {
 /// Allocation-free exact verifier for one suffix-scanner survivor in the
 /// compiler-private continuous Span-fill entry.
 ///
-/// Both variants are derived solely from the already authenticated exact
-/// product facts. The word plan carries every byte of an 8..=15-byte
+/// All variants are derived solely from the already authenticated exact
+/// product facts. The scalar plans carry every byte of a 1..=15-byte
 /// singleton product as immediates. The block plan is admitted only when all
 /// sixteen graph lanes are singleton and its existing serialized expected
 /// block therefore describes the complete language.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeCompleteSpanFillExactVerifier {
+    Short(prefix_block::ExactPrefixShortPlan),
     Words(prefix_block::ExactPrefixWordPlan),
     Block16(NativePrefixBlockGuard),
 }
@@ -29503,6 +29513,7 @@ enum NativeCompleteSpanFillExactVerifier {
 impl NativeCompleteSpanFillExactVerifier {
     const fn width(self) -> u8 {
         match self {
+            Self::Short(short) => short.width(),
             Self::Words(words) => words.width(),
             Self::Block16(_) => 16,
         }
@@ -29523,6 +29534,115 @@ struct NativeCompleteSpanFillExactSurvivorVerifier {
     full_width: u8,
 }
 
+/// Reconstruct the complete short singleton from ordinary-entry facts after
+/// its public code and complete program-data image have authenticated.
+///
+/// The moving scanner owns one exact anchored column and the scalar prefix
+/// guard owns every remaining selective column. Range predicates contribute
+/// immediates; bitmap predicates are read only from the already hash-sealed
+/// target data. Exact byte-set scanners deliberately decline because their
+/// distinct storage layouts are unnecessary for this first bounded route.
+fn derive_authenticated_complete_span_fill_short_plan(
+    layout: NativeDfaLayout,
+    program_data: &[u8],
+) -> Option<prefix_block::ExactPrefixShortPlan> {
+    let width = layout.exact_prefix_match_width?;
+    if !(1..=7).contains(&width)
+        || layout.exact_prefix_words.is_some()
+        || layout.complete_span_fill_exact_short.is_some()
+        || layout.prefix_block.is_some()
+        || layout.prefix_relation.is_some()
+        || layout.exact_start_byte_set.is_some()
+    {
+        return None;
+    }
+    let scanner = layout.start_filter?;
+    let [range] = scanner.ranges() else {
+        return None;
+    };
+    if !scanner.from_anchored_prefix
+        || scanner.candidate_bytes != 1
+        || range.start != range.end
+        || scanner.scan_offset >= width
+    {
+        return None;
+    }
+
+    let mut bytes = [0_u8; 7];
+    let mut seen = 0_u8;
+    let mut record = |position: u8, byte: u8| -> Option<()> {
+        if position >= width {
+            return None;
+        }
+        let bit = 1_u8.checked_shl(u32::from(position))?;
+        if seen & bit != 0 {
+            return None;
+        }
+        bytes[usize::from(position)] = byte;
+        seen |= bit;
+        Some(())
+    };
+    record(scanner.scan_offset, range.start)?;
+    if let Some(prefix) = layout.prefix_filter {
+        if prefix.guaranteed_bytes != width {
+            return None;
+        }
+        for predicate in prefix.predicates() {
+            let byte = match predicate.membership {
+                ScalarPrefixMembership::Ranges(ranges) => {
+                    let [range] = ranges.ranges() else {
+                        return None;
+                    };
+                    if !range.is_singleton() || predicate.bitmap_offset != 0 {
+                        return None;
+                    }
+                    range.start()
+                }
+                ScalarPrefixMembership::Bitmap256 => {
+                    let start = usize::try_from(predicate.bitmap_offset).ok()?;
+                    let end = start.checked_add(PREFIX_BITMAP_BYTES)?;
+                    let bitmap = program_data.get(start..end)?;
+                    let mut singleton = None;
+                    for (byte_index, &bits) in bitmap.iter().enumerate() {
+                        for bit in 0_u8..8 {
+                            if bits & (1_u8 << bit) == 0 {
+                                continue;
+                            }
+                            if singleton.is_some() {
+                                return None;
+                            }
+                            singleton = Some(
+                                u8::try_from(byte_index.checked_mul(8)?.checked_add(usize::from(bit))?)
+                                    .ok()?,
+                            );
+                        }
+                    }
+                    singleton?
+                }
+                ScalarPrefixMembership::RejectAll => return None,
+            };
+            record(predicate.position, byte)?;
+        }
+    }
+    let expected_seen = (1_u8.checked_shl(u32::from(width))?).wrapping_sub(1);
+    if seen != expected_seen {
+        return None;
+    }
+    prefix_block::exact_short_from_bytes(&bytes[..usize::from(width)])
+}
+
+fn complete_span_fill_short_plan(
+    layout: NativeDfaLayout,
+) -> Option<prefix_block::ExactPrefixShortPlan> {
+    layout.complete_span_fill_exact_short.filter(|short| {
+        (1..=7).contains(&short.width())
+            && layout.exact_prefix_match_width == Some(short.width())
+            && layout.exact_prefix_words.is_none()
+            && layout.prefix_block.is_none()
+            && short.is_canonical()
+    })
+}
+
 fn derive_complete_span_fill_exact_verifier(
     layout: NativeDfaLayout,
     entry_contract: NativeDfaEntryContract,
@@ -29538,6 +29658,26 @@ fn derive_complete_span_fill_exact_verifier(
         return Err(ObjectError::InvalidModule(
             "continuous Span-fill exact verifier disagrees with match width",
         ));
+    }
+    if layout.complete_span_fill_exact_short.is_some()
+        && complete_span_fill_short_plan(layout).is_none()
+    {
+        return Err(ObjectError::InvalidModule(
+            "continuous Span-fill exact short receipt is malformed",
+        ));
+    }
+    if let Some(short) = complete_span_fill_short_plan(layout) {
+        if !(1..=7).contains(&width)
+            || short.width() != width
+            || !short.is_canonical()
+            || layout.exact_prefix_words.is_some()
+            || layout.prefix_block.is_some()
+        {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span-fill exact short verifier is inconsistent",
+            ));
+        }
+        return Ok(Some(NativeCompleteSpanFillExactVerifier::Short(short)));
     }
     if let Some(words) = layout.exact_prefix_words {
         if !(8..16).contains(&width)
@@ -29573,13 +29713,21 @@ fn select_complete_span_fill_suffix_verifier(
 ) -> Result<Option<NativeCompleteSpanFillExactSurvivorVerifier>, ObjectError> {
     let width = verifier.width();
     let verifier_matches_layout = match verifier {
+        NativeCompleteSpanFillExactVerifier::Short(short) => {
+            complete_span_fill_short_plan(layout) == Some(short)
+                && layout.exact_prefix_words.is_none()
+                && layout.prefix_block.is_none()
+                && (1..=7).contains(&width)
+        }
         NativeCompleteSpanFillExactVerifier::Words(words) => {
-            layout.exact_prefix_words == Some(words)
+            complete_span_fill_short_plan(layout).is_none()
+                && layout.exact_prefix_words == Some(words)
                 && layout.prefix_block.is_none()
                 && (8..16).contains(&width)
         }
         NativeCompleteSpanFillExactVerifier::Block16(block) => {
-            layout.exact_prefix_words.is_none()
+            complete_span_fill_short_plan(layout).is_none()
+                && layout.exact_prefix_words.is_none()
                 && layout.prefix_block == Some(block)
                 && block.lane_mask == u16::MAX
                 && width == 16
@@ -35122,6 +35270,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             exact_span_width,
             exact_prefix_match_width,
             exact_prefix_words,
+            complete_span_fill_exact_short: None,
             output: view.output,
             start_filter,
             exact_start_byte_set,
@@ -51023,6 +51172,9 @@ fn x86_emit_seeded_reverse_prepass(
             ])?; // candidate = exact match start
         }
         match verifier.exact {
+            NativeCompleteSpanFillExactVerifier::Short(short) => {
+                x86_emit_exact_prefix_short(assembler, short, rejected)?;
+            }
             NativeCompleteSpanFillExactVerifier::Words(words) => {
                 x86_emit_exact_prefix_words(assembler, words, rejected)?;
             }
@@ -52301,6 +52453,67 @@ fn x86_emit_exact_prefix_words(
     Ok(())
 }
 
+fn x86_emit_exact_prefix_short(
+    assembler: &mut X86Assembler,
+    short: prefix_block::ExactPrefixShortPlan,
+    failed: X86Label,
+) -> Result<(), ObjectError> {
+    if !short.is_canonical() {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-prefix short plan is malformed",
+        ));
+    }
+    let mut compare = |byte_width: u8, offset: u8, expected: u32| -> Result<(), ObjectError> {
+        let expected_bytes = expected.to_le_bytes();
+        let instruction = match (byte_width, offset) {
+            (1, 0) => vec![0x80, 0x3c, 0x17, expected_bytes[0]],
+            (1, _) => vec![0x80, 0x7c, 0x17, offset, expected_bytes[0]],
+            (2, 0) => {
+                let mut instruction = vec![0x66, 0x81, 0x3c, 0x17];
+                instruction.extend_from_slice(&expected_bytes[..2]);
+                instruction
+            }
+            (4, 0) => {
+                let mut instruction = vec![0x81, 0x3c, 0x17];
+                instruction.extend_from_slice(&expected_bytes);
+                instruction
+            }
+            (4, _) => {
+                let mut instruction = vec![0x81, 0x7c, 0x17, offset];
+                instruction.extend_from_slice(&expected_bytes);
+                instruction
+            }
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "x86 exact-prefix short compare is malformed",
+                ));
+            }
+        };
+        assembler.instruction(&instruction)?;
+        assembler.branch(&[0x0f, 0x85], failed)?;
+        Ok(())
+    };
+    match short.width() {
+        1 => compare(1, 0, short.first())?,
+        2 => compare(2, 0, short.first())?,
+        3 => {
+            compare(2, 0, short.first())?;
+            compare(1, 2, short.first() >> 16)?;
+        }
+        4 => compare(4, 0, short.first())?,
+        5..=7 => {
+            compare(4, 0, short.first())?;
+            compare(4, short.trailing_offset(), short.trailing())?;
+        }
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "x86 exact-prefix short width is malformed",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn x86_emit_prefix_guard_path(
     assembler: &mut X86Assembler,
     layout: NativeDfaLayout,
@@ -52780,6 +52993,11 @@ fn lower_x86_64_dfa_with_entry_contract(
     features: FeatureSet,
     entry_contract: NativeDfaEntryContract,
 ) -> Result<NativeDfaEmission, ObjectError> {
+    if layout.complete_span_fill_exact_short.is_some() && !entry_contract.complete_span_fill() {
+        return Err(ObjectError::InvalidModule(
+            "x86 authenticated exact-short receipt escaped its private entry",
+        ));
+    }
     if !native_default_exception_layout_is_valid(&layout) {
         return Err(ObjectError::InvalidModule(
             "x86 default-exception layout shape",
@@ -71785,6 +72003,25 @@ fn aarch64_load_w_imm(destination: u8, base: u8, byte_offset: u16) -> Result<u32
         | aarch64_reg(destination, 0)?)
 }
 
+/// Unscaled 32-bit load for the overlapping exact-short survivor tail. Its
+/// compiler plan limits the positive displacement to `1..=3` and proves that
+/// all four loaded bytes remain inside the semantic match extent.
+fn aarch64_load_w_unscaled(
+    destination: u8,
+    base: u8,
+    byte_offset: u8,
+) -> Result<u32, ObjectError> {
+    if !(1..=3).contains(&byte_offset) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-short word offset",
+        ));
+    }
+    Ok(0xb840_0000
+        | (u32::from(byte_offset) << 12)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_load_byte_reg(destination: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
     Ok(
         0x3860_6800
@@ -72020,6 +72257,56 @@ fn aarch64_emit_exact_prefix_words(
     compare(0, words.first())?;
     if words.width() > 8 {
         compare(words.trailing_offset(), words.trailing())?;
+    }
+    Ok(())
+}
+
+fn aarch64_emit_exact_prefix_short(
+    assembler: &mut Aarch64Assembler,
+    short: prefix_block::ExactPrefixShortPlan,
+    failed: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if !short.is_canonical() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 exact-prefix short plan is malformed",
+        ));
+    }
+    assembler.instruction(aarch64_add_x_reg(12, 0, 2)?)?;
+    let mut compare = |byte_width: u8, offset: u8, expected: u32| -> Result<(), ObjectError> {
+        let load = match (byte_width, offset) {
+            (1, _) => aarch64_load_byte_imm(8, 12, u16::from(offset))?,
+            (2, 0) => aarch64_load_halfword_imm(8, 12, 0)?,
+            (4, 0) => aarch64_load_w_imm(8, 12, 0)?,
+            (4, 1..=3) => aarch64_load_w_unscaled(8, 12, offset)?,
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 exact-prefix short compare is malformed",
+                ));
+            }
+        };
+        assembler.instruction(load)?;
+        aarch64_load_u32_constant(assembler, 10, expected)?;
+        assembler.instruction(aarch64_cmp_w(8, 10)?)?;
+        assembler.branch_cond(AARCH64_NE, failed)?;
+        Ok(())
+    };
+    match short.width() {
+        1 => compare(1, 0, short.first())?,
+        2 => compare(2, 0, short.first())?,
+        3 => {
+            compare(2, 0, short.first())?;
+            compare(1, 2, short.first() >> 16)?;
+        }
+        4 => compare(4, 0, short.first())?,
+        5..=7 => {
+            compare(4, 0, short.first())?;
+            compare(4, short.trailing_offset(), short.trailing())?;
+        }
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 exact-prefix short width is malformed",
+            ));
+        }
     }
     Ok(())
 }
@@ -79178,6 +79465,11 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy(
     allow_persistent_pair_registers: bool,
     allow_complete_pair_relation_batch: bool,
 ) -> Result<NativeDfaEmission, ObjectError> {
+    if layout.complete_span_fill_exact_short.is_some() && !entry_contract.complete_span_fill() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 authenticated exact-short receipt escaped its private entry",
+        ));
+    }
     if !native_default_exception_layout_is_valid(&layout) {
         return Err(ObjectError::InvalidModule(
             "AArch64 default-exception layout shape",
@@ -90674,7 +90966,14 @@ mod tests {
             .expect("valid AArch64 ASIMD target");
         for target in [Target::x86_64_linux(), aarch64_asimd] {
             for (pattern, width) in [
-                ("abcdefgh", 8_usize),
+                ("a", 1_usize),
+                ("ab", 2),
+                ("abc", 3),
+                ("abcd", 4),
+                ("abcde", 5),
+                ("abcdef", 6),
+                ("abcdefg", 7),
+                ("abcdefgh", 8),
                 ("abcdefghi", 9),
                 ("Sherlock Holmes", 15),
                 ("Sherlock Holmes!", 16),
@@ -90686,11 +90985,20 @@ mod tests {
                 let recipe_scope = complete_span_fill_recipe_scope(true);
                 let scoped = compile(request).expect("compile continuous exact singleton");
                 drop(recipe_scope);
-                let source = *scoped
+                let raw_source = *scoped
                     .module()
                     .native_complete_span_reduce_source
                     .as_deref()
                     .unwrap_or_else(|| panic!("missing width-{width} continuous source"));
+                let trusted_core = scoped
+                    .module()
+                    .native_direct_search_trusted_core
+                    .expect("continuous source public trusted core");
+                let source = scoped
+                    .module()
+                    .authenticate_complete_span_fill_source(trusted_core)
+                    .expect("authenticate continuous source")
+                    .unwrap_or_else(|| panic!("missing width-{width} authenticated source"));
                 assert_eq!(
                     scoped
                         .module()
@@ -90700,6 +91008,12 @@ mod tests {
                     *ordinary.module(),
                     "recipe changed the width-{width} ordinary entry for {target:?}",
                 );
+                assert_eq!(
+                    source.layout.complete_span_fill_exact_short.is_some(),
+                    width <= 7,
+                    "width-{width} authenticated short receipt for {target:?}",
+                );
+                assert!(raw_source.layout.complete_span_fill_exact_short.is_none());
 
                 let verifier = derive_complete_span_fill_exact_verifier(
                     source.layout,
@@ -90707,9 +91021,22 @@ mod tests {
                     true,
                 )
                 .expect("authenticate exact verifier layout")
-                .unwrap_or_else(|| panic!("missing width-{width} verifier for {target:?}"));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing width-{width} verifier for {target:?}: start={:?} exact_start={:?} prefix={:?} relation={:?} block={:?}",
+                        source.layout.start_filter,
+                        source.layout.exact_start_byte_set,
+                        source.layout.prefix_filter,
+                        source.layout.prefix_relation,
+                        source.layout.prefix_block,
+                    )
+                });
                 assert_eq!(usize::from(verifier.width()), width);
                 match (width, verifier) {
+                    (1..=7, NativeCompleteSpanFillExactVerifier::Short(short)) => {
+                        assert_eq!(usize::from(short.width()), width);
+                        assert!(short.is_canonical());
+                    }
                     (8..=15, NativeCompleteSpanFillExactVerifier::Words(words)) => {
                         assert_eq!(usize::from(words.width()), width);
                     }
@@ -90736,7 +91063,11 @@ mod tests {
                 let reverse = source
                     .layout
                     .seeded_reverse
-                    .expect("exact singleton seeded reverse proof");
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "width-{width} {target:?} has no exact singleton seeded reverse proof; suffix={suffix:?}"
+                        )
+                    });
                 let width_u8 = u8::try_from(width).expect("small exact width");
                 let scalar_filter = suffix
                     .exact_pair_filter
@@ -90786,31 +91117,35 @@ mod tests {
                 if width == 15 {
                     assert_eq!(selected.candidate_backtrack, 7);
                 }
-                assert!(
-                    select_complete_span_fill_suffix_verifier(
-                        source.layout,
-                        suffix,
-                        reverse,
-                        verifier,
-                        suffix.minimum_width - 2,
-                    )
-                    .expect("undersized scanner geometry is not malformed")
-                    .is_none(),
-                    "width-{width} verifier accepted an undersized scanner bound",
-                );
-                let mut misaligned_reverse = reverse;
-                misaligned_reverse.boundary_offset -= 1;
-                assert!(
-                    select_complete_span_fill_suffix_verifier(
-                        source.layout,
-                        suffix,
-                        misaligned_reverse,
-                        verifier,
-                        width_u8 - 1,
-                    )
-                    .is_err(),
-                    "width-{width} verifier accepted a misaligned survivor",
-                );
+                if let Some(undersized) = suffix.minimum_width.checked_sub(2) {
+                    assert!(
+                        select_complete_span_fill_suffix_verifier(
+                            source.layout,
+                            suffix,
+                            reverse,
+                            verifier,
+                            undersized,
+                        )
+                        .expect("undersized scanner geometry is not malformed")
+                        .is_none(),
+                        "width-{width} verifier accepted an undersized scanner bound",
+                    );
+                }
+                if reverse.boundary_offset != 0 {
+                    let mut misaligned_reverse = reverse;
+                    misaligned_reverse.boundary_offset -= 1;
+                    assert!(
+                        select_complete_span_fill_suffix_verifier(
+                            source.layout,
+                            suffix,
+                            misaligned_reverse,
+                            verifier,
+                            width_u8.saturating_sub(1),
+                        )
+                        .is_err(),
+                        "width-{width} verifier accepted a misaligned survivor",
+                    );
+                }
                 let mut wrong_backtrack = suffix;
                 wrong_backtrack.restart = NativeSuffixRestart::Bounded {
                     backtrack: u64::from(selected.candidate_backtrack) + 1,
@@ -90827,6 +91162,44 @@ mod tests {
                     .is_none(),
                     "width-{width} verifier accepted a wrong candidate displacement",
                 );
+                if width <= 7 {
+                    let mut declined_layout = source.layout;
+                    declined_layout.suffix_filter = Some(wrong_backtrack);
+                    let mut incumbent_layout = declined_layout;
+                    incumbent_layout.complete_span_fill_exact_short = None;
+                    let lower = |layout| match target.architecture {
+                        Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                            layout,
+                            target.features,
+                            NativeDfaEntryContract::CompleteSpanFillV1,
+                        ),
+                        Architecture::Aarch64 => {
+                            lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                                layout,
+                                target.features,
+                                target.operating_system,
+                                source.aarch64_sve_filter_plan,
+                                source.aarch64_sve_suffix_kind,
+                                NativeDfaEntryContract::CompleteSpanFillV1,
+                            )
+                        }
+                    };
+                    let declined = lower(declined_layout)
+                        .expect("lower short verifier geometry decline");
+                    let incumbent = lower(incumbent_layout)
+                        .expect("lower short verifier incumbent");
+                    assert_eq!(
+                        declined.code, incumbent.code,
+                        "width-{width} {target:?} decline changed incumbent text",
+                    );
+                    assert_eq!(
+                        declined.relocations, incumbent.relocations,
+                        "width-{width} {target:?} decline changed incumbent relocations",
+                    );
+                    assert_eq!(declined.scanner, incumbent.scanner);
+                    assert_eq!(declined.suffix_scanner, incumbent.suffix_scanner);
+                    assert_eq!(declined.conjunction, incumbent.conjunction);
+                }
                 let mut unsupported_restart = suffix;
                 unsupported_restart.restart = NativeSuffixRestart::OriginalStart;
                 assert!(
@@ -90862,6 +91235,46 @@ mod tests {
                 .expect("lower exact survivor verifier");
                 assert_eq!(emission.semantic_call_instructions, 0);
                 assert!(!emission.code.is_empty());
+
+                if width <= 7 {
+                    let appended = scoped
+                        .module()
+                        .clone()
+                        .append_direct_span_fill(OutputContract::Span)
+                        .expect("append authenticated short continuous fill")
+                        .expect("short continuous fill eligibility");
+                    assert_eq!(
+                        appended.direct_span_fill_strategy(),
+                        Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1),
+                    );
+                    let symbol = &appended.symbols[appended
+                        .direct_span_fill_symbol_index
+                        .expect("short continuous fill symbol")];
+                    let start = usize::try_from(symbol.offset).expect("short fill offset");
+                    let size = usize::try_from(symbol.size).expect("short fill size");
+                    assert_eq!(size, emission.code.len());
+                    assert_eq!(
+                        appended.sections[TEXT_SECTION]
+                            .bytes()
+                            .get(start..start + size),
+                        Some(emission.code.as_slice()),
+                    );
+                }
+
+                if width == 1 {
+                    let mut forged = scoped.module().clone();
+                    forged
+                        .native_complete_span_reduce_source
+                        .as_mut()
+                        .expect("continuous source")
+                        .layout
+                        .complete_span_fill_exact_short =
+                        source.layout.complete_span_fill_exact_short;
+                    assert!(
+                        forged.append_direct_span_fill(OutputContract::Span).is_err(),
+                        "{target:?} admitted a short receipt before program authentication",
+                    );
+                }
             }
         }
     }
@@ -96729,6 +97142,7 @@ mod tests {
             exact_span_width: (output == OutputContract::Span).then_some(1),
             exact_prefix_match_width: None,
             exact_prefix_words: None,
+            complete_span_fill_exact_short: None,
             output,
             start_filter: None,
             exact_start_byte_set: None,
@@ -96982,6 +97396,7 @@ mod tests {
             exact_span_width: None,
             exact_prefix_match_width: None,
             exact_prefix_words: None,
+            complete_span_fill_exact_short: None,
             output: OutputContract::SelectedEnd,
             start_filter: None,
             exact_start_byte_set: None,
@@ -97164,6 +97579,7 @@ mod tests {
             exact_span_width: (output == OutputContract::Span).then_some(1),
             exact_prefix_match_width: None,
             exact_prefix_words: None,
+            complete_span_fill_exact_short: None,
             output,
             start_filter: None,
             exact_start_byte_set: None,
@@ -97325,6 +97741,7 @@ mod tests {
             exact_span_width: (output == OutputContract::Span).then_some(1),
             exact_prefix_match_width: None,
             exact_prefix_words: None,
+            complete_span_fill_exact_short: None,
             output,
             start_filter: None,
             exact_start_byte_set: None,
@@ -159997,6 +160414,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             exact_span_width: None,
             exact_prefix_match_width: None,
             exact_prefix_words: None,
+            complete_span_fill_exact_short: None,
             output: OutputContract::SelectedEnd,
             start_filter: None,
             exact_start_byte_set: None,
@@ -162342,6 +162760,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             exact_span_width: None,
             exact_prefix_match_width: None,
             exact_prefix_words: None,
+            complete_span_fill_exact_short: None,
             output: OutputContract::Span,
             start_filter: None,
             exact_start_byte_set: None,
@@ -162541,6 +162960,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             exact_span_width: None,
             exact_prefix_match_width: None,
             exact_prefix_words: None,
+            complete_span_fill_exact_short: None,
             output: OutputContract::Exists,
             start_filter: Some(start_filter),
             exact_start_byte_set: None,

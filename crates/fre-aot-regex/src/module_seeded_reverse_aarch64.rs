@@ -838,6 +838,9 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
             )?)?;
         }
         match verifier.exact {
+            NativeCompleteSpanFillExactVerifier::Short(short) => {
+                aarch64_emit_exact_prefix_short(assembler, short, rejected)?;
+            }
             NativeCompleteSpanFillExactVerifier::Words(words) => {
                 aarch64_emit_exact_prefix_words(assembler, words, rejected)?;
             }
@@ -1044,6 +1047,7 @@ mod tests {
             prefix_relation: None,
             prefix_block: None,
             exact_prefix_words: None,
+            complete_span_fill_exact_short: None,
             prefix_fast_forward: None,
         };
         (layout, suffix, reverse)

@@ -60,6 +60,60 @@ impl ExactPrefixWordPlan {
     }
 }
 
+/// Exact-size scalar words that cover one exact 1..=7-byte product.
+///
+/// Widths one through four use byte, halfword and word loads (three bytes use
+/// one halfword plus one byte). Widths five through seven use two overlapping
+/// words, with the second starting at `width - 4`. Thus no load extends past
+/// the semantic match extent. Like the long-word plan, these constants remain
+/// compiler-only and do not consume target data bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactPrefixShortPlan {
+    width: u8,
+    first: u32,
+    trailing: u32,
+}
+
+impl ExactPrefixShortPlan {
+    #[must_use]
+    pub(crate) const fn width(self) -> u8 {
+        self.width
+    }
+
+    #[must_use]
+    pub(crate) const fn first(self) -> u32 {
+        self.first
+    }
+
+    #[must_use]
+    pub(crate) const fn trailing(self) -> u32 {
+        self.trailing
+    }
+
+    #[must_use]
+    pub(crate) const fn trailing_offset(self) -> u8 {
+        if self.width >= 5 {
+            self.width - 4
+        } else {
+            0
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn is_canonical(self) -> bool {
+        match self.width {
+            1 => self.first <= u8::MAX as u32 && self.trailing == 0,
+            2 => self.first <= u16::MAX as u32 && self.trailing == 0,
+            3 => self.first <= 0x00ff_ffff && self.trailing == 0,
+            4 => self.trailing == 0,
+            5 => (self.first >> 8) == (self.trailing & 0x00ff_ffff),
+            6 => (self.first >> 16) == (self.trailing & 0x0000_ffff),
+            7 => (self.first >> 24) == (self.trailing & 0x0000_00ff),
+            _ => false,
+        }
+    }
+}
+
 impl PrefixBlockPlan {
     #[must_use]
     pub(crate) const fn expected(self) -> [u8; PREFIX_BLOCK_BYTES] {
@@ -165,6 +219,40 @@ pub(crate) fn derive_exact_words(
     })
 }
 
+/// Pack an independently authenticated exact short product into in-bounds
+/// scalar compares.
+///
+/// This is deliberately separate from [`derive_exact_words`]: the ordinary
+/// direct-entry prefix guard keeps its established 8..=15-byte plan and byte
+/// image, while the private continuous Span-fill entry may consume this
+/// cheaper survivor receipt.
+#[must_use]
+pub(crate) fn exact_short_from_bytes(bytes: &[u8]) -> Option<ExactPrefixShortPlan> {
+    let width = bytes.len();
+    if !(1..8).contains(&width) {
+        return None;
+    }
+    let first_width = width.min(4);
+    let mut first_bytes = [0_u8; 4];
+    first_bytes[..first_width].copy_from_slice(&bytes[..first_width]);
+    let trailing = if width >= 5 {
+        let trailing_offset = width.checked_sub(4)?;
+        u32::from_le_bytes(
+            bytes
+                .get(trailing_offset..trailing_offset + 4)?
+                .try_into()
+                .ok()?,
+        )
+    } else {
+        0
+    };
+    Some(ExactPrefixShortPlan {
+        width: u8::try_from(width).ok()?,
+        first: u32::from_le_bytes(first_bytes),
+        trailing,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +346,31 @@ mod tests {
             assert!(covered[..width].iter().all(|covered| *covered));
             assert!(covered[width..].iter().all(|covered| !*covered));
         }
+    }
+
+    #[test]
+    fn short_exact_words_use_only_in_bounds_scalar_chunks() {
+        let bytes = *b"abcdefg";
+        for width in 1_usize..=7 {
+            let plan = exact_short_from_bytes(&bytes[..width]).unwrap();
+            assert!(plan.is_canonical());
+            let first = plan.first().to_le_bytes();
+            let first_width = width.min(4);
+            assert_eq!(&first[..first_width], &b"abcdefg"[..first_width]);
+            assert!(first[first_width..].iter().all(|byte| *byte == 0));
+            if width >= 5 {
+                let offset = width - 4;
+                assert_eq!(
+                    &plan.trailing().to_le_bytes()[..4],
+                    &b"abcdefg"[offset..width],
+                );
+                assert_eq!(usize::from(plan.trailing_offset()), offset);
+            } else {
+                assert_eq!(plan.trailing(), 0);
+            }
+        }
+        assert!(exact_short_from_bytes(&[]).is_none());
+        assert!(exact_short_from_bytes(b"abcdefgh").is_none());
     }
 
     #[test]
