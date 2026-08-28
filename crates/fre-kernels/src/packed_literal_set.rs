@@ -1548,6 +1548,24 @@ impl PackedLiteralSetPlan {
         Ok(self.find_window_value_unmetered_validated(haystack, window, iterator_native))
     }
 
+    #[inline]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the validated window and relative match endpoint prove the absolute endpoint fits"
+    )]
+    fn selected_end_window_value_unmetered_with_native(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        iterator_native: Option<&Searcher>,
+    ) -> Result<Option<usize>, PackedLiteralSetError> {
+        validate_window(window, haystack.len())?;
+        let window_bytes = &haystack[window.start()..window.end()];
+        Ok(self
+            .find_relative_unmetered_with_native(window_bytes, iterator_native)
+            .map(|(_, relative_end)| window.start() + relative_end))
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "the validated slice and packed engine contracts prove these window-relative additions"
@@ -1561,7 +1579,22 @@ impl PackedLiteralSetPlan {
     ) -> Option<(usize, usize)> {
         debug_assert!(window.start() <= window.end() && window.end() <= haystack.len());
         let window_bytes = &haystack[window.start()..window.end()];
-        let matched = if let Some(native) = iterator_native {
+        self.find_relative_unmetered_with_native(window_bytes, iterator_native)
+            .map(|(relative_start, relative_end)| {
+                (
+                    window.start() + relative_start,
+                    window.start() + relative_end,
+                )
+            })
+    }
+
+    #[inline]
+    fn find_relative_unmetered_with_native(
+        &self,
+        window_bytes: &[u8],
+        iterator_native: Option<&Searcher>,
+    ) -> Option<(usize, usize)> {
+        if let Some(native) = iterator_native {
             native
                 .find(window_bytes)
                 .map(|matched| (matched.start(), matched.end()))
@@ -1590,13 +1623,7 @@ impl PackedLiteralSetPlan {
                 } => find_native_shared_columns(searcher, shared_columns, window_bytes),
                 PackedLiteralEngine::Factored(factored) => factored.find(window_bytes),
             }
-        };
-        matched.map(|(relative_start, relative_end)| {
-            (
-                window.start() + relative_start,
-                window.start() + relative_end,
-            )
-        })
+        }
     }
 
     #[allow(
@@ -1823,6 +1850,10 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
     }
 
     /// Return only the selected ordered span's endpoint inside `window`.
+    ///
+    /// The construction-selected relative engine is shared with span search,
+    /// but this projection rebases only its endpoint and never constructs the
+    /// discarded absolute start.
     #[doc(hidden)]
     #[inline]
     pub fn selected_end_window_value(
@@ -1830,8 +1861,8 @@ impl PackedLiteralSetOrdinaryExecutor<'_> {
         haystack: &[u8],
         window: Window,
     ) -> Result<Option<usize>, PackedLiteralSetError> {
-        self.find_window_value(haystack, window)
-            .map(|matched| matched.map(|(_, end)| end))
+        self.plan
+            .selected_end_window_value_unmetered_with_native(haystack, window, None)
     }
 
     /// Visit non-overlapping positive-width spans without finite accounting.

@@ -5144,6 +5144,31 @@ fn capture_free_name_metadata() -> CaptureNameMetadata {
     }
 }
 
+/// Consume the exact literal leaf authenticated by the capture-transparent
+/// singleton handoff.
+///
+/// The borrowed handoff closes before this function is called. Consequently,
+/// reaching any other HIR kind indicates an internal disagreement between the
+/// proof and the same immutable HIR owner, not a semantic fallback.
+fn into_capture_transparent_literal_box(mut hir: Hir) -> Result<Box<[u8]>, BuildError> {
+    loop {
+        match hir.into_kind() {
+            HirKind::Capture(capture) => hir = *capture.sub,
+            HirKind::Literal(literal) => return Ok(literal.0),
+            HirKind::Empty
+            | HirKind::Class(_)
+            | HirKind::Look(_)
+            | HirKind::Repetition(_)
+            | HirKind::Concat(_)
+            | HirKind::Alternation(_) => {
+                return Err(BuildError::InternalInvariant(
+                    "singleton literal handoff disagreed with its owned HIR",
+                ));
+            }
+        }
+    }
+}
+
 /// Per-search accounting with the selected plan kept explicit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SearchAccounting {
@@ -6148,6 +6173,30 @@ impl RipgrepStandardLiteralByteCensusAccumulator {
         }
     }
 
+    #[inline]
+    fn classify_fixed(
+        &mut self,
+        text: &str,
+        forbidden_byte: Option<u8>,
+    ) -> Option<(u64, bool)> {
+        match self {
+            Self::Bitset(census) => {
+                classify_ripgrep_literal_text_with_recorder::<false>(
+                    text,
+                    forbidden_byte,
+                    |byte| census.insert(byte),
+                )
+            }
+            Self::Presence(presence) => {
+                classify_ripgrep_literal_text_with_recorder::<false>(
+                    text,
+                    forbidden_byte,
+                    |byte| presence[usize::from(byte)] = true,
+                )
+            }
+        }
+    }
+
     fn into_census(self) -> RipgrepStandardLiteralByteCensus {
         match self {
             Self::Bitset(census) => census,
@@ -6238,6 +6287,9 @@ struct RipgrepStandardLiteralContext {
     source: Box<str>,
     admission: AdmissionStatus,
     syntax: ParseSummary,
+    // Authentication already visits every positive literal. Retain its exact
+    // minimum so typed publication does not rescan the complete borrowed set.
+    minimum_match_bytes: usize,
 }
 
 /// Already-derived facade fields moved only into the authenticated large flat
@@ -6723,6 +6775,10 @@ fn build_ripgrep_flat_literal_handoff(
 
 impl RipgrepStandardLiteralContext {
     fn with_hir(self, hir: Hir) -> PortableParsedBuildContext {
+        debug_assert_eq!(
+            hir.properties().minimum_len(),
+            Some(self.minimum_match_bytes),
+        );
         PortableParsedBuildContext {
             source: self.source,
             admission: self.admission,
@@ -6852,6 +6908,63 @@ fn append_ripgrep_literal_source<const META_REJECTED: bool>(
     }
 }
 
+#[inline(always)]
+fn append_ripgrep_fixed_escape_free_literal(
+    source: &mut String,
+    text: &str,
+) {
+    // Authentication has already established non-emptiness. Decode only the
+    // first scalar to reproduce the pinned HIR printer's grouping decision.
+    let grouped = text
+        .chars()
+        .next()
+        .is_some_and(|first| first.len_utf8() < text.len());
+    if grouped {
+        source.push_str("(?:");
+    }
+    source.push_str(text);
+    if grouped {
+        source.push(')');
+    }
+}
+
+/// Publish the typed fixed-string source after authentication proved that no
+/// literal contains a regex metacharacter.
+///
+/// Keep this complete second pass out of the shared construction body. The
+/// incumbent serializer remains unchanged for every mixed or escaped set,
+/// while the admitted path copies each already-validated UTF-8 string without
+/// decoding all of its scalars again in `regex_syntax::escape_into`.
+#[cold]
+#[inline(never)]
+fn build_ripgrep_fixed_escape_free_source<'literal, Literal, LiteralAt>(
+    pattern_count: usize,
+    literal_at: &LiteralAt,
+    source_bytes: usize,
+) -> Option<String>
+where
+    Literal: RipgrepStandardLiteral<'literal>,
+    LiteralAt: Fn(usize) -> Option<Literal>,
+{
+    let mut source = String::with_capacity(source_bytes);
+    if pattern_count >= 2 {
+        source.push_str("(?:");
+        for index in 0..pattern_count {
+            if index != 0 {
+                source.push('|');
+            }
+            let text = literal_at(index)?.text()?;
+            append_ripgrep_fixed_escape_free_literal(&mut source, text);
+        }
+        source.push(')');
+    } else {
+        let text = literal_at(0)?.text()?;
+        append_ripgrep_fixed_escape_free_literal(&mut source, text);
+    }
+    debug_assert_eq!(source.len(), source_bytes);
+    Some(source)
+}
+
 /// Validate the facts unique to ripgrep's typed literal handoff and report
 /// whether the literal needs the pinned HIR Printer's non-capturing group.
 ///
@@ -6885,17 +6998,35 @@ fn classify_ripgrep_standard_literal_text_with_recorder(
     forbidden_byte: Option<u8>,
     mut record: impl FnMut(u8),
 ) -> Option<bool> {
+    classify_ripgrep_literal_text_with_recorder::<true>(
+        text,
+        forbidden_byte,
+        &mut record,
+    )
+    .map(|(_escapes, grouped)| grouped)
+}
+
+#[inline]
+fn classify_ripgrep_literal_text_with_recorder<const REJECT_META_CHARACTERS: bool>(
+    text: &str,
+    forbidden_byte: Option<u8>,
+    mut record: impl FnMut(u8),
+) -> Option<(u64, bool)> {
     let first = text.chars().next()?;
+    let mut escapes = 0_u64;
     for &byte in text.as_bytes() {
-        if byte == b'\n'
-            || forbidden_byte == Some(byte)
-            || (byte.is_ascii() && regex_syntax::is_meta_character(char::from(byte)))
-        {
+        if byte == b'\n' || forbidden_byte == Some(byte) {
             return None;
+        }
+        if byte.is_ascii() && regex_syntax::is_meta_character(char::from(byte)) {
+            if REJECT_META_CHARACTERS {
+                return None;
+            }
+            escapes = escapes.checked_add(1)?;
         }
         record(byte);
     }
-    Some(first.len_utf8() < text.len())
+    Some((escapes, first.len_utf8() < text.len()))
 }
 
 /// Authenticate the literal shape used by ripgrep's ordinary, case-sensitive
@@ -6926,7 +7057,7 @@ where
     Literal: RipgrepStandardLiteral<'literal>,
     LiteralAt: Fn(usize) -> Option<Literal>,
 {
-    ripgrep_standard_literal_context_from_with_census::<_, _, REJECT_META_CHARACTERS>(
+    ripgrep_standard_literal_context_from_impl::<_, _, REJECT_META_CHARACTERS, false>(
         pattern_count,
         literal_at,
         limits,
@@ -6957,7 +7088,38 @@ where
     Literal: RipgrepStandardLiteral<'literal>,
     LiteralAt: Fn(usize) -> Option<Literal>,
 {
-    if REJECT_META_CHARACTERS && !matches!(forbidden_byte, None | Some(b'\x00')) {
+    ripgrep_standard_literal_context_from_impl::<_, _, REJECT_META_CHARACTERS, true>(
+        pattern_count,
+        literal_at,
+        limits,
+        canonical_source_limit,
+        forbidden_byte,
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn ripgrep_standard_literal_context_from_impl<
+    'literal,
+    Literal,
+    LiteralAt,
+    const REJECT_META_CHARACTERS: bool,
+    const COLLECT_BYTE_CENSUS: bool,
+>(
+    pattern_count: usize,
+    literal_at: LiteralAt,
+    limits: BuildLimits,
+    canonical_source_limit: usize,
+    forbidden_byte: Option<u8>,
+) -> Option<(
+    RipgrepStandardLiteralContext,
+    Option<RipgrepStandardLiteralByteCensus>,
+)>
+where
+    Literal: RipgrepStandardLiteral<'literal>,
+    LiteralAt: Fn(usize) -> Option<Literal>,
+{
+    if COLLECT_BYTE_CENSUS && !matches!(forbidden_byte, None | Some(b'\x00')) {
         return None;
     }
     let pattern_count_u64 = u64::try_from(pattern_count).ok()?;
@@ -6996,6 +7158,12 @@ where
     }
 
     let mut literal_bytes = 0_u64;
+    let mut minimum_match_bytes = usize::MAX;
+    // Only the census-carrying fixed-string seam may consume this fact. Its
+    // mandatory validation already classifies every metacharacter while
+    // deriving the exact escaped-source envelope.
+    let mut typed_fixed_escape_free =
+        COLLECT_BYTE_CENSUS && !REJECT_META_CHARACTERS;
     let mut source_bytes = if pattern_count >= 2 {
         // The pinned HIR Printer wraps every alternation in `(?:...)` and
         // places one `|` between branches. Since `hir_nodes` is the branch
@@ -7029,13 +7197,14 @@ where
     }
     let mut all_single_character = true;
     let mut literal_byte_census =
-        REJECT_META_CHARACTERS.then_some(RipgrepStandardLiteralByteCensusAccumulator::empty());
+        COLLECT_BYTE_CENSUS.then_some(RipgrepStandardLiteralByteCensusAccumulator::empty());
     for index in 0..pattern_count {
         let literal = literal_at(index)?;
         let bytes_slice = literal.bytes();
         if bytes_slice.is_empty() {
             return None;
         }
+        minimum_match_bytes = minimum_match_bytes.min(bytes_slice.len());
         let bytes = u64::try_from(bytes_slice.len()).ok()?;
         let next_literal_bytes = literal_bytes.checked_add(bytes)?;
         let unescaped_source_bytes = source_bytes.checked_add(bytes)?;
@@ -7046,12 +7215,22 @@ where
             return None;
         }
         let text = literal.text()?;
-        let (escapes, grouped) = if REJECT_META_CHARACTERS {
-            let Some(census) = literal_byte_census.as_mut() else {
-                return None;
-            };
+        let (escapes, grouped) = if let Some(census) = literal_byte_census.as_mut() {
             census.prepare_for_cumulative_bytes(next_literal_bytes);
-            (0_u64, census.classify(text, forbidden_byte)?)
+            if REJECT_META_CHARACTERS {
+                (0_u64, census.classify(text, forbidden_byte)?)
+            } else {
+                census.classify_fixed(text, forbidden_byte)?
+            }
+        } else if REJECT_META_CHARACTERS {
+            (
+                0_u64,
+                classify_ripgrep_standard_literal_text_with_recorder(
+                    text,
+                    forbidden_byte,
+                    |_| {},
+                )?,
+            )
         } else {
             // Raw HIR bytes independently validate UTF-8 above and retain
             // the incumbent scalar scan and exact escaping calculation.
@@ -7079,10 +7258,11 @@ where
         if !within_source_and_work(escaped_source_bytes, next_literal_bytes) {
             return None;
         }
+        typed_fixed_escape_free &= escapes == 0;
         literal_bytes = next_literal_bytes;
         source_bytes = escaped_source_bytes;
     }
-    if REJECT_META_CHARACTERS && all_single_character {
+    if (REJECT_META_CHARACTERS || COLLECT_BYTE_CENSUS) && all_single_character {
         // The pinned HIR smart constructor collapses this shape into one
         // Unicode class, so it is not the incumbent flat-literal terminal.
         return None;
@@ -7094,27 +7274,36 @@ where
         .checked_add(literal_bytes)?;
     debug_assert!(within_source_and_work(source_bytes, literal_bytes));
 
-    let mut source = String::with_capacity(source_bytes_usize);
-    if pattern_count >= 2 {
-        source.push_str("(?:");
-        for index in 0..pattern_count {
-            if index != 0 {
-                source.push('|');
+    let source = if typed_fixed_escape_free {
+        build_ripgrep_fixed_escape_free_source::<Literal, _>(
+            pattern_count,
+            &literal_at,
+            source_bytes_usize,
+        )?
+    } else {
+        let mut source = String::with_capacity(source_bytes_usize);
+        if pattern_count >= 2 {
+            source.push_str("(?:");
+            for index in 0..pattern_count {
+                if index != 0 {
+                    source.push('|');
+                }
+                let text = literal_at(index)?.text()?;
+                append_ripgrep_literal_source::<REJECT_META_CHARACTERS>(
+                    &mut source,
+                    text,
+                );
             }
-            let text = literal_at(index)?.text()?;
+            source.push(')');
+        } else {
+            let text = literal_at(0)?.text()?;
             append_ripgrep_literal_source::<REJECT_META_CHARACTERS>(
                 &mut source,
                 text,
             );
         }
-        source.push(')');
-    } else {
-        let text = literal_at(0)?.text()?;
-        append_ripgrep_literal_source::<REJECT_META_CHARACTERS>(
-            &mut source,
-            text,
-        );
-    }
+        source
+    };
     debug_assert_eq!(source.len(), source_bytes_usize);
 
     Some((
@@ -7135,6 +7324,7 @@ where
                 largest_finite_repeat: None,
                 guarantees_valid_utf8_nonempty: true,
             },
+            minimum_match_bytes,
         },
         literal_byte_census.map(RipgrepStandardLiteralByteCensusAccumulator::into_census),
     ))
@@ -7744,7 +7934,7 @@ impl PortableBuilder {
         {
             return Ok(None);
         }
-        self.build_ripgrep_standard_literal_bytes_with_census(
+        self.build_ripgrep_standard_literal_bytes_with_census::<_, _, true>(
             patterns,
             canonical_source_limit,
             None,
@@ -7803,7 +7993,7 @@ impl PortableBuilder {
         {
             return Ok(None);
         }
-        self.build_ripgrep_standard_literal_bytes_with_census(
+        self.build_ripgrep_standard_literal_bytes_with_census::<_, _, true>(
             patterns,
             canonical_source_limit,
             forbidden_byte,
@@ -7811,7 +8001,50 @@ impl PortableBuilder {
         )
     }
 
-    fn build_ripgrep_standard_literal_bytes_with_census<T, F>(
+    /// Build explicitly fixed strings, including regex metacharacters, from
+    /// ripgrep's authenticated ordinary literal receipt.
+    ///
+    /// This differs from
+    /// [`Self::build_ripgrep_standard_literals_ordinary_with_census`] only in
+    /// treating every input character as literal data when deriving the exact
+    /// canonical source. Callers must select this seam only from explicit
+    /// fixed-string configuration. Every value, resource and engine decline
+    /// remains `Ok(None)` for the unchanged configured-HIR fallback.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    pub fn build_ripgrep_fixed_literals_ordinary_with_census(
+        self,
+        patterns: &[&str],
+        canonical_source_limit: usize,
+        forbidden_byte: Option<u8>,
+    ) -> Result<
+        Option<(
+            RipgrepStandardLiteralsBuild,
+            RipgrepStandardLiteralByteCensus,
+        )>,
+        BuildError,
+    > {
+        if patterns.len() < 2
+            || !matches!(forbidden_byte, None | Some(b'\x00'))
+        {
+            return Ok(None);
+        }
+        self.build_ripgrep_standard_literal_bytes_with_census::<_, _, false>(
+            patterns,
+            canonical_source_limit,
+            forbidden_byte,
+            publish_ripgrep_borrowed_flat_literal_set_ordinary,
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn build_ripgrep_standard_literal_bytes_with_census<
+        T,
+        F,
+        const REJECT_META_CHARACTERS: bool,
+    >(
         self,
         pattern_texts: &[&str],
         canonical_source_limit: usize,
@@ -7830,7 +8063,11 @@ impl PortableBuilder {
             return Ok(None);
         }
         let Some((context, literal_byte_census)) =
-            ripgrep_standard_literal_context_from_with_census::<_, _, true>(
+            ripgrep_standard_literal_context_from_with_census::<
+                _,
+                _,
+                REJECT_META_CHARACTERS,
+            >(
                 pattern_texts.len(),
                 |index| pattern_texts.get(index).copied(),
                 self.limits,
@@ -7867,7 +8104,7 @@ impl PortableBuilder {
         if planner_work > self.limits.max_planner_work {
             return Ok(None);
         }
-        let minimum_match_bytes = patterns.iter().map(|pattern| pattern.len()).min();
+        let minimum_match_bytes = Some(context.minimum_match_bytes);
         let source_storage_bytes = context.source.len();
         let CaptureNameMetadata {
             names: capture_names,
@@ -9413,14 +9650,59 @@ impl PortableBuilder {
                 .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
         }
-        let singleton_literal = singleton_literal_handoff
-            .as_ref()
-            .map(finite::SingletonLiteralHandoff::literal)
-            .or_else(|| {
-                finite_words
-                    .as_ref()
-                    .and_then(|words| (words.len() == 1).then(|| words[0].as_slice()))
+        if let Some(singleton_literal_handoff) = singleton_literal_handoff {
+            let borrowed_literal = singleton_literal_handoff.literal();
+            let literal = if borrowed_literal.is_empty() {
+                LiteralPlan::new(borrowed_literal, self.limits.literal)?
+            } else {
+                let authenticated_pointer = borrowed_literal.as_ptr();
+                let authenticated_bytes = borrowed_literal.len();
+                // Only copied identity facts survive this point, so the
+                // handoff's borrow ends before its exact HIR owner moves.
+                let owned = into_capture_transparent_literal_box(rust.hir)?;
+                if owned.len() != authenticated_bytes || owned.as_ptr() != authenticated_pointer {
+                    return Err(BuildError::InternalInvariant(
+                        "owned singleton literal differs from its authenticated borrow",
+                    ));
+                }
+                LiteralPlan::from_owned_box(owned, self.limits.literal)?
+            };
+            let storage = literal.storage_bytes();
+            return Ok(PortableRegex {
+                source,
+                capture_names,
+                line_total_grep_plan,
+                plan: PortablePlan::ExactLiteral(literal),
+                profile: profile.clone(),
+                limits: self.limits,
+                selection: self.selection,
+                report: BuildReport {
+                    profile: profile.clone(),
+                    admission,
+                    syntax,
+                    plan: PlanKind::ExactLiteral,
+                    planner_work: finite_work,
+                    lowering: None,
+                    states: 0,
+                    edges: 0,
+                    plan_storage_bytes: storage,
+                    source_storage_bytes,
+                    capture_name_storage_bytes,
+                    charged_persistent_bytes: 0,
+                    persistent_byte_limit: 0,
+                    captures_len,
+                    static_captures_len,
+                    minimum_match_bytes,
+                    required_literal: None,
+                    literal_class_run_literal: None,
+                    forward_anchored: None,
+                }
+                .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
             });
+        }
+        let singleton_literal = finite_words
+            .as_ref()
+            .and_then(|words| (words.len() == 1).then(|| words[0].as_slice()));
         if let Some(singleton_literal) = singleton_literal {
             let literal = LiteralPlan::new(singleton_literal, self.limits.literal)?;
             let storage = literal.storage_bytes();
@@ -14750,6 +15032,12 @@ impl PortableRegex {
                     )
                 }
             }
+            PortablePlan::FixedPredicateWord64(plan) => {
+                PortableOrdinarySessionPlan::FixedPredicateWord64 { plan }
+            }
+            PortablePlan::LineDomainByteAtoms(plan) => {
+                PortableOrdinarySessionPlan::LineDomainByteAtoms { plan }
+            }
             PortablePlan::K0(k0) => {
                 let positive =
                     matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0);
@@ -16166,8 +16454,7 @@ impl PortableRegex {
                 )
                 .map_err(SearchError::from),
             PortablePlan::LineDomainByteAtoms(plan) => plan
-                .find_window_value(haystack, window, limits)
-                .map(|matched| matched.map(Match::end))
+                .first_end_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             _ => {
                 if limits == SearchLimits::unlimited()
@@ -18767,14 +19054,18 @@ pub struct PortableSearchSession<'a> {
 /// and leaves its shared ASCII-root engine sidecar unbound. The first endpoint
 /// or span call settles that sidecar once, caching either a qualified AArch64
 /// engine or an unavailable result. Count also settles and reuses the admitted
-/// narrow 5..=24-root engine. The separately admitted 25..=48-root tier keeps
-/// count on the incumbent direct scanner and leaves its sidecar unbound; other
-/// ineligible counts likewise retain their incumbent fallback without settling
-/// the sidecar. A qualified engine still prepares its classifier only when a
-/// call first reaches the branch that can use it.
+/// narrow 5..=24-root engine. The separately admitted 25..=48-root,
+/// 49..=72-root and 73..=96-root tiers keep count on the incumbent direct
+/// scanner and leave their sidecar unbound; other ineligible counts likewise
+/// retain their incumbent fallback without settling the sidecar. A qualified
+/// engine still prepares its classifier only when a call first reaches the
+/// branch that can use it.
 /// Other matcher families retain only their compact binding. No method on this
 /// type accepts finite limits or publishes accounting; callers that need
 /// either contract should use [`PortableSearchSession`] instead.
+/// A compact native binding also recognizes zero-origin selected-span calls
+/// and enters the matcher's existing full-window ordinary API; nonzero ranged
+/// calls retain the canonical context-preserving projection.
 ///
 /// A session never retains a haystack. It can therefore be reused across
 /// unrelated sources by one mutable, thread-confined worker. An eligible
@@ -18790,6 +19081,27 @@ pub struct PortableSearchSession<'a> {
 #[derive(Debug)]
 pub struct PortableOrdinarySession<'a> {
     plan: PortableOrdinarySessionPlan<'a>,
+}
+
+impl PortableOrdinarySession<'_> {
+    /// Whether this session is bound to a positive-width literal-set engine
+    /// whose selected-end count is total for every valid window.
+    ///
+    /// This is a narrow embedding receipt: it deliberately excludes other
+    /// ordinary plans even when their current count implementation may also
+    /// be total.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn supports_literal_set_selected_end_count(&self) -> bool {
+        matches!(
+            &self.plan,
+            PortableOrdinarySessionPlan::PackedLiteralSet { .. }
+                | PortableOrdinarySessionPlan::LiteralSetDfa { .. }
+                | PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa { .. }
+                | PortableOrdinarySessionPlan::LiteralSetCompact { .. }
+                | PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii { .. }
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -18870,6 +19182,20 @@ enum PortableOrdinarySessionPlan<'a> {
     /// session construction untouched.
     K0WholeLineRunChain {
         engine: k0_whole_line_run_chain::Engine<'a>,
+    },
+    /// Appended so every incumbent ordinary-session variant retains its
+    /// established discriminant. The immutable plan is selected once during
+    /// construction and ordinary operations enter its report-free engines
+    /// without a second compact-canonical discriminant check.
+    FixedPredicateWord64 {
+        plan: &'a FixedPredicateWord64Plan,
+    },
+    /// Appended so every incumbent ordinary-session variant retains its
+    /// established discriminant. Binding the immutable line-domain owner once
+    /// avoids redispatching through both compact and native plan enums on each
+    /// grep line.
+    LineDomainByteAtoms {
+        plan: &'a line_domain_byte_atoms::OwnedPlan,
     },
 }
 
@@ -19221,15 +19547,16 @@ impl<'a> PortableOrdinaryCanonical<'a> {
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from)
             }
-            Self::Native(regex) => match &regex.plan {
-                PortablePlan::LiteralClassRunLiteral(plan)
-                    if plan.boundary_semantics()
-                        == LiteralClassRunLiteralBoundarySemantics::Unguarded =>
+            Self::Native(regex) => {
+                if let PortablePlan::LiteralClassRunLiteral(plan) = &regex.plan
+                    && plan.boundary_semantics()
+                        == LiteralClassRunLiteralBoundarySemantics::Unguarded
                 {
                     ordinary_literal_class_run_find_at_value(plan, haystack, start)
+                } else {
+                    regex.find_window_value(haystack, window, SearchLimits::unlimited())
                 }
-                _ => regex.find_window_value(haystack, window, SearchLimits::unlimited()),
-            },
+            }
         }
     }
 
@@ -19676,6 +20003,27 @@ mod ordinary_session_full_is_match_probe {
                 ..counts
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod ordinary_session_native_zero_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn reset() {
+        CALLS.set(0);
+    }
+
+    pub(super) fn calls() -> usize {
+        CALLS.get()
+    }
+
+    pub(super) fn record() {
+        CALLS.set(CALLS.get().saturating_add(1));
     }
 }
 
@@ -25291,6 +25639,85 @@ fn count_ordinary_fixed_predicate_selected_ends_at(
         .map_err(fixed_predicate_word64_unlimited_count_error)
 }
 
+/// Execute the report-free fixed-predicate endpoint projection outside the
+/// shared canonical dispatch body. Keeping this call out of
+/// `PortableOrdinaryCanonical::shortest_match_at_value` leaves every unrelated
+/// canonical route's established inlined layout unchanged.
+#[inline(never)]
+fn ordinary_fixed_predicate_first_acceptance_at_value(
+    plan: &FixedPredicateWord64Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<usize>, SearchError> {
+    plan.earliest_end_window_value(
+        haystack,
+        LiteralWindow::new(start, haystack.len()),
+        fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+    )
+    .map_err(SearchError::from)
+}
+
+#[inline(never)]
+fn ordinary_fixed_predicate_is_match_at_value(
+    plan: &FixedPredicateWord64Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<bool, SearchError> {
+    plan.is_match_window_value(
+        haystack,
+        LiteralWindow::new(start, haystack.len()),
+        fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+    )
+    .map_err(SearchError::from)
+}
+
+#[inline]
+fn ordinary_fixed_predicate_find_at_value(
+    plan: &FixedPredicateWord64Plan,
+    haystack: &[u8],
+    start: usize,
+) -> Result<Option<Match>, SearchError> {
+    plan.find_window_value(
+        haystack,
+        LiteralWindow::new(start, haystack.len()),
+        fixed_predicate_word64_search_limits(SearchLimits::unlimited()),
+    )
+    .map(|matched| matched.map(|(start, end)| Match { start, end }))
+    .map_err(SearchError::from)
+}
+
+/// Count lines through a construction-bound positive-width endpoint engine.
+///
+/// The LF-exclusion proof is checked by the caller before this reducer is
+/// entered. Consequently, the first acceptance after `at` belongs wholly to
+/// one line, and its endpoint lets us skip that line's remaining bytes with a
+/// single delimiter search. Each increment owns at least one distinct source
+/// byte, so a `u64` count cannot saturate on any supported pointer width.
+#[inline(never)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the suffix memchr result proves the next line start fits"
+)]
+fn count_ordinary_matching_lf_lines_by_first_acceptance<E>(
+    haystack: &[u8],
+    mut first_acceptance_at: impl FnMut(usize) -> Result<Option<usize>, E>,
+) -> Result<u64, E> {
+    let mut at = 0_usize;
+    let mut count = 0_u64;
+    loop {
+        let Some(end) = first_acceptance_at(at)? else {
+            return Ok(count);
+        };
+        debug_assert!(end > at, "a positive-width endpoint must advance");
+        debug_assert!(end <= haystack.len(), "an endpoint belongs to its source");
+        count = count.saturating_add(1);
+        let Some(relative_lf) = memchr(b'\n', &haystack[end..]) else {
+            return Ok(count);
+        };
+        at = end + relative_lf + 1;
+    }
+}
+
 impl<'r> PortableOrdinarySession<'r> {
     /// Whether a match exists anywhere in `haystack`.
     ///
@@ -25311,6 +25738,11 @@ impl<'r> PortableOrdinarySession<'r> {
             #[cfg(test)]
             ordinary_session_full_is_match_probe::record_native();
             return regex.try_is_match_ordinary(haystack);
+        }
+        if let PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } = &self.plan {
+            #[cfg(test)]
+            ordinary_session_full_is_match_probe::record_delegated();
+            return ordinary_fixed_predicate_is_match_at_value(plan, haystack, 0);
         }
         #[cfg(test)]
         ordinary_session_full_is_match_probe::record_delegated();
@@ -25367,6 +25799,16 @@ impl<'r> PortableOrdinarySession<'r> {
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from)
             }
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                ordinary_fixed_predicate_is_match_at_value(plan, haystack, start)
+            }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { plan } => plan
+                .is_match_window_value(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(session) => session
                 .shortest_match_at_value(haystack, start)
                 .map(|endpoint| endpoint.is_some()),
@@ -25452,6 +25894,16 @@ impl<'r> PortableOrdinarySession<'r> {
                     .first_acceptance_at(haystack, start)
                     .map_err(SearchError::from)
             }
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                ordinary_fixed_predicate_first_acceptance_at_value(plan, haystack, start)
+            }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { plan } => plan
+                .first_end_window_value(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .map_err(SearchError::from),
             PortableOrdinarySessionPlan::Canonical(session) => {
                 session.shortest_match_at_value(haystack, start)
             }
@@ -25522,8 +25974,10 @@ impl<'r> PortableOrdinarySession<'r> {
     /// uniform-standard literal set likewise selects its endpoint first, then
     /// subtracts its sealed common width; its ordinary route and direct misses
     /// retain the canonical selected span. Other packed and DFA literal sets
-    /// use their bound selected-span engines. Canonical fallback plans retain
-    /// their existing selected-span implementation with unlimited limits.
+    /// use their bound selected-span engines. A compact native owner at offset
+    /// zero enters the matcher's full-window ordinary selected-span API. Other
+    /// canonical fallback calls retain their ranged selected-span implementation
+    /// with unlimited limits.
     /// Assertions inspect the complete original haystack and offsets remain
     /// relative to it.
     ///
@@ -25571,6 +26025,23 @@ impl<'r> PortableOrdinarySession<'r> {
                     SearchWindow::new(start, haystack.len()),
                     SearchLimits::unlimited(),
                 ),
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                ordinary_fixed_predicate_find_at_value(plan, haystack, start)
+            }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { plan } => plan
+                .find_window_value(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .map_err(SearchError::from),
+            PortableOrdinarySessionPlan::Canonical(PortableOrdinaryCanonical::Native(regex))
+                if start == 0 =>
+            {
+                #[cfg(test)]
+                ordinary_session_native_zero_probe::record();
+                regex.try_find_ordinary(haystack)
+            }
             PortableOrdinarySessionPlan::Canonical(session) => {
                 session.find_at_value(haystack, start)
             }
@@ -25740,6 +26211,25 @@ impl<'r> PortableOrdinarySession<'r> {
                 PortableOrdinaryCanonical::Native(regex)
                     .try_visit_spans_at(haystack, start, visitor)
             }
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                PortableOrdinaryCanonical::FixedPredicateWord64(plan)
+                    .try_visit_spans_at(haystack, start, visitor)
+            }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { plan } => {
+                let cursor = plan.search_cursor(haystack);
+                try_visit_ordinary_spans_at(
+                    haystack.len(),
+                    start,
+                    |search_start| {
+                        cursor
+                            .find_at_value(search_start, SearchLimits::unlimited())
+                            .map_err(|error| {
+                                PortableFindIterError::Search(SearchError::from(error))
+                            })
+                    },
+                    visitor,
+                )
+            }
             PortableOrdinarySessionPlan::Canonical(session) => {
                 session.try_visit_spans_at(haystack, start, visitor)
             }
@@ -25819,6 +26309,90 @@ impl<'r> PortableOrdinarySession<'r> {
                 }
                 Ok(outcome)
             }
+        }
+    }
+
+    /// Whether this session retains the specialized compact matching-LF-line
+    /// kernel after the embedding authenticates that no literal consumes LF.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn supports_compact_matching_lf_line_count(&self) -> bool {
+        matches!(
+            &self.plan,
+            PortableOrdinarySessionPlan::LiteralSetCompact { .. }
+        )
+    }
+
+    /// Whether this session can count matching LF-delimited lines after the
+    /// embedding independently authenticates that no literal consumes LF.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn supports_matching_lf_line_count(&self) -> bool {
+        matches!(
+            &self.plan,
+            PortableOrdinarySessionPlan::ExactLiteral { .. }
+                | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { .. }
+                | PortableOrdinarySessionPlan::PackedLiteralSet { .. }
+                | PortableOrdinarySessionPlan::LiteralSetCompact { .. }
+        )
+    }
+
+    /// Count LF-delimited lines containing at least one selected match.
+    ///
+    /// The compact literal owner retains its specialized direct scanner.
+    /// Positive exact-literal and packed-literal owners select only the first
+    /// accepting endpoint, then use the authenticated LF boundary to skip the
+    /// rest of that matching line. No route reconstructs a selected span for
+    /// this operation. DFA owners deliberately remain unsupported and retain
+    /// their established per-line paths.
+    /// The embedding must supply its independently retained proof that LF is
+    /// absent from every literal. Unsupported calls and calls without that
+    /// proof return `Ok(None)` before inspecting `haystack` or changing retained
+    /// route state.
+    #[doc(hidden)]
+    #[inline(never)]
+    pub fn count_matching_lf_lines(
+        &mut self,
+        haystack: &[u8],
+        lf_is_excluded: bool,
+    ) -> Result<Option<u64>, SearchError> {
+        if !lf_is_excluded {
+            return Ok(None);
+        }
+        match &mut self.plan {
+            PortableOrdinarySessionPlan::ExactLiteral { executor }
+            | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { executor } => {
+                count_ordinary_matching_lf_lines_by_first_acceptance(
+                    haystack,
+                    |start| {
+                        executor
+                            .first_end_window_value(
+                                haystack,
+                                LiteralWindow::new(start, haystack.len()),
+                            )
+                            .map_err(SearchError::from)
+                    },
+                )
+                .map(Some)
+            }
+            PortableOrdinarySessionPlan::PackedLiteralSet { executor } => {
+                count_ordinary_matching_lf_lines_by_first_acceptance(
+                    haystack,
+                    |start| {
+                        executor
+                            .selected_end_window_value(
+                                haystack,
+                                LiteralWindow::new(start, haystack.len()),
+                            )
+                            .map_err(SearchError::from)
+                    },
+                )
+                .map(Some)
+            }
+            PortableOrdinarySessionPlan::LiteralSetCompact { executor } => executor
+                .count_matching_lf_lines_value(haystack, true)
+                .map_err(SearchError::from),
+            _ => Ok(None),
         }
     }
 
@@ -26017,6 +26591,10 @@ impl<'r> PortableOrdinarySession<'r> {
                 }
                 Ok(Some(count))
             }
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { plan } => {
+                count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start)
+            }
+            PortableOrdinarySessionPlan::LineDomainByteAtoms { .. } => Ok(None),
             PortableOrdinarySessionPlan::Canonical(
                 PortableOrdinaryCanonical::FixedPredicateWord64(plan),
             ) => count_ordinary_fixed_predicate_selected_ends_at(plan, haystack, start),
@@ -31647,7 +32225,8 @@ mod tests {
             assert_eq!(ordinary.find_at(haystack, 0), Ok(expected));
             assert_eq!(
                 super::unicode_word_run::full_prepared_find_call_count(),
-                0,
+                1,
+                "a zero-origin ordinary-session span enters the prepared full route",
             );
         }
 
@@ -31822,6 +32401,62 @@ mod tests {
         };
         assert_eq!(owned.build_report().plan, PlanKind::K0);
         assert_eq!(owned.find(b"xxccc"), borrowed.find(b"xxccc"));
+    }
+
+    #[test]
+    fn owned_singleton_literal_handoff_adopts_the_authenticated_hir_leaf() {
+        let leaf = b"needle".to_vec().into_boxed_slice();
+        let leaf_pointer = leaf.as_ptr();
+        let built = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literal_hir_owned(Hir::literal(leaf), usize::MAX)
+            .expect("owned direct construction completes");
+        let super::RipgrepStandardLiteralHirBuild::Built(regex) = built else {
+            panic!("owned singleton literal was refused");
+        };
+        let PortablePlan::ExactLiteral(literal) = &regex.plan else {
+            panic!("owned singleton literal selected another plan");
+        };
+        assert_eq!(literal.needle(), b"needle");
+        assert_eq!(literal.needle().as_ptr(), leaf_pointer);
+        assert_eq!(regex.find(b"xxneedleyy"), Some(Match { start: 2, end: 8 }));
+
+        let nested_leaf = b"thread".to_vec().into_boxed_slice();
+        let nested_pointer = nested_leaf.as_ptr();
+        let nested = Hir::capture(regex_syntax::hir::Capture {
+            index: 1,
+            name: Some(Box::from("outer")),
+            sub: Box::new(Hir::capture(regex_syntax::hir::Capture {
+                index: 2,
+                name: None,
+                sub: Box::new(Hir::literal(nested_leaf)),
+            })),
+        });
+        let transferred = super::into_capture_transparent_literal_box(nested)
+            .expect("capture-transparent literal owner transfers");
+        assert_eq!(&*transferred, b"thread");
+        assert_eq!(transferred.as_ptr(), nested_pointer);
+
+        let captured = PortableBuilder::new("(?P<outer>(needle))")
+            .build()
+            .expect("captured exact literal construction completes");
+        assert_eq!(captured.build_report().plan, PlanKind::ExactLiteral);
+        assert_eq!(captured.captures_len(), 3);
+        assert_eq!(captured.find(b"xxneedleyy"), regex.find(b"xxneedleyy"));
+
+        let mut refusing_limits = BuildLimits::default();
+        refusing_limits.literal.max_needle_bytes = b"needle".len() - 1;
+        let refused = PortableBuilder::new("needle")
+            .limits(refusing_limits)
+            .build()
+            .expect_err("owned transfer must recheck the literal needle limit");
+        assert!(matches!(
+            refused,
+            BuildError::Literal(fre_kernels::LiteralError::NeedleLimit {
+                needed: 6,
+                limit: 5,
+            })
+        ));
     }
 
     #[test]
@@ -32245,6 +32880,214 @@ mod tests {
                 .expect("resource refusal completes")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ripgrep_fixed_typed_source_reuses_authenticated_escape_fact() {
+        let plain_patterns = ["literal000", "éliteral001"];
+        let (plain, _census) =
+            super::ripgrep_standard_literal_context_from_with_census::<_, _, false>(
+                plain_patterns.len(),
+                |index| plain_patterns.get(index).copied(),
+                BuildLimits::default(),
+                usize::MAX,
+                None,
+            )
+            .expect("escape-free fixed strings are authenticated");
+        let expected_plain_source = "(?:(?:literal000)|(?:éliteral001))";
+        assert_eq!(&*plain.source, expected_plain_source);
+        for (source_limit, admitted) in [
+            (expected_plain_source.len(), true),
+            (expected_plain_source.len() - 1, false),
+        ] {
+            assert_eq!(
+                super::ripgrep_standard_literal_context_from_with_census::<_, _, false>(
+                    plain_patterns.len(),
+                    |index| plain_patterns.get(index).copied(),
+                    BuildLimits::default(),
+                    source_limit,
+                    None,
+                )
+                .is_some(),
+                admitted,
+                "source_limit={source_limit}",
+            );
+        }
+
+        let mixed_width = ["é", "literal001"];
+        let (mixed_width, _census) =
+            super::ripgrep_standard_literal_context_from_with_census::<_, _, false>(
+                mixed_width.len(),
+                |index| mixed_width.get(index).copied(),
+                BuildLimits::default(),
+                usize::MAX,
+                None,
+            )
+            .expect("mixed-width fixed strings are authenticated");
+        assert_eq!(&*mixed_width.source, "(?:é|(?:literal001))");
+
+        let escaped = ["literal000", ".*éliteral001"];
+        let (escaped, _census) =
+            super::ripgrep_standard_literal_context_from_with_census::<_, _, false>(
+                escaped.len(),
+                |index| escaped.get(index).copied(),
+                BuildLimits::default(),
+                usize::MAX,
+                None,
+            )
+            .expect("fixed strings with metacharacters are authenticated");
+        assert_eq!(
+            &*escaped.source,
+            r"(?:(?:literal000)|(?:\.\*éliteral001))",
+        );
+    }
+
+    #[test]
+    fn ripgrep_fixed_typed_literals_match_owned_hir_and_preserve_declines() {
+        let metacharacters = [
+            ".", "[", "]", "(", ")", "{", "}", "*", "+", "?", "|", "^", "$", "\\",
+            "-", "&", "~", "#",
+        ];
+        let mut patterns = (0..64)
+            .map(|index| {
+                format!(
+                    "{}fixed{index:04}é",
+                    metacharacters[index % metacharacters.len()]
+                )
+            })
+            .collect::<Vec<_>>();
+        patterns[63] = ".".to_owned();
+        let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let hir = Hir::alternation(
+            patterns
+                .iter()
+                .map(|pattern| Hir::literal(pattern.as_bytes()))
+                .collect(),
+        );
+        let owned = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_standard_literal_hir_owned(hir, usize::MAX)
+            .expect("owned fixed-string HIR construction completes");
+        let super::RipgrepStandardLiteralHirBuild::Built(owned) = owned else {
+            panic!("owned fixed-string HIR was refused");
+        };
+        let (typed, census) = PortableBuilder::new("")
+            .multi_line(true)
+            .retained_find_iter(true)
+            .build_ripgrep_fixed_literals_ordinary_with_census(
+                &borrowed,
+                usize::MAX,
+                None,
+            )
+            .expect("typed fixed-string construction completes")
+            .expect("typed fixed strings are admitted");
+        let RipgrepStandardLiteralsBuild::Portable(typed) = typed else {
+            panic!("small typed fixed strings retained an ordinary-only owner");
+        };
+
+        assert_eq!(typed.as_str(), owned.as_str());
+        assert_eq!(typed.build_report(), owned.build_report());
+        assert_eq!(typed.build_report().minimum_match_bytes, Some(1));
+        assert_eq!(
+            typed.runtime_implementation_id(),
+            owned.runtime_implementation_id(),
+        );
+        for byte in 0..=u8::MAX {
+            let expected = patterns
+                .iter()
+                .any(|pattern| pattern.as_bytes().contains(&byte));
+            assert_eq!(census.contains(byte), expected, "byte={byte:#04x}");
+        }
+        for haystack in [
+            patterns[0].as_bytes(),
+            patterns[13].as_bytes(),
+            b"aXbfixed0000".as_slice(),
+            b"absent".as_slice(),
+        ] {
+            assert_eq!(typed.find(haystack), owned.find(haystack));
+            assert_eq!(
+                typed.shortest_match(haystack, SearchLimits::unlimited()),
+                owned.shortest_match(haystack, SearchLimits::unlimited()),
+            );
+        }
+        let haystack = format!("xx{}/{}yy", patterns[0], patterns[13]).into_bytes();
+        let mut typed_spans = Vec::new();
+        typed
+            .ordinary_session()
+            .expect("typed ordinary session binds")
+            .try_visit_spans(&haystack, |matched| {
+                typed_spans.push((matched.start(), matched.end()));
+                Ok::<bool, ()>(true)
+            })
+            .expect("typed span visit runs")
+            .expect("typed visitor completes");
+        let mut owned_spans = Vec::new();
+        owned
+            .ordinary_session()
+            .expect("owned ordinary session binds")
+            .try_visit_spans(&haystack, |matched| {
+                owned_spans.push((matched.start(), matched.end()));
+                Ok::<bool, ()>(true)
+            })
+            .expect("owned span visit runs")
+            .expect("owned visitor completes");
+        assert_eq!(typed_spans, owned_spans);
+
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_standard_literals_ordinary_with_census(
+                    &borrowed,
+                    usize::MAX,
+                    None,
+                )
+                .expect("standard meta refusal completes")
+                .is_none()
+        );
+        let source_bytes = typed.as_str().len();
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_fixed_literals_ordinary_with_census(
+                    &borrowed,
+                    source_bytes,
+                    None,
+                )
+                .expect("exact fixed source limit completes")
+                .is_some()
+        );
+        assert!(
+            PortableBuilder::new("")
+                .multi_line(true)
+                .build_ripgrep_fixed_literals_ordinary_with_census(
+                    &borrowed,
+                    source_bytes - 1,
+                    None,
+                )
+                .expect("one-below fixed source refusal completes")
+                .is_none()
+        );
+
+        for (invalid, forbidden_byte) in [
+            (vec!["ok", "line\nfeed"], None),
+            (vec!["ok", "nul\0byte"], Some(b'\0')),
+            (vec!["ok", "x-byte"], Some(b'x')),
+            (vec![".", "*"], None),
+        ] {
+            assert!(
+                PortableBuilder::new("")
+                    .multi_line(true)
+                    .build_ripgrep_fixed_literals_ordinary_with_census(
+                        &invalid,
+                        usize::MAX,
+                        forbidden_byte,
+                    )
+                    .expect("fixed-string refusal completes")
+                    .is_none(),
+                "invalid={invalid:?}, forbidden_byte={forbidden_byte:?}",
+            );
+        }
     }
 
     #[test]
@@ -48014,8 +48857,18 @@ mod tests {
                 .search_session(SearchSessionLimits::unlimited())
                 .unwrap();
             assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+            assert_eq!(
+                super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+                0,
+                "finite, accounted, ranged, and explicit-session APIs stay canonical",
+            );
             let mut ordinary = regex.ordinary_session().unwrap();
             assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+            assert_eq!(
+                super::literal_class_run_literal_ordinary_find_probe::snapshot(),
+                1,
+                "a zero-origin ordinary-session span enters the ordinary full route",
+            );
             assert_eq!(
                 regex
                     .find_iter(haystack, PortableFindIterLimits::unlimited())
@@ -48039,20 +48892,20 @@ mod tests {
             );
             assert_eq!(
                 super::literal_class_run_literal_ordinary_find_probe::snapshot(),
-                0,
-                "finite, accounted, ranged, session, iterator, and capture APIs stay canonical",
+                1,
+                "iterator and capture APIs stay canonical after the ordinary-session handoff",
             );
 
             assert!(regex.is_match(haystack));
             assert_eq!(
                 super::literal_class_run_literal_ordinary_find_probe::snapshot(),
-                0,
-                "the already-specialized ordinary existence facade is independent",
+                1,
+                "the already-specialized ordinary existence facade leaves the span route unchanged",
             );
             assert_eq!(regex.find(haystack), expected);
             assert_eq!(
                 super::literal_class_run_literal_ordinary_find_probe::snapshot(),
-                1,
+                2,
             );
         }
     }
@@ -48159,8 +49012,18 @@ mod tests {
                 .unwrap();
             assert!(session.is_match_value(haystack, unlimited).unwrap());
             assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, 0),
+                "finite, ranged, accounted, and explicit-session APIs stay canonical",
+            );
             let mut ordinary = regex.ordinary_session().unwrap();
             assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+            assert_eq!(
+                super::literal_class_run_search_ordinary_facade_probe::snapshot(),
+                (0, usize::from(ordinary_guarded)),
+                "an eligible zero-origin ordinary-session span enters the ordinary full route",
+            );
             assert_eq!(
                 regex
                     .find_iter(haystack, PortableFindIterLimits::unlimited())
@@ -48184,19 +49047,19 @@ mod tests {
             );
             assert_eq!(
                 super::literal_class_run_search_ordinary_facade_probe::snapshot(),
-                (0, 0),
-                "finite, ranged, accounted, session, iterator, and capture APIs stay canonical",
+                (0, usize::from(ordinary_guarded)),
+                "iterator and capture APIs stay canonical after the ordinary-session handoff",
             );
 
             assert!(regex.is_match(haystack));
             assert_eq!(
                 super::literal_class_run_search_ordinary_facade_probe::snapshot(),
-                (0, 0),
+                (0, usize::from(ordinary_guarded)),
             );
             assert_eq!(regex.find(haystack), expected);
             assert_eq!(
                 super::literal_class_run_search_ordinary_facade_probe::snapshot(),
-                (0, usize::from(ordinary_guarded)),
+                (0, 2 * usize::from(ordinary_guarded)),
             );
         }
     }
@@ -49113,9 +49976,7 @@ mod tests {
         let fixed = fixed.ordinary_session().unwrap();
         assert!(matches!(
             fixed.plan,
-            super::PortableOrdinarySessionPlan::Canonical(
-                super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
-            )
+            super::PortableOrdinarySessionPlan::FixedPredicateWord64 { .. }
         ));
 
         let anchored = PortableBuilder::new(r"(?-u:\A[ab]+Z)")
@@ -49183,6 +50044,24 @@ mod tests {
                 super::PortableOrdinaryCanonical::Native(bound_regex)
             ) if core::ptr::eq(*bound_regex, &reverse_inner_union)
         ));
+
+        let line = PortableBuilder::new(r"(?m)^(?-u:[\x00\xE1])$")
+            .build()
+            .unwrap();
+        assert_eq!(line.build_report().plan, PlanKind::LineDomainByteAtoms);
+        let PortablePlan::LineDomainByteAtoms(line_plan) = &line.plan else {
+            unreachable!("line-domain fixture changed plan")
+        };
+        let line_session = line.ordinary_session().unwrap();
+        assert!(matches!(
+            &line_session.plan,
+            super::PortableOrdinarySessionPlan::LineDomainByteAtoms { plan: bound }
+                if core::ptr::eq(*bound, line_plan.as_ref())
+        ));
+        assert_eq!(
+            core::mem::size_of::<super::PortableOrdinaryCanonical<'static>>(),
+            2 * core::mem::size_of::<usize>(),
+        );
     }
 
     #[test]
@@ -49206,9 +50085,15 @@ mod tests {
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::FixedPredicateWord64(_),
                 ) => "canonical-fixed-predicate",
+                super::PortableOrdinarySessionPlan::FixedPredicateWord64 { .. } => {
+                    "fixed-predicate"
+                }
                 super::PortableOrdinarySessionPlan::Canonical(
                     super::PortableOrdinaryCanonical::ReverseInner(_),
                 ) => "canonical-reverse-inner",
+                super::PortableOrdinarySessionPlan::LineDomainByteAtoms { .. } => {
+                    "line-domain-byte-atoms"
+                }
                 super::PortableOrdinarySessionPlan::RequiredLiteral { .. } => {
                     "required-literal"
                 }
@@ -49341,10 +50226,10 @@ mod tests {
         .build()
         .unwrap();
         check(
-            "canonical fixed predicate",
+            "fixed predicate",
             &fixed,
             b"unmatched",
-            "canonical-fixed-predicate",
+            "fixed-predicate",
             0,
         );
 
@@ -49458,10 +50343,21 @@ mod tests {
             "literal-set-compact",
             0,
         );
+
+        let line = PortableBuilder::new(r"(?m)^(?-u:[A-Z][a-z]{2,8})$")
+            .build()
+            .unwrap();
+        check(
+            "line-domain byte atoms",
+            &line,
+            b"Ada\nno\nGrace\n",
+            "line-domain-byte-atoms",
+            0,
+        );
     }
 
     #[test]
-    fn ordinary_session_full_is_match_native_routes_match_offset_zero_exhaustively() {
+    fn ordinary_session_full_is_match_routes_match_offset_zero_exhaustively() {
         fn sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
             let mut sources = vec![Vec::new()];
             let mut level = vec![Vec::new()];
@@ -49506,12 +50402,23 @@ mod tests {
             let baseline = regex::bytes::Regex::new(pattern).unwrap();
             let mut actual = regex.ordinary_session().unwrap();
             let mut legacy = regex.ordinary_session().unwrap();
-            assert!(matches!(
-                &actual.plan,
-                super::PortableOrdinarySessionPlan::Canonical(
-                    super::PortableOrdinaryCanonical::Native(bound)
-                ) if core::ptr::eq(*bound, &regex)
-            ));
+            if expected_plan == PlanKind::LineDomainByteAtoms {
+                let PortablePlan::LineDomainByteAtoms(line_plan) = &regex.plan else {
+                    unreachable!("line-domain fixture changed plan")
+                };
+                assert!(matches!(
+                    &actual.plan,
+                    super::PortableOrdinarySessionPlan::LineDomainByteAtoms { plan: bound }
+                        if core::ptr::eq(*bound, line_plan.as_ref())
+                ));
+            } else {
+                assert!(matches!(
+                    &actual.plan,
+                    super::PortableOrdinarySessionPlan::Canonical(
+                        super::PortableOrdinaryCanonical::Native(bound)
+                    ) if core::ptr::eq(*bound, &regex)
+                ));
+            }
 
             for haystack in &haystacks {
                 let expected = baseline.is_match(haystack);
@@ -49527,6 +50434,286 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ordinary_session_native_zero_span_route_is_isolated() {
+        fn check_native(
+            label: &str,
+            regex: &PortableRegex,
+            haystack: &[u8],
+            nonzero: usize,
+        ) {
+            let unlimited = SearchLimits::unlimited();
+            let expected_span = regex.find_at_value(haystack, 0, unlimited).unwrap();
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::Native(bound)
+                ) if core::ptr::eq(*bound, regex)
+            ));
+
+            super::ordinary_session_native_zero_probe::reset();
+            assert_eq!(
+                ordinary.find_at(haystack, 0),
+                Ok(expected_span),
+                "span label={label}",
+            );
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                1,
+                "zero-origin route label={label}",
+            );
+
+            super::ordinary_session_native_zero_probe::reset();
+            assert_eq!(
+                ordinary.find_at(haystack, nonzero),
+                regex.find_at_value(haystack, nonzero, unlimited),
+                "nonzero span label={label}",
+            );
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                0,
+                "nonzero calls retain the canonical ranged route label={label}",
+            );
+
+            let invalid = haystack.len().checked_add(1).unwrap();
+            assert!(ordinary.find_at(haystack, invalid).is_err());
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                0,
+                "invalid nonzero calls retain their typed-error route label={label}",
+            );
+
+            let mut checked = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                checked.find_at_value(haystack, 0, unlimited).unwrap(),
+                expected_span,
+            );
+            assert_eq!(
+                regex.find_at(haystack, 0, unlimited).unwrap().0,
+                expected_span,
+            );
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                0,
+                "checked and accounted APIs remain outside the ordinary route label={label}",
+            );
+        }
+
+        let prefix = PortableBuilder::new(r"(?-u:ERROR_[0-9]+|WARN_[A-Z]+)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(prefix.build_report().plan, PlanKind::PrefixClassAlternation);
+        check_native("prefix class", &prefix, b"!WARN_AZ!ERROR_123!", 2);
+
+        let anchored = PortableBuilder::new(r"(?-u:\A[ab]+Z)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(anchored.build_report().plan, PlanKind::ForwardAnchored);
+        check_native("forward anchored", &anchored, b"abbaZ", 1);
+
+        let word = PortableBuilder::new(r"\b\w{2,}\b").build().unwrap();
+        assert_eq!(word.build_report().plan, PlanKind::UnicodeWordRun);
+        check_native("unicode word", &word, "!αβ ab!".as_bytes(), 1);
+
+        let scalar = PortableBuilder::new(r"\p{Greek}+").build().unwrap();
+        assert_eq!(scalar.build_report().plan, PlanKind::UnicodeScalarRun);
+        check_native("unicode scalar", &scalar, "!αβ!".as_bytes(), 1);
+
+        for (label, regex, haystack) in [
+            (
+                "canonical exact",
+                PortableBuilder::new("").unicode(false).build().unwrap(),
+                b"source".as_slice(),
+            ),
+            (
+                "canonical fixed predicate",
+                PortableBuilder::new(
+                    r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]",
+                )
+                .unicode(false)
+                .build()
+                .unwrap(),
+                b"unmatched".as_slice(),
+            ),
+        ] {
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(matches!(
+                &ordinary.plan,
+                super::PortableOrdinarySessionPlan::Canonical(
+                    super::PortableOrdinaryCanonical::ExactLiteral(_)
+                )
+                    | super::PortableOrdinarySessionPlan::FixedPredicateWord64 { .. }
+            ));
+            super::ordinary_session_native_zero_probe::reset();
+            assert_eq!(
+                ordinary.find_at(haystack, 0),
+                regex.find_at_value(haystack, 0, SearchLimits::unlimited()),
+                "span label={label}",
+            );
+            assert_eq!(
+                super::ordinary_session_native_zero_probe::calls(),
+                0,
+                "non-Native canonical owner keeps its incumbent route label={label}",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_session_bound_zero_span_matches_oracle_exhaustively() {
+        fn sources(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
+            let mut sources = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..maximum_len {
+                let mut next = Vec::new();
+                for prefix in &level {
+                    for &byte in alphabet {
+                        let mut source = prefix.clone();
+                        source.push(byte);
+                        sources.push(source.clone());
+                        next.push(source);
+                    }
+                }
+                level = next;
+            }
+            sources
+        }
+
+        let mut haystacks = sources(&[b'a', b'b', b'Z', b'!', b'\n', 0, 0x80, 0xE1], 3);
+        haystacks.extend([
+            "!αβ!".as_bytes().to_vec(),
+            "AΩ!β".as_bytes().to_vec(),
+            vec![0xCE, b'a', 0x80, b'!', 0xFF],
+            b"a\nA\n\xE1\n!".to_vec(),
+            b"!WARN_AZ!ERROR_123!".to_vec(),
+            b"ERROX_123 WARM_AZ ERROR_0".to_vec(),
+        ]);
+
+        for (pattern, expected_plan) in [
+            (r"(?-u:\A[ab]+Z)", PlanKind::ForwardAnchored),
+            (
+                r"(?-u:ERROR_[0-9]+|WARN_[A-Z]+)",
+                PlanKind::PrefixClassAlternation,
+            ),
+            (r"\b\w{2,}\b", PlanKind::UnicodeWordRun),
+            (r"\p{Greek}+", PlanKind::UnicodeScalarRun),
+            (
+                r"(?m)^(?-u:[\x00\xE1])$",
+                PlanKind::LineDomainByteAtoms,
+            ),
+        ] {
+            let regex = PortableBuilder::new(pattern).build().unwrap();
+            assert_eq!(regex.build_report().plan, expected_plan, "pattern={pattern:?}");
+            let baseline = regex::bytes::Regex::new(pattern).unwrap();
+            let mut ordinary = regex.ordinary_session().unwrap();
+            if expected_plan == PlanKind::LineDomainByteAtoms {
+                let PortablePlan::LineDomainByteAtoms(line_plan) = &regex.plan else {
+                    unreachable!("line-domain fixture changed plan")
+                };
+                assert!(matches!(
+                    &ordinary.plan,
+                    super::PortableOrdinarySessionPlan::LineDomainByteAtoms { plan: bound }
+                        if core::ptr::eq(*bound, line_plan.as_ref())
+                ));
+            } else {
+                assert!(matches!(
+                    &ordinary.plan,
+                    super::PortableOrdinarySessionPlan::Canonical(
+                        super::PortableOrdinaryCanonical::Native(bound)
+                    ) if core::ptr::eq(*bound, &regex)
+                ));
+            }
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    let expected_span = baseline.find_at(haystack, start).map(|matched| Match {
+                        start: matched.start(),
+                        end: matched.end(),
+                    });
+                    assert_eq!(
+                        ordinary.find_at(haystack, start),
+                        Ok(expected_span),
+                        "span pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_line_domain_binding_preserves_public_operations_and_count_decline() {
+        let pattern = r"(?m)^(?-u:[A-Z][a-z]{2,8})$";
+        let regex = PortableBuilder::new(pattern).build().unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LineDomainByteAtoms);
+        let baseline = regex::bytes::Regex::new(pattern).unwrap();
+        let haystack = b"Ada\nno\nGrace\nABCD\n\xE1\nEve\n";
+        let mut ordinary = regex.ordinary_session().unwrap();
+
+        assert_eq!(ordinary.is_match(haystack), Ok(baseline.is_match(haystack)));
+        for start in 0..=haystack.len() {
+            assert_eq!(
+                ordinary.is_match_at(haystack, start),
+                Ok(baseline.is_match_at(haystack, start)),
+                "existence start={start}",
+            );
+            assert_eq!(
+                ordinary.first_acceptance_at(haystack, start),
+                Ok(baseline.shortest_match_at(haystack, start)),
+                "endpoint start={start}",
+            );
+            assert_eq!(
+                ordinary.find_at(haystack, start),
+                Ok(baseline.find_at(haystack, start).map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                })),
+                "span start={start}",
+            );
+
+            let mut expected = Vec::new();
+            let mut cursor = start;
+            while let Some(matched) = baseline.find_at(haystack, cursor) {
+                expected.push(Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+                cursor = matched.end();
+            }
+            let mut actual = Vec::new();
+            assert_eq!(
+                ordinary.try_visit_spans_at(haystack, start, |matched| {
+                    actual.push(matched);
+                    Ok::<bool, ()>(true)
+                }),
+                Ok(Ok(())),
+                "visit start={start}",
+            );
+            assert_eq!(actual, expected, "visit spans start={start}");
+            assert_eq!(
+                ordinary.count_positive_width_selected_ends_at(haystack, start),
+                Ok(None),
+                "unsupported count start={start}",
+            );
+        }
+
+        let invalid = haystack.len() + 1;
+        assert!(matches!(
+            ordinary.find_at(haystack, invalid),
+            Err(SearchError::LineDomainByteAtoms(
+                fre_kernels::LineDomainByteAtomsSearchError::InvalidWindow
+            ))
+        ));
+        assert_eq!(
+            ordinary.count_positive_width_selected_ends_at(haystack, invalid),
+            Ok(None),
+            "unsupported count declines before validating the source window",
+        );
     }
 
     #[test]
@@ -50063,7 +51250,11 @@ mod tests {
                     Ok(expected),
                     "pattern={pattern:?}, start={start}",
                 );
-                assert_eq!(super::ordinary_literal_class_run_find_at_probe::calls(), 1);
+                assert_eq!(
+                    super::ordinary_literal_class_run_find_at_probe::calls(),
+                    usize::from(start != 0),
+                    "the established zero-origin Native route bypasses the ranged class-run helper",
+                );
             }
 
             super::ordinary_literal_class_run_find_at_probe::reset();
@@ -50814,9 +52005,7 @@ mod tests {
         let mut ordinary = regex.ordinary_session().unwrap();
         assert!(matches!(
             &ordinary.plan,
-            PortableOrdinarySessionPlan::Canonical(
-                super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
-            )
+            PortableOrdinarySessionPlan::FixedPredicateWord64 { .. }
         ));
 
         for haystack in byte_words(b"acefx", 6) {
@@ -50842,18 +52031,26 @@ mod tests {
 
     #[test]
     fn ordinary_fixed_predicate_count_routes_exact_tails_and_preserves_errors() {
-        fn selected_count(regex: &PortableRegex, haystack: &[u8], start: usize) -> u64 {
+        fn selected_spans(
+            regex: &PortableRegex,
+            haystack: &[u8],
+            start: usize,
+        ) -> Vec<Match> {
             let mut cursor = start;
-            let mut count = 0_u64;
+            let mut spans = Vec::new();
             while let Some(matched) = regex
                 .find_at_value(haystack, cursor, SearchLimits::unlimited())
                 .unwrap()
             {
                 assert!(matched.end() > cursor);
                 cursor = matched.end();
-                count = count.checked_add(1).unwrap();
+                spans.push(matched);
             }
-            count
+            spans
+        }
+
+        fn selected_count(regex: &PortableRegex, haystack: &[u8], start: usize) -> u64 {
+            u64::try_from(selected_spans(regex, haystack, start).len()).unwrap()
         }
 
         for (pattern, haystack) in [
@@ -50868,17 +52065,71 @@ mod tests {
             let mut ordinary = regex.ordinary_session().unwrap();
             assert!(matches!(
                 &ordinary.plan,
-                PortableOrdinarySessionPlan::Canonical(
-                    super::PortableOrdinaryCanonical::FixedPredicateWord64(_)
-                )
+                PortableOrdinarySessionPlan::FixedPredicateWord64 { .. }
             ));
             for start in 0..=haystack.len() {
+                let expected = regex
+                    .find_at_value(haystack, start, SearchLimits::unlimited())
+                    .unwrap();
+                assert_eq!(ordinary.find_at(haystack, start), Ok(expected));
+                assert_eq!(
+                    ordinary.first_acceptance_at(haystack, start),
+                    Ok(expected.map(|matched| matched.end())),
+                );
+                assert_eq!(ordinary.is_match_at(haystack, start), Ok(expected.is_some()));
                 assert_eq!(
                     ordinary.count_positive_width_selected_ends_at(haystack, start),
                     Ok(Some(selected_count(&regex, haystack, start))),
                     "pattern={pattern:?}, start={start}",
                 );
             }
+
+            let visit_start = usize::from(!haystack.is_empty());
+            let expected = selected_spans(&regex, haystack, visit_start);
+            let mut visited = Vec::new();
+            assert_eq!(
+                ordinary
+                    .try_visit_spans_at(haystack, visit_start, |matched| {
+                        visited.push(matched);
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap(),
+                Ok(()),
+            );
+            assert_eq!(visited, expected, "pattern={pattern:?}");
+
+            let mut stopped = Vec::new();
+            assert_eq!(
+                ordinary
+                    .try_visit_spans(haystack, |matched| {
+                        stopped.push(matched);
+                        Ok::<bool, ()>(false)
+                    })
+                    .unwrap(),
+                Ok(()),
+            );
+            assert_eq!(stopped, selected_spans(&regex, haystack, 0)[..stopped.len()]);
+
+            let mut errored = Vec::new();
+            assert_eq!(
+                ordinary
+                    .try_visit_spans(haystack, |matched| {
+                        errored.push(matched);
+                        Err::<bool, _>("callback")
+                    })
+                    .unwrap(),
+                Err("callback"),
+            );
+            assert_eq!(errored, selected_spans(&regex, haystack, 0)[..errored.len()]);
+
+            let mut invalid_callback = false;
+            assert!(ordinary
+                .try_visit_spans_at(haystack, haystack.len() + 1, |_| {
+                    invalid_callback = true;
+                    Ok::<bool, ()>(true)
+                })
+                .is_err());
+            assert!(!invalid_callback);
             assert_eq!(
                 ordinary.count_positive_width_selected_ends_at(haystack, haystack.len() + 1),
                 Err(SearchError::FixedPredicateWord64(
@@ -51154,6 +52405,276 @@ mod tests {
                 b"xxneedleXYZ,needleXYZ,needleXYZy",
                 0,
             ),
+            Ok(Some(3)),
+        );
+    }
+
+    #[test]
+    fn ordinary_matching_lf_line_reducer_covers_bound_literal_engines() {
+        let exact = PortableBuilder::new("needle")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(exact.build_report().plan, PlanKind::ExactLiteral);
+        let mut exact = exact.ordinary_session().unwrap();
+        assert!(exact.supports_matching_lf_line_count());
+        assert_eq!(
+            exact.count_matching_lf_lines(
+                b"\nneedle needle\nmiss\nneedle\nneedle",
+                false,
+            ),
+            Ok(None),
+            "a missing LF-exclusion proof declines before execution",
+        );
+        assert_eq!(
+            exact.count_matching_lf_lines(
+                b"\nneedle needle\nmiss\nneedle\nneedle",
+                true,
+            ),
+            Ok(Some(3)),
+        );
+
+        let packed = PortableBuilder::new("alpha|beta|gamma")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(packed.build_report().plan, PlanKind::PackedLiteralSet);
+        let mut packed = packed.ordinary_session().unwrap();
+        assert!(packed.supports_matching_lf_line_count());
+        assert_eq!(
+            packed.count_matching_lf_lines(
+                b"alpha beta\nmiss\n\ngamma\nbetabeta",
+                true,
+            ),
+            Ok(Some(3)),
+        );
+
+        let unsupported = PortableBuilder::new("a+z")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        let mut unsupported = unsupported.ordinary_session().unwrap();
+        assert!(!unsupported.supports_matching_lf_line_count());
+        assert_eq!(
+            unsupported.count_matching_lf_lines(b"aaaz\naaaz", true),
+            Ok(None),
+            "an unsupported plan declines before source execution",
+        );
+    }
+
+    #[test]
+    fn ordinary_matching_lf_line_reducer_exhaustively_matches_line_reference() {
+        fn sources(max_len: usize) -> Vec<Vec<u8>> {
+            let mut all = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..max_len {
+                let mut next = Vec::new();
+                for prefix in &level {
+                    for byte in [b'a', b'b', b'\n'] {
+                        let mut source = prefix.clone();
+                        source.push(byte);
+                        all.push(source.clone());
+                        next.push(source);
+                    }
+                }
+                level = next;
+            }
+            all
+        }
+
+        fn reference(regex: &PortableRegex, haystack: &[u8]) -> u64 {
+            let mut count = 0_u64;
+            let mut start = 0_usize;
+            loop {
+                let end = super::memchr(b'\n', &haystack[start..])
+                    .map_or(haystack.len(), |relative| start.saturating_add(relative));
+                if regex.is_match(&haystack[start..end]) {
+                    count = count.saturating_add(1);
+                }
+                if end == haystack.len() {
+                    return count;
+                }
+                start = end.saturating_add(1);
+            }
+        }
+
+        let exact = PortableBuilder::new("ab")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let packed = PortableBuilder::new("ab|ba|aa")
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(packed.build_report().plan, PlanKind::PackedLiteralSet);
+
+        let sources = sources(5);
+        for regex in [&exact, &packed] {
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(ordinary.supports_matching_lf_line_count());
+            for haystack in &sources {
+                assert_eq!(
+                    ordinary.count_matching_lf_lines(haystack, true),
+                    Ok(Some(reference(regex, haystack))),
+                    "plan={:?}, haystack={haystack:?}",
+                    regex.build_report().plan,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_dfa_matching_line_count_declines_before_input_and_state() {
+        fn direct_next(session: &super::PortableOrdinarySession<'_>) -> bool {
+            let super::PortableOrdinarySessionPlan::LiteralSetUniformStandardDfa {
+                direct_next,
+                ..
+            } = &session.plan
+            else {
+                panic!("uniform fixture changed ordinary-session route")
+            };
+            *direct_next
+        }
+
+        let source = (0..=128)
+            .map(|index| format!("p{index:03}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let regex = PortableBuilder::new(&source)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::LiteralSetDfa);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        assert!(!ordinary.supports_matching_lf_line_count());
+
+        assert_eq!(ordinary.first_acceptance_at(b"p000zz", 0), Ok(Some(4)));
+        assert!(direct_next(&ordinary));
+        assert_eq!(
+            ordinary.count_matching_lf_lines(b"p001\np128", true),
+            Ok(None),
+        );
+        assert!(
+            direct_next(&ordinary),
+            "an unsupported aggregate preserves prior uniform route evidence",
+        );
+
+        let nonuniform = PortableBuilder::new("b|abc|ab")
+            .unicode(false)
+            .limits(BuildLimits {
+                packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                    max_patterns: 0,
+                    ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(nonuniform.build_report().plan, PlanKind::LiteralSetDfa);
+        let mut nonuniform = nonuniform.ordinary_session().unwrap();
+        assert!(matches!(
+            &nonuniform.plan,
+            super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                ..
+            }
+        ));
+        super::literal_set_dfa_ordinary_engine_bind_probe::reset();
+        assert!(!nonuniform.supports_matching_lf_line_count());
+        assert_eq!(
+            nonuniform.count_matching_lf_lines(b"abcabc\nx\nb b\n\nab", true),
+            Ok(None),
+        );
+        assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
+        assert!(
+            matches!(
+                &nonuniform.plan,
+                super::PortableOrdinarySessionPlan::LiteralSetDfa {
+                    ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                    ..
+                }
+            ),
+            "an unsupported aggregate cannot settle the lazy DFA sidecar",
+        );
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let narrow_source = [
+                "0", "2", "4", "6", "8", "A", "C", "E", "G", "I", "a", "c", "e", "g",
+                "i", "k",
+            ]
+            .into_iter()
+            .flat_map(|root| (4_usize..=20).map(move |width| root.repeat(width)))
+            .collect::<Vec<_>>()
+            .join("|");
+            let narrow = PortableBuilder::new(&narrow_source)
+                .unicode(false)
+                .limits(BuildLimits {
+                    packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                        max_patterns: 0,
+                        ..fre_kernels::PackedLiteralSetBuildLimits::default()
+                    },
+                    ..BuildLimits::default()
+                })
+                .build()
+                .unwrap();
+            let mut narrow = narrow.ordinary_session().unwrap();
+            assert!(matches!(
+                &narrow.plan,
+                super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                    ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                    ..
+                }
+            ));
+            super::literal_set_dfa_ordinary_engine_bind_probe::reset();
+            assert!(!narrow.supports_matching_lf_line_count());
+            assert_eq!(
+                narrow.count_matching_lf_lines(b"!!!!AAAA!!!!\nmiss", true),
+                Ok(None),
+            );
+            assert_eq!(super::literal_set_dfa_ordinary_engine_bind_probe::calls(), 0);
+            assert!(matches!(
+                &narrow.plan,
+                super::PortableOrdinarySessionPlan::LiteralSetDfaNarrowAscii {
+                    ascii_engine: super::PortableOrdinaryLiteralSetEngine::Unbound,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_compact_matching_line_count_keeps_specialized_kernel() {
+        let patterns = (0..256)
+            .map(|index| {
+                let mut pattern = format!("public{index:04}");
+                pattern.extend(core::iter::repeat_n('q', 256 - pattern.len()));
+                pattern
+            })
+            .collect::<Vec<_>>();
+        let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let (built, census) = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literals_ordinary_with_census(
+                &borrowed,
+                usize::MAX,
+                None,
+            )
+            .unwrap()
+            .expect("compact typed literal owner is admitted");
+        assert!(!census.contains(b'\n'));
+        let RipgrepStandardLiteralsBuild::Ordinary(regex) = built else {
+            panic!("compact fixture retained the checked portable owner")
+        };
+        let mut ordinary = regex.ordinary_session();
+        assert!(ordinary.supports_matching_lf_line_count());
+        let haystack = format!(
+            "miss\n{}{}\n\n{}\n{}",
+            patterns[7], patterns[255], patterns[19], patterns[91],
+        );
+        assert_eq!(
+            ordinary.count_matching_lf_lines(haystack.as_bytes(), true),
             Ok(Some(3)),
         );
     }
@@ -57384,8 +58905,18 @@ mod tests {
                 .unwrap(),
             expected,
         );
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, accounted, windowed, and explicit-session APIs stay canonical",
+        );
         let mut ordinary = ascii.ordinary_session().unwrap();
         assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+        assert_eq!(
+            super::bounded_required_literal_ordinary_facade_probe::snapshot(),
+            (0, 1),
+            "a zero-origin ordinary-session span enters the ordinary full route",
+        );
         let expected_iter = vec![(5, 11)];
         let accounted_iter = ascii
             .find_iter(haystack, PortableFindIterLimits::unlimited())
@@ -57419,8 +58950,8 @@ mod tests {
         );
         assert_eq!(
             super::bounded_required_literal_ordinary_facade_probe::snapshot(),
-            (0, 0),
-            "finite, accounted, windowed, session, and capture APIs stay canonical",
+            (0, 1),
+            "iterator and capture APIs stay canonical after the ordinary-session handoff",
         );
 
         assert!(ascii.is_match(haystack));
@@ -57434,7 +58965,7 @@ mod tests {
         );
         assert_eq!(
             super::bounded_required_literal_ordinary_facade_probe::snapshot(),
-            (2, 3),
+            (2, 4),
             "only anchor-free ordinary boolean/span calls enter the bounded route",
         );
 
@@ -57454,7 +58985,7 @@ mod tests {
         assert_eq!(unbounded.find(b"aaaaZQ"), Some(Match { start: 0, end: 6 }));
         assert_eq!(
             super::bounded_required_literal_ordinary_facade_probe::snapshot(),
-            (2, 3),
+            (2, 4),
             "anchored bounded and unbounded plans retain their existing routes",
         );
 
@@ -59436,8 +60967,18 @@ mod tests {
             .unwrap();
         assert!(session.is_match_value(haystack, unlimited).unwrap());
         assert_eq!(session.find_value(haystack, unlimited).unwrap(), expected);
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (0, 0),
+            "finite, windowed, and explicit-session APIs stay canonical",
+        );
         let mut ordinary_session = regex.ordinary_session().unwrap();
         assert_eq!(ordinary_session.find_at(haystack, 0).unwrap(), expected);
+        assert_eq!(
+            super::forward_anchored_ordinary_facade_probe::snapshot(),
+            (0, 1),
+            "a zero-origin ordinary-session span enters the ordinary full route",
+        );
 
         assert_eq!(
             regex
@@ -59470,15 +61011,15 @@ mod tests {
         );
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (0, 0),
-            "finite, windowed, session, iterator, and capture APIs stay canonical",
+            (0, 1),
+            "iterator and capture APIs stay canonical after the ordinary-session handoff",
         );
 
         assert!(regex.is_match(haystack));
         assert_eq!(regex.find(haystack), expected);
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (1, 1),
+            (1, 2),
         );
 
         let fixed = PortableBuilder::new(pattern)
@@ -59491,7 +61032,7 @@ mod tests {
         assert_eq!(fixed.find(haystack), expected);
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (2, 2),
+            (2, 3),
             "fixed-end ordinary values use only their full-window projection",
         );
 
@@ -59505,7 +61046,7 @@ mod tests {
         assert_eq!(unrelated.find(haystack), expected);
         assert_eq!(
             super::forward_anchored_ordinary_facade_probe::snapshot(),
-            (2, 2),
+            (2, 3),
             "unrelated owners cannot enter the forward ordinary route",
         );
     }
@@ -59937,6 +61478,11 @@ mod tests {
                 .is_match_value(haystack, SearchLimits::unlimited())
                 .unwrap()
         );
+        assert_eq!(
+            super::unicode_scalar_run_ordinary_facade_probe::calls(),
+            ordinary,
+            "finite, windowed, and explicit-session APIs stay canonical",
+        );
         let mut ordinary_session = regex.ordinary_session().unwrap();
         assert_eq!(
             ordinary_session
@@ -59944,6 +61490,11 @@ mod tests {
                 .unwrap()
                 .map(|matched| (matched.start(), matched.end())),
             expected,
+        );
+        assert_eq!(
+            super::unicode_scalar_run_ordinary_facade_probe::calls(),
+            ordinary + 1,
+            "a zero-origin ordinary-session span enters the ordinary full route",
         );
         assert!(ordinary_session.is_match_at(haystack, 0).unwrap());
 
@@ -60003,8 +61554,8 @@ mod tests {
         ));
         assert_eq!(
             super::unicode_scalar_run_ordinary_facade_probe::calls(),
-            ordinary,
-            "finite, windowed, session, iterator, capture, and ordinary-session APIs stay canonical",
+            ordinary + 1,
+            "iterator, capture, finite refusal, and invalid-window APIs stay canonical",
         );
 
         let capture_cases: &[(&str, &[Option<&str>])] = &[

@@ -12,6 +12,7 @@ use aho_corasick::dfa::DFA;
 use aho_corasick::nfa::contiguous::NFA;
 use aho_corasick::nfa::noncontiguous;
 use aho_corasick::{Anchored, Input, MatchKind};
+use memchr::memchr;
 
 use crate::Window;
 use crate::literal_set::{
@@ -808,8 +809,12 @@ impl CompactEngine {
             .try_find_iter(input)
             .expect("the compact literal NFA supports unanchored iteration");
         for matched in matches {
-            let span = self.absolute_span(matched)?;
-            match visitor(span) {
+            // Aho already derives this absolute start while constructing its
+            // match. Reuse it instead of subtracting the uniform width again
+            // for every tail match.
+            let span = matched.span();
+            debug_assert_eq!(span.end - span.start, self.width);
+            match visitor((span.start, span.end)) {
                 Ok(true) => {}
                 Ok(false) => return Ok(Ok(())),
                 Err(error) => return Ok(Err(error)),
@@ -832,6 +837,71 @@ impl CompactEngine {
         u64::try_from(count).map_err(|_| LiteralSetError::ArithmeticOverflow {
             computation: "compact literal-set ordinary match count",
         })
+    }
+
+    /// Count LF-delimited lines with at least one acceptance. The caller has
+    /// authenticated that LF cannot occur in any retained literal, so the
+    /// first acceptance in a line permits skipping directly to its boundary.
+    #[inline(never)]
+    fn count_matching_lf_lines_value(
+        &self,
+        haystack: &[u8],
+    ) -> Result<u64, LiteralSetError> {
+        let window = Window::full(haystack);
+        if self.window_is_too_short(window) {
+            return Ok(0);
+        }
+        let mut count = 0_u64;
+        if let Some(mut scanner) =
+            CompactOrdinaryScanner::new(self, haystack, window)
+        {
+            while let Some(end) = scanner.next_end() {
+                count = count.checked_add(1).ok_or(
+                    LiteralSetError::ArithmeticOverflow {
+                        computation: "compact literal-set matching LF-line count",
+                    },
+                )?;
+                let Some(relative_lf) = memchr(b'\n', &haystack[end..]) else {
+                    break;
+                };
+                scanner.at = end
+                    .checked_add(relative_lf)
+                    .and_then(|at| at.checked_add(1))
+                    .ok_or(LiteralSetError::ArithmeticOverflow {
+                        computation: "compact literal-set next LF-line start",
+                    })?;
+                scanner.state = scanner.start_state;
+            }
+            return Ok(count);
+        }
+        let mut at = 0;
+        loop {
+            let input = Input::new(haystack).span(at..haystack.len());
+            let Some(matched) = self
+                .automaton
+                .try_find(&input)
+                .expect("the compact literal NFA supports unanchored search")
+            else {
+                break;
+            };
+            count = count.checked_add(1).ok_or(
+                LiteralSetError::ArithmeticOverflow {
+                    computation: "compact literal-set matching LF-line count",
+                },
+            )?;
+            let Some(relative_lf) = memchr(b'\n', &haystack[matched.end()..])
+            else {
+                break;
+            };
+            at = matched
+                .end()
+                .checked_add(relative_lf)
+                .and_then(|at| at.checked_add(1))
+                .ok_or(LiteralSetError::ArithmeticOverflow {
+                    computation: "compact literal-set next LF-line start",
+                })?;
+        }
+        Ok(count)
     }
 
     /// Reduce a whole direct-scanner window without outlining each accepted
@@ -1020,6 +1090,23 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
         window: Window,
     ) -> Result<u64, LiteralSetError> {
         self.engine.count_spans_window_value(haystack, window)
+    }
+
+    /// Count matching LF-delimited lines when the embedding has independently
+    /// proved that no retained literal contains LF.
+    #[doc(hidden)]
+    #[inline]
+    pub fn count_matching_lf_lines_value(
+        &self,
+        haystack: &[u8],
+        lf_is_excluded: bool,
+    ) -> Result<Option<u64>, LiteralSetError> {
+        if !lf_is_excluded {
+            return Ok(None);
+        }
+        self.engine
+            .count_matching_lf_lines_value(haystack)
+            .map(Some)
     }
 }
 
@@ -1390,6 +1477,68 @@ mod tests {
             compact_ordinary_scanner_probe::binds(),
             1,
             "ordinary count binds the direct no-prefilter scanner once",
+        );
+    }
+
+    #[test]
+    fn direct_scanner_counts_each_authenticated_lf_line_once() {
+        let mut patterns = broad_root_256x128_patterns();
+        for pattern in &mut patterns {
+            if pattern[0] >= b'\n' {
+                pattern[0] = pattern[0].saturating_add(1);
+            }
+        }
+        assert!(patterns.iter().all(|pattern| !pattern.contains(&b'\n')));
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the broad-root set admits the compact ordinary owner")
+            .into_ordinary();
+        assert!(plan.engine.automaton.prefilter().is_none());
+        let ordinary = plan.ordinary_executor();
+
+        let mut haystack = b"miss\n".to_vec();
+        haystack.extend_from_slice(&patterns[0]);
+        haystack.extend_from_slice(&patterns[0]);
+        haystack.extend_from_slice(b"\n\n");
+        haystack.extend_from_slice(&patterns[17]);
+        haystack.push(b'\n');
+        haystack.extend_from_slice(&patterns[255]);
+        haystack.extend_from_slice(&patterns[1]);
+        haystack.push(b'\n');
+        haystack.extend_from_slice(&patterns[5]);
+
+        compact_ordinary_scanner_probe::reset();
+        assert_eq!(
+            ordinary.count_matching_lf_lines_value(&haystack, true),
+            Ok(Some(4)),
+        );
+        assert_eq!(compact_ordinary_scanner_probe::binds(), 1);
+        assert_eq!(
+            ordinary.count_matching_lf_lines_value(&haystack, false),
+            Ok(None),
+        );
+    }
+
+    #[test]
+    fn prefiltered_scanner_counts_each_authenticated_lf_line_once() {
+        let patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the common-prefix set admits the compact ordinary owner")
+            .into_ordinary();
+        assert!(plan.engine.automaton.prefilter().is_some());
+        let ordinary = plan.ordinary_executor();
+
+        let mut haystack = b"miss\n".to_vec();
+        haystack.extend_from_slice(&patterns[3]);
+        haystack.extend_from_slice(&patterns[3]);
+        haystack.push(b'\n');
+        haystack.extend_from_slice(&patterns[7]);
+        haystack.extend_from_slice(b"\n\n");
+        haystack.extend_from_slice(&patterns[11]);
+        assert_eq!(
+            ordinary.count_matching_lf_lines_value(&haystack, true),
+            Ok(Some(3)),
         );
     }
 
@@ -2212,5 +2361,64 @@ mod tests {
             Ok(Err("callback")),
         );
         assert_eq!(compact_ordinary_scanner_probe::binds(), 0);
+    }
+
+    #[test]
+    fn prefiltered_tail_spans_keep_absolute_nonzero_windows_and_callback_control() {
+        let patterns = public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES);
+        let compact = compact(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .unwrap();
+        let ordinary = compact.ordinary_executor();
+
+        let mut haystack = vec![b'x'];
+        let start = haystack.len();
+        haystack.extend_from_slice(&patterns[3]);
+        let adjacent = haystack.len();
+        haystack.extend_from_slice(&patterns[7]);
+        let end = haystack.len();
+        haystack.push(b'x');
+        let window = Window::new(start, end);
+        let expected = [(start, adjacent), (adjacent, end)];
+
+        assert!(ordinary.engine.automaton.prefilter().is_some());
+        assert!(CompactOrdinaryScanner::new(ordinary.engine, &haystack, window).is_none());
+        assert_eq!(
+            ordinary.find_window_value(&haystack, window),
+            Ok(Some(expected[0]))
+        );
+        assert_eq!(ordinary.count_spans_window_value(&haystack, window), Ok(2));
+
+        let mut spans = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |span| {
+                spans.push(span);
+                Ok::<bool, &'static str>(true)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(spans, expected);
+
+        let mut stop_calls = 0;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |span| {
+                stop_calls += 1;
+                assert_eq!(span, expected[0]);
+                Ok::<bool, &'static str>(false)
+            }),
+            Ok(Ok(())),
+        );
+        assert_eq!(stop_calls, 1);
+
+        let mut error_calls = 0;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, window, |span| {
+                error_calls += 1;
+                assert_eq!(span, expected[0]);
+                Err::<bool, _>("callback")
+            }),
+            Ok(Err("callback")),
+        );
+        assert_eq!(error_calls, 1);
     }
 }

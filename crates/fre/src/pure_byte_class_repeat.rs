@@ -2102,8 +2102,18 @@ mod tests {
                 .is_match_window_value(haystack, full, unlimited)
                 .unwrap()
         );
+        assert_eq!(
+            super::ordinary_full_call_counts(),
+            (0, 0),
+            "finite, accounted, windowed, and explicit-session APIs stay canonical",
+        );
         let mut ordinary = regex.ordinary_session().unwrap();
         assert_eq!(ordinary.find_at(haystack, 0).unwrap(), expected);
+        assert_eq!(
+            super::ordinary_full_call_counts(),
+            (0, 1),
+            "a zero-origin ordinary-session span enters the ordinary full route",
+        );
 
         assert_eq!(
             regex
@@ -2136,14 +2146,14 @@ mod tests {
         );
         assert_eq!(
             super::ordinary_full_call_counts(),
-            (0, 0),
-            "finite, accounted, windowed, session, iterator, and capture APIs stay canonical",
+            (0, 1),
+            "iterator and capture APIs stay canonical after the ordinary-session handoff",
         );
 
         assert!(regex.is_match(haystack));
-        assert_eq!(super::ordinary_full_call_counts(), (1, 0));
-        assert_eq!(regex.find(haystack), expected);
         assert_eq!(super::ordinary_full_call_counts(), (1, 1));
+        assert_eq!(regex.find(haystack), expected);
+        assert_eq!(super::ordinary_full_call_counts(), (1, 2));
 
         let bounded = build("(?-u:[aceg]){2,5}");
         assert!(matches!(
@@ -2162,7 +2172,7 @@ mod tests {
         assert_eq!(forced.find(haystack), expected);
         assert_eq!(
             super::ordinary_full_call_counts(),
-            (1, 1),
+            (1, 2),
             "bounded and forced-K0 ordinary calls retain their own routes",
         );
     }

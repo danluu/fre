@@ -3458,7 +3458,7 @@ mod tests {
     }
 
     #[test]
-    fn only_public_ordinary_find_enters_the_unmetered_span_route() {
+    fn public_and_zero_origin_ordinary_session_find_enter_the_unmetered_span_route() {
         const PATTERN: &str = r"\b\p{Greek}+\b";
         let hit = "!Ωμέγα!".as_bytes();
         let miss = b"plain ASCII";
@@ -3529,6 +3529,11 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end())),
             expected,
         );
+        assert_eq!(
+            ordinary_find_probe::calls(),
+            ordinary_calls,
+            "finite, windowed, and explicit-session APIs stay canonical",
+        );
         let mut ordinary = regex.ordinary_session().expect("ordinary session");
         assert_eq!(
             ordinary
@@ -3536,6 +3541,11 @@ mod tests {
                 .expect("ordinary-session span")
                 .map(|matched| (matched.start(), matched.end())),
             expected,
+        );
+        assert_eq!(
+            ordinary_find_probe::calls(),
+            ordinary_calls + 1,
+            "a zero-origin ordinary-session span enters the ordinary full route",
         );
 
         let expected_iter = vec![expected.expect("hit span")];
@@ -3580,8 +3590,8 @@ mod tests {
         ));
         assert_eq!(
             ordinary_find_probe::calls(),
-            ordinary_calls,
-            "finite, windowed, session, iterator, capture, and boolean APIs stay canonical",
+            ordinary_calls + 1,
+            "iterator, capture, boolean, and finite refusal APIs stay canonical",
         );
 
         let bounded_plan = plan(r"\b\p{Greek}{2,8}\b", true);
@@ -3602,7 +3612,7 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end())),
             expected,
         );
-        assert_eq!(ordinary_find_probe::calls(), ordinary_calls);
+        assert_eq!(ordinary_find_probe::calls(), ordinary_calls + 1);
     }
 
     #[test]

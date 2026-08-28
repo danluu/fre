@@ -62,9 +62,13 @@ fn fused_full_existence_preserves_prefix_duplicate_raw_byte_and_incumbent_routes
         fused.match_semantics,
         LiteralSetMatchSemantics::LeftmostFirst
     );
-    assert_eq!(fused.patterns, PATTERNS.len() - 1);
-    assert_eq!(fused.pattern_bytes, 24);
+    assert_eq!(fused.patterns, PATTERNS.len());
+    assert_eq!(fused.pattern_bytes, 26);
     assert_eq!(fused.minimum_pattern_bytes, 2);
+    assert_eq!(
+        set.build_report().fused_literal_set_source_id_offset,
+        Some(0),
+    );
     assert!(fused.build_work_upper_bound > 0);
     assert!(fused.build_bytes_upper_bound > 0);
     assert_eq!(

@@ -47,6 +47,17 @@ const ORDINARY_ROOT_ASCII_MIN_BYTES: usize = ASCII_NARROW_BYTES * 8;
 // source-independent bytes-per-root amortization floor.
 const ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES: usize = ORDINARY_ROOT_ASCII_MIN_BYTES * 2;
 
+// A third tier extends the same exact ASCII classifier to 49..=72 roots only
+// after three times the narrow source extent. Every tier therefore preserves
+// the same source-bytes-per-admitted-root amortization floor while leaving the
+// established 5..=24 and 25..=48 decisions unchanged.
+const ORDINARY_ROOT_ASCII_EXTRA_WIDE_MIN_BYTES: usize = ORDINARY_ROOT_ASCII_MIN_BYTES * 3;
+
+// A fourth tier extends the same exact ASCII classifier to 73..=96 roots only
+// after four times the narrow source extent, preserving the same fixed
+// source-bytes-per-admitted-root amortization floor as the first three tiers.
+const ORDINARY_ROOT_ASCII_ULTRA_WIDE_MIN_BYTES: usize = ORDINARY_ROOT_ASCII_MIN_BYTES * 4;
+
 // Keep an arbitrary root sparse enough that two uniformly distributed
 // full-byte classifier blocks contain at most three expected exact-DFA
 // candidates. Tying the limit to three halves of the physical 16-byte
@@ -54,6 +65,10 @@ const ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES: usize = ORDINARY_ROOT_ASCII_MIN_BYTES 
 // an unrelated pattern-count constant.
 const ORDINARY_ROOT_ASCII_MAX_MEMBERS: usize = ASCII_NARROW_BYTES * 3 / 2;
 const ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS: usize = ORDINARY_ROOT_ASCII_MAX_MEMBERS * 2;
+const ORDINARY_ROOT_ASCII_EXTRA_WIDE_MAX_MEMBERS: usize =
+    ORDINARY_ROOT_ASCII_MAX_MEMBERS * 3;
+const ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS: usize =
+    ORDINARY_ROOT_ASCII_MAX_MEMBERS * 4;
 
 // Direct existence keeps its native classifier for a short accepting prefix.
 // Past that prefix, four straight transitions amortize cursor and loop control
@@ -359,11 +374,11 @@ impl LiteralSetDfaRootRange {
 /// Biased exact ranges occupy the nonzero low-16-bit domain. A non-contiguous
 /// set of at most four exact roots instead records the nonzero mask of their
 /// high-nibble buckets in the high 16 bits, leaving the range half exactly
-/// zero. Two otherwise impossible high-half bucket masks mark
-/// construction-proved 5..=24 and 25..=48 member ASCII roots whose exact
-/// classifier may be prepared by an ordinary worker. The selected-span
-/// scanner can retain the incumbent low-half `Option<NonZeroU16>` projection
-/// without learning about either wider form.
+/// zero. Four otherwise impossible high-half bucket masks mark
+/// construction-proved 5..=24, 25..=48, 49..=72 and 73..=96 member ASCII
+/// roots whose exact classifier may be prepared by an ordinary worker. The
+/// selected-span scanner can retain the incumbent low-half
+/// `Option<NonZeroU16>` projection without learning about any wider form.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LiteralSetDfaRoot(NonZeroU32);
@@ -374,6 +389,12 @@ impl LiteralSetDfaRoot {
     // A real Set4 root marks at most four of the sixteen buckets, so a mask
     // with fifteen set bits is also free for the wider sparse-ASCII tier.
     const ASCII_SPARSE_WIDE_MARKER: u16 = u16::MAX - 1;
+    // A second fifteen-bucket mask likewise cannot encode a real Set4 root
+    // and identifies the separately amortized 49..=72-member tier.
+    const ASCII_SPARSE_EXTRA_WIDE_MARKER: u16 = u16::MAX - 2;
+    // This fourteen-bucket mask cannot encode a real Set4 root either and
+    // identifies the separately amortized 73..=96-member tier.
+    const ASCII_SPARSE_ULTRA_WIDE_MARKER: u16 = u16::MAX - 3;
 
     fn from_range(range: LiteralSetDfaRootRange) -> Self {
         Self(
@@ -397,11 +418,18 @@ impl LiteralSetDfaRoot {
         )
     }
 
-    fn from_ascii_sparse(wide: bool) -> Self {
-        let marker = if wide {
-            Self::ASCII_SPARSE_WIDE_MARKER
-        } else {
+    fn from_ascii_sparse(members: usize) -> Self {
+        debug_assert!(
+            members > 4 && members <= ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS,
+        );
+        let marker = if members <= ORDINARY_ROOT_ASCII_MAX_MEMBERS {
             Self::ASCII_SPARSE_MARKER
+        } else if members <= ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS {
+            Self::ASCII_SPARSE_WIDE_MARKER
+        } else if members <= ORDINARY_ROOT_ASCII_EXTRA_WIDE_MAX_MEMBERS {
+            Self::ASCII_SPARSE_EXTRA_WIDE_MARKER
+        } else {
+            Self::ASCII_SPARSE_ULTRA_WIDE_MARKER
         };
         let encoded = u32::from(marker) << Self::SET4_BUCKET_SHIFT;
         Self(
@@ -448,6 +476,12 @@ impl LiteralSetDfaRoot {
             }
             marker if marker == u32::from(Self::ASCII_SPARSE_WIDE_MARKER) => {
                 Some(ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES)
+            }
+            marker if marker == u32::from(Self::ASCII_SPARSE_EXTRA_WIDE_MARKER) => {
+                Some(ORDINARY_ROOT_ASCII_EXTRA_WIDE_MIN_BYTES)
+            }
+            marker if marker == u32::from(Self::ASCII_SPARSE_ULTRA_WIDE_MARKER) => {
+                Some(ORDINARY_ROOT_ASCII_ULTRA_WIDE_MIN_BYTES)
             }
             _ => None,
         }
@@ -612,12 +646,13 @@ fn direct_dfa_set4_members_from_buckets(
 /// Derive one exact arbitrary ASCII root set for the ordinary-session engine.
 ///
 /// Set4 and contiguous-range roots retain their smaller existing bindings.
-/// The construction marker proves that this wider route has 5..=48 exact
+/// The construction marker proves that this wider route has 5..=96 exact
 /// roots and that every one is ASCII. Replaying only the ASCII half of the
 /// DFA alphabet therefore reconstructs the complete set without revisiting
 /// 128 transitions that construction already proved cannot be roots. The
-/// 25..=48 tier requires twice the source extent used by the existing
-/// 5..=24-member tier before this same classifier is prepared or consulted.
+/// 25..=48, 49..=72 and 73..=96 tiers require respectively twice, three times
+/// and four times the source extent used by the existing 5..=24-member tier
+/// before this same classifier is prepared or consulted.
 #[cold]
 #[inline(never)]
 fn direct_dfa_ascii_root_set(
@@ -642,7 +677,7 @@ fn direct_dfa_ascii_root_set(
         words[word] |= 1_u64 << bit;
         members = members.checked_add(1)?;
     }
-    (members > 4 && members <= ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS)
+    (members > 4 && members <= ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS)
         .then_some(AsciiByteSet::from_words(words))
 }
 
@@ -795,6 +830,7 @@ mod ordinary_direct_probe {
         static ROOT_ASCII_CALLS: Cell<usize> = const { Cell::new(0) };
         static ROOT_ASCII_SKIPPED_BYTES: Cell<usize> = const { Cell::new(0) };
         static SPAN_ASCII_REUSES: Cell<usize> = const { Cell::new(0) };
+        static SPAN_ASCII_DENSE_HANDOFFS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
@@ -812,6 +848,7 @@ mod ordinary_direct_probe {
         ROOT_ASCII_CALLS.set(0);
         ROOT_ASCII_SKIPPED_BYTES.set(0);
         SPAN_ASCII_REUSES.set(0);
+        SPAN_ASCII_DENSE_HANDOFFS.set(0);
     }
 
     pub(super) fn record() {
@@ -920,6 +957,16 @@ mod ordinary_direct_probe {
     pub(super) fn span_ascii_reuses() -> usize {
         SPAN_ASCII_REUSES.get()
     }
+
+    pub(super) fn record_span_ascii_dense_handoff() {
+        SPAN_ASCII_DENSE_HANDOFFS.set(
+            SPAN_ASCII_DENSE_HANDOFFS.get().saturating_add(1),
+        );
+    }
+
+    pub(super) fn span_ascii_dense_handoffs() -> usize {
+        SPAN_ASCII_DENSE_HANDOFFS.get()
+    }
 }
 
 #[cold]
@@ -970,12 +1017,10 @@ fn direct_dfa_root(
     if members > exact_members.len() {
         #[cfg(target_arch = "aarch64")]
         {
-            if !all_ascii || members > ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS {
+            if !all_ascii || members > ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS {
                 return None;
             }
-            return Some(LiteralSetDfaRoot::from_ascii_sparse(
-                members > ORDINARY_ROOT_ASCII_MAX_MEMBERS,
-            ));
+            return Some(LiteralSetDfaRoot::from_ascii_sparse(members));
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -2404,6 +2449,30 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
         if self.end - at < minimum_bytes {
             return true;
         }
+        let already_prepared = roots.is_some();
+        if !already_prepared {
+            // The marker, positive-width admission and pinned unanchored DFA
+            // construction together make leaving this start state exact root
+            // membership. Preserve the incumbent DFA on a cold, immediately
+            // dense source without first reconstructing the whole classifier;
+            // a sparse initial pair still prepares it once below.
+            let anchored = Anchored::No;
+            if self
+                .automaton
+                .next_state(anchored, self.start_state, self.haystack[at])
+                != self.start_state
+            {
+                return true;
+            }
+            if self
+                .automaton
+                .next_state(anchored, self.start_state, self.haystack[at + 1])
+                != self.start_state
+            {
+                self.restart = at + 1;
+                return true;
+            }
+        }
         let roots = roots.get_or_insert_with(|| {
             let roots = direct_dfa_ascii_root_set(self.automaton, self.start_state)
                 .expect("the construction-sealed sparse ASCII root remains exact");
@@ -2411,12 +2480,14 @@ impl<'a, 'h> LiteralSetDfaScanner<'a, 'h> {
             ordinary_direct_probe::record_root_ascii_preparation();
             AsciiByteSetClassifier::new(roots)
         });
-        if roots.set().contains(self.haystack[at]) {
-            return true;
-        }
-        if roots.set().contains(self.haystack[at + 1]) {
-            self.restart = at + 1;
-            return true;
+        if already_prepared {
+            if roots.set().contains(self.haystack[at]) {
+                return true;
+            }
+            if roots.set().contains(self.haystack[at + 1]) {
+                self.restart = at + 1;
+                return true;
+            }
         }
         let remaining = &self.haystack[at..self.end];
         let Some(relative) = find_direct_dfa_ascii_root_after_initial_miss(roots, remaining) else {
@@ -2880,10 +2951,11 @@ impl<'a> LiteralSetOrdinaryExecutor<'a> {
     /// Bind one worker-owned engine whose exact ASCII root can be prepared
     /// lazily against this executor's immutable direct-DFA identity.
     ///
-    /// AArch64 retains one exact 5..=48-member ASCII classifier only when its
-    /// direct-DFA identity carries one of the two construction markers. Other
-    /// targets and root shapes retain the unchanged executor alone. The wider
-    /// marker also retains its larger source threshold in the packed identity.
+    /// AArch64 retains one exact 5..=96-member ASCII classifier only when its
+    /// direct-DFA identity carries one of the four construction markers.
+    /// Other targets and root shapes retain the unchanged executor alone. The
+    /// wider markers also retain their larger source thresholds in the packed
+    /// identity.
     /// Binding performs no classifier construction, so short and unused
     /// operations do not pay its setup cost.
     #[doc(hidden)]
@@ -3426,6 +3498,11 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                 Ok(false) => return Ok(Ok(())),
                 Err(error) => return Ok(Err(error)),
             }
+            // Root seeking wins when selected spans are sparse, but its
+            // bounded native prefix adds control flow to every dense span.
+            // Two adjacent selections provide source-local evidence for the
+            // incumbent direct scanner without retaining any haystack state.
+            let mut previous_end = first.1;
             if reuse_prepared_root {
                 while let Some(matched) =
                     scanner.next_span_with_prepared_ascii_root(
@@ -3433,10 +3510,27 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                         minimum_bytes,
                     )
                 {
+                    let follows_match_nearby = matched
+                        .0
+                        .saturating_sub(previous_end)
+                        <= ORDINARY_UNIFORM_SPAN_MAX_GAP_BYTES;
                     match visitor(matched) {
                         Ok(true) => {}
                         Ok(false) => return Ok(Ok(())),
                         Err(error) => return Ok(Err(error)),
+                    }
+                    previous_end = matched.1;
+                    if follows_match_nearby {
+                        #[cfg(test)]
+                        ordinary_direct_probe::record_span_ascii_dense_handoff();
+                        while let Some(matched) = scanner.next_span() {
+                            match visitor(matched) {
+                                Ok(true) => {}
+                                Ok(false) => return Ok(Ok(())),
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        }
+                        break;
                     }
                 }
             } else {
@@ -3446,10 +3540,27 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
                         minimum_bytes,
                     )
                 {
+                    let follows_match_nearby = matched
+                        .0
+                        .saturating_sub(previous_end)
+                        <= ORDINARY_UNIFORM_SPAN_MAX_GAP_BYTES;
                     match visitor(matched) {
                         Ok(true) => {}
                         Ok(false) => return Ok(Ok(())),
                         Err(error) => return Ok(Err(error)),
+                    }
+                    previous_end = matched.1;
+                    if follows_match_nearby {
+                        #[cfg(test)]
+                        ordinary_direct_probe::record_span_ascii_dense_handoff();
+                        while let Some(matched) = scanner.next_span() {
+                            match visitor(matched) {
+                                Ok(true) => {}
+                                Ok(false) => return Ok(Ok(())),
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        }
+                        break;
                     }
                 }
             }
@@ -3463,9 +3574,9 @@ impl<'a> LiteralSetOrdinaryEngine<'a> {
     /// Count every non-overlapping selected span through the narrow sparse
     /// ASCII root engine used by span visitation.
     ///
-    /// Returns `Ok(None)` for the separately admitted wide tier so its count
-    /// caller can retain the compact endpoint route. Exists and span calls
-    /// continue to use the bound wide engine unchanged.
+    /// Returns `Ok(None)` for the separately admitted wider tiers so their
+    /// count caller can retain the compact endpoint route. Exists and span
+    /// calls continue to use the bound wider engines unchanged.
     ///
     /// # Errors
     ///
@@ -6750,7 +6861,11 @@ mod tests {
         LiteralSetError, LiteralSetMatchSemantics, LiteralSetOrdinaryExecutor, LiteralSetPlan,
         LiteralSetSearchLimits, ORDINARY_DIRECT_DFA_BULK_BYTES,
         ORDINARY_DIRECT_DFA_NATIVE_BYTES, ORDINARY_ROOT_RANGE_MIN_BYTES,
-        ORDINARY_ROOT_ASCII_MAX_MEMBERS, ORDINARY_ROOT_ASCII_MIN_BYTES,
+        ORDINARY_ROOT_ASCII_EXTRA_WIDE_MAX_MEMBERS,
+        ORDINARY_ROOT_ASCII_EXTRA_WIDE_MIN_BYTES, ORDINARY_ROOT_ASCII_MAX_MEMBERS,
+        ORDINARY_ROOT_ASCII_MIN_BYTES,
+        ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS,
+        ORDINARY_ROOT_ASCII_ULTRA_WIDE_MIN_BYTES,
         ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS, ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES,
         ORDINARY_ROOT_SET4_MIN_BYTES, ORDINARY_UNIFORM_SPAN_MAX_PATTERN_BYTES,
         PINNED_AHO_PREFILTER_TEDDY_MAX_PATTERNS,
@@ -8604,6 +8719,14 @@ mod tests {
         (0_u8..=96).step_by(2).collect()
     }
 
+    fn root_ascii_extra_wide_test_roots() -> Vec<u8> {
+        (u8::MIN..=0x7f).filter(|byte| byte % 4 != 0).collect()
+    }
+
+    fn root_ascii_over_density_test_roots() -> Vec<u8> {
+        (u8::MIN..=0x7f).filter(|byte| byte % 5 != 0).collect()
+    }
+
     fn root_ascii_patterns_for_roots(roots: &[u8]) -> Vec<Vec<u8>> {
         // Seventeen widths per non-contiguous root exceed the compact Set4
         // encoding and Aho 1.1.4's Teddy ceiling, producing the direct
@@ -9452,6 +9575,142 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn ordinary_direct_dfa_ascii_root_admits_extra_wide_tier_after_larger_extent() {
+        let roots = root_ascii_extra_wide_test_roots();
+        assert!(roots.len() > ORDINARY_ROOT_ASCII_EXTRA_WIDE_MAX_MEMBERS);
+        for root_count in [
+            ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS + 1,
+            64,
+            ORDINARY_ROOT_ASCII_EXTRA_WIDE_MAX_MEMBERS,
+        ] {
+            let patterns = root_ascii_patterns_for_roots(&roots[..root_count]);
+            let plan = LiteralSetPlan::new_stable(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert!(plan.automaton.prefilter().is_none());
+            let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            assert!(!ordinary.narrow_ascii_count_engine_supported());
+            let root = ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root)
+                .expect("the admitted extra-wide ASCII root retains its marker");
+            assert!(root.is_ascii_sparse());
+            assert_eq!(
+                root.ascii_sparse_min_bytes(),
+                Some(ORDINARY_ROOT_ASCII_EXTRA_WIDE_MIN_BYTES),
+            );
+            assert_eq!(root.as_range(), None);
+            assert_eq!(root.set4_bucket_mask(), None);
+
+            let mut engine = ordinary
+                .bind_engine()
+                .expect("an admitted extra-wide ASCII root binds its lazy engine");
+            let short_miss = vec![
+                b' ';
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                    + ORDINARY_ROOT_ASCII_EXTRA_WIDE_MIN_BYTES
+                    - 1
+            ];
+            assert_eq!(
+                engine.exists_window_value(&short_miss, Window::full(&short_miss)),
+                Ok(false),
+            );
+            assert!(engine.prepared_ascii_root.is_none());
+
+            let long_miss = vec![
+                b' ';
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                    + ORDINARY_ROOT_ASCII_EXTRA_WIDE_MIN_BYTES
+            ];
+            assert_eq!(
+                engine.exists_window_value(&long_miss, Window::full(&long_miss)),
+                Ok(false),
+            );
+            let retained_roots = engine
+                .prepared_ascii_root
+                .as_ref()
+                .expect("the first extra-wide-tier eligible call prepares its classifier")
+                .set()
+                .words()
+                .into_iter()
+                .map(u64::count_ones)
+                .sum::<u32>();
+            assert_eq!(usize::try_from(retained_roots).unwrap(), root_count);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ordinary_direct_dfa_ascii_root_admits_ultra_wide_tier_after_larger_extent() {
+        let roots = root_ascii_extra_wide_test_roots();
+        assert_eq!(roots.len(), ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS);
+        for root_count in [
+            ORDINARY_ROOT_ASCII_EXTRA_WIDE_MAX_MEMBERS + 1,
+            80,
+            ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS,
+        ] {
+            let patterns = root_ascii_patterns_for_roots(&roots[..root_count]);
+            let plan = LiteralSetPlan::new_stable(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            assert!(plan.automaton.prefilter().is_none());
+            let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            assert!(!ordinary.narrow_ascii_count_engine_supported());
+            let root = ordinary
+                .direct_dfa_identity
+                .and_then(LiteralSetDirectDfaIdentity::root)
+                .expect("the admitted ultra-wide ASCII root retains its marker");
+            assert!(root.is_ascii_sparse());
+            assert_eq!(
+                root.ascii_sparse_min_bytes(),
+                Some(ORDINARY_ROOT_ASCII_ULTRA_WIDE_MIN_BYTES),
+            );
+            assert_eq!(root.as_range(), None);
+            assert_eq!(root.set4_bucket_mask(), None);
+
+            let mut engine = ordinary
+                .bind_engine()
+                .expect("an admitted ultra-wide ASCII root binds its lazy engine");
+            let short_miss = vec![
+                b' ';
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                    + ORDINARY_ROOT_ASCII_ULTRA_WIDE_MIN_BYTES
+                    - 1
+            ];
+            assert_eq!(
+                engine.exists_window_value(&short_miss, Window::full(&short_miss)),
+                Ok(false),
+            );
+            assert!(engine.prepared_ascii_root.is_none());
+
+            let long_miss = vec![
+                b' ';
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES
+                    + ORDINARY_ROOT_ASCII_ULTRA_WIDE_MIN_BYTES
+            ];
+            assert_eq!(
+                engine.exists_window_value(&long_miss, Window::full(&long_miss)),
+                Ok(false),
+            );
+            let retained_roots = engine
+                .prepared_ascii_root
+                .as_ref()
+                .expect("the first ultra-wide-tier eligible call prepares its classifier")
+                .set()
+                .words()
+                .into_iter()
+                .map(u64::count_ones)
+                .sum::<u32>();
+            assert_eq!(usize::try_from(retained_roots).unwrap(), root_count);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn ordinary_direct_dfa_ascii_root_prepares_once_for_exists_and_span() {
         #[cfg(not(feature = "static-dispatch"))]
         assert_eq!(
@@ -9574,6 +9833,44 @@ mod tests {
             0,
         );
 
+        // A cold source whose first post-prefix byte is an exact root keeps
+        // the incumbent scanner without reconstructing the full root set.
+        // The alternating separator prevents the repeated-root test patterns
+        // from accepting while preserving dense root evidence.
+        let cold_dense = [ROOT_ASCII_24[0], b'!'].repeat(
+            (ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_ASCII_MIN_BYTES) / 2,
+        );
+        assert_eq!(
+            ordinary.find_window_value(&cold_dense, Window::full(&cold_dense)),
+            Ok(None),
+        );
+        assert_eq!(
+            prepared.find_window_value(&cold_dense, Window::full(&cold_dense)),
+            Ok(None),
+        );
+        assert!(prepared.prepared_ascii_root.is_none());
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+
+        // The same cold bypass preserves the first proved separator and
+        // restarts exactly at a root in the second post-prefix byte.
+        let mut cold_second = vec![
+            b'!';
+            ORDINARY_DIRECT_DFA_NATIVE_BYTES + ORDINARY_ROOT_ASCII_MIN_BYTES
+        ];
+        cold_second[ORDINARY_DIRECT_DFA_NATIVE_BYTES + 1] = ROOT_ASCII_24[0];
+        assert_eq!(
+            ordinary.find_window_value(&cold_second, Window::full(&cold_second)),
+            Ok(None),
+        );
+        assert_eq!(
+            prepared.find_window_value(&cold_second, Window::full(&cold_second)),
+            Ok(None),
+        );
+        assert!(prepared.prepared_ascii_root.is_none());
+        assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
+        assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
+
         let long_suffix = ORDINARY_ROOT_ASCII_MIN_BYTES;
         let long_miss = vec![
             b'!';
@@ -9681,6 +9978,7 @@ mod tests {
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 3);
         assert_eq!(ordinary_direct_probe::span_ascii_reuses(), 2);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 0);
 
         // Dense spans stay on the established native route even though the
         // same worker already owns a prepared classifier.
@@ -9706,6 +10004,67 @@ mod tests {
         assert_eq!(ordinary_direct_probe::root_ascii_preparations(), 0);
         assert_eq!(ordinary_direct_probe::root_ascii_calls(), 0);
         assert_eq!(ordinary_direct_probe::span_ascii_reuses(), 0);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 1);
+
+        // The established two-byte boundary is exact. A third separator
+        // retains root-aware traversal, and callback stop/error on the second
+        // selected span never commits a handoff for an abandoned traversal.
+        let mut spaced = Vec::new();
+        for index in 0..8 {
+            spaced.extend_from_slice(&patterns[(index % ROOT_ASCII_24.len()) * 17]);
+            spaced.extend_from_slice(b"!!!");
+        }
+        ordinary_direct_probe::reset();
+        let mut spaced_spans = 0;
+        assert_eq!(
+            prepared.try_visit_spans_window_value(
+                &spaced,
+                Window::full(&spaced),
+                |_| {
+                    spaced_spans += 1;
+                    Ok::<bool, ()>(true)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(spaced_spans, 8);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 0);
+
+        ordinary_direct_probe::reset();
+        let mut stopped_spans = 0;
+        assert_eq!(
+            prepared.try_visit_spans_window_value(
+                &dense,
+                Window::full(&dense),
+                |_| {
+                    stopped_spans += 1;
+                    Ok::<bool, ()>(stopped_spans < 2)
+                },
+            ),
+            Ok(Ok(())),
+        );
+        assert_eq!(stopped_spans, 2);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 0);
+
+        ordinary_direct_probe::reset();
+        let mut errored_spans = 0;
+        assert_eq!(
+            prepared.try_visit_spans_window_value(
+                &dense,
+                Window::full(&dense),
+                |_| {
+                    errored_spans += 1;
+                    if errored_spans == 2 {
+                        Err("stop")
+                    } else {
+                        Ok(true)
+                    }
+                },
+            ),
+            Ok(Err("stop")),
+        );
+        assert_eq!(errored_spans, 2);
+        assert_eq!(ordinary_direct_probe::span_ascii_dense_handoffs(), 0);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -9788,112 +10147,131 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn ordinary_direct_dfa_wide_ascii_root_matches_incumbent_in_curated_windows() {
-        let roots = root_ascii_wide_test_roots();
-        let patterns = root_ascii_patterns_for_roots(
-            &roots[..ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS],
-        );
-        let plan = LiteralSetPlan::new_stable(
-            &patterns,
-            LiteralSetBuildLimits::default(),
-        )
-        .unwrap();
-        let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
-        let mut engine = ordinary
-            .bind_engine()
-            .expect("forty-eight non-contiguous ASCII roots bind the wide engine");
+    fn ordinary_direct_dfa_wide_ascii_roots_match_incumbent_in_curated_windows() {
+        fn check(roots: &[u8], minimum_bytes: usize, miss: u8) {
+            assert!(!roots.contains(&miss));
+            let patterns = root_ascii_patterns_for_roots(roots);
+            let plan = LiteralSetPlan::new_stable(
+                &patterns,
+                LiteralSetBuildLimits::default(),
+            )
+            .unwrap();
+            let ordinary = plan.ordinary_executor().expect("direct ordinary DFA");
+            let mut engine = ordinary
+                .bind_engine()
+                .expect("an admitted ASCII root set binds its tiered engine");
 
-        let mut haystack = vec![b'!'; ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES + 37];
-        let first_match = haystack.len();
-        haystack.extend_from_slice(&patterns[0]);
-        haystack.extend(core::iter::repeat_n(b'!', 41));
-        let second_match = haystack.len();
-        haystack.extend_from_slice(&patterns[patterns.len() - 1]);
-        haystack.extend(core::iter::repeat_n(b'!', 19));
-        let ends = [
-            0,
-            1,
-            ORDINARY_DIRECT_DFA_NATIVE_BYTES,
-            first_match,
-            first_match + 1,
-            first_match + patterns[0].len(),
-            second_match,
-            second_match + patterns[patterns.len() - 1].len(),
-            haystack.len(),
-        ];
-        for &start in &ends {
-            for &end in &ends {
-                if start > end {
-                    continue;
+            let mut haystack = vec![miss; minimum_bytes + 37];
+            let first_match = haystack.len();
+            haystack.extend_from_slice(&patterns[0]);
+            haystack.extend(core::iter::repeat_n(miss, 41));
+            let second_match = haystack.len();
+            haystack.extend_from_slice(&patterns[patterns.len() - 1]);
+            haystack.extend(core::iter::repeat_n(miss, 19));
+            let ends = [
+                0,
+                1,
+                ORDINARY_DIRECT_DFA_NATIVE_BYTES,
+                first_match,
+                first_match + 1,
+                first_match + patterns[0].len(),
+                second_match,
+                second_match + patterns[patterns.len() - 1].len(),
+                haystack.len(),
+            ];
+            for &start in &ends {
+                for &end in &ends {
+                    if start > end {
+                        continue;
+                    }
+                    let window = Window::new(start, end);
+                    let expected_endpoint =
+                        ordinary.first_acceptance_window_value(&haystack, window);
+                    assert_eq!(
+                        engine.first_acceptance_window_value(&haystack, window),
+                        expected_endpoint,
+                        "endpoint window={window:?}",
+                    );
+                    assert_eq!(
+                        engine.exists_window_value(&haystack, window),
+                        expected_endpoint.map(|endpoint| endpoint.is_some()),
+                        "exists window={window:?}",
+                    );
+                    assert_eq!(
+                        engine.find_window_value(&haystack, window),
+                        ordinary.find_window_value(&haystack, window),
+                        "span window={window:?}",
+                    );
+
+                    let mut expected_spans = Vec::new();
+                    assert_eq!(
+                        ordinary.try_visit_spans_window_value(
+                            &haystack,
+                            window,
+                            |matched| {
+                                expected_spans.push(matched);
+                                Ok::<bool, ()>(true)
+                            },
+                        ),
+                        Ok(Ok(())),
+                    );
+                    let mut actual_spans = Vec::new();
+                    assert_eq!(
+                        engine.try_visit_spans_window_value(
+                            &haystack,
+                            window,
+                            |matched| {
+                                actual_spans.push(matched);
+                                Ok::<bool, ()>(true)
+                            },
+                        ),
+                        Ok(Ok(())),
+                    );
+                    assert_eq!(actual_spans, expected_spans, "spans window={window:?}");
+                    assert_eq!(
+                        ordinary.count_spans_window_value(&haystack, window),
+                        Ok(u64::try_from(expected_spans.len()).unwrap()),
+                        "compact count window={window:?}",
+                    );
+                    assert_eq!(
+                        engine.try_count_spans_window_value(&haystack, window),
+                        Ok(None),
+                        "tiered engine count gate window={window:?}",
+                    );
                 }
-                let window = Window::new(start, end);
-                let expected_endpoint =
-                    ordinary.first_acceptance_window_value(&haystack, window);
-                assert_eq!(
-                    engine.first_acceptance_window_value(&haystack, window),
-                    expected_endpoint,
-                    "endpoint window={window:?}",
-                );
-                assert_eq!(
-                    engine.exists_window_value(&haystack, window),
-                    expected_endpoint.map(|endpoint| endpoint.is_some()),
-                    "exists window={window:?}",
-                );
-                assert_eq!(
-                    engine.find_window_value(&haystack, window),
-                    ordinary.find_window_value(&haystack, window),
-                    "span window={window:?}",
-                );
-
-                let mut expected_spans = Vec::new();
-                assert_eq!(
-                    ordinary.try_visit_spans_window_value(
-                        &haystack,
-                        window,
-                        |matched| {
-                            expected_spans.push(matched);
-                            Ok::<bool, ()>(true)
-                        },
-                    ),
-                    Ok(Ok(())),
-                );
-                let mut actual_spans = Vec::new();
-                assert_eq!(
-                    engine.try_visit_spans_window_value(
-                        &haystack,
-                        window,
-                        |matched| {
-                            actual_spans.push(matched);
-                            Ok::<bool, ()>(true)
-                        },
-                    ),
-                    Ok(Ok(())),
-                );
-                assert_eq!(actual_spans, expected_spans, "spans window={window:?}");
-                assert_eq!(
-                    ordinary.count_spans_window_value(&haystack, window),
-                    Ok(u64::try_from(expected_spans.len()).unwrap()),
-                    "compact count window={window:?}",
-                );
-                assert_eq!(
-                    engine.try_count_spans_window_value(&haystack, window),
-                    Ok(None),
-                    "wide engine count gate window={window:?}",
-                );
             }
         }
+
+        let wide = root_ascii_wide_test_roots();
+        check(
+            &wide[..ORDINARY_ROOT_ASCII_WIDE_MAX_MEMBERS],
+            ORDINARY_ROOT_ASCII_WIDE_MIN_BYTES,
+            b'!',
+        );
+        let extra_wide = root_ascii_extra_wide_test_roots();
+        check(
+            &extra_wide[..ORDINARY_ROOT_ASCII_EXTRA_WIDE_MAX_MEMBERS],
+            ORDINARY_ROOT_ASCII_EXTRA_WIDE_MIN_BYTES,
+            b' ',
+        );
+        check(
+            &extra_wide[..ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS],
+            ORDINARY_ROOT_ASCII_ULTRA_WIDE_MIN_BYTES,
+            b' ',
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ordinary_direct_dfa_ascii_root_rejects_over_density_or_non_ascii_roots() {
-        let over_density = root_ascii_wide_test_roots();
+        let over_density = root_ascii_over_density_test_roots();
+        assert!(over_density.len() > ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS);
         for roots in [
             &[
                 b'0', b'2', b'4', b'6', b'8', b'A', b'C', b'E', b'G', b'I', b'a', b'c',
                 b'e', b'g', b'i', 0x80,
             ][..],
-            over_density.as_slice(),
+            &over_density[..=ORDINARY_ROOT_ASCII_ULTRA_WIDE_MAX_MEMBERS],
         ] {
             let patterns = root_ascii_patterns_for_roots(roots);
             let plan = LiteralSetPlan::new_stable(

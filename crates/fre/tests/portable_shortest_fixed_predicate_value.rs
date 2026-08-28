@@ -71,6 +71,43 @@ fn fixed_predicate_shortest_values_match_accounted_results_at_every_boundary() {
 }
 
 #[test]
+fn ordinary_fixed_predicate_endpoints_match_immutable_values_at_every_boundary() {
+    for (pattern, haystack) in [
+        (ONE_ANCHOR_PATTERN, b"--Qacegikmortvx0--".as_slice()),
+        (GENERAL_PAIR_PATTERN, b"xxxxxxxadgjmpsv--".as_slice()),
+    ] {
+        let regex = fixed(pattern);
+        let mut ordinary = regex.ordinary_session().unwrap();
+        for start in 0..=haystack.len() {
+            let expected = regex
+                .shortest_match_at_value(haystack, start, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                ordinary.first_acceptance_at(haystack, start),
+                Ok(expected),
+                "endpoint pattern={pattern:?}, start={start}",
+            );
+            assert_eq!(
+                ordinary.is_match_at(haystack, start),
+                Ok(expected.is_some()),
+                "existence pattern={pattern:?}, start={start}",
+            );
+        }
+
+        let invalid_start = haystack.len() + 1;
+        assert_eq!(
+            ordinary
+                .first_acceptance_at(haystack, invalid_start)
+                .unwrap_err(),
+            regex
+                .shortest_match_at_value(haystack, invalid_start, SearchLimits::unlimited(),)
+                .unwrap_err(),
+            "invalid range error changed for pattern={pattern:?}",
+        );
+    }
+}
+
+#[test]
 fn fixed_predicate_shortest_value_closes_at_exact_work_with_zero_scratch() {
     let regex = fixed(ONE_ANCHOR_PATTERN);
     for haystack in [
