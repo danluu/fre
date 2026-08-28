@@ -72273,6 +72273,16 @@ fn aarch64_emit_exact_prefix_short(
     }
     assembler.instruction(aarch64_add_x_reg(12, 0, 2)?)?;
     let mut compare = |byte_width: u8, offset: u8, expected: u32| -> Result<(), ObjectError> {
+        let expected = match byte_width {
+            1 => expected & u32::from(u8::MAX),
+            2 => expected & u32::from(u16::MAX),
+            4 => expected,
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 exact-prefix short compare width is malformed",
+                ));
+            }
+        };
         let load = match (byte_width, offset) {
             (1, _) => aarch64_load_byte_imm(8, 12, u16::from(offset))?,
             (2, 0) => aarch64_load_halfword_imm(8, 12, 0)?,
@@ -91277,6 +91287,413 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn continuous_span_fill_short_verifier_declines_non_singletons_byte_identically() {
+        let aarch64_asimd = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("valid AArch64 ASIMD target");
+        for target in [Target::x86_64_linux(), aarch64_asimd] {
+            for pattern in ["a[bc]", "(?:ab|ac)"] {
+                let recipe_scope = complete_span_fill_recipe_scope(true);
+                let scoped = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(OutputContract::Span),
+                )
+                .expect("compile fixed-width non-singleton continuous source");
+                drop(recipe_scope);
+                let raw_source = *scoped
+                    .module()
+                    .native_complete_span_reduce_source
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("missing continuous source for {pattern:?}"));
+                let trusted_core = scoped
+                    .module()
+                    .native_direct_search_trusted_core
+                    .expect("continuous source public trusted core");
+                let authenticated = scoped
+                    .module()
+                    .authenticate_complete_span_fill_source(trusted_core)
+                    .expect("authenticate fixed-width non-singleton source")
+                    .unwrap_or_else(|| panic!("authenticated source declined for {pattern:?}"));
+                assert!(
+                    authenticated
+                        .layout
+                        .complete_span_fill_exact_short
+                        .is_none(),
+                    "{pattern:?} is not an exact singleton",
+                );
+                assert!(
+                    derive_complete_span_fill_exact_verifier(
+                        authenticated.layout,
+                        NativeDfaEntryContract::CompleteSpanFillV1,
+                        true,
+                    )
+                    .expect("non-singleton verifier decline is well formed")
+                    .is_none(),
+                    "{pattern:?} admitted the exact-singleton verifier",
+                );
+                assert_eq!(
+                    authenticated.layout, raw_source.layout,
+                    "{pattern:?} authentication changed the incumbent layout for {target:?}",
+                );
+
+                let lower = |source: NativeCompleteSpanReduceSource| match target.architecture {
+                    Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                        source.layout,
+                        target.features,
+                        NativeDfaEntryContract::CompleteSpanFillV1,
+                    ),
+                    Architecture::Aarch64 => {
+                        lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                            source.layout,
+                            target.features,
+                            target.operating_system,
+                            source.aarch64_sve_filter_plan,
+                            source.aarch64_sve_suffix_kind,
+                            NativeDfaEntryContract::CompleteSpanFillV1,
+                        )
+                    }
+                };
+                let declined = lower(authenticated).expect("lower declined non-singleton route");
+                let incumbent = lower(raw_source).expect("lower incumbent non-singleton route");
+                assert_eq!(
+                    declined.code, incumbent.code,
+                    "{pattern:?} decline changed incumbent text for {target:?}",
+                );
+                assert_eq!(
+                    declined.relocations, incumbent.relocations,
+                    "{pattern:?} decline changed incumbent relocations for {target:?}",
+                );
+                assert_eq!(declined.scanner, incumbent.scanner);
+                assert_eq!(declined.suffix_scanner, incumbent.suffix_scanner);
+                assert_eq!(declined.conjunction, incumbent.conjunction);
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_span_fill_short_verifier_reconstructs_nul_high_bit_and_bitmap_singletons() {
+        const PATTERN: &str = r"(?-u:\x00\x80\xffA\x00\x81\xfe)";
+        const EXPECTED: [u8; 7] = [0x00, 0x80, 0xff, b'A', 0x00, 0x81, 0xfe];
+        let aarch64_asimd = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .expect("valid AArch64 ASIMD target");
+        for target in [Target::x86_64_linux(), aarch64_asimd] {
+            let recipe_scope = complete_span_fill_recipe_scope(true);
+            let scoped = compile(
+                CompileRequest::new(PATTERN, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile exact binary short singleton");
+            drop(recipe_scope);
+            let trusted_core = scoped
+                .module()
+                .native_direct_search_trusted_core
+                .expect("binary singleton public trusted core");
+            let source = scoped
+                .module()
+                .authenticate_complete_span_fill_source(trusted_core)
+                .expect("authenticate binary singleton source")
+                .expect("binary singleton continuous source");
+            let actual = source
+                .layout
+                .complete_span_fill_exact_short
+                .expect("binary singleton short verifier");
+            assert_eq!(actual.width(), 7);
+            assert_eq!(actual.first().to_le_bytes(), EXPECTED[..4]);
+            assert_eq!(actual.trailing().to_le_bytes(), EXPECTED[3..]);
+
+            // Re-encode every authenticated singleton predicate into a
+            // disjoint 256-bit table, so one reconstruction covers NUL, both
+            // high-bit words, and the all-bitmap branch without requiring the
+            // ordinary target cost model to choose bitmap membership.
+            let mut bitmap_layout = source.layout;
+            bitmap_layout.complete_span_fill_exact_short = None;
+            let mut prefix = bitmap_layout
+                .prefix_filter
+                .expect("binary singleton scalar prefix predicates");
+            let predicate_count = usize::from(prefix.predicate_count);
+            assert_eq!(predicate_count, EXPECTED.len() - 1);
+            let mut bitmap_data = vec![0_u8; predicate_count * PREFIX_BITMAP_BYTES];
+            for (index, predicate) in prefix.predicates[..predicate_count]
+                .iter_mut()
+                .enumerate()
+            {
+                let byte = EXPECTED[usize::from(predicate.position)];
+                let offset = index * PREFIX_BITMAP_BYTES;
+                bitmap_data[offset + usize::from(byte) / 8] |= 1_u8 << (byte & 7);
+                predicate.membership = ScalarPrefixMembership::Bitmap256;
+                predicate.bitmap_offset = u32::try_from(offset).expect("small bitmap offset");
+            }
+            bitmap_layout.prefix_filter = Some(prefix);
+            let reconstructed = derive_authenticated_complete_span_fill_short_plan(
+                bitmap_layout,
+                &bitmap_data,
+            )
+            .expect("reconstruct exact singleton from authenticated bitmaps");
+            assert_eq!(reconstructed, actual);
+        }
+    }
+
+    #[test]
+    fn aarch64_exact_short_width_three_masks_the_halfword_immediate() {
+        let short = prefix_block::exact_short_from_bytes(b"abc").expect("width-three plan");
+        let mut assembler = Aarch64Assembler::new();
+        let failed = assembler.label().expect("failed-comparison label");
+        aarch64_emit_exact_prefix_short(&mut assembler, short, failed)
+            .expect("emit width-three exact verifier");
+        let words = assembler
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("AArch64 instruction")))
+            .collect::<Vec<_>>();
+        assert_eq!(words[0], aarch64_add_x_reg(12, 0, 2).unwrap());
+        assert_eq!(words[1], aarch64_load_halfword_imm(8, 12, 0).unwrap());
+        assert_eq!(
+            words[2],
+            aarch64_movz_x(10, u16::from_le_bytes(*b"ab"), 0).unwrap(),
+        );
+        assert_eq!(words[3], aarch64_cmp_w(8, 10).unwrap());
+        assert_eq!(words[5], aarch64_load_byte_imm(8, 12, 2).unwrap());
+        assert_eq!(words[6], aarch64_movz_x(10, u16::from(b'c'), 0).unwrap());
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links exact short continuous fills and compares every refill with their ordinary entries"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one host-linked differential keeps seven objects, refill state, and boundary fixtures together"
+    )]
+    fn linked_host_continuous_span_fill_short_singletons_match_generic_state_for_state() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-continuous-short-{}-{}",
+            std::process::id(),
+            if cfg!(target_arch = "x86_64") {
+                "x86"
+            } else {
+                "arm"
+            },
+        ));
+        fs::create_dir_all(&directory).expect("create exact-short link directory");
+        let mut source = String::from(
+            r#"#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+typedef struct { size_t start; size_t end; } result_t;
+typedef struct { size_t next_start; size_t last_match_end; uint32_t flags; uint32_t reserved; } state_t;
+typedef uint32_t (*search_fn)(const unsigned char*,size_t,size_t,size_t,result_t*);
+typedef uint32_t (*fill_fn)(const unsigned char*,size_t,state_t*,result_t*,size_t,size_t*);
+static void finish(state_t *s){s->flags=(s->flags&1u)|4u;}
+static uint32_t generic_fill(search_fn search,const unsigned char *h,size_t n,state_t *state,result_t *out,size_t cap,size_t *written){
+  size_t count=0;
+  while(count<cap && !(state->flags&4u)){
+    if(state->flags&2u){state->flags&=~2u;if(state->next_start==n){finish(state);break;}state->next_start++;}
+    size_t search_start=state->next_start;uint32_t status=search(h,n,search_start,n,&out[count]);
+    if(status==0u){finish(state);break;}
+    if(status!=1u){finish(state);*written=count;return 2u;}
+    if(search_start>out[count].start||out[count].start>out[count].end||out[count].end>n){finish(state);*written=count;return 2u;}
+    if(out[count].start==out[count].end&&(state->flags&1u)&&state->last_match_end==out[count].end){
+      if(state->next_start==n){finish(state);break;}state->next_start++;continue;
+    }
+    state->next_start=out[count].end;state->last_match_end=out[count].end;state->flags|=1u;
+    if(out[count].start==out[count].end)state->flags|=2u;else state->flags&=~2u;count++;
+  }
+  *written=count;return (state->flags&4u)?0u:1u;
+}
+static int same_state(const state_t *a,const state_t *b){return a->next_start==b->next_start&&a->last_match_end==b->last_match_end&&a->flags==b->flags&&a->reserved==b->reserved;}
+static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char *h,size_t n,state_t initial,size_t cap,unsigned minimum_calls){
+  state_t ds=initial,gs=initial;
+  for(unsigned calls=1;calls<=128;calls++){
+    result_t dout[4],gout[4];for(size_t i=0;i<4;i++){dout[i].start=gout[i].start=(size_t)-2;dout[i].end=gout[i].end=(size_t)-1;}
+    size_t dw=(size_t)-1,gw=(size_t)-1;uint32_t dr=direct(h,n,&ds,dout,cap,&dw);uint32_t gr=generic_fill(search,h,n,&gs,gout,cap,&gw);
+    int outputs=dw<=4&&gw<=4;
+    if(outputs){for(size_t i=0;i<dw;i++)outputs&=dout[i].start==gout[i].start&&dout[i].end==gout[i].end;}
+    if(outputs){for(size_t i=dw;i<4;i++)outputs&=dout[i].start==(size_t)-2&&dout[i].end==(size_t)-1;}
+    if(dr!=gr||dw!=gw||!same_state(&ds,&gs)||!outputs){fprintf(stderr,"case=%u call=%u status=%u/%u written=%zu/%zu state=%zu,%zu,%u/%zu,%zu,%u\n",id,calls,dr,gr,dw,gw,ds.next_start,ds.last_match_end,ds.flags,gs.next_start,gs.last_match_end,gs.flags);return 1;}
+    if(dr==0u){if(calls<minimum_calls){fprintf(stderr,"case=%u terminated before refill boundary: %u < %u\n",id,calls,minimum_calls);return 2;}return 0;}
+    if(dr!=1u||dw!=cap){fprintf(stderr,"case=%u invalid continuation status=%u written=%zu cap=%zu\n",id,dr,dw,cap);return 3;}
+  }
+  fprintf(stderr,"case=%u did not terminate\n",id);return 4;
+}
+"#,
+        );
+        let mut objects = Vec::new();
+        let literals = ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg"];
+        let mut cases = Vec::new();
+        for (literal_index, literal) in literals.iter().enumerate() {
+            let width = literal.len();
+            let recipe_scope = complete_span_fill_recipe_scope(true);
+            let compiled = compile(
+                CompileRequest::new(*literal, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile host exact-short continuous source");
+            drop(recipe_scope);
+            let module = compiled
+                .module()
+                .clone()
+                .append_direct_span_fill(OutputContract::Span)
+                .expect("append host exact-short continuous fill")
+                .expect("host exact-short continuous-fill eligibility");
+            assert_eq!(
+                module.direct_span_fill_strategy(),
+                Some(DirectSpanFillStrategy::NativeContinuousCompleteDfaV1),
+            );
+            let entry = module.entry_symbol().to_owned();
+            let fill = module
+                .direct_span_fill_symbol()
+                .expect("host exact-short fill symbol")
+                .to_owned();
+            writeln!(
+                source,
+                "extern uint32_t {entry}(const unsigned char*,size_t,size_t,size_t,result_t*);"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "extern uint32_t {fill}(const unsigned char*,size_t,state_t*,result_t*,size_t,size_t*);"
+            )
+            .unwrap();
+            let object = directory.join(format!("width-{width}.o"));
+            fs::write(
+                &object,
+                emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+                    .expect("emit host exact-short object"),
+            )
+            .expect("write host exact-short object");
+            objects.push(object);
+
+            let literal_bytes = literal.as_bytes();
+            let too_short = literal_bytes[..width - 1].to_vec();
+            let dense = literal_bytes.repeat(11);
+            let mut near_unit = literal_bytes.to_vec();
+            near_unit[0] = b'x';
+            let repeated_near_miss = near_unit.repeat(257);
+            let mut late = repeated_near_miss.clone();
+            late.extend_from_slice(literal_bytes);
+            let mut boundary = vec![b'X'; 192];
+            for start in [64 - width, 64, 128 - width, 128, 192 - width] {
+                boundary[start..start + width].copy_from_slice(literal_bytes);
+            }
+            for (name, haystack) in [
+                ("short", too_short),
+                ("dense", dense.clone()),
+                ("near", repeated_near_miss),
+                ("late", late),
+                ("resume", dense),
+                ("boundary", boundary),
+            ] {
+                let symbol = format!("h{width}_{name}");
+                let bytes = if haystack.is_empty() {
+                    String::from("0")
+                } else {
+                    haystack
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                writeln!(
+                    source,
+                    "static const unsigned char {symbol}[]={{{bytes}}};"
+                )
+                .unwrap();
+                cases.push((
+                    literal_index,
+                    name,
+                    symbol,
+                    haystack.len(),
+                    entry.clone(),
+                    fill.clone(),
+                    width,
+                ));
+            }
+        }
+        source.push_str("int main(void){unsigned id=0;\n");
+        for (literal_index, name, haystack, len, entry, fill, width) in cases {
+            let (state, capacity, minimum_calls) = match name {
+                "dense" => (String::from("(state_t){0,0,0,0}"), 2, 6),
+                "late" => (String::from("(state_t){0,0,0,0}"), 1, 2),
+                "resume" => (
+                    format!("(state_t){{{},0,1,0}}", width.saturating_add(1)),
+                    3,
+                    2,
+                ),
+                "boundary" => (String::from("(state_t){0,0,0,0}"), 1, 6),
+                _ => (String::from("(state_t){0,0,0,0}"), 2, 1),
+            };
+            writeln!(
+                source,
+                "id++;if(check(id,{fill},{entry},{haystack},{len},{state},{capacity},{minimum_calls}))return (int)(10+id);/* width={} fixture={name} index={literal_index} */",
+                width,
+            )
+            .unwrap();
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("continuous-short.c");
+        let executable = directory.join("continuous-short");
+        fs::write(&c_path, source).expect("write exact-short C differential");
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let mut link = Command::new(compiler);
+        if cfg!(target_os = "macos") {
+            link.arg("-arch").arg(if cfg!(target_arch = "x86_64") {
+                "x86_64"
+            } else {
+                "arm64"
+            });
+        }
+        let linked = link
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("link exact-short C differential");
+        assert!(
+            linked.status.success(),
+            "link status={:?} stdout={} stderr={}",
+            linked.status.code(),
+            String::from_utf8_lossy(&linked.stdout),
+            String::from_utf8_lossy(&linked.stderr),
+        );
+        let executed = Command::new(&executable)
+            .output()
+            .expect("execute exact-short C differential");
+        assert!(
+            executed.status.success(),
+            "execution status={:?} stdout={} stderr={}",
+            executed.status.code(),
+            String::from_utf8_lossy(&executed.stdout),
+            String::from_utf8_lossy(&executed.stderr),
+        );
+        fs::remove_dir_all(&directory).expect("remove exact-short link directory");
     }
 
     #[test]
