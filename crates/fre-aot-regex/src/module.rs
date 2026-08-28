@@ -50,7 +50,8 @@ use crate::{
     },
     dfa_loop_skip,
     finite_language::{
-        NativeFiniteExistsChoiceView, NativeFiniteLanguageView,
+        NativeExactSingletonSpanFillReceipt, NativeFiniteExistsChoiceView,
+        NativeFiniteLanguageView,
         NativeFiniteSelectedEndGrepCountView, NativeFiniteSelectedEndTeddyView,
     },
     mandatory_teddy::{
@@ -1720,123 +1721,16 @@ struct NativeCompleteSpanReduceSource {
     program_sha256: [u8; 32],
     /// Compiler-private exact singleton used only to replace seeded-reverse
     /// verification after the unchanged suffix scanner finds a survivor.
-    fill_exact_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    fill_exact_singleton: Option<NativeExactSingletonSpanFillReceipt>,
     /// Independently preserved identity of the semantic source program. The
     /// selector authenticates the receipt against this value rather than an
     /// identity supplied by the receipt itself.
     fill_source_artifact_identity: Option<[u8; 32]>,
 }
 
+#[cfg(test)]
 const COMPLETE_SPAN_FILL_LONG_EXACT_MIN_BYTES: usize = 17;
 const COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES: usize = 32;
-const COMPLETE_SPAN_FILL_EXACT_SINGLETON_IDENTITY_DOMAIN: &[u8] =
-    b"fre-aot-regex/complete-span-fill-exact-singleton/v1\0";
-
-/// Fixed-capacity copy of one independently authenticated finite-language
-/// singleton. The seal binds its bytes and length to the serialized program
-/// identity supplied by the source-fact sidecar.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NativeCompleteSpanFillExactSingletonWitness {
-    bytes: [u8; COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES],
-    length: u8,
-    seal: [u8; 32],
-}
-
-impl NativeCompleteSpanFillExactSingletonWitness {
-    fn bind(literal: &[u8], artifact_identity: [u8; 32]) -> Option<Self> {
-        if !(COMPLETE_SPAN_FILL_LONG_EXACT_MIN_BYTES
-            ..=COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES)
-            .contains(&literal.len())
-            || artifact_identity == [0; 32]
-        {
-            return None;
-        }
-        let length = u8::try_from(literal.len()).ok()?;
-        let mut bytes = [0_u8; COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES];
-        bytes[..literal.len()].copy_from_slice(literal);
-        let seal = Self::seal_for(bytes, length, artifact_identity);
-        Some(Self { bytes, length, seal })
-    }
-
-    fn seal_for(
-        bytes: [u8; COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES],
-        length: u8,
-        artifact_identity: [u8; 32],
-    ) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        digest.update(COMPLETE_SPAN_FILL_EXACT_SINGLETON_IDENTITY_DOMAIN);
-        digest.update(artifact_identity);
-        digest.update([length]);
-        digest.update(bytes);
-        digest.finalize().into()
-    }
-
-    fn authenticates(self, artifact_identity: [u8; 32]) -> bool {
-        let length = usize::from(self.length);
-        (COMPLETE_SPAN_FILL_LONG_EXACT_MIN_BYTES
-            ..=COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES)
-            .contains(&length)
-            && artifact_identity != [0; 32]
-            && self.bytes[length..].iter().all(|&byte| byte == 0)
-            && self.seal == Self::seal_for(self.bytes, self.length, artifact_identity)
-    }
-
-    const fn width(self) -> u8 {
-        self.length
-    }
-
-    const fn compare_count(self) -> u8 {
-        if self.length <= 24 { 3 } else { 4 }
-    }
-
-    const fn compare_offset(self, index: u8) -> Option<u8> {
-        match (self.compare_count(), index) {
-            (_, 0) => Some(0),
-            (_, 1) => Some(8),
-            (3, 2) => Some(self.length - 8),
-            (4, 2) => Some(16),
-            (4, 3) => Some(self.length - 8),
-            _ => None,
-        }
-    }
-
-    fn qword(self, offset: u8) -> Option<u64> {
-        let start = usize::from(offset);
-        let end = start.checked_add(8)?;
-        if end > usize::from(self.length) {
-            return None;
-        }
-        Some(u64::from_le_bytes(
-            self.bytes.get(start..end)?.try_into().ok()?,
-        ))
-    }
-}
-
-/// Keeps the source-fact artifact identity separate from both the literal
-/// witness and the native data-section identity used to authenticate the
-/// retained module recipe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NativeCompleteSpanFillExactSingletonReceipt {
-    witness: NativeCompleteSpanFillExactSingletonWitness,
-    artifact_identity: [u8; 32],
-}
-
-impl NativeCompleteSpanFillExactSingletonReceipt {
-    fn bind(literal: &[u8], artifact_identity: [u8; 32]) -> Option<Self> {
-        Some(Self {
-            witness: NativeCompleteSpanFillExactSingletonWitness::bind(
-                literal,
-                artifact_identity,
-            )?,
-            artifact_identity,
-        })
-    }
-
-    fn authenticates(self, expected_artifact_identity: [u8; 32]) -> bool {
-        self.artifact_identity == expected_artifact_identity
-            && self.witness.authenticates(expected_artifact_identity)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeCompleteSpanSourcePurpose {
@@ -2075,7 +1969,7 @@ std::thread_local! {
     static COMPLETE_SPAN_FILL_RECIPE_ENABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static COMPLETE_SPAN_FILL_EXACT_SINGLETON:
-        std::cell::Cell<Option<NativeCompleteSpanFillExactSingletonReceipt>> =
+        std::cell::Cell<Option<NativeExactSingletonSpanFillReceipt>> =
         const { std::cell::Cell::new(None) };
     static COMPLETE_SPAN_FILL_SOURCE_ARTIFACT_IDENTITY:
         std::cell::Cell<Option<[u8; 32]>> = const { std::cell::Cell::new(None) };
@@ -2157,8 +2051,10 @@ fn complete_span_fill_recipe_enabled() -> bool {
 }
 
 pub(crate) struct CompleteSpanFillExactSingletonScope {
-    previous: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    previous: Option<NativeExactSingletonSpanFillReceipt>,
     previous_source_artifact_identity: Option<[u8; 32]>,
+    /// A TLS restoration token must be dropped on the installing thread.
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Drop for CompleteSpanFillExactSingletonScope {
@@ -2176,12 +2072,9 @@ impl Drop for CompleteSpanFillExactSingletonScope {
 /// lowering transaction. `None` deliberately clears an enclosing value so a
 /// nested non-singleton compile cannot inherit stale bytes.
 pub(crate) fn complete_span_fill_exact_singleton_scope(
-    literal: Option<&[u8]>,
+    current: Option<NativeExactSingletonSpanFillReceipt>,
     artifact_identity: [u8; 32],
 ) -> CompleteSpanFillExactSingletonScope {
-    let current = literal.and_then(|literal| {
-        NativeCompleteSpanFillExactSingletonReceipt::bind(literal, artifact_identity)
-    });
     let previous = COMPLETE_SPAN_FILL_EXACT_SINGLETON.with(|witness| {
         witness.replace(current)
     });
@@ -2193,11 +2086,12 @@ pub(crate) fn complete_span_fill_exact_singleton_scope(
     CompleteSpanFillExactSingletonScope {
         previous,
         previous_source_artifact_identity,
+        _not_send: std::marker::PhantomData,
     }
 }
 
 fn complete_span_fill_exact_singleton()
-    -> Option<NativeCompleteSpanFillExactSingletonReceipt>
+    -> Option<NativeExactSingletonSpanFillReceipt>
 {
     COMPLETE_SPAN_FILL_EXACT_SINGLETON.with(std::cell::Cell::get)
 }
@@ -3907,6 +3801,11 @@ impl CompiledModule {
             ))?
             .data
             .as_ref();
+        let serialized_program_identity = self.serialized_program_identity.ok_or(
+            ObjectError::InvalidModule(
+                "continuous Span fill serialized program identity is absent",
+            ),
+        )?;
         let program_end = program_offset.checked_add(program_size).ok_or(
             ObjectError::ArithmeticOverflow("continuous Span fill program extent"),
         )?;
@@ -3928,6 +3827,27 @@ impl CompiledModule {
         {
             return Err(ObjectError::InvalidModule(
                 "continuous Span fill program identity is inconsistent",
+            ));
+        }
+        // These are two deliberately distinct domains. The checks above bind
+        // native lowering data to `source.program_*`; the module surface has
+        // separately authenticated `serialized_program_identity`, which is
+        // the semantic `CompiledProgram::serialize()` identity. Bind both the
+        // retained source identity and opaque finite-language receipt only to
+        // that semantic identity, so neither foreign bytes nor a foreign pair
+        // can change verifier immediates under an unchanged source program.
+        let Some(fill_source_artifact_identity) = source.fill_source_artifact_identity else {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span fill source artifact identity is absent",
+            ));
+        };
+        if fill_source_artifact_identity != serialized_program_identity.sha256
+            || source.fill_exact_singleton.is_some_and(|receipt| {
+                !receipt.authenticates(serialized_program_identity.sha256)
+            })
+        {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span fill singleton is not bound to the authenticated program",
             ));
         }
         authenticate_native_direct_search_trusted_core(
@@ -29693,7 +29613,7 @@ enum NativeCompleteSpanFillExactVerifier {
     Words(prefix_block::ExactPrefixWordPlan),
     Block16(NativePrefixBlockGuard),
     LongSingleton {
-        witness: NativeCompleteSpanFillExactSingletonWitness,
+        receipt: NativeExactSingletonSpanFillReceipt,
         source_artifact_identity: [u8; 32],
     },
 }
@@ -29704,7 +29624,7 @@ impl NativeCompleteSpanFillExactVerifier {
             Self::Short(short) => short.width(),
             Self::Words(words) => words.width(),
             Self::Block16(_) => 16,
-            Self::LongSingleton { witness, .. } => witness.width(),
+            Self::LongSingleton { receipt, .. } => receipt.width(),
         }
     }
 }
@@ -29850,10 +29770,15 @@ fn derive_complete_span_fill_exact_verifier_with_long_singleton(
     layout: NativeDfaLayout,
     entry_contract: NativeDfaEntryContract,
     allow_block16: bool,
-    long_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    long_singleton: Option<NativeExactSingletonSpanFillReceipt>,
     source_artifact_identity: Option<[u8; 32]>,
 ) -> Result<Option<NativeCompleteSpanFillExactVerifier>, ObjectError> {
     if !entry_contract.complete_span_fill() {
+        if long_singleton.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "continuous Span-fill singleton receipt reached another entry contract",
+            ));
+        }
         return Ok(None);
     }
     if layout.complete_span_fill_exact_short.is_some()
@@ -29863,7 +29788,9 @@ fn derive_complete_span_fill_exact_verifier_with_long_singleton(
             "continuous Span-fill exact short receipt is malformed",
         ));
     }
-    if let Some(width) = layout.exact_prefix_match_width {
+    if long_singleton.is_none()
+        && let Some(width) = layout.exact_prefix_match_width
+    {
         if layout.exact_span_width != Some(u64::from(width)) {
             return Err(ObjectError::InvalidModule(
                 "continuous Span-fill exact verifier disagrees with match width",
@@ -29905,18 +29832,23 @@ fn derive_complete_span_fill_exact_verifier_with_long_singleton(
             )));
         }
     }
-    let (Some(receipt), Some(source_artifact_identity)) =
-        (long_singleton, source_artifact_identity)
-    else {
+    let Some(receipt) = long_singleton else {
         return Ok(None);
     };
+    let Some(source_artifact_identity) = source_artifact_identity else {
+        return Err(ObjectError::InvalidModule(
+            "continuous Span-fill singleton receipt lost its source identity",
+        ));
+    };
     if !receipt.authenticates(source_artifact_identity)
-        || layout.exact_span_width != Some(u64::from(receipt.witness.width()))
+        || layout.exact_span_width != Some(u64::from(receipt.width()))
     {
-        return Ok(None);
+        return Err(ObjectError::InvalidModule(
+            "continuous Span-fill singleton receipt disagrees with the authenticated program",
+        ));
     }
     Ok(Some(NativeCompleteSpanFillExactVerifier::LongSingleton {
-        witness: receipt.witness,
+        receipt,
         source_artifact_identity,
     }))
 }
@@ -29952,12 +29884,12 @@ fn select_complete_span_fill_suffix_verifier(
                 && width == 16
         }
         NativeCompleteSpanFillExactVerifier::LongSingleton {
-            witness,
+            receipt,
             source_artifact_identity,
         } => {
             (17..=32).contains(&width)
-                && witness.width() == width
-                && witness.authenticates(source_artifact_identity)
+                && receipt.width() == width
+                && receipt.authenticates(source_artifact_identity)
         }
     };
     if layout.output != OutputContract::Span
@@ -51448,12 +51380,12 @@ fn x86_emit_seeded_reverse_prepass(
                 x86_emit_prefix_block(assembler, block, kind, rejected)?;
             }
             NativeCompleteSpanFillExactVerifier::LongSingleton {
-                witness,
+                receipt,
                 source_artifact_identity,
             } => {
                 x86_emit_complete_span_fill_long_singleton(
                     assembler,
-                    witness,
+                    receipt,
                     source_artifact_identity,
                     rejected,
                 )?;
@@ -52791,24 +52723,24 @@ fn x86_emit_exact_prefix_short(
 
 fn x86_emit_complete_span_fill_long_singleton(
     assembler: &mut X86Assembler,
-    witness: NativeCompleteSpanFillExactSingletonWitness,
+    receipt: NativeExactSingletonSpanFillReceipt,
     source_artifact_identity: [u8; 32],
     failed: X86Label,
 ) -> Result<(), ObjectError> {
-    if !witness.authenticates(source_artifact_identity)
-        || !(3..=4).contains(&witness.compare_count())
+    if !receipt.authenticates(source_artifact_identity)
+        || !(3..=4).contains(&receipt.compare_count())
     {
         return Err(ObjectError::InvalidModule(
             "x86 continuous Span-fill long singleton is malformed",
         ));
     }
-    for index in 0..witness.compare_count() {
-        let offset = witness.compare_offset(index).ok_or(
+    for index in 0..receipt.compare_count() {
+        let offset = receipt.compare_offset(index).ok_or(
             ObjectError::InvalidModule(
                 "x86 continuous Span-fill long singleton offset is absent",
             ),
         )?;
-        let expected = witness.qword(offset).ok_or(
+        let expected = receipt.qword(offset).ok_or(
             ObjectError::InvalidModule(
                 "x86 continuous Span-fill long singleton word is out of bounds",
             ),
@@ -53324,7 +53256,7 @@ fn lower_x86_64_dfa_with_entry_contract_and_long_singleton(
     layout: NativeDfaLayout,
     features: FeatureSet,
     entry_contract: NativeDfaEntryContract,
-    long_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    long_singleton: Option<NativeExactSingletonSpanFillReceipt>,
     source_artifact_identity: Option<[u8; 32]>,
 ) -> Result<NativeDfaEmission, ObjectError> {
     if layout.complete_span_fill_exact_short.is_some() && !entry_contract.complete_span_fill() {
@@ -72691,25 +72623,25 @@ fn aarch64_emit_exact_prefix_short(
 
 fn aarch64_emit_complete_span_fill_long_singleton(
     assembler: &mut Aarch64Assembler,
-    witness: NativeCompleteSpanFillExactSingletonWitness,
+    receipt: NativeExactSingletonSpanFillReceipt,
     source_artifact_identity: [u8; 32],
     failed: Aarch64Label,
 ) -> Result<(), ObjectError> {
-    if !witness.authenticates(source_artifact_identity)
-        || !(3..=4).contains(&witness.compare_count())
+    if !receipt.authenticates(source_artifact_identity)
+        || !(3..=4).contains(&receipt.compare_count())
     {
         return Err(ObjectError::InvalidModule(
             "AArch64 continuous Span-fill long singleton is malformed",
         ));
     }
     assembler.instruction(aarch64_add_x_reg(12, 0, 2)?)?;
-    for index in 0..witness.compare_count() {
-        let offset = witness.compare_offset(index).ok_or(
+    for index in 0..receipt.compare_count() {
+        let offset = receipt.compare_offset(index).ok_or(
             ObjectError::InvalidModule(
                 "AArch64 continuous Span-fill long singleton offset is absent",
             ),
         )?;
-        let expected = witness.qword(offset).ok_or(
+        let expected = receipt.qword(offset).ok_or(
             ObjectError::InvalidModule(
                 "AArch64 continuous Span-fill long singleton word is out of bounds",
             ),
@@ -79907,7 +79839,7 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_long_singleton(
     sve_filter_plan: Option<Aarch64SveFilterPlan>,
     sve_suffix_kind: Option<Aarch64SveFilterKind>,
     entry_contract: NativeDfaEntryContract,
-    long_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    long_singleton: Option<NativeExactSingletonSpanFillReceipt>,
     source_artifact_identity: Option<[u8; 32]>,
 ) -> Result<NativeDfaEmission, ObjectError> {
     lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy_and_long_singleton(
@@ -79969,7 +79901,7 @@ fn lower_aarch64_dfa_with_entry_contract_suffix_kind_and_pair_register_policy_an
     entry_contract: NativeDfaEntryContract,
     allow_persistent_pair_registers: bool,
     allow_complete_pair_relation_batch: bool,
-    long_singleton: Option<NativeCompleteSpanFillExactSingletonReceipt>,
+    long_singleton: Option<NativeExactSingletonSpanFillReceipt>,
     source_artifact_identity: Option<[u8; 32]>,
 ) -> Result<NativeDfaEmission, ObjectError> {
     if layout.complete_span_fill_exact_short.is_some() && !entry_contract.complete_span_fill() {
@@ -92207,7 +92139,7 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
                 ..=COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES
             {
                 let pattern = format!("{}01234567", &PREFIX[..width - 8]);
-                let request = CompileRequest::new(pattern, target)
+                let request = CompileRequest::new(pattern.clone(), target)
                     .mode(CompileMode::Optimizing)
                     .output(OutputContract::Span);
                 let ordinary = compile(request.clone()).expect("compile ordinary long singleton");
@@ -92234,13 +92166,12 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
                     .fill_source_artifact_identity
                     .unwrap_or_else(|| panic!("missing width-{width} source identity"));
                 assert!(receipt.authenticates(source_artifact_identity));
-                let witness = receipt.witness;
-                assert_eq!(usize::from(witness.width()), width);
-                assert_eq!(witness.compare_count(), if width <= 24 { 3 } else { 4 });
+                assert_eq!(usize::from(receipt.width()), width);
+                assert_eq!(receipt.compare_count(), if width <= 24 { 3 } else { 4 });
                 let mut covered = [false; COMPLETE_SPAN_FILL_LONG_EXACT_MAX_BYTES];
-                for index in 0..witness.compare_count() {
-                    let offset = witness.compare_offset(index).expect("compare offset");
-                    assert!(witness.qword(offset).is_some());
+                for index in 0..receipt.compare_count() {
+                    let offset = receipt.compare_offset(index).expect("compare offset");
+                    assert!(receipt.qword(offset).is_some());
                     for byte in &mut covered[usize::from(offset)..usize::from(offset) + 8] {
                         *byte = true;
                     }
@@ -92255,15 +92186,18 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
                 )
                 .expect("missing sidecar is a valid decline")
                 .is_none());
-                assert!(derive_complete_span_fill_exact_verifier_with_long_singleton(
-                    source.layout,
-                    NativeDfaEntryContract::CompleteSpanFillV1,
-                    true,
-                    Some(receipt),
-                    None,
-                )
-                .expect("missing source identity is a valid decline")
-                .is_none());
+                assert!(matches!(
+                    derive_complete_span_fill_exact_verifier_with_long_singleton(
+                        source.layout,
+                        NativeDfaEntryContract::CompleteSpanFillV1,
+                        true,
+                        Some(receipt),
+                        None,
+                    ),
+                    Err(ObjectError::InvalidModule(
+                        "continuous Span-fill singleton receipt lost its source identity"
+                    ))
+                ));
                 assert!(derive_complete_span_fill_exact_verifier_with_long_singleton(
                     source.layout,
                     NativeDfaEntryContract::CompleteSpanFillV1,
@@ -92285,38 +92219,93 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
                 assert_eq!(
                     verifier,
                     NativeCompleteSpanFillExactVerifier::LongSingleton {
-                        witness,
+                        receipt,
                         source_artifact_identity,
                     },
                 );
-                let mut swapped_receipt = receipt;
-                swapped_receipt.artifact_identity[0] ^= 1;
-                assert!(derive_complete_span_fill_exact_verifier_with_long_singleton(
-                    source.layout,
-                    NativeDfaEntryContract::CompleteSpanFillV1,
-                    true,
-                    Some(swapped_receipt),
-                    Some(source_artifact_identity),
-                )
-                .expect("swapped identity is a valid decline")
-                .is_none());
-                let foreign_identity = [0xa5; 32];
-                let foreign_literal = vec![b'Z'; width];
-                let foreign_receipt = NativeCompleteSpanFillExactSingletonReceipt::bind(
-                    &foreign_literal,
-                    foreign_identity,
-                )
-                .expect("same-width foreign receipt");
+                let mut wrong_width_layout = source.layout;
+                wrong_width_layout.exact_span_width = Some(
+                    u64::try_from(width + 1).expect("generated width fits u64"),
+                );
+                assert!(matches!(
+                    derive_complete_span_fill_exact_verifier_with_long_singleton(
+                        wrong_width_layout,
+                        NativeDfaEntryContract::CompleteSpanFillV1,
+                        true,
+                        Some(receipt),
+                        Some(source_artifact_identity),
+                    ),
+                    Err(ObjectError::InvalidModule(
+                        "continuous Span-fill singleton receipt disagrees with the authenticated program"
+                    ))
+                ));
+                let mut foreign_bytes = pattern.into_bytes();
+                foreign_bytes[0] ^= 1;
+                let foreign_pattern = String::from_utf8(foreign_bytes)
+                    .expect("generated singleton remains UTF-8");
+                let foreign_request = CompileRequest::new(foreign_pattern, target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span);
+                let foreign_scope = complete_span_fill_recipe_scope(true);
+                let foreign = compile(foreign_request).expect("compile foreign singleton");
+                drop(foreign_scope);
+                let foreign_source = foreign
+                    .module()
+                    .native_complete_span_reduce_source
+                    .as_deref()
+                    .expect("foreign singleton source");
+                let foreign_receipt = foreign_source
+                    .fill_exact_singleton
+                    .expect("opaque foreign singleton receipt");
+                let foreign_identity = foreign_source
+                    .fill_source_artifact_identity
+                    .expect("foreign singleton identity");
                 assert!(foreign_receipt.authenticates(foreign_identity));
-                assert!(derive_complete_span_fill_exact_verifier_with_long_singleton(
-                    source.layout,
-                    NativeDfaEntryContract::CompleteSpanFillV1,
-                    true,
-                    Some(foreign_receipt),
-                    Some(source_artifact_identity),
-                )
-                .expect("foreign receipt is a valid decline")
-                .is_none());
+                assert!(matches!(
+                    derive_complete_span_fill_exact_verifier_with_long_singleton(
+                        source.layout,
+                        NativeDfaEntryContract::CompleteSpanFillV1,
+                        true,
+                        Some(foreign_receipt),
+                        Some(source_artifact_identity),
+                    ),
+                    Err(ObjectError::InvalidModule(
+                        "continuous Span-fill singleton receipt disagrees with the authenticated program"
+                    ))
+                ));
+
+                let mut genuine_identity_foreign_bytes = scoped.module().clone();
+                genuine_identity_foreign_bytes
+                    .native_complete_span_reduce_source
+                    .as_deref_mut()
+                    .expect("genuine-identity substitution source")
+                    .fill_exact_singleton = Some(foreign_receipt);
+                let genuine_identity_error = genuine_identity_foreign_bytes
+                    .append_direct_span_fill(OutputContract::Span)
+                    .expect_err("foreign bytes under the genuine source identity must fail closed");
+                assert!(matches!(
+                    genuine_identity_error,
+                    ObjectError::InvalidModule(
+                        "continuous Span fill singleton is not bound to the authenticated program"
+                    )
+                ));
+
+                let mut paired_foreign = scoped.module().clone();
+                let paired_source = paired_foreign
+                    .native_complete_span_reduce_source
+                    .as_deref_mut()
+                    .expect("paired-substitution source");
+                paired_source.fill_exact_singleton = Some(foreign_receipt);
+                paired_source.fill_source_artifact_identity = Some(foreign_identity);
+                let paired_error = paired_foreign
+                    .append_direct_span_fill(OutputContract::Span)
+                    .expect_err("paired foreign singleton and identity must fail closed");
+                assert!(matches!(
+                    paired_error,
+                    ObjectError::InvalidModule(
+                        "continuous Span fill singleton is not bound to the authenticated program"
+                    )
+                ));
 
                 let suffix = source.layout.suffix_filter.expect("suffix scanner");
                 let Some(reverse) = source.layout.seeded_reverse else {
@@ -92382,7 +92371,7 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
                             source.layout,
                             target.features,
                             NativeDfaEntryContract::CompleteSpanFillV1,
-                            Some(foreign_receipt),
+                            None,
                             Some(source_artifact_identity),
                         ),
                     ),
@@ -92412,14 +92401,14 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
                             source.aarch64_sve_filter_plan,
                             source.aarch64_sve_suffix_kind,
                             NativeDfaEntryContract::CompleteSpanFillV1,
-                            Some(foreign_receipt),
+                            None,
                             Some(source_artifact_identity),
                         ),
                     ),
                 };
                 let incumbent = incumbent.expect("lower seeded-reverse incumbent");
                 let specialized = specialized.expect("lower long specialization");
-                let declined = declined.expect("mismatch retains incumbent");
+                let declined = declined.expect("absent proof retains incumbent");
                 assert_ne!(specialized.code, incumbent.code);
                 assert_eq!(specialized.relocations, incumbent.relocations);
                 assert_eq!(specialized.semantic_call_instructions, 0);
@@ -92442,46 +92431,57 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
 
     #[test]
     fn continuous_span_fill_long_singleton_scope_is_forgery_safe_and_nested() {
-        const FIRST: &[u8] = b"abcdefghijklmnopq";
-        const SECOND: &[u8] = b"qrstuvwxyzABCDEFG";
-        let first_identity = [0x31; 32];
-        let second_identity = [0x52; 32];
+        fn compile_receipt(
+            pattern: &str,
+        ) -> (NativeExactSingletonSpanFillReceipt, [u8; 32]) {
+            let compiled = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile exact singleton source fact");
+            let identity = compiled.program().artifact_identity();
+            let receipt = compiled
+                .program()
+                .native_exact_singleton_span_fill_receipt()
+                .expect("opaque exact singleton source fact");
+            assert!(receipt.authenticates(identity));
+            (receipt, identity)
+        }
+
+        let (first, first_identity) = compile_receipt("abcdefghijklmnopq");
+        let (second, second_identity) = compile_receipt("qrstuvwxyzABCDEFG");
         assert!(complete_span_fill_exact_singleton().is_none());
         assert!(
-            NativeCompleteSpanFillExactSingletonWitness::bind(&FIRST[..16], first_identity)
-                .is_none()
+            compile(
+                CompileRequest::new("abcdefghijklmnop", Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile 16-byte neighbor")
+            .program()
+            .native_exact_singleton_span_fill_receipt()
+            .is_none()
         );
         assert!(
-            NativeCompleteSpanFillExactSingletonWitness::bind(&[b'x'; 33], first_identity)
-                .is_none()
-        );
-        assert!(
-            NativeCompleteSpanFillExactSingletonWitness::bind(FIRST, [0; 32]).is_none()
+            compile(
+                CompileRequest::new("x".repeat(33), Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .expect("compile 33-byte neighbor")
+            .program()
+            .native_exact_singleton_span_fill_receipt()
+            .is_none()
         );
 
-        let first_scope =
-            complete_span_fill_exact_singleton_scope(Some(FIRST), first_identity);
-        let first = complete_span_fill_exact_singleton().expect("outer witness");
+        let first_scope = complete_span_fill_exact_singleton_scope(Some(first), first_identity);
+        assert_eq!(complete_span_fill_exact_singleton(), Some(first));
         assert_eq!(
             complete_span_fill_source_artifact_identity(),
             Some(first_identity),
         );
-        assert!(first.authenticates(first_identity));
-        assert_ne!(first.artifact_identity, second_identity);
-        let mut forged = first;
-        forged.witness.bytes[0] ^= 1;
-        assert!(!forged.authenticates(first_identity));
-        forged = first;
-        forged.witness.seal[0] ^= 1;
-        assert!(!forged.authenticates(first_identity));
-        forged = first;
-        forged.witness.bytes[31] = 1;
-        forged.witness.seal = NativeCompleteSpanFillExactSingletonWitness::seal_for(
-            forged.witness.bytes,
-            forged.witness.length,
-            first_identity,
-        );
-        assert!(!forged.authenticates(first_identity));
+        assert!(!second.authenticates(first_identity));
         {
             let clear = complete_span_fill_exact_singleton_scope(None, first_identity);
             assert!(complete_span_fill_exact_singleton().is_none());
@@ -92493,18 +92493,31 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
         }
         assert_eq!(complete_span_fill_exact_singleton(), Some(first));
         {
-            let second_scope =
-                complete_span_fill_exact_singleton_scope(Some(SECOND), second_identity);
-            let second = complete_span_fill_exact_singleton().expect("nested witness");
+            let second_scope = complete_span_fill_exact_singleton_scope(
+                Some(second),
+                second_identity,
+            );
             assert_eq!(
                 complete_span_fill_source_artifact_identity(),
                 Some(second_identity),
             );
-            assert!(second.authenticates(second_identity));
-            assert!(!second.authenticates(first_identity));
-            assert_ne!(second, first);
+            assert_eq!(complete_span_fill_exact_singleton(), Some(second));
             drop(second_scope);
         }
+        assert_eq!(complete_span_fill_exact_singleton(), Some(first));
+        assert_eq!(
+            complete_span_fill_source_artifact_identity(),
+            Some(first_identity),
+        );
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _second_scope = complete_span_fill_exact_singleton_scope(
+                Some(second),
+                second_identity,
+            );
+            assert_eq!(complete_span_fill_exact_singleton(), Some(second));
+            panic!("exercise exact-singleton TLS unwind restoration");
+        }));
+        assert!(unwind.is_err());
         assert_eq!(complete_span_fill_exact_singleton(), Some(first));
         assert_eq!(
             complete_span_fill_source_artifact_identity(),
@@ -92521,10 +92534,7 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
         .mode(CompileMode::Optimizing)
         .output(OutputContract::Span);
         let ordinary = compile(request.clone()).expect("non-singleton control");
-        let stale_scope = complete_span_fill_exact_singleton_scope(
-            Some(FIRST),
-            ordinary.program().artifact_identity(),
-        );
+        let stale_scope = complete_span_fill_exact_singleton_scope(Some(first), first_identity);
         let stale = complete_span_fill_exact_singleton().expect("stale outer witness");
         let recipe_scope = complete_span_fill_recipe_scope(true);
         let scoped = compile(request).expect("non-singleton nested compile");
@@ -92542,7 +92552,7 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
         assert_eq!(complete_span_fill_exact_singleton(), Some(stale));
         assert_eq!(
             complete_span_fill_source_artifact_identity(),
-            Some(ordinary.program().artifact_identity()),
+            Some(first_identity),
         );
         assert_eq!(
             scoped

@@ -11291,6 +11291,16 @@ impl CompiledProgram {
             .exact_singleton_literal(self.identity.artifact, self.output)
     }
 
+    /// Return an opaque exact-singleton `Span` source-fact receipt. Unlike a
+    /// byte slice plus caller-supplied identity, this can only be issued by
+    /// the authenticated finite-language authority.
+    pub(crate) fn native_exact_singleton_span_fill_receipt(
+        &self,
+    ) -> Option<crate::finite_language::NativeExactSingletonSpanFillReceipt> {
+        self.native_finite_language_program()?
+            .exact_singleton_span_fill_receipt(self.identity.artifact, self.output)
+    }
+
     /// Return the bounded graph-derived fixed-prefix facts.
     ///
     /// The analysis uses only the validated Thompson graph. It does not inspect

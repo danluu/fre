@@ -848,12 +848,12 @@ pub(super) fn aarch64_emit_seeded_reverse_prepass(
                 aarch64_emit_prefix_block(assembler, block, rejected)?;
             }
             NativeCompleteSpanFillExactVerifier::LongSingleton {
-                witness,
+                receipt,
                 source_artifact_identity,
             } => {
                 aarch64_emit_complete_span_fill_long_singleton(
                     assembler,
-                    witness,
+                    receipt,
                     source_artifact_identity,
                     rejected,
                 )?;

@@ -1507,6 +1507,95 @@ fn exact_singleton_identity(
     digest.finalize().into()
 }
 
+/// Opaque source-fact authority for one exact non-empty `Span` singleton.
+///
+/// Only this module can construct the receipt, after re-authenticating the
+/// complete finite-language sidecar. Native lowering may copy and inspect it,
+/// but cannot issue different literal bytes under a genuine program identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeExactSingletonSpanFillReceipt {
+    bytes: [u8; fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES],
+    length: u8,
+    artifact_identity: [u8; 32],
+    singleton_identity: [u8; 32],
+}
+
+impl NativeExactSingletonSpanFillReceipt {
+    fn derive(literal: &[u8], artifact_identity: [u8; 32]) -> Option<Self> {
+        if artifact_identity == [0; 32]
+            || !(17..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&literal.len())
+        {
+            return None;
+        }
+        let length = u8::try_from(literal.len()).ok()?;
+        let mut bytes = [0_u8; fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES];
+        bytes[..literal.len()].copy_from_slice(literal);
+        Some(Self {
+            bytes,
+            length,
+            artifact_identity,
+            singleton_identity: exact_singleton_identity(
+                artifact_identity,
+                OutputContract::Span,
+                literal,
+            ),
+        })
+    }
+
+    fn literal(&self, expected_artifact_identity: [u8; 32]) -> Option<&[u8]> {
+        let length = usize::from(self.length);
+        if self.artifact_identity != expected_artifact_identity
+            || expected_artifact_identity == [0; 32]
+            || !(17..=fre_aot_optimizer::COUNT_V3_MAX_LITERAL_BYTES).contains(&length)
+            || self.bytes[length..].iter().any(|&byte| byte != 0)
+        {
+            return None;
+        }
+        let literal = self.bytes.get(..length)?;
+        (self.singleton_identity
+            == exact_singleton_identity(
+                expected_artifact_identity,
+                OutputContract::Span,
+                literal,
+            ))
+        .then_some(literal)
+    }
+
+    pub(crate) fn authenticates(&self, expected_artifact_identity: [u8; 32]) -> bool {
+        self.literal(expected_artifact_identity).is_some()
+    }
+
+    pub(crate) const fn width(self) -> u8 {
+        self.length
+    }
+
+    pub(crate) const fn compare_count(self) -> u8 {
+        if self.length <= 24 { 3 } else { 4 }
+    }
+
+    pub(crate) const fn compare_offset(self, index: u8) -> Option<u8> {
+        match (self.compare_count(), index) {
+            (_, 0) => Some(0),
+            (_, 1) => Some(8),
+            (3, 2) => Some(self.length - 8),
+            (4, 2) => Some(16),
+            (4, 3) => Some(self.length - 8),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn qword(self, offset: u8) -> Option<u64> {
+        let start = usize::from(offset);
+        let end = start.checked_add(8)?;
+        if end > usize::from(self.length) {
+            return None;
+        }
+        Some(u64::from_le_bytes(
+            self.bytes.get(start..end)?.try_into().ok()?,
+        ))
+    }
+}
+
 impl NativeFiniteSelectedEndTeddyChoice {
     fn derive(
         literals: &[Vec<u8>],
@@ -2739,6 +2828,17 @@ impl NativeFiniteLanguageProgram {
             return None;
         }
         Some(literal)
+    }
+
+    /// Issue an opaque lowering receipt only after the exact singleton proof
+    /// above has been re-authenticated against the current semantic program.
+    pub(crate) fn exact_singleton_span_fill_receipt(
+        &self,
+        artifact_identity: [u8; 32],
+        output: OutputContract,
+    ) -> Option<NativeExactSingletonSpanFillReceipt> {
+        let literal = self.exact_singleton_literal(artifact_identity, output)?;
+        NativeExactSingletonSpanFillReceipt::derive(literal, artifact_identity)
     }
 
     /// Target-neutral correctness oracle for the future native lowering. The
