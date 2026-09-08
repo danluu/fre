@@ -19084,6 +19084,22 @@ pub struct PortableOrdinarySession<'a> {
 }
 
 impl PortableOrdinarySession<'_> {
+    /// Whether this session is bound to a positive-width exact literal or
+    /// literal-set engine whose selected-end count is total for every valid
+    /// window. Assertions and other context-sensitive plans are excluded.
+    ///
+    /// An embedding that aggregates complete lines must independently prove
+    /// that its line terminator cannot occur in any selected match.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn supports_literal_selected_end_count(&self) -> bool {
+        matches!(
+            &self.plan,
+            PortableOrdinarySessionPlan::ExactLiteral { .. }
+                | PortableOrdinarySessionPlan::ExactLiteralRetainedCount { .. }
+        ) || self.supports_literal_set_selected_end_count()
+    }
+
     /// Whether this session is bound to a positive-width literal-set engine
     /// whose selected-end count is total for every valid window.
     ///
@@ -52301,6 +52317,36 @@ mod tests {
             ordinary.count_positive_width_selected_ends_at(b"aa\nab\nba", 3),
             Ok(Some(1)),
         );
+    }
+
+    #[test]
+    fn ordinary_literal_count_receipt_excludes_contextual_and_nullable_plans() {
+        for pattern in ["a", "aba", "aaaaaaaaa", "needleXYZ"] {
+            let regex = PortableBuilder::new(pattern).unicode(false).build().unwrap();
+            let mut ordinary = regex.ordinary_session().unwrap();
+            assert!(ordinary.supports_literal_selected_end_count(), "{pattern}");
+            assert!(!ordinary.supports_literal_set_selected_end_count(), "{pattern}");
+            let haystack = format!("{pattern}{pattern}\n{pattern}");
+            for start in 0..=haystack.len() {
+                let expected = regex::bytes::Regex::new(pattern)
+                    .unwrap()
+                    .find_iter(&haystack.as_bytes()[start..])
+                    .count();
+                assert_eq!(
+                    ordinary.count_positive_width_selected_ends_at(haystack.as_bytes(), start),
+                    Ok(Some(u64::try_from(expected).unwrap())),
+                    "pattern={pattern}, start={start}",
+                );
+            }
+            assert!(ordinary
+                .count_positive_width_selected_ends_at(haystack.as_bytes(), usize::MAX)
+                .is_err());
+        }
+        for pattern in ["", "a?", "^aba", "aba$", r"\baba\b", r"aba\w"] {
+            let regex = PortableBuilder::new(pattern).unicode(false).build().unwrap();
+            let ordinary = regex.ordinary_session().unwrap();
+            assert!(!ordinary.supports_literal_selected_end_count(), "{pattern}");
+        }
     }
 
     #[test]
