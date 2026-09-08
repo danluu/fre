@@ -93705,6 +93705,190 @@ static int check(unsigned id,fill_fn direct,search_fn search,const unsigned char
         }
     }
 
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes a prepared Exists batch with an injected search status on the host ISA"]
+    fn linked_prepared_exists_batch_preserves_mock_search_errors() {
+        check_linked_prepared_exists_batch_errors(linked_sparse_host_target());
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires Rosetta to execute an x86-64 prepared Exists batch with injected search statuses"]
+    fn linked_prepared_exists_batch_preserves_mock_search_errors_under_rosetta() {
+        check_linked_prepared_exists_batch_errors(Target::x86_64_macos());
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn check_linked_prepared_exists_batch_errors(target: Target) {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let mut wrapper = match target.architecture {
+            Architecture::X86_64 => lower_x86_64_prepared_exists_batch(),
+            Architecture::Aarch64 => lower_aarch64_prepared_exists_batch(),
+        }
+        .expect("lower prepared Exists batch");
+        let mock_offset = wrapper.code.len();
+        // The ABI-compatible mock increments the handle's call counter and
+        // returns the u32 status stored in its input. It never observes the
+        // batch outputs, so error injection preserves the no-alias contract.
+        match target.architecture {
+            Architecture::X86_64 => {
+                wrapper.code.extend_from_slice(&[
+                    0x48, 0xff, 0x07, // inc qword ptr [rdi]
+                    0x8b, 0x06, // mov eax, [rsi]
+                    0xc3,
+                ]);
+                patch_x86_64_local_call(
+                    &mut wrapper.code,
+                    wrapper.prepared_call_offset,
+                    mock_offset,
+                )
+                .expect("retarget x86 prepared call to mock");
+            }
+            Architecture::Aarch64 => {
+                for word in [
+                    aarch64_load_x_imm(9, 0, 0).unwrap(),
+                    aarch64_add_x_imm(9, 9, 1).unwrap(),
+                    aarch64_store_x(9, 0, 0).unwrap(),
+                    aarch64_load_w_imm(0, 1, 0).unwrap(),
+                    0xd65f_03c0,
+                ] {
+                    wrapper.code.extend_from_slice(&word.to_le_bytes());
+                }
+                patch_aarch64_local_call(
+                    &mut wrapper.code,
+                    wrapper.prepared_call_offset,
+                    mock_offset,
+                )
+                .expect("retarget AArch64 prepared call to mock");
+            }
+        }
+
+        let symbol = if cfg!(target_os = "macos") {
+            "_fre_test_prepared_exists_batch"
+        } else {
+            "fre_test_prepared_exists_batch"
+        };
+        let mut assembly = format!(".text\n.p2align 4\n.globl {symbol}\n{symbol}:\n");
+        for bytes in wrapper.code.chunks(16) {
+            let encoded = bytes
+                .iter()
+                .map(|byte| format!("0x{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(assembly, ".byte {encoded}").unwrap();
+        }
+        let source = r#"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef struct { const unsigned char *ptr; size_t len; } haystack_t;
+extern uint32_t fre_test_prepared_exists_batch(void *, const haystack_t *, size_t,
+                                              unsigned char *, size_t *);
+#define CHECK(condition) do { if (!(condition)) { \
+    fprintf(stderr, "prepared Exists check failed at line %d\n", __LINE__); \
+    return 1; } } while (0)
+static int check_error(uint32_t error, size_t prefix) {
+    uint32_t statuses[4] = {0, 1, 0, 1};
+    haystack_t inputs[4];
+    unsigned char output[4];
+    size_t calls = 0, processed = SIZE_MAX;
+    statuses[prefix] = error;
+    for (size_t i = 0; i < 4; i++)
+        inputs[i] = (haystack_t){(const unsigned char *)&statuses[i], sizeof(uint32_t)};
+    memset(output, 0xa5, sizeof(output));
+    uint32_t status = fre_test_prepared_exists_batch(&calls, inputs, 4, output, &processed);
+    CHECK(status == error && processed == prefix && calls == prefix + 1);
+    for (size_t i = 0; i < 4; i++)
+        CHECK(output[i] == (i < prefix ? (unsigned char)statuses[i] : 0xa5));
+    return 0;
+}
+int main(void) {
+    const uint32_t errors[] = {2, 3, 5, 7, 255, 256, UINT32_C(0x80000000), UINT32_MAX};
+    for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++)
+        for (size_t prefix = 0; prefix < 4; prefix++)
+            if (check_error(errors[i], prefix)) return 1;
+    uint32_t statuses[3] = {0, 1, 0};
+    haystack_t inputs[3];
+    for (size_t i = 0; i < 3; i++)
+        inputs[i] = (haystack_t){(const unsigned char *)&statuses[i], sizeof(uint32_t)};
+    unsigned char output[3] = {0xa5, 0xa5, 0xa5};
+    size_t calls = 0, processed = SIZE_MAX;
+    uint32_t status = fre_test_prepared_exists_batch(&calls, inputs, 3, output, &processed);
+    CHECK(status == 0 && processed == 3 && calls == 3);
+    CHECK(output[0] == 0 && output[1] == 1 && output[2] == 0);
+    calls = 0; processed = SIZE_MAX;
+    status = fre_test_prepared_exists_batch(&calls, NULL, 0, NULL, &processed);
+    CHECK(status == 0 && processed == 0 && calls == 0);
+    processed = SIZE_MAX;
+    memset(output, 0xa5, sizeof(output));
+    status = fre_test_prepared_exists_batch(&calls, NULL, 1, output, &processed);
+    CHECK(status == 2 && processed == SIZE_MAX && calls == 0);
+    CHECK(output[0] == 0xa5 && output[1] == 0xa5 && output[2] == 0xa5);
+    inputs[2].ptr = NULL;
+    status = fre_test_prepared_exists_batch(&calls, inputs, 3, output, &processed);
+    CHECK(status == 2 && processed == 2 && calls == 2);
+    CHECK(output[0] == 0 && output[1] == 1 && output[2] == 0xa5);
+    return 0;
+}
+"#;
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-prepared-exists-errors-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create prepared Exists linker directory");
+        let asm_path = directory.join("batch.s");
+        let c_path = directory.join("errors.c");
+        let executable = directory.join("errors");
+        fs::write(&asm_path, assembly).expect("write prepared Exists wrapper assembly");
+        fs::write(&c_path, source).expect("write prepared Exists error harness");
+        let compiler = if cfg!(target_os = "macos") { "clang" } else { "cc" };
+        let mut command = Command::new(compiler);
+        if cfg!(target_os = "macos") {
+            command.arg("-arch").arg(match target.architecture {
+                Architecture::X86_64 => "x86_64",
+                Architecture::Aarch64 => "arm64",
+            });
+        }
+        let output = command
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&asm_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("link prepared Exists error harness");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute prepared Exists error harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::remove_dir_all(&directory).expect("remove prepared Exists linker directory");
+    }
+
     #[test]
     fn direct_exists_batch_publishes_only_statuses_proved_boolean() {
         let x86 = lower_x86_64_direct_exists_batch(

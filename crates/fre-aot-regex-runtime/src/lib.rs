@@ -806,10 +806,13 @@ pub type FreAotRegexIndependentSpanFillV1 = unsafe extern "C" fn(
 /// Compiler-produced Exists-batch entry for one exclusively prepared program.
 ///
 /// Status zero means all independent haystacks were processed. After argument
-/// validation, `processed_out` contains the initialized prefix length and each
-/// corresponding output byte is exactly zero or one. A later invalid input or
-/// search failure preserves that prefix. A zero input count is valid, permits
-/// null input/output arrays, and publishes a processed count of zero.
+/// validation, `processed_out` is initialized to zero. When the call returns,
+/// it counts the completely initialized output prefix and each corresponding
+/// byte is exactly zero or one. A later invalid input or search failure
+/// preserves that prefix. A zero input count is valid, permits null
+/// input/output arrays, and publishes a processed count of zero. Writable
+/// extents must not overlap any input or each other, as for the target-neutral
+/// [`fre_aot_regex_runtime_is_match_batch_exclusive_v1`] entry.
 pub type FreAotRegexExclusiveExistsBatchV1 = unsafe extern "C" fn(
     FreAotRegexExclusiveHandleV1,
     *const FreAotRegexHaystackV1,

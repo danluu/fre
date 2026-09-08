@@ -1,0 +1,548 @@
+{
+  "rows": [
+    {
+      "scenario": "negative",
+      "batch": 1,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 4.984371840194757,
+      "candidate_ns_per_batch": 4.9904852175996925,
+      "ratio": 0.9987749933847362,
+      "runs": [
+        0.9983650959310327,
+        0.9991916297993956
+      ]
+    },
+    {
+      "scenario": "negative",
+      "batch": 1,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 49.79753741387282,
+      "candidate_ns_per_batch": 49.96088247256235,
+      "ratio": 0.9967305409631376,
+      "runs": [
+        0.9966103287827545,
+        0.9968533549552319
+      ]
+    },
+    {
+      "scenario": "negative",
+      "batch": 1,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 724.2994745153786,
+      "candidate_ns_per_batch": 723.7188257478418,
+      "ratio": 1.0008023126480603,
+      "runs": [
+        1.0008336344586701,
+        1.0007708652226002
+      ]
+    },
+    {
+      "scenario": "negative",
+      "batch": 8,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 31.58176099650646,
+      "candidate_ns_per_batch": 31.39287660563519,
+      "ratio": 1.0060167914283256,
+      "runs": [
+        0.9881993580471177,
+        1.0242975414795263
+      ]
+    },
+    {
+      "scenario": "negative",
+      "batch": 8,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 403.4093796497133,
+      "candidate_ns_per_batch": 402.0462485796264,
+      "ratio": 1.0033904832463991,
+      "runs": [
+        1.0051180908937114,
+        1.0016111718218592
+      ]
+    },
+    {
+      "scenario": "negative",
+      "batch": 8,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 5886.203578847311,
+      "candidate_ns_per_batch": 5872.639686550642,
+      "ratio": 1.0023096755497758,
+      "runs": [
+        1.0043139036352788,
+        1.000250976752804
+      ]
+    },
+    {
+      "scenario": "negative",
+      "batch": 64,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 206.0798034908464,
+      "candidate_ns_per_batch": 208.25413480236168,
+      "ratio": 0.9895592406192617,
+      "runs": [
+        0.9876555590462498,
+        0.9914969487255658
+      ]
+    },
+    {
+      "scenario": "negative",
+      "batch": 64,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 3133.7497472574296,
+      "candidate_ns_per_batch": 3123.6263561299556,
+      "ratio": 1.0032409097546533,
+      "runs": [
+        0.9992850273127405,
+        1.0073481741251968
+      ]
+    },
+    {
+      "scenario": "negative",
+      "batch": 64,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 47498.017052252864,
+      "candidate_ns_per_batch": 47502.169283811025,
+      "ratio": 0.9999125885907788,
+      "runs": [
+        0.998635764670952,
+        1.0012543510722072
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 1,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 23.465002610587106,
+      "candidate_ns_per_batch": 23.258162798875556,
+      "ratio": 1.008893213685887,
+      "runs": [
+        1.0201162092780376,
+        0.9976774656309825
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 1,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 23.92902717245738,
+      "candidate_ns_per_batch": 23.35239715733399,
+      "ratio": 1.0246925406089327,
+      "runs": [
+        1.026617427950512,
+        1.0226740437972788
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 1,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 23.714355776764005,
+      "candidate_ns_per_batch": 23.403603846514795,
+      "ratio": 1.0132779520746966,
+      "runs": [
+        1.0254412821723238,
+        1.001284678697575
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 8,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 172.86716185683082,
+      "candidate_ns_per_batch": 173.95790189568274,
+      "ratio": 0.9937298620702726,
+      "runs": [
+        1.0019521086746712,
+        0.9855679056873592
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 8,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 178.3197032235427,
+      "candidate_ns_per_batch": 176.45734090959914,
+      "ratio": 1.0105541787286574,
+      "runs": [
+        1.0167343204871946,
+        1.0043039150639166
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 8,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 176.2016489521489,
+      "candidate_ns_per_batch": 176.2830441070039,
+      "ratio": 0.9995382700856608,
+      "runs": [
+        0.9968820256148103,
+        1.0022246241965909
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 64,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 1319.954878320435,
+      "candidate_ns_per_batch": 1318.2462496654152,
+      "ratio": 1.001296137694648,
+      "runs": [
+        1.003359668416692,
+        0.9992120132447766
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 64,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 1439.504407327339,
+      "candidate_ns_per_batch": 1422.343329735864,
+      "ratio": 1.012065355271615,
+      "runs": [
+        1.01598822309554,
+        1.0080993532434221
+      ]
+    },
+    {
+      "scenario": "early",
+      "batch": 64,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 2380.529171678066,
+      "candidate_ns_per_batch": 2474.3183453524257,
+      "ratio": 0.962094944714561,
+      "runs": [
+        0.959584018069257,
+        0.9646375500774254
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 1,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 23.682917526175586,
+      "candidate_ns_per_batch": 23.32221586576583,
+      "ratio": 1.0154660115696477,
+      "runs": [
+        1.023220930773715,
+        1.0078063853592885
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 1,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 82.38210187870514,
+      "candidate_ns_per_batch": 82.38887606763637,
+      "ratio": 0.999917777869361,
+      "runs": [
+        1.0040346557065676,
+        0.9957520785127336
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 1,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 757.0595262000539,
+      "candidate_ns_per_batch": 757.5423164090956,
+      "ratio": 0.9993626887916569,
+      "runs": [
+        0.9984842996848845,
+        1.000241503627194
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 8,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 177.77726136631927,
+      "candidate_ns_per_batch": 174.67293413275976,
+      "ratio": 1.0177722281300894,
+      "runs": [
+        1.0227704983734247,
+        1.0126345664943954
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 8,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 639.2098246059388,
+      "candidate_ns_per_batch": 648.2452454162259,
+      "ratio": 0.986061724518341,
+      "runs": [
+        0.9903361660848801,
+        0.9817702529667476
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 8,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 6021.731239124681,
+      "candidate_ns_per_batch": 6036.160488147362,
+      "ratio": 0.9976095319117154,
+      "runs": [
+        0.9960124333131973,
+        0.9992123111607452
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 64,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 1326.307696051309,
+      "candidate_ns_per_batch": 1326.901896629261,
+      "ratio": 0.999552189517958,
+      "runs": [
+        0.9913652312105005,
+        1.007945578862742
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 64,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 5098.976243905485,
+      "candidate_ns_per_batch": 5164.398955446167,
+      "ratio": 0.9873319795575263,
+      "runs": [
+        0.9802328148954597,
+        0.9944300642356523
+      ]
+    },
+    {
+      "scenario": "late",
+      "batch": 64,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 48527.65911906554,
+      "candidate_ns_per_batch": 48508.966877616935,
+      "ratio": 1.000385335797725,
+      "runs": [
+        1.0007087417772411,
+        1.0000603374950325
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 1,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 55.384457291070206,
+      "candidate_ns_per_batch": 55.5428207825298,
+      "ratio": 0.9971488035856219,
+      "runs": [
+        0.9911966505203065,
+        1.0033819496540963
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 1,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 3181.292262820164,
+      "candidate_ns_per_batch": 3210.7007028093794,
+      "ratio": 0.9908404916211957,
+      "runs": [
+        0.98836239833694,
+        0.9933191224602084
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 1,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 52830.40871010543,
+      "candidate_ns_per_batch": 51786.43335274533,
+      "ratio": 1.0201592442223049,
+      "runs": [
+        1.0207924153239873,
+        1.019533758173282
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 8,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 446.5295864797974,
+      "candidate_ns_per_batch": 441.8918247594029,
+      "ratio": 1.010495242184939,
+      "runs": [
+        1.0328056729609894,
+        0.9891017580358846
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 8,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 25156.08071868005,
+      "candidate_ns_per_batch": 26038.865822364776,
+      "ratio": 0.9660974057124061,
+      "runs": [
+        0.9669218179673938,
+        0.9652313202160149
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 8,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 457610.9472873437,
+      "candidate_ns_per_batch": 473298.35045397974,
+      "ratio": 0.9668551492909515,
+      "runs": [
+        0.9747565583499327,
+        0.9588779067803171
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 64,
+      "bytes": 64,
+      "pairs": 62,
+      "baseline_ns_per_batch": 3402.570131861252,
+      "candidate_ns_per_batch": 3482.8955282137613,
+      "ratio": 0.9769371789357962,
+      "runs": [
+        0.9792256052004911,
+        0.9746105885305719
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 64,
+      "bytes": 4096,
+      "pairs": 62,
+      "baseline_ns_per_batch": 201553.14207711213,
+      "candidate_ns_per_batch": 202349.95451139344,
+      "ratio": 0.9960622060123249,
+      "runs": [
+        1.0196991636597659,
+        0.9738352505383855
+      ]
+    },
+    {
+      "scenario": "dense-decoy",
+      "batch": 64,
+      "bytes": 65536,
+      "pairs": 62,
+      "baseline_ns_per_batch": 3349265.1652309382,
+      "candidate_ns_per_batch": 3248620.336968475,
+      "ratio": 1.030980791173764,
+      "runs": [
+        1.0451470851019407,
+        1.0174422960595046
+      ]
+    }
+  ],
+  "all_geo": 0.9994961010635227,
+  "scalar_geo": 1.0054538303891751,
+  "batched_geo": 0.9965304877563528,
+  "regressions": 19,
+  "batched_regressions": 13,
+  "binaries": {
+    "baseline": {
+      "path": "/Users/danluu/dev/fre-aot-general-perf-target-baseline-20260908-r1/release/examples/public_prepared_exists_batch",
+      "sha256": "59e0d18ba1c7b8d4122269f2eed0658bae9f187a5fc2b4c20d755b8c6363aed6"
+    },
+    "candidate": {
+      "path": "/Users/danluu/dev/fre-aot-general-perf-20260908-r1/target/release/examples/public_prepared_exists_batch",
+      "sha256": "1e56e571afc2357cd3894e3b2c7766208046d2a7ce56ff5ae7af8b3e4a849686"
+    }
+  },
+  "logs": [
+    {
+      "path": "/Users/danluu/dev/fre-aot-prepared-batch-evidence-20260908-r1.jsonl",
+      "sha256": "6ba5873853631af2e98ea55d86c59c85a83447103854a37ab3b8399419adcc0b",
+      "samples": 2414,
+      "metadata": {
+        "binaries": {
+          "baseline": {
+            "path": "/Users/danluu/dev/fre-aot-general-perf-target-baseline-20260908-r1/release/examples/public_prepared_exists_batch",
+            "sha256": "59e0d18ba1c7b8d4122269f2eed0658bae9f187a5fc2b4c20d755b8c6363aed6"
+          },
+          "candidate": {
+            "path": "/Users/danluu/dev/fre-aot-general-perf-20260908-r1/target/release/examples/public_prepared_exists_batch",
+            "sha256": "1e56e571afc2357cd3894e3b2c7766208046d2a7ce56ff5ae7af8b3e4a849686"
+          }
+        },
+        "co_tenancy": "not controlled; load averages recorded; no timing samples filtered",
+        "cpu_count": 18,
+        "event": "metadata",
+        "host": "MacBook-Pro-2.local",
+        "pairs": 31,
+        "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+        "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+        "ratio_convention": "baseline_elapsed_ns / candidate_elapsed_ns; >1 favors candidate",
+        "schema": "fre-prepared-exists-pairs-v1",
+        "started_utc": "2026-09-08T19:20:00.362867+00:00",
+        "target_ms": 40,
+        "timing_scope": "endpoint internal batch timer; fresh process per sample; startup excluded"
+      }
+    },
+    {
+      "path": "/Users/danluu/dev/fre-aot-prepared-batch-evidence-20260908-r2.jsonl",
+      "sha256": "9f9ebfeeab71b3ca86e15c3685323d3d96d3581a36f4bb9b89c3e64928c4f3e1",
+      "samples": 2410,
+      "metadata": {
+        "binaries": {
+          "baseline": {
+            "path": "/Users/danluu/dev/fre-aot-general-perf-target-baseline-20260908-r1/release/examples/public_prepared_exists_batch",
+            "sha256": "59e0d18ba1c7b8d4122269f2eed0658bae9f187a5fc2b4c20d755b8c6363aed6"
+          },
+          "candidate": {
+            "path": "/Users/danluu/dev/fre-aot-general-perf-20260908-r1/target/release/examples/public_prepared_exists_batch",
+            "sha256": "1e56e571afc2357cd3894e3b2c7766208046d2a7ce56ff5ae7af8b3e4a849686"
+          }
+        },
+        "co_tenancy": "not controlled; load averages recorded; no timing samples filtered",
+        "cpu_count": 18,
+        "event": "metadata",
+        "host": "MacBook-Pro-2.local",
+        "pairs": 31,
+        "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+        "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+        "ratio_convention": "baseline_elapsed_ns / candidate_elapsed_ns; >1 favors candidate",
+        "schema": "fre-prepared-exists-pairs-v1",
+        "started_utc": "2026-09-08T19:21:51.884497+00:00",
+        "target_ms": 50,
+        "timing_scope": "endpoint internal batch timer; fresh process per sample; startup excluded"
+      }
+    }
+  ],
+  "total_measurement_processes": 4464
+}

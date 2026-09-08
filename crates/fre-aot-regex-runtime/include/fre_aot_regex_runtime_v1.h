@@ -124,8 +124,9 @@ typedef uint32_t (*FreAotRegexIndependentSpanFillV1)(
 
 /*
  * Additive compiler-produced Exists batch for independent haystacks. Status
- * 0 means every input was processed. processed_out is required and counts
- * initialized output bytes; each initialized byte is exactly 0 or 1. A zero
+ * 0 means every input was processed. processed_out is required, initialized
+ * to zero after top-level validation, and counts initialized output bytes
+ * when the call returns; each initialized byte is exactly 0 or 1. A zero
  * count is valid and permits null haystacks and matched_out pointers. For a
  * nonzero count, both arrays are nonnull, the descriptor array is naturally
  * aligned, and every descriptor has a nonnull ptr even when len is zero. Read

@@ -293,3 +293,29 @@ pass that same resolved executable as both inputs to
 authenticates binary identity, the per-arm timed mode, output digests, and route
 evidence in its append-only log. This is a benchmark endpoint only and does not
 change or bypass the production matcher API.
+
+The `public_prepared_exists_batch` example measures the prepared native loop
+using a generated literal in Fast mode. It requires an authenticated
+`compiled-prepared` / `exists-batch-v1` / `native-frozen-loop` route and checks
+both scalar and batch results against an independent exact-byte oracle.
+Build the same endpoint and manifest in both source trees:
+
+```sh
+FRE_RIPGREP_AOT_PATTERNS_FILE="$PWD/tools/ripgrep-aot-thin/testdata/public-prepared-exists-batch.tsv" \
+FRE_RIPGREP_AOT_VARIANTS=all \
+cargo build --release -j1 -p fre-ripgrep-aot-thin --example public_prepared_exists_batch
+```
+
+Then run `python3 tools/ripgrep-aot-thin/examples/run_public_prepared_exists_batch.py
+--baseline BASE_EXE --candidate CANDIDATE_EXE --output NEW.jsonl` (on one line).
+The runner covers batches of 1, 8, and 64 at 64 B, 4 KiB, and 64 KiB, with
+negative, early, late, and dense-decoy inputs. It alternates the order of 31
+fresh-process pairs per cell, excludes setup from timing, and retains failures
+and regressions in an incrementally flushed log. Batch size one uses the
+unchanged scalar API and is a control for unrelated timing variation.
+
+The prepared batch ABI guarantees the exact initialized output prefix when
+the synchronous call returns, including after a descriptor or search failure.
+The linked compiler tests inject search errors on both native and optional
+Rosetta x86-64 paths to verify this contract independently of any particular
+matcher implementation.

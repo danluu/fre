@@ -6818,6 +6818,119 @@ mod tests {
     }
 
     #[test]
+    fn compiled_prepared_exists_batch_preserves_results_and_error_prefixes() {
+        if generated::BUILD_VARIANT_POLICY != "all" {
+            return;
+        }
+        let Some(spec) = generated::SPECS.iter().find(|spec| {
+            spec.mode == AotMode::Fast
+                && spec.output == AotOutput::Exists
+                && !spec.case_insensitive
+                && matches!(
+                    spec.pattern,
+                    "PM_RESUME" | "FRE_PUBLIC_BATCH_NEEDLE_7f4a9c2d"
+                )
+        }) else {
+            // External manifests need not contain the package's public
+            // compiled-prepared fixture or its generated benchmark fixture.
+            return;
+        };
+        let pattern = spec.pattern;
+        assert!(spec.description.contains("bulk=native-frozen-loop"));
+        assert!(matches!(
+            spec.backend,
+            BackendFactory::Prepared {
+                span_fill: None,
+                exists_batch: Some(_),
+                ..
+            }
+        ));
+
+        let mut matcher = AotMatcher::new(AotMode::Fast, AotOutput::Exists, pattern, false)
+            .expect("prepare public Fast Exists fixture");
+        let misses = [
+            b"PM_PAUSE".as_slice(),
+            b"".as_slice(),
+            b"unrelated public input".as_slice(),
+        ];
+        let mut miss_results = [true; 3];
+        matcher
+            .is_match_batch(&misses, &mut miss_results)
+            .expect("compiled prepared all-miss batch");
+        assert_eq!(miss_results, [false; 3]);
+
+        let embedded = format!("prefix {pattern} suffix");
+        let mixed = [
+            pattern.as_bytes(),
+            b"PM_PAUSE".as_slice(),
+            embedded.as_bytes(),
+            b"".as_slice(),
+        ];
+        let mut mixed_results = [false; 4];
+        matcher
+            .is_match_batch(&mixed, &mut mixed_results)
+            .expect("compiled prepared mixed batch");
+        assert_eq!(mixed_results, [true, false, true, false]);
+
+        let (batch, handle) = match &matcher.backend {
+            Backend::Prepared(prepared) => (
+                prepared
+                    .exists_batch
+                    .expect("compiled prepared Exists batch entry"),
+                prepared.handle,
+            ),
+            _ => panic!("public Fast fixture lost its prepared backend"),
+        };
+        let mut processed = usize::MAX;
+        // SAFETY: a zero count permits null descriptor and result arrays, and
+        // the exclusively owned prepared handle remains live for this call.
+        let status = unsafe {
+            batch(
+                handle,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut processed,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(processed, 0);
+
+        let valid = pattern.as_bytes();
+        let descriptors = [
+            AbiHaystack {
+                ptr: valid.as_ptr(),
+                len: valid.len(),
+            },
+            AbiHaystack {
+                ptr: std::ptr::null(),
+                len: 0,
+            },
+            AbiHaystack {
+                ptr: valid.as_ptr(),
+                len: valid.len(),
+            },
+        ];
+        let mut raw_results = [0xa5_u8; 3];
+        processed = usize::MAX;
+        // SAFETY: the first descriptor is valid. The null second descriptor
+        // deliberately triggers late validation before source access; the
+        // third slot is a valid but unprocessed tail.
+        let status = unsafe {
+            batch(
+                handle,
+                descriptors.as_ptr(),
+                descriptors.len(),
+                raw_results.as_mut_ptr(),
+                &raw mut processed,
+            )
+        };
+        assert_eq!(status, 2);
+        assert_eq!(processed, 1);
+        assert_eq!(raw_results, [1, 0xa5, 0xa5]);
+    }
+
+    #[test]
     fn compiled_prepared_fast_finds_dense_matches_across_refills() {
         let pattern = "PM_RESUME";
         if !generated::SPECS.iter().any(|spec| {
