@@ -167,6 +167,8 @@ pub use fre_kernels::{
     PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
     PackedLiteralSetLongSharedFragmentBuildReceipt,
 };
+#[doc(hidden)]
+pub use fre_kernels::LiteralSetCompactOrdinaryRouteReceipt;
 pub use bounded_byte_class_sequence::{
     Accounting as BoundedByteClassSequenceAccounting,
     Error as BoundedByteClassSequenceSearchError,
@@ -6269,6 +6271,15 @@ impl RipgrepOrdinaryRegex {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         self.literal_set.runtime_implementation_id()
+    }
+
+    /// Return cold facts about the retained compact ordinary route.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    #[must_use]
+    pub fn compact_ordinary_route_receipt(&self) -> LiteralSetCompactOrdinaryRouteReceipt {
+        self.literal_set.construction_route_receipt()
     }
 
     /// Bind one thread-confined ordinary worker session.
@@ -31151,8 +31162,9 @@ mod tests {
         K0NegativePrefilterOutcome, K0NegativePrefilterState, K0PackedFrontierExistsReceipt,
         K0PackedFrontierPlan, K0PooledValue, K0PooledValueExecution, K0PooledValueOperation,
         K0ReverseSuffixSpanAttempt, K0SpanSourceCursor,
-        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetBuildLimits, LiteralSetError,
-        LiteralWindow, Match, OperationSemantics,
+        LITERAL_CLASS_RUN_LITERAL_SPAN_VISIT_OPERATION_ID, LiteralSetBuildLimits,
+        LiteralSetCompactOrdinaryRouteReceipt, LiteralSetError, LiteralWindow, Match,
+        OperationSemantics,
         PACKED_LITERAL_SET_LONG_SHARED_FRAGMENT_BUILD_CAPABILITY_ID,
         PackedLiteralSetError, PlanKind, PlanSelection, PortableBuilder,
         PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
@@ -32592,6 +32604,31 @@ mod tests {
             .collect()
     }
 
+    fn public_prefilter_defeating_ripgrep_literals() -> Vec<String> {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut patterns = Vec::with_capacity(512);
+        for byte in b'A'..=b'D' {
+            patterns.push(core::iter::repeat_n(char::from(byte), 64).collect());
+        }
+        let mut state = 0x74a0_1c51_d00d_f00d_u64;
+        for index in 4_usize..512 {
+            let mut pattern = String::with_capacity(64);
+            for byte_index in 0_usize..64 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407)
+                    ^ u64::try_from(index * 64 + byte_index).unwrap();
+                let alphabet_index =
+                    usize::try_from(state % u64::try_from(ALPHABET.len()).unwrap()).unwrap();
+                pattern.push(char::from(ALPHABET[alphabet_index]));
+            }
+            patterns.push(pattern);
+        }
+        assert_eq!(patterns.len(), 512);
+        assert!(patterns.iter().all(|pattern| pattern.len() == 64));
+        patterns
+    }
+
     fn build_public_uniform_ripgrep_literals(patterns: &[String]) -> PortableRegex {
         let borrowed = patterns.iter().map(String::as_str).collect::<Vec<_>>();
         PortableBuilder::new("")
@@ -32837,6 +32874,98 @@ mod tests {
             session.count_positive_width_selected_ends_at(&haystack, 1),
             Ok(Some(2)),
         );
+    }
+
+    #[test]
+    fn ripgrep_ordinary_route_receipt_covers_regex_and_fixed_seams() {
+        fn assert_common_receipt(receipt: LiteralSetCompactOrdinaryRouteReceipt) {
+            assert_eq!(receipt.schema_version, 3);
+            assert_eq!(
+                receipt.capability_id,
+                "literal-set-compact-ordinary-route-v3",
+            );
+            assert_eq!(receipt.engine_width_bytes, 64);
+            assert_eq!(receipt.automaton_min_pattern_bytes, 64);
+            assert_eq!(receipt.automaton_max_pattern_bytes, 64);
+            assert!(receipt.automaton_match_kind_standard);
+            assert!(receipt.automaton_prefilter_is_none);
+            assert!(receipt.compact_ordinary_scanner_eligible);
+            assert_eq!(receipt.lf_short_segment_min_pattern_bytes, 64);
+            assert_eq!(receipt.lf_segment_initial_probe_bytes, 256);
+            assert_eq!(receipt.lf_segment_refill_probe_bytes, 4_096);
+            let expected_skip =
+                receipt.engine_width_bytes >= receipt.lf_short_segment_min_pattern_bytes;
+            assert_eq!(receipt.literals_exclude_lf, expected_skip);
+            assert_eq!(receipt.lf_short_segment_skip_enabled, expected_skip);
+        }
+
+        fn assert_common_behavior(
+            regex: &super::RipgrepOrdinaryRegex,
+            patterns: &[String],
+        ) {
+            let mut haystack = b"\nshort\n".to_vec();
+            let first_start = haystack.len();
+            haystack.extend_from_slice(patterns[17].as_bytes());
+            let first_end = haystack.len();
+            haystack.extend_from_slice(b"\nxy\n");
+            let second_start = haystack.len();
+            haystack.extend_from_slice(patterns[31].as_bytes());
+            let second_end = haystack.len();
+            haystack.push(b'\n');
+            let expected = [(first_start, first_end), (second_start, second_end)];
+
+            let mut spans = Vec::new();
+            let mut session = regex.ordinary_session();
+            assert!(session.supports_compact_matching_lf_line_count());
+            session
+                .try_visit_spans(&haystack, |matched| {
+                    spans.push((matched.start(), matched.end()));
+                    Ok::<bool, ()>(true)
+                })
+                .expect("ordinary compact span visit runs")
+                .expect("ordinary compact visitor completes");
+            assert_eq!(spans, expected);
+
+            assert_eq!(
+                regex
+                    .ordinary_session()
+                    .count_matching_lf_lines(&haystack, true),
+                Ok(Some(2)),
+            );
+        }
+
+        let regex_patterns = public_prefilter_defeating_ripgrep_literals();
+        let regex_borrowed = regex_patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let (regex, _census) = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_standard_literals_ordinary_with_census(
+                &regex_borrowed,
+                usize::MAX,
+                None,
+            )
+            .expect("regex literal route construction completes")
+            .expect("regex literals are admitted");
+        let RipgrepStandardLiteralsBuild::Ordinary(regex) = regex else {
+            panic!("regex literal seam retained a portable owner");
+        };
+        assert_common_receipt(regex.compact_ordinary_route_receipt());
+        assert_common_behavior(&regex, &regex_patterns);
+
+        let fixed_borrowed = regex_patterns.iter().map(String::as_str).collect::<Vec<_>>();
+        let (fixed, _census) = PortableBuilder::new("")
+            .multi_line(true)
+            .build_ripgrep_fixed_literals_ordinary_with_census(
+                &fixed_borrowed,
+                usize::MAX,
+                None,
+            )
+            .expect("fixed literal route construction completes")
+            .expect("fixed literals are admitted");
+        let RipgrepStandardLiteralsBuild::Ordinary(fixed) = fixed else {
+            panic!("fixed literal seam retained a portable owner");
+        };
+        assert_common_receipt(fixed.compact_ordinary_route_receipt());
+        assert_common_behavior(&fixed, &regex_patterns);
     }
 
     #[test]

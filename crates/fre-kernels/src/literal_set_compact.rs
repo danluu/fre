@@ -33,6 +33,11 @@ const ORDINARY_MAX_PATTERNS: usize = 4_096;
 const ORDINARY_MIN_PATTERN_BYTES: usize = 8;
 const ORDINARY_MIN_DENSE_BUILD_WORK: usize = 4 * 1024 * 1024;
 const MAX_DENSE_DEPTH: usize = 24;
+const LF_SHORT_SEGMENT_MIN_PATTERN_BYTES: usize = 64;
+const LF_SEGMENT_INITIAL_PROBE_BYTES: usize = 256;
+const LF_SEGMENT_REFILL_PROBE_BYTES: usize = 4_096;
+const ORDINARY_ROUTE_RECEIPT_SCHEMA_VERSION: u32 = 3;
+const ORDINARY_ROUTE_CAPABILITY_ID: &str = "literal-set-compact-ordinary-route-v3";
 
 #[derive(Clone, Copy, Debug)]
 struct CompactAdmission {
@@ -57,6 +62,7 @@ const ORDINARY_ADMISSION: CompactAdmission = CompactAdmission {
 struct CompactEngine {
     automaton: NFA,
     width: usize,
+    literals_exclude_lf: bool,
 }
 
 /// One no-prefilter compact-NFA scan shared by ordinary projections.
@@ -72,10 +78,14 @@ struct CompactOrdinaryScanner<'a, 'h> {
     automaton: &'a NFA,
     haystack: &'h [u8],
     start_state: StateID,
-    state: StateID,
     at: usize,
-    end: usize,
+    window_end: usize,
     width: usize,
+    skip_short_lf_segments: bool,
+    // A bounded LF-free slice may outlive one accepted match. Retaining its
+    // endpoint avoids repeatedly searching the same suffix on dense hits.
+    segment_end: usize,
+    segment_ends_at_lf: bool,
 }
 
 #[cfg(test)]
@@ -84,10 +94,16 @@ mod compact_ordinary_scanner_probe {
 
     std::thread_local! {
         static BINDS: Cell<usize> = const { Cell::new(0) };
+        static SHORT_LF_PROBE_CALLS: Cell<usize> = const { Cell::new(0) };
+        static SHORT_LF_PROBE_BYTES: Cell<usize> = const { Cell::new(0) };
+        static SHORT_LF_SEGMENT_SKIPS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn reset() {
         BINDS.set(0);
+        SHORT_LF_PROBE_CALLS.set(0);
+        SHORT_LF_PROBE_BYTES.set(0);
+        SHORT_LF_SEGMENT_SKIPS.set(0);
     }
 
     pub(super) fn record() {
@@ -96,6 +112,27 @@ mod compact_ordinary_scanner_probe {
 
     pub(super) fn binds() -> usize {
         BINDS.get()
+    }
+
+    pub(super) fn record_short_lf_probe(bytes: usize) {
+        SHORT_LF_PROBE_CALLS.set(SHORT_LF_PROBE_CALLS.get().saturating_add(1));
+        SHORT_LF_PROBE_BYTES.set(SHORT_LF_PROBE_BYTES.get().saturating_add(bytes));
+    }
+
+    pub(super) fn record_short_lf_segment_skip() {
+        SHORT_LF_SEGMENT_SKIPS.set(SHORT_LF_SEGMENT_SKIPS.get().saturating_add(1));
+    }
+
+    pub(super) fn short_lf_probe_calls() -> usize {
+        SHORT_LF_PROBE_CALLS.get()
+    }
+
+    pub(super) fn short_lf_probe_bytes() -> usize {
+        SHORT_LF_PROBE_BYTES.get()
+    }
+
+    pub(super) fn short_lf_segment_skips() -> usize {
+        SHORT_LF_SEGMENT_SKIPS.get()
     }
 }
 
@@ -117,6 +154,29 @@ pub struct LiteralSetCompactPlan {
 pub struct LiteralSetCompactOrdinaryPlan {
     engine: CompactEngine,
     build: LiteralSetBuildAccounting,
+}
+
+/// Cold construction-route facts read from one retained compact owner.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiteralSetCompactOrdinaryRouteReceipt {
+    pub schema_version: u32,
+    pub capability_id: &'static str,
+    pub engine_width_bytes: usize,
+    pub automaton_min_pattern_bytes: usize,
+    pub automaton_max_pattern_bytes: usize,
+    pub automaton_match_kind_standard: bool,
+    pub automaton_prefilter_is_none: bool,
+    pub compact_ordinary_scanner_eligible: bool,
+    /// True only after the ordinary-only, minimum-width-qualified construction
+    /// performed a complete LF census and found none. False is conservative:
+    /// it may mean LF was present or that this route did not authenticate it.
+    pub literals_exclude_lf: bool,
+    pub lf_short_segment_min_pattern_bytes: usize,
+    pub lf_segment_initial_probe_bytes: usize,
+    pub lf_segment_refill_probe_bytes: usize,
+    pub lf_short_segment_skip_enabled: bool,
 }
 
 /// Unpublished compact owner retaining its shared construction NFA.
@@ -168,6 +228,7 @@ enum CompactPreflight {
         compact_build: LiteralSetBuildAccounting,
         width: usize,
         dense_depth: usize,
+        literals_exclude_lf: bool,
     },
 }
 
@@ -255,20 +316,21 @@ fn compact_preflight<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: LiteralSetBuildLimits,
 ) -> Result<CompactPreflight, LiteralSetError> {
-    compact_preflight_with_admission(patterns, limits, DUAL_ADMISSION)
+    compact_preflight_with_admission(patterns, limits, DUAL_ADMISSION, false)
 }
 
 fn compact_ordinary_preflight<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: LiteralSetBuildLimits,
 ) -> Result<CompactPreflight, LiteralSetError> {
-    compact_preflight_with_admission(patterns, limits, ORDINARY_ADMISSION)
+    compact_preflight_with_admission(patterns, limits, ORDINARY_ADMISSION, true)
 }
 
 fn compact_preflight_with_admission<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: LiteralSetBuildLimits,
     admission: CompactAdmission,
+    authenticate_lf_short_segments: bool,
 ) -> Result<CompactPreflight, LiteralSetError> {
     if !(MIN_PATTERNS..=admission.max_patterns).contains(&patterns.len()) {
         return Ok(CompactPreflight::NotApplicable);
@@ -294,12 +356,23 @@ fn compact_preflight_with_admission<P: AsRef<[u8]>>(
     // topology-selector charge. Together with the canonical receipt this also
     // covers a complete compact attempt followed by same-shared-NFA canonical
     // fallback.
+    // The new LF census belongs only to the ordinary-only owner and only to
+    // widths that can use it. This leaves the dual-owner policy and narrower
+    // ordinary construction accounting byte-for-byte unchanged.
+    let authenticate_lf_short_segments =
+        authenticate_lf_short_segments && width >= LF_SHORT_SEGMENT_MIN_PATTERN_BYTES;
+    let lf_authentication_work = if authenticate_lf_short_segments {
+        canonical_build.pattern_bytes
+    } else {
+        0
+    };
     let Some(compact_build_work) = canonical_build
         .dfa_cells_upper_bound
         .checked_mul(2)
         .and_then(|work| work.checked_add(canonical_build.trie_states_upper_bound))
         .and_then(|work| work.checked_add(canonical_build.patterns))
         .and_then(|work| work.checked_add(deepest_branch_build_work))
+        .and_then(|work| work.checked_add(lf_authentication_work))
         .and_then(|work| work.checked_add(canonical_build.build_work_upper_bound))
     else {
         return Ok(CompactPreflight::Canonical(canonical_build));
@@ -346,11 +419,16 @@ fn compact_preflight_with_admission<P: AsRef<[u8]>>(
     let mut compact_build = canonical_build;
     compact_build.build_work_upper_bound = compact_build_work;
     compact_build.build_bytes_upper_bound = compact_build_bytes;
+    let literals_exclude_lf = authenticate_lf_short_segments
+        && patterns
+            .iter()
+            .all(|pattern| !pattern.as_ref().contains(&b'\n'));
     Ok(CompactPreflight::Eligible {
         canonical_build,
         compact_build,
         width,
         dense_depth,
+        literals_exclude_lf,
     })
 }
 
@@ -383,9 +461,7 @@ fn canonical_outcome<P: AsRef<[u8]>>(
     canonical_plan(patterns, build, limits).map(LiteralSetCompactBuildOutcome::Canonical)
 }
 
-fn build_shared<P: AsRef<[u8]>>(
-    patterns: &[P],
-) -> Result<noncontiguous::NFA, LiteralSetError> {
+fn build_shared<P: AsRef<[u8]>>(patterns: &[P]) -> Result<noncontiguous::NFA, LiteralSetError> {
     let mut builder = noncontiguous::Builder::new();
     builder.match_kind(MatchKind::Standard);
     builder
@@ -412,7 +488,11 @@ fn compact_engine(
     shared: &noncontiguous::NFA,
     width: usize,
     dense_depth: usize,
+    literals_exclude_lf: bool,
 ) -> Option<CompactEngine> {
+    if width == 0 || dense_depth > MAX_DENSE_DEPTH || dense_depth >= width {
+        return None;
+    }
     debug_assert!(dense_depth <= MAX_DENSE_DEPTH);
     debug_assert!(dense_depth < width);
     let mut builder = NFA::builder();
@@ -422,10 +502,20 @@ fn compact_engine(
     // dense-state choices outside this forced prefix.
     builder.dense_depth(dense_depth);
     let automaton = builder.build_from_noncontiguous(shared).ok()?;
+    if automaton.match_kind() != MatchKind::Standard
+        || automaton.min_pattern_len() != width
+        || automaton.max_pattern_len() != width
+    {
+        return None;
+    }
     debug_assert_eq!(automaton.match_kind(), MatchKind::Standard);
     debug_assert_eq!(automaton.min_pattern_len(), width);
     debug_assert_eq!(automaton.max_pattern_len(), width);
-    Some(CompactEngine { automaton, width })
+    Some(CompactEngine {
+        automaton,
+        width,
+        literals_exclude_lf,
+    })
 }
 
 impl CompactEngine {
@@ -436,12 +526,26 @@ impl CompactEngine {
 }
 
 impl<'a, 'h> CompactOrdinaryScanner<'a, 'h> {
+    /// Keep receipt classification and scanner construction on one predicate
+    /// without allocating or observing a synthetic source.
+    #[inline]
+    fn is_eligible(engine: &CompactEngine) -> bool {
+        engine.width != 0 && engine.automaton.prefilter().is_none()
+    }
+
+    #[inline]
+    fn short_lf_segment_skip_enabled(engine: &CompactEngine) -> bool {
+        Self::is_eligible(engine)
+            && engine.literals_exclude_lf
+            && engine.width >= LF_SHORT_SEGMENT_MIN_PATTERN_BYTES
+    }
+
     /// Bind the direct scanner only when Aho has no construction-selected
     /// prefilter to preserve. Compact construction independently proves the
     /// positive fixed width and Standard semantics used by the scan body.
     #[inline]
     fn new(engine: &'a CompactEngine, haystack: &'h [u8], window: Window) -> Option<Self> {
-        if engine.width == 0 || engine.automaton.prefilter().is_some() {
+        if !Self::is_eligible(engine) {
             return None;
         }
         debug_assert_eq!(engine.automaton.match_kind(), MatchKind::Standard);
@@ -454,49 +558,139 @@ impl<'a, 'h> CompactOrdinaryScanner<'a, 'h> {
         debug_assert!(!engine.automaton.is_match(start_state));
         #[cfg(test)]
         compact_ordinary_scanner_probe::record();
+        let skip_short_lf_segments = Self::short_lf_segment_skip_enabled(engine);
         Some(Self {
             automaton: &engine.automaton,
             haystack,
             start_state,
-            state: start_state,
             at: window.start(),
-            end: window.end(),
+            window_end: window.end(),
             width: engine.width,
+            skip_short_lf_segments,
+            segment_end: window.start(),
+            segment_ends_at_lf: false,
         })
+    }
+
+    /// Discover one bounded LF-free slice. The first probe in each search is
+    /// small to bound early-existence lookahead; continued scans amortize the
+    /// delimiter search with larger blocks. The LF itself is never included
+    /// in the slice. Callers distinguish a real LF from a discovery-block end.
+    #[inline(always)]
+    fn discover_lf_segment(&mut self, probe_cap: usize) {
+        let probe_bytes = probe_cap.min(self.window_end - self.at);
+        debug_assert!(probe_bytes > 0);
+        #[cfg(test)]
+        compact_ordinary_scanner_probe::record_short_lf_probe(probe_bytes);
+        let probe_end = self.at + probe_bytes;
+        if let Some(relative_lf) = memchr(b'\n', &self.haystack[self.at..probe_end]) {
+            self.segment_end = self.at + relative_lf;
+            self.segment_ends_at_lf = true;
+        } else {
+            self.segment_end = probe_end;
+            self.segment_ends_at_lf = false;
+        }
+    }
+
+    #[inline(always)]
+    fn exhaust(&mut self) {
+        self.at = self.window_end;
     }
 
     /// Return the next non-overlapping first acceptance without constructing
     /// an Aho input, iterator or match value.
     #[inline(always)]
     fn next_end(&mut self) -> Option<usize> {
-        let base = self.at;
-        // Restrict the source once so byte iteration needs only its own end
-        // condition. Recover the absolute cursor only when a match escapes.
-        let remaining = &self.haystack[base..self.end];
-        let mut state = self.state;
+        if self.skip_short_lf_segments {
+            self.next_end_in_lf_segments()
+        } else {
+            self.next_end_without_lf_segments()
+        }
+    }
+
+    /// Non-overlapping searches start at the root, but discovery-block ends
+    /// do not reset automaton state: a match may straddle such an end. Only
+    /// an authenticated actual LF resets the state. The inner byte loop has
+    /// neither a delimiter branch nor a second per-byte bound check.
+    #[inline(always)]
+    fn next_end_in_lf_segments(&mut self) -> Option<usize> {
+        debug_assert!(self.at <= self.window_end);
+        if self.at >= self.window_end {
+            self.exhaust();
+            return None;
+        }
+        let mut state = self.start_state;
+        let mut can_skip = true;
+        let mut probe_cap = LF_SEGMENT_INITIAL_PROBE_BYTES;
+        loop {
+            if self.at >= self.segment_end {
+                // The matching-line projection can advance the cursor past
+                // this cache. A stale delimiter must not consume a new byte.
+                if self.at == self.segment_end && self.segment_ends_at_lf {
+                    self.at += 1;
+                    state = self.start_state;
+                    can_skip = true;
+                }
+                if self.at >= self.window_end {
+                    self.exhaust();
+                    return None;
+                }
+                self.discover_lf_segment(probe_cap);
+                probe_cap = LF_SEGMENT_REFILL_PROBE_BYTES;
+            }
+
+            // A short block without LF may be the start of a longer record;
+            // it must be scanned and its partial NFA state carried forward.
+            if can_skip && self.segment_ends_at_lf && self.segment_end - self.at < self.width {
+                self.at = self.segment_end + 1;
+                state = self.start_state;
+                #[cfg(test)]
+                compact_ordinary_scanner_probe::record_short_lf_segment_skip();
+                continue;
+            }
+            let remaining = &self.haystack[self.at..self.segment_end];
+            let mut bytes = remaining.iter();
+            while let Some(&byte) = bytes.next() {
+                state = self.automaton.next_state(Anchored::No, state, byte);
+                if !self.automaton.is_special(state) {
+                    continue;
+                }
+                // Aho's unanchored Standard traversal has no transitions to
+                // its dead state, or special start states without a prefilter.
+                debug_assert!(
+                    self.automaton.is_match(state),
+                    "a Standard compact NFA without a prefilter has no other reachable special states",
+                );
+                let accepted_end = self.segment_end - bytes.len();
+                self.at = accepted_end;
+                return Some(accepted_end);
+            }
+            self.at = self.segment_end;
+            can_skip = false;
+        }
+    }
+
+    #[inline(always)]
+    fn next_end_without_lf_segments(&mut self) -> Option<usize> {
+        debug_assert!(self.at <= self.window_end);
+        if self.at >= self.window_end {
+            self.exhaust();
+            return None;
+        }
+        let remaining = &self.haystack[self.at..self.window_end];
+        let mut state = self.start_state;
         let mut bytes = remaining.iter();
         while let Some(&byte) = bytes.next() {
-            state = self
-                .automaton
-                .next_state(Anchored::No, state, byte);
+            state = self.automaton.next_state(Anchored::No, state, byte);
             if !self.automaton.is_special(state) {
                 continue;
             }
-            // Aho's unanchored Standard traversal has no transitions to its
-            // dead state. It also excludes start states from `is_special`
-            // when no prefilter is retained, including impossible-root
-            // self-loops.
-            debug_assert!(
-                self.automaton.is_match(state),
-                "a Standard compact NFA without a prefilter has no other reachable special states",
-            );
-            let accepted_end = self.end - bytes.len();
+            debug_assert!(self.automaton.is_match(state));
+            let accepted_end = self.window_end - bytes.len();
             self.at = accepted_end;
-            self.state = self.start_state;
             return Some(accepted_end);
         }
-        self.state = state;
-        self.at = self.end;
+        self.exhaust();
         None
     }
 
@@ -522,7 +716,7 @@ impl LiteralSetCompactPlan {
         patterns: &[P],
         limits: LiteralSetBuildLimits,
     ) -> Result<LiteralSetCompactBuildOutcome, LiteralSetError> {
-        let (canonical_build, mut compact_build, width, dense_depth) =
+        let (canonical_build, mut compact_build, width, dense_depth, literals_exclude_lf) =
             match compact_preflight(patterns, limits)? {
                 CompactPreflight::NotApplicable => {
                     return Ok(LiteralSetCompactBuildOutcome::NotApplicable);
@@ -535,13 +729,20 @@ impl LiteralSetCompactPlan {
                     compact_build,
                     width,
                     dense_depth,
-                } => (canonical_build, compact_build, width, dense_depth),
+                    literals_exclude_lf,
+                } => (
+                    canonical_build,
+                    compact_build,
+                    width,
+                    dense_depth,
+                    literals_exclude_lf,
+                ),
             };
         let shared = build_shared(patterns)?;
         // Checked and explicit-session calls retain the exact established DFA
         // contract. The compact NFA is an additional ordinary-only engine.
         let canonical = canonical_from_shared(&shared, canonical_build, limits)?;
-        let engine = match compact_engine(&shared, width, dense_depth) {
+        let engine = match compact_engine(&shared, width, dense_depth, literals_exclude_lf) {
             Some(engine) => engine,
             None => return Ok(LiteralSetCompactBuildOutcome::Canonical(canonical)),
         };
@@ -626,7 +827,7 @@ impl LiteralSetCompactOrdinaryPlan {
         patterns: &[P],
         limits: LiteralSetBuildLimits,
     ) -> Result<LiteralSetCompactOrdinaryBuildOutcome, LiteralSetError> {
-        let (canonical_build, mut compact_build, width, dense_depth) =
+        let (canonical_build, mut compact_build, width, dense_depth, literals_exclude_lf) =
             match compact_ordinary_preflight(patterns, limits)? {
                 CompactPreflight::NotApplicable => {
                     return Ok(LiteralSetCompactOrdinaryBuildOutcome::NotApplicable);
@@ -640,10 +841,17 @@ impl LiteralSetCompactOrdinaryPlan {
                     compact_build,
                     width,
                     dense_depth,
-                } => (canonical_build, compact_build, width, dense_depth),
+                    literals_exclude_lf,
+                } => (
+                    canonical_build,
+                    compact_build,
+                    width,
+                    dense_depth,
+                    literals_exclude_lf,
+                ),
             };
         let shared = build_shared(patterns)?;
-        let Some(engine) = compact_engine(&shared, width, dense_depth) else {
+        let Some(engine) = compact_engine(&shared, width, dense_depth, literals_exclude_lf) else {
             return canonical_from_shared(&shared, canonical_build, limits)
                 .map(LiteralSetCompactOrdinaryBuildOutcome::Canonical);
         };
@@ -679,6 +887,36 @@ impl LiteralSetCompactOrdinaryPlan {
     #[must_use]
     pub const fn build_accounting(&self) -> LiteralSetBuildAccounting {
         self.build
+    }
+
+    /// Read the retained automaton and direct-scanner construction route.
+    ///
+    /// This cold receipt shares the exact eligibility predicates used by the
+    /// scanner constructor without allocating or inspecting a source.
+    #[doc(hidden)]
+    #[cold]
+    #[inline(never)]
+    #[must_use]
+    pub fn construction_route_receipt(&self) -> LiteralSetCompactOrdinaryRouteReceipt {
+        let automaton = &self.engine.automaton;
+        let compact_ordinary_scanner_eligible = CompactOrdinaryScanner::is_eligible(&self.engine);
+        let lf_short_segment_skip_enabled =
+            CompactOrdinaryScanner::short_lf_segment_skip_enabled(&self.engine);
+        LiteralSetCompactOrdinaryRouteReceipt {
+            schema_version: ORDINARY_ROUTE_RECEIPT_SCHEMA_VERSION,
+            capability_id: ORDINARY_ROUTE_CAPABILITY_ID,
+            engine_width_bytes: self.engine.width,
+            automaton_min_pattern_bytes: automaton.min_pattern_len(),
+            automaton_max_pattern_bytes: automaton.max_pattern_len(),
+            automaton_match_kind_standard: automaton.match_kind() == MatchKind::Standard,
+            automaton_prefilter_is_none: automaton.prefilter().is_none(),
+            compact_ordinary_scanner_eligible,
+            literals_exclude_lf: self.engine.literals_exclude_lf,
+            lf_short_segment_min_pattern_bytes: LF_SHORT_SEGMENT_MIN_PATTERN_BYTES,
+            lf_segment_initial_probe_bytes: LF_SEGMENT_INITIAL_PROBE_BYTES,
+            lf_segment_refill_probe_bytes: LF_SEGMENT_REFILL_PROBE_BYTES,
+            lf_short_segment_skip_enabled,
+        }
     }
 
     /// Bind ordinary unmetered operations once to this owner.
@@ -843,24 +1081,19 @@ impl CompactEngine {
     /// authenticated that LF cannot occur in any retained literal, so the
     /// first acceptance in a line permits skipping directly to its boundary.
     #[inline(never)]
-    fn count_matching_lf_lines_value(
-        &self,
-        haystack: &[u8],
-    ) -> Result<u64, LiteralSetError> {
+    fn count_matching_lf_lines_value(&self, haystack: &[u8]) -> Result<u64, LiteralSetError> {
         let window = Window::full(haystack);
         if self.window_is_too_short(window) {
             return Ok(0);
         }
         let mut count = 0_u64;
-        if let Some(mut scanner) =
-            CompactOrdinaryScanner::new(self, haystack, window)
-        {
+        if let Some(mut scanner) = CompactOrdinaryScanner::new(self, haystack, window) {
             while let Some(end) = scanner.next_end() {
-                count = count.checked_add(1).ok_or(
-                    LiteralSetError::ArithmeticOverflow {
+                count = count
+                    .checked_add(1)
+                    .ok_or(LiteralSetError::ArithmeticOverflow {
                         computation: "compact literal-set matching LF-line count",
-                    },
-                )?;
+                    })?;
                 let Some(relative_lf) = memchr(b'\n', &haystack[end..]) else {
                     break;
                 };
@@ -870,7 +1103,6 @@ impl CompactEngine {
                     .ok_or(LiteralSetError::ArithmeticOverflow {
                         computation: "compact literal-set next LF-line start",
                     })?;
-                scanner.state = scanner.start_state;
             }
             return Ok(count);
         }
@@ -884,13 +1116,12 @@ impl CompactEngine {
             else {
                 break;
             };
-            count = count.checked_add(1).ok_or(
-                LiteralSetError::ArithmeticOverflow {
+            count = count
+                .checked_add(1)
+                .ok_or(LiteralSetError::ArithmeticOverflow {
                     computation: "compact literal-set matching LF-line count",
-                },
-            )?;
-            let Some(relative_lf) = memchr(b'\n', &haystack[matched.end()..])
-            else {
+                })?;
+            let Some(relative_lf) = memchr(b'\n', &haystack[matched.end()..]) else {
                 break;
             };
             at = matched
@@ -1113,15 +1344,20 @@ impl LiteralSetCompactOrdinaryExecutor<'_> {
 #[cfg(test)]
 mod tests {
     use aho_corasick::automaton::Automaton;
+    use aho_corasick::nfa::noncontiguous;
     use aho_corasick::{Anchored, MatchKind};
 
     use super::{
         ALPHABET_LEN, BYTES_PER_DFA_CELL_ENVELOPE, BYTES_PER_TRIE_STATE_ENVELOPE,
-        CompactOrdinaryScanner, CompactPreflight, LiteralSetCompactBuildOutcome,
-        LiteralSetCompactOrdinaryBuildOutcome, LiteralSetCompactOrdinaryCandidate,
-        LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan, MAX_DENSE_DEPTH, MAX_PATTERNS,
-        MIN_PATTERN_BYTES, compact_ordinary_preflight, compact_ordinary_scanner_probe,
-        compact_preflight, deepest_branch_build_work_upper_bound, deepest_branch_dense_depth,
+        CompactOrdinaryScanner, CompactPreflight, LF_SEGMENT_INITIAL_PROBE_BYTES,
+        LF_SEGMENT_REFILL_PROBE_BYTES, LF_SHORT_SEGMENT_MIN_PATTERN_BYTES,
+        LiteralSetCompactBuildOutcome, LiteralSetCompactOrdinaryBuildOutcome,
+        LiteralSetCompactOrdinaryCandidate, LiteralSetCompactOrdinaryPlan,
+        LiteralSetCompactOrdinaryRouteReceipt, LiteralSetCompactPlan, MAX_DENSE_DEPTH,
+        MAX_PATTERNS, MIN_PATTERN_BYTES, MIN_PATTERNS, ORDINARY_MAX_PATTERNS,
+        ORDINARY_MIN_DENSE_BUILD_WORK, build_shared, compact_engine, compact_ordinary_preflight,
+        compact_ordinary_scanner_probe, compact_preflight, deepest_branch_build_work_upper_bound,
+        deepest_branch_build_work_upper_bound_with_limit, deepest_branch_dense_depth,
     };
     use crate::{
         LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, Window,
@@ -1337,11 +1573,13 @@ mod tests {
             compact_build,
             width,
             dense_depth,
+            literals_exclude_lf,
         } = compact_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap()
         else {
             panic!("public compact fixture should pass preflight");
         };
         assert_eq!(dense_depth, 9);
+        assert!(!literals_exclude_lf);
         assert_eq!(
             deepest_branch_build_work_upper_bound(MAX_PATTERNS, width),
             Some(6_375),
@@ -1362,6 +1600,158 @@ mod tests {
             .unwrap(),
             CompactPreflight::Canonical(_),
         ));
+    }
+
+    #[test]
+    fn ordinary_lf_authentication_is_exactly_charged_and_fail_closed() {
+        let active_width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES.max(64);
+        let lf_free = broad_root_512_lf_free_patterns(active_width);
+        let borrowed = lf_free.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let CompactPreflight::Eligible {
+            canonical_build,
+            compact_build,
+            literals_exclude_lf,
+            ..
+        } = compact_ordinary_preflight(&borrowed, LiteralSetBuildLimits::default()).unwrap()
+        else {
+            panic!("the threshold-qualified ordinary fixture should pass compact preflight");
+        };
+        assert!(literals_exclude_lf);
+        let topology_work = deepest_branch_build_work_upper_bound_with_limit(
+            canonical_build.patterns,
+            canonical_build.minimum_pattern_bytes,
+            ORDINARY_MAX_PATTERNS,
+        )
+        .unwrap();
+        let without_lf_census = canonical_build.dfa_cells_upper_bound * 2
+            + canonical_build.trie_states_upper_bound
+            + canonical_build.patterns
+            + topology_work
+            + canonical_build.build_work_upper_bound;
+        assert_eq!(
+            compact_build.build_work_upper_bound,
+            without_lf_census + canonical_build.pattern_bytes,
+        );
+        assert!(matches!(
+            compact_ordinary_preflight(
+                &borrowed,
+                LiteralSetBuildLimits {
+                    max_build_work: compact_build.build_work_upper_bound,
+                    ..LiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap(),
+            CompactPreflight::Eligible {
+                literals_exclude_lf: true,
+                ..
+            },
+        ));
+        assert!(matches!(
+            compact_ordinary_preflight(
+                &borrowed,
+                LiteralSetBuildLimits {
+                    max_build_work: compact_build.build_work_upper_bound - 1,
+                    ..LiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap(),
+            CompactPreflight::Canonical(_),
+        ));
+
+        let mut contains_lf = lf_free;
+        contains_lf[0][active_width / 2] = b'\n';
+        let borrowed_lf = contains_lf.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let CompactPreflight::Eligible {
+            compact_build: lf_build,
+            literals_exclude_lf: false,
+            ..
+        } = compact_ordinary_preflight(&borrowed_lf, LiteralSetBuildLimits::default()).unwrap()
+        else {
+            panic!("LF presence changes the fact, not the conservative work charge");
+        };
+        assert_eq!(
+            lf_build.build_work_upper_bound,
+            compact_build.build_work_upper_bound
+        );
+
+        let narrow_width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES
+            .checked_sub(1)
+            .expect("the positive LF threshold has a one-below boundary");
+        let narrow = broad_root_lf_threshold_boundary_patterns(narrow_width);
+        let borrowed_narrow = narrow.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let CompactPreflight::Eligible {
+            canonical_build: narrow_canonical,
+            compact_build: narrow_compact,
+            literals_exclude_lf: false,
+            ..
+        } = compact_ordinary_preflight(&borrowed_narrow, LiteralSetBuildLimits::default()).unwrap()
+        else {
+            panic!("the narrow ordinary fixture remains compact but skips LF authentication");
+        };
+        let narrow_topology = deepest_branch_build_work_upper_bound_with_limit(
+            narrow_canonical.patterns,
+            narrow_canonical.minimum_pattern_bytes,
+            ORDINARY_MAX_PATTERNS,
+        )
+        .unwrap();
+        assert_eq!(
+            narrow_compact.build_work_upper_bound,
+            narrow_canonical.dfa_cells_upper_bound * 2
+                + narrow_canonical.trie_states_upper_bound
+                + narrow_canonical.patterns
+                + narrow_topology
+                + narrow_canonical.build_work_upper_bound,
+        );
+    }
+
+    #[test]
+    fn compact_engine_release_contract_fails_closed() {
+        let width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES;
+        let patterns = broad_root_512_lf_free_patterns(width);
+        let borrowed = patterns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let shared = build_shared(&borrowed).expect("the standard fixture builds a shared NFA");
+
+        assert!(compact_engine(&shared, width, 1, true).is_some());
+        assert!(compact_engine(&shared, 0, 0, true).is_none());
+        assert!(compact_engine(&shared, width, MAX_DENSE_DEPTH + 1, true).is_none());
+        assert!(compact_engine(&shared, width, width, true).is_none());
+        assert!(compact_engine(&shared, width + 1, 1, true).is_none());
+
+        let mut builder = noncontiguous::Builder::new();
+        builder.match_kind(MatchKind::LeftmostFirst);
+        let leftmost = builder
+            .build(borrowed.iter().copied())
+            .expect("the leftmost-first fixture builds a shared NFA");
+        assert!(compact_engine(&leftmost, width, 1, true).is_none());
+
+        let mut mixed = patterns;
+        mixed[0].push(b'X');
+        let mixed_borrowed = mixed.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mixed_shared =
+            build_shared(&mixed_borrowed).expect("the mixed-width fixture builds a shared NFA");
+        assert!(compact_engine(&mixed_shared, width, 1, true).is_none());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn compact_scanner_release_guards_fail_closed() {
+        let width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES;
+        let patterns = broad_root_512_lf_free_patterns(width);
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the release-guard fixture admits the compact ordinary owner")
+            .into_ordinary();
+        let haystack = vec![b'!'; width * 2];
+
+        let mut inverted =
+            CompactOrdinaryScanner::new(&plan.engine, &haystack, Window::full(&haystack))
+                .expect("the release-guard fixture binds the direct scanner");
+        inverted.at = inverted.window_end + 1;
+        assert_eq!(inverted.next_end(), None);
+        assert_eq!(inverted.at, inverted.window_end);
+        compact_ordinary_scanner_probe::reset();
+        assert_eq!(inverted.next_end(), None);
+        assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_calls(), 0);
     }
 
     #[test]
@@ -1411,6 +1801,77 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(patterns.len(), 256);
         assert!(patterns.iter().all(|pattern| pattern.len() == 128));
+        patterns
+    }
+
+    fn broad_root_256x128_lf_free_patterns() -> Vec<Vec<u8>> {
+        let mut patterns = broad_root_256x128_patterns();
+        for pattern in &mut patterns {
+            if pattern[0] >= b'\n' {
+                pattern[0] = pattern[0].saturating_add(1);
+            }
+        }
+        assert!(patterns.iter().all(|pattern| !pattern.contains(&b'\n')));
+        patterns
+    }
+
+    fn broad_root_lf_free_patterns(count: usize, width: usize) -> Vec<Vec<u8>> {
+        assert!(width >= 2);
+        assert!(count <= ORDINARY_MAX_PATTERNS);
+        let patterns = (0_usize..count)
+            .map(|index| {
+                let mut pattern = vec![b'a'; width];
+                let raw_root = u8::try_from(index % 255).unwrap();
+                pattern[0] = if raw_root >= b'\n' {
+                    raw_root.saturating_add(1)
+                } else {
+                    raw_root
+                };
+                pattern[1] = b'a' + u8::try_from(index / 255).unwrap();
+                pattern
+            })
+            .collect::<Vec<_>>();
+        assert!(patterns.iter().all(|pattern| !pattern.contains(&b'\n')));
+        patterns
+    }
+
+    fn broad_root_lf_threshold_boundary_patterns(width: usize) -> Vec<Vec<u8>> {
+        let count = (MIN_PATTERNS..=ORDINARY_MAX_PATTERNS)
+            .find(|&count| {
+                let pattern_bytes = count.checked_mul(width).unwrap();
+                let trie_states = pattern_bytes.checked_add(1).unwrap();
+                trie_states
+                    .checked_mul(ALPHABET_LEN)
+                    .and_then(|work| work.checked_add(pattern_bytes))
+                    .and_then(|work| work.checked_add(count))
+                    .is_some_and(|work| work >= ORDINARY_MIN_DENSE_BUILD_WORK)
+            })
+            .expect("the one-below-LF-threshold fixture reaches ordinary admission");
+        broad_root_lf_free_patterns(count, width)
+    }
+
+    fn broad_root_512_lf_free_patterns(width: usize) -> Vec<Vec<u8>> {
+        broad_root_lf_free_patterns(512, width)
+    }
+
+    fn broad_root_256_lf_free_patterns(width: usize) -> Vec<Vec<u8>> {
+        assert!(width >= 2);
+        let patterns = (0_u16..=255)
+            .map(|index| {
+                let mut pattern = vec![b'a'; width];
+                let raw_root = u8::try_from(index.min(254)).unwrap();
+                pattern[0] = if raw_root >= b'\n' {
+                    raw_root.saturating_add(1)
+                } else {
+                    raw_root
+                };
+                if index == 255 {
+                    pattern[1] = b'b';
+                }
+                pattern
+            })
+            .collect::<Vec<_>>();
+        assert!(patterns.iter().all(|pattern| !pattern.contains(&b'\n')));
         patterns
     }
 
@@ -1482,13 +1943,7 @@ mod tests {
 
     #[test]
     fn direct_scanner_counts_each_authenticated_lf_line_once() {
-        let mut patterns = broad_root_256x128_patterns();
-        for pattern in &mut patterns {
-            if pattern[0] >= b'\n' {
-                pattern[0] = pattern[0].saturating_add(1);
-            }
-        }
-        assert!(patterns.iter().all(|pattern| !pattern.contains(&b'\n')));
+        let patterns = broad_root_256x128_lf_free_patterns();
         let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
             .unwrap()
             .expect("the broad-root set admits the compact ordinary owner")
@@ -1540,6 +1995,1044 @@ mod tests {
             ordinary.count_matching_lf_lines_value(&haystack, true),
             Ok(Some(3)),
         );
+    }
+
+    #[test]
+    fn ordinary_route_receipt_matches_actual_scanner_and_lf_admission() {
+        let one_below_threshold = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES
+            .checked_sub(1)
+            .expect("the positive LF threshold has a one-below boundary");
+        let cases = [
+            (
+                broad_root_lf_threshold_boundary_patterns(one_below_threshold),
+                true,
+                false,
+            ),
+            (
+                broad_root_512_lf_free_patterns(LF_SHORT_SEGMENT_MIN_PATTERN_BYTES),
+                true,
+                true,
+            ),
+            (
+                broad_root_512_lf_free_patterns(LF_SHORT_SEGMENT_MIN_PATTERN_BYTES + 1),
+                true,
+                true,
+            ),
+            (broad_root_256x128_patterns(), true, false),
+            (
+                public_patterns(MAX_PATTERNS, MIN_PATTERN_BYTES),
+                false,
+                true,
+            ),
+        ];
+        for (patterns, expected_prefilter_is_none, expected_lf_excluded) in cases {
+            let width = patterns[0].len();
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("the focused ordinary shape retains a compact owner")
+                .into_ordinary();
+            let scratch = vec![0_u8; width];
+            let actual_scanner_eligible =
+                CompactOrdinaryScanner::new(&plan.engine, &scratch, Window::full(&scratch))
+                    .is_some();
+            let expected_skip_enabled = expected_prefilter_is_none && expected_lf_excluded;
+            assert_eq!(
+                plan.construction_route_receipt(),
+                LiteralSetCompactOrdinaryRouteReceipt {
+                    schema_version: 3,
+                    capability_id: "literal-set-compact-ordinary-route-v3",
+                    engine_width_bytes: width,
+                    automaton_min_pattern_bytes: width,
+                    automaton_max_pattern_bytes: width,
+                    automaton_match_kind_standard: true,
+                    automaton_prefilter_is_none: expected_prefilter_is_none,
+                    compact_ordinary_scanner_eligible: actual_scanner_eligible,
+                    literals_exclude_lf: expected_lf_excluded,
+                    lf_short_segment_min_pattern_bytes: LF_SHORT_SEGMENT_MIN_PATTERN_BYTES,
+                    lf_segment_initial_probe_bytes: LF_SEGMENT_INITIAL_PROBE_BYTES,
+                    lf_segment_refill_probe_bytes: LF_SEGMENT_REFILL_PROBE_BYTES,
+                    lf_short_segment_skip_enabled: expected_skip_enabled,
+                },
+            );
+            assert_eq!(actual_scanner_eligible, expected_prefilter_is_none);
+        }
+
+        let dual = compact(
+            &broad_root_256x128_lf_free_patterns(),
+            LiteralSetBuildLimits::default(),
+        )
+        .unwrap()
+        .expect("the LF-free broad-root shape retains the dual compact owner");
+        assert!(dual.engine.automaton.prefilter().is_none());
+        assert!(
+            !dual.engine.literals_exclude_lf,
+            "R74 deliberately authenticates and enables only the ordinary-only owner",
+        );
+    }
+
+    #[test]
+    fn direct_scanner_skips_only_authenticated_short_lf_segments() {
+        let width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES.max(64);
+        let mut patterns = broad_root_512_lf_free_patterns(width);
+        patterns[17][width - 1] = b'\r';
+        let canonical =
+            LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the broad-root 512x64 set admits the compact ordinary owner")
+            .into_ordinary();
+        assert!(plan.engine.automaton.prefilter().is_none());
+        let receipt = plan.construction_route_receipt();
+        assert!(receipt.literals_exclude_lf);
+        assert!(receipt.lf_short_segment_skip_enabled);
+        assert_eq!(
+            receipt.lf_segment_initial_probe_bytes,
+            LF_SEGMENT_INITIAL_PROBE_BYTES,
+        );
+
+        let mut haystack = b"\n".to_vec();
+        haystack.extend(core::iter::repeat_n(b'!', width - 1));
+        haystack.push(b'\n');
+        let first_start = haystack.len();
+        haystack.extend_from_slice(&patterns[17]);
+        let first_end = haystack.len();
+        // The LF is exactly one width from `first_start`. Discovering it must
+        // leave the CR-ending match immediately before it visible.
+        haystack.extend_from_slice(b"\n\r\n");
+        let second_start = haystack.len();
+        haystack.extend_from_slice(&patterns[31]);
+        let second_end = haystack.len();
+
+        let ordinary = plan.ordinary_executor();
+        compact_ordinary_scanner_probe::reset();
+        let mut spans = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, Window::full(&haystack), |span| {
+                spans.push(span);
+                Ok::<bool, ()>(true)
+            },),
+            Ok(Ok(())),
+        );
+        assert_eq!(
+            spans,
+            [(first_start, first_end), (second_start, second_end)]
+        );
+        assert_eq!(compact_ordinary_scanner_probe::binds(), 1);
+        // The LF cached immediately after a hit is consumed directly, not
+        // counted as another short-segment skip or delimiter discovery.
+        assert_eq!(compact_ordinary_scanner_probe::short_lf_segment_skips(), 3);
+        assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_calls(), 5);
+        assert!(
+            compact_ordinary_scanner_probe::short_lf_probe_bytes()
+                <= 5 * LF_SEGMENT_REFILL_PROBE_BYTES,
+        );
+        assert_eq!(
+            ordinary.count_spans_window_value(&haystack, Window::full(&haystack)),
+            Ok(2)
+        );
+        assert_eq!(
+            ordinary.count_matching_lf_lines_value(&haystack, true),
+            Ok(Some(2))
+        );
+
+        let mut stopped = 0;
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, Window::full(&haystack), |_| {
+                stopped += 1;
+                Ok::<bool, &'static str>(false)
+            },),
+            Ok(Ok(())),
+        );
+        assert_eq!(stopped, 1);
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(&haystack, Window::full(&haystack), |_| Err::<
+                bool,
+                _,
+            >(
+                "short-LF callback"
+            ),),
+            Ok(Err("short-LF callback")),
+        );
+
+        for window in [
+            Window::new(first_start, first_end),
+            Window::new(first_start, first_end + 1),
+            Window::new(first_start + 1, first_end + 1),
+            Window::new(second_start, second_end),
+            Window::new(1, second_end),
+        ] {
+            let expected = canonical
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(ordinary.find_window_value(&haystack, window), Ok(expected));
+            assert_eq!(
+                ordinary.selected_end_window_value(&haystack, window),
+                Ok(expected.map(|(_, end)| end)),
+            );
+            assert_eq!(
+                ordinary.exists_window_value(&haystack, window),
+                Ok(expected.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn direct_scanner_resumes_short_segment_probes_after_lf() {
+        for width in [64, 65, 80, 96, 128] {
+            let patterns = broad_root_512_lf_free_patterns(width);
+            let canonical =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("broad-root LF-resumption fixture")
+                .into_ordinary();
+            let mut haystack = vec![b'!'; width + 17];
+            haystack.push(b'\n');
+            for _ in 0..3 {
+                haystack.extend(core::iter::repeat_n(b'!', width - 1));
+                haystack.push(b'\n');
+            }
+            let ordinary = plan.ordinary_executor();
+            compact_ordinary_scanner_probe::reset();
+            assert_eq!(
+                ordinary.find_window_value(&haystack, Window::full(&haystack)),
+                Ok(None),
+            );
+            assert_eq!(compact_ordinary_scanner_probe::short_lf_segment_skips(), 3);
+
+            let first_start = haystack.len();
+            haystack.extend_from_slice(&patterns[17]);
+            let first_end = haystack.len();
+            // A partial literal before LF must never combine with a suffix
+            // after LF, even when the preceding record is too long to skip.
+            haystack.extend_from_slice(&patterns[31][..width - 1]);
+            haystack.push(b'\n');
+            haystack.extend_from_slice(&patterns[31][width - 1..]);
+            haystack.push(b'\n');
+            let second_start = haystack.len();
+            haystack.extend_from_slice(&patterns[63]);
+            let second_end = haystack.len();
+            haystack.extend_from_slice(b"\n!\n");
+            let window = Window::full(&haystack);
+            let mut spans = Vec::new();
+            assert_eq!(
+                ordinary.try_visit_spans_window_value(&haystack, window, |span| {
+                    spans.push(span);
+                    Ok::<bool, ()>(true)
+                }),
+                Ok(Ok(())),
+            );
+            assert_eq!(
+                spans,
+                [(first_start, first_end), (second_start, second_end)]
+            );
+            assert_eq!(ordinary.count_spans_window_value(&haystack, window), Ok(2));
+            assert_eq!(
+                ordinary.count_matching_lf_lines_value(&haystack, true),
+                Ok(Some(2))
+            );
+            for start in [0, 1, width, first_start, first_start + 1, first_end] {
+                for end in [first_end, second_start, second_end, haystack.len()] {
+                    if start > end {
+                        continue;
+                    }
+                    let bounded = Window::new(start, end);
+                    let expected = canonical
+                        .find_window(&haystack, bounded, LiteralSetSearchLimits::unlimited())
+                        .unwrap()
+                        .0;
+                    assert_eq!(ordinary.find_window_value(&haystack, bounded), Ok(expected));
+                    assert_eq!(
+                        ordinary.exists_window_value(&haystack, bounded),
+                        Ok(expected.is_some())
+                    );
+                    assert_eq!(
+                        ordinary.selected_end_window_value(&haystack, bounded),
+                        Ok(expected.map(|(_, end)| end))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_lf_route_matches_canonical_for_every_small_window_and_projection() {
+        let width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES.max(64);
+        let mut patterns = broad_root_256_lf_free_patterns(width);
+        patterns[17][width - 1] = b'\r';
+        patterns[255] = patterns[17].clone();
+        let canonical =
+            LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the all-window fixture admits the compact ordinary owner")
+            .into_ordinary();
+        let receipt = plan.construction_route_receipt();
+        assert!(receipt.automaton_prefilter_is_none);
+        assert!(receipt.lf_short_segment_skip_enabled);
+        let ordinary = plan.ordinary_executor();
+
+        let mut haystack = b"\nxy\r\n".to_vec();
+        let matched_start = haystack.len();
+        haystack.extend_from_slice(&patterns[17]);
+        let matched_end = haystack.len();
+        haystack.extend_from_slice(b"\nq\r\n");
+        assert_eq!(
+            ordinary.count_matching_lf_lines_value(&haystack, true),
+            Ok(Some(1)),
+        );
+
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = Window::new(start, end);
+                let expected = canonical
+                    .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                let expected_spans = if start <= matched_start && matched_end <= end {
+                    vec![(matched_start, matched_end)]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    expected,
+                    expected_spans.first().copied(),
+                    "window={window:?}"
+                );
+                assert_eq!(
+                    ordinary.find_window_value(&haystack, window),
+                    Ok(expected),
+                    "find window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.selected_end_window_value(&haystack, window),
+                    Ok(expected.map(|(_, accepted_end)| accepted_end)),
+                    "end window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.exists_window_value(&haystack, window),
+                    Ok(expected.is_some()),
+                    "exists window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.count_spans_window_value(&haystack, window),
+                    Ok(u64::try_from(expected_spans.len()).unwrap()),
+                    "count window={window:?}",
+                );
+                let mut actual_spans = Vec::new();
+                assert_eq!(
+                    ordinary.try_visit_spans_window_value(&haystack, window, |span| {
+                        actual_spans.push(span);
+                        Ok::<bool, ()>(true)
+                    },),
+                    Ok(Ok(())),
+                    "visit window={window:?}",
+                );
+                assert_eq!(actual_spans, expected_spans, "spans window={window:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_active_lf_route_matches_canonical_across_widths_and_windows() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+
+        fn below(seed: &mut u64, upper: usize) -> usize {
+            usize::try_from(next(seed) % u64::try_from(upper).unwrap()).unwrap()
+        }
+
+        let active_width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES.max(64);
+        let widths = [active_width, active_width + 1, active_width + 64];
+        let mut seed = 0x74a0_1f5e_9d3c_27b1_u64;
+        for width in widths {
+            let mut patterns = broad_root_256_lf_free_patterns(width);
+            patterns[31][width - 1] = b'\r';
+            patterns[255] = patterns[31].clone();
+            let canonical_plan =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            let canonical = canonical_plan
+                .ordinary_executor()
+                .expect("the seeded canonical plan binds ordinary search");
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("the seeded LF-rich fixture admits the compact ordinary owner")
+                .into_ordinary();
+            assert!(
+                plan.construction_route_receipt()
+                    .lf_short_segment_skip_enabled
+            );
+            let ordinary = plan.ordinary_executor();
+
+            for case in 0_usize..64 {
+                let len = below(&mut seed, width * 4 + 33);
+                let mut haystack = (0..len)
+                    .map(|_| match next(&mut seed) % 12 {
+                        0 | 1 => b'\n',
+                        2 => b'\r',
+                        value => b'A' + u8::try_from(value - 3).unwrap(),
+                    })
+                    .collect::<Vec<_>>();
+                if len >= width {
+                    for injection in 0..=(case % 3) {
+                        let pattern_index =
+                            (below(&mut seed, patterns.len()) + injection * 31) % patterns.len();
+                        let at = below(&mut seed, len - width + 1);
+                        haystack[at..at + width].copy_from_slice(&patterns[pattern_index]);
+                    }
+                }
+                let window = if case % 4 == 0 {
+                    Window::full(&haystack)
+                } else {
+                    let start = below(&mut seed, len + 1);
+                    let end = start + below(&mut seed, len - start + 1);
+                    Window::new(start, end)
+                };
+
+                assert_eq!(
+                    ordinary.find_window_value(&haystack, window),
+                    canonical.find_window_value(&haystack, window),
+                    "find width={width}, case={case}, window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.exists_window_value(&haystack, window),
+                    canonical.exists_window_value(&haystack, window),
+                    "exists width={width}, case={case}, window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.selected_end_window_value(&haystack, window),
+                    canonical.selected_end_window_value(&haystack, window),
+                    "end width={width}, case={case}, window={window:?}",
+                );
+                assert_eq!(
+                    ordinary.count_spans_window_value(&haystack, window),
+                    canonical.count_spans_window_value(&haystack, window),
+                    "count width={width}, case={case}, window={window:?}",
+                );
+
+                // Count matching LF-delimited lines through an independent
+                // line-window oracle. This projection alone advances the
+                // compact scanner cursor directly after one acceptance, so it
+                // must begin its next search at that cursor with fresh state.
+                let mut expected_matching_lines = 0_u64;
+                let mut line_start = 0_usize;
+                loop {
+                    let relative_lf = haystack[line_start..]
+                        .iter()
+                        .position(|&byte| byte == b'\n');
+                    let line_end =
+                        relative_lf.map_or(haystack.len(), |relative| line_start + relative);
+                    if canonical
+                        .find_window_value(&haystack, Window::new(line_start, line_end))
+                        .unwrap()
+                        .is_some()
+                    {
+                        expected_matching_lines += 1;
+                    }
+                    let Some(_) = relative_lf else {
+                        break;
+                    };
+                    line_start = line_end + 1;
+                }
+                assert_eq!(
+                    ordinary.count_matching_lf_lines_value(&haystack, true),
+                    Ok(Some(expected_matching_lines)),
+                    "matching LF lines width={width}, case={case}",
+                );
+
+                let mut expected_spans = Vec::new();
+                canonical
+                    .try_visit_spans_window_value(&haystack, window, |span| {
+                        expected_spans.push(span);
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap()
+                    .unwrap();
+                let mut actual_spans = Vec::new();
+                ordinary
+                    .try_visit_spans_window_value(&haystack, window, |span| {
+                        actual_spans.push(span);
+                        Ok::<bool, ()>(true)
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    actual_spans, expected_spans,
+                    "spans width={width}, case={case}, window={window:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lf_probe_boundaries_match_the_canonical_dfa() {
+        let active_width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES.max(64);
+        for width in [active_width, active_width + 1, active_width + 64] {
+            let patterns = broad_root_512_lf_free_patterns(width);
+            let canonical =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("the boundary fixture admits the compact ordinary owner")
+                .into_ordinary();
+            assert!(
+                plan.construction_route_receipt()
+                    .lf_short_segment_skip_enabled
+            );
+            let ordinary = plan.ordinary_executor();
+            let mut offsets = vec![
+                0,
+                width - 1,
+                width,
+                width + 1,
+                63,
+                64,
+                65,
+                LF_SEGMENT_INITIAL_PROBE_BYTES - 1,
+                LF_SEGMENT_INITIAL_PROBE_BYTES,
+                LF_SEGMENT_INITIAL_PROBE_BYTES + 1,
+                LF_SEGMENT_INITIAL_PROBE_BYTES + LF_SEGMENT_REFILL_PROBE_BYTES - 1,
+                LF_SEGMENT_INITIAL_PROBE_BYTES + LF_SEGMENT_REFILL_PROBE_BYTES,
+                LF_SEGMENT_INITIAL_PROBE_BYTES + LF_SEGMENT_REFILL_PROBE_BYTES + 1,
+            ];
+            offsets.sort_unstable();
+            offsets.dedup();
+            for lf_offset in offsets {
+                let mut haystack = vec![b'!'; lf_offset];
+                haystack.push(b'\n');
+                haystack.extend(core::iter::repeat_n(b'!', width + 2));
+                let window = Window::full(&haystack);
+                let expected = canonical
+                    .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0;
+                compact_ordinary_scanner_probe::reset();
+                assert_eq!(ordinary.find_window_value(&haystack, window), Ok(expected));
+                let expected_skip =
+                    usize::from(lf_offset < width && lf_offset < LF_SEGMENT_INITIAL_PROBE_BYTES);
+                assert_eq!(
+                    compact_ordinary_scanner_probe::short_lf_segment_skips(),
+                    expected_skip,
+                    "width={width}, lf_offset={lf_offset}",
+                );
+                assert!(compact_ordinary_scanner_probe::short_lf_probe_calls() >= 1);
+                assert!(
+                    compact_ordinary_scanner_probe::short_lf_probe_bytes()
+                        <= compact_ordinary_scanner_probe::short_lf_probe_calls()
+                            * LF_SEGMENT_REFILL_PROBE_BYTES,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn any_lf_consuming_literal_disables_short_segment_probing() {
+        let width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES.max(64);
+        for lf_index in [0, width / 2, width - 1] {
+            let mut patterns = broad_root_512_lf_free_patterns(width);
+            patterns[0][lf_index] = b'\n';
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("the LF-containing set retains the compact ordinary owner")
+                .into_ordinary();
+            let receipt = plan.construction_route_receipt();
+            assert!(receipt.compact_ordinary_scanner_eligible);
+            assert!(!receipt.literals_exclude_lf);
+            assert!(!receipt.lf_short_segment_skip_enabled);
+            assert_eq!(
+                receipt.lf_segment_initial_probe_bytes,
+                LF_SEGMENT_INITIAL_PROBE_BYTES
+            );
+            assert_eq!(
+                receipt.lf_segment_refill_probe_bytes,
+                LF_SEGMENT_REFILL_PROBE_BYTES
+            );
+
+            compact_ordinary_scanner_probe::reset();
+            let ordinary = plan.ordinary_executor();
+            assert_eq!(
+                ordinary.find_window_value(&patterns[0], Window::full(&patterns[0])),
+                Ok(Some((0, width))),
+                "LF index {lf_index}",
+            );
+            assert_eq!(
+                ordinary.count_spans_window_value(&patterns[0], Window::full(&patterns[0])),
+                Ok(1),
+            );
+            assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_calls(), 0);
+            assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_bytes(), 0);
+            assert_eq!(compact_ordinary_scanner_probe::short_lf_segment_skips(), 0);
+        }
+    }
+
+    #[test]
+    fn poisoned_lf_authentication_is_detected_by_the_oracle() {
+        let width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES;
+        let mut patterns = broad_root_512_lf_free_patterns(width);
+        patterns[0][width / 2] = b'\n';
+        let mut plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the poisoned fixture retains the compact ordinary owner")
+            .into_ordinary();
+        let haystack = &patterns[0];
+        let window = Window::full(haystack);
+        let canonical =
+            LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let expected = canonical
+            .find_window(haystack, window, LiteralSetSearchLimits::unlimited())
+            .unwrap()
+            .0;
+        assert_eq!(expected, Some((0, width)));
+        assert_eq!(
+            plan.ordinary_executor().find_window_value(haystack, window),
+            Ok(expected)
+        );
+        assert!(!plan.engine.literals_exclude_lf);
+
+        // An intentionally false construction fact must make this fixture
+        // disagree with the independent DFA; otherwise the negative control
+        // cannot detect an unsound LF census.
+        plan.engine.literals_exclude_lf = true;
+        compact_ordinary_scanner_probe::reset();
+        assert_eq!(
+            plan.ordinary_executor().find_window_value(haystack, window),
+            Ok(None)
+        );
+        assert_eq!(compact_ordinary_scanner_probe::short_lf_segment_skips(), 1);
+    }
+
+    #[test]
+    fn lf_at_and_outside_window_end_preserves_exact_width_matches() {
+        for width in [64, 65, 128] {
+            let patterns = broad_root_512_lf_free_patterns(width);
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("the window-end fixture admits the compact ordinary owner")
+                .into_ordinary();
+            let mut haystack = b"!\n".to_vec();
+            let start = haystack.len();
+            haystack.extend_from_slice(&patterns[17]);
+            let end = haystack.len();
+            haystack.push(b'\n');
+
+            for window_end in [end, end + 1] {
+                compact_ordinary_scanner_probe::reset();
+                let mut scanner = CompactOrdinaryScanner::new(
+                    &plan.engine,
+                    &haystack,
+                    Window::new(start, window_end),
+                )
+                .unwrap();
+                assert_eq!(scanner.next_span(), Some((start, end)));
+                assert_eq!(compact_ordinary_scanner_probe::short_lf_segment_skips(), 0);
+                assert_eq!(scanner.next_end(), None);
+                let probes = compact_ordinary_scanner_probe::short_lf_probe_calls();
+                assert_eq!(scanner.next_end(), None);
+                assert_eq!(
+                    compact_ordinary_scanner_probe::short_lf_probe_calls(),
+                    probes
+                );
+            }
+
+            // LF immediately outside a short window must not be read even
+            // when the probe cap exceeds the remaining source.
+            let short = b"!\n";
+            compact_ordinary_scanner_probe::reset();
+            let mut scanner =
+                CompactOrdinaryScanner::new(&plan.engine, short, Window::new(0, 1)).unwrap();
+            assert_eq!(scanner.next_end(), None);
+            assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_bytes(), 1);
+            assert_eq!(compact_ordinary_scanner_probe::short_lf_segment_skips(), 0);
+
+            let mut short_record = patterns[17][..width - 1].to_vec();
+            short_record.push(b'\n');
+            assert_eq!(
+                plan.ordinary_executor()
+                    .find_window_value(&short_record, Window::full(&short_record),),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn no_lf_discovery_is_bounded_and_does_not_reprobe_scanned_bytes() {
+        let width = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES.max(64);
+        let patterns = broad_root_512_lf_free_patterns(width);
+        let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the no-LF fixture admits the compact ordinary owner")
+            .into_ordinary();
+        let haystack = vec![b'!'; 4_096];
+        compact_ordinary_scanner_probe::reset();
+        assert_eq!(
+            plan.ordinary_executor()
+                .find_window_value(&haystack, Window::full(&haystack)),
+            Ok(None),
+        );
+        assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_calls(), 2);
+        assert_eq!(
+            compact_ordinary_scanner_probe::short_lf_probe_bytes(),
+            haystack.len(),
+        );
+        assert_eq!(compact_ordinary_scanner_probe::short_lf_segment_skips(), 0);
+
+        let mut exhausted =
+            CompactOrdinaryScanner::new(&plan.engine, &haystack, Window::full(&haystack))
+                .expect("the active no-LF fixture binds the direct scanner");
+        compact_ordinary_scanner_probe::reset();
+        assert_eq!(exhausted.next_end(), None);
+        assert_eq!(exhausted.at, exhausted.window_end);
+        let probe_calls_after_exhaustion = compact_ordinary_scanner_probe::short_lf_probe_calls();
+        assert_eq!(exhausted.next_end(), None);
+        assert_eq!(exhausted.at, exhausted.window_end);
+        assert_eq!(
+            compact_ordinary_scanner_probe::short_lf_probe_calls(),
+            probe_calls_after_exhaustion,
+            "a fused exhausted scanner must not re-probe",
+        );
+
+        let one_below_threshold = LF_SHORT_SEGMENT_MIN_PATTERN_BYTES
+            .checked_sub(1)
+            .expect("the positive LF threshold has a one-below boundary");
+        let narrow_patterns = broad_root_lf_threshold_boundary_patterns(one_below_threshold);
+        let narrow = ordinary_candidate(&narrow_patterns, LiteralSetBuildLimits::default())
+            .unwrap()
+            .expect("the one-below-threshold control retains the compact ordinary owner")
+            .into_ordinary();
+        assert!(
+            !narrow
+                .construction_route_receipt()
+                .lf_short_segment_skip_enabled
+        );
+        compact_ordinary_scanner_probe::reset();
+        assert_eq!(
+            narrow
+                .ordinary_executor()
+                .find_window_value(&haystack, Window::full(&haystack)),
+            Ok(None),
+        );
+        assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_calls(), 0);
+        assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_bytes(), 0);
+    }
+
+    fn assert_delimiter_block_projections(
+        plan: &LiteralSetCompactOrdinaryPlan,
+        canonical: &LiteralSetPlan,
+        haystack: &[u8],
+        window: Window,
+        expected_spans: &[(usize, usize)],
+    ) {
+        let ordinary = plan.ordinary_executor();
+        let oracle = canonical
+            .ordinary_executor()
+            .expect("canonical ordinary executor");
+        let first = expected_spans.first().copied();
+        let count = u64::try_from(expected_spans.len()).unwrap();
+        assert_eq!(oracle.find_window_value(haystack, window), Ok(first));
+        assert_eq!(oracle.count_spans_window_value(haystack, window), Ok(count));
+        assert_eq!(
+            oracle.exists_window_value(haystack, window),
+            Ok(first.is_some())
+        );
+        assert_eq!(ordinary.find_window_value(haystack, window), Ok(first));
+        assert_eq!(
+            ordinary.selected_end_window_value(haystack, window),
+            Ok(first.map(|(_, end)| end))
+        );
+        assert_eq!(
+            ordinary.count_spans_window_value(haystack, window),
+            Ok(count)
+        );
+        assert_eq!(
+            ordinary.exists_window_value(haystack, window),
+            Ok(first.is_some())
+        );
+        let mut actual = Vec::new();
+        assert_eq!(
+            ordinary.try_visit_spans_window_value(haystack, window, |span| {
+                actual.push(span);
+                Ok::<bool, ()>(true)
+            }),
+            Ok(Ok(()))
+        );
+        assert_eq!(actual.as_slice(), expected_spans);
+    }
+
+    #[test]
+    fn delimiter_blocks_preserve_matches_crossing_initial_and_refill_edges() {
+        for width in [64, 65, 128, 320] {
+            let patterns = broad_root_256_lf_free_patterns(width);
+            let canonical =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("block-crossing ordinary fixture")
+                .into_ordinary();
+            assert!(
+                plan.construction_route_receipt()
+                    .lf_short_segment_skip_enabled
+            );
+            for window_start in [0, 7] {
+                for edge in [
+                    LF_SEGMENT_INITIAL_PROBE_BYTES,
+                    LF_SEGMENT_INITIAL_PROBE_BYTES + LF_SEGMENT_REFILL_PROBE_BYTES,
+                ] {
+                    // Half the literal lies on either side of a discovery
+                    // boundary. A fresh root there would lose the match.
+                    let start = window_start + edge - width / 2;
+                    let end = start + width;
+                    let mut haystack = vec![b'!'; start];
+                    haystack.extend_from_slice(&patterns[17]);
+                    haystack.extend(core::iter::repeat_n(b'!', width + 17));
+                    let window = Window::new(window_start, haystack.len());
+                    compact_ordinary_scanner_probe::reset();
+                    let mut scanner =
+                        CompactOrdinaryScanner::new(&plan.engine, &haystack, window).unwrap();
+                    assert_eq!(
+                        scanner.next_span(),
+                        Some((start, end)),
+                        "width={width}, edge={edge}, base={window_start}"
+                    );
+                    assert_eq!(
+                        compact_ordinary_scanner_probe::short_lf_probe_calls(),
+                        if edge == LF_SEGMENT_INITIAL_PROBE_BYTES {
+                            2
+                        } else {
+                            3
+                        }
+                    );
+                    assert_eq!(scanner.next_end(), None);
+                    assert_delimiter_block_projections(
+                        &plan,
+                        &canonical,
+                        &haystack,
+                        window,
+                        &[(start, end)],
+                    );
+                    assert_delimiter_block_projections(
+                        &plan,
+                        &canonical,
+                        &haystack,
+                        Window::new(window_start, end - 1),
+                        &[],
+                    );
+                    assert_delimiter_block_projections(
+                        &plan,
+                        &canonical,
+                        &haystack,
+                        Window::new(start + 1, haystack.len()),
+                        &[],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delimiter_cache_reuses_discovery_across_many_nonoverlapping_hits() {
+        for width in [64, 65, 128, 320] {
+            let patterns = broad_root_256_lf_free_patterns(width);
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("cached-hit ordinary fixture")
+                .into_ordinary();
+            let hits = 96;
+            let haystack = patterns[17].repeat(hits);
+            compact_ordinary_scanner_probe::reset();
+            let mut scanner =
+                CompactOrdinaryScanner::new(&plan.engine, &haystack, Window::full(&haystack))
+                    .unwrap();
+            for index in 0..hits {
+                assert_eq!(
+                    scanner.next_span(),
+                    Some((index * width, (index + 1) * width))
+                );
+                if index == 0 && width <= LF_SEGMENT_INITIAL_PROBE_BYTES {
+                    assert_eq!(compact_ordinary_scanner_probe::short_lf_probe_calls(), 1);
+                    assert_eq!(
+                        compact_ordinary_scanner_probe::short_lf_probe_bytes(),
+                        LF_SEGMENT_INITIAL_PROBE_BYTES,
+                        "an early hit must not trigger refill-sized lookahead"
+                    );
+                }
+            }
+            assert_eq!(scanner.next_end(), None);
+            let calls = compact_ordinary_scanner_probe::short_lf_probe_calls();
+            assert!(calls <= haystack.len().div_ceil(LF_SEGMENT_INITIAL_PROBE_BYTES));
+            assert_eq!(
+                compact_ordinary_scanner_probe::short_lf_probe_bytes(),
+                haystack.len(),
+                "no-LF discovery slices must partition the corpus, not repeatedly search hit suffixes"
+            );
+            assert_eq!(compact_ordinary_scanner_probe::short_lf_segment_skips(), 0);
+            assert_eq!(scanner.next_end(), None);
+            assert_eq!(
+                compact_ordinary_scanner_probe::short_lf_probe_calls(),
+                calls
+            );
+            assert_eq!(
+                plan.ordinary_executor()
+                    .count_spans_window_value(&haystack, Window::full(&haystack)),
+                Ok(hits as u64)
+            );
+        }
+    }
+
+    #[test]
+    fn actual_lf_at_discovery_and_window_edges_consumes_only_the_delimiter() {
+        for width in [64, 65, 128, 320] {
+            let patterns = broad_root_256_lf_free_patterns(width);
+            let canonical =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("delimiter-edge ordinary fixture")
+                .into_ordinary();
+            for edge in [
+                LF_SEGMENT_INITIAL_PROBE_BYTES,
+                LF_SEGMENT_INITIAL_PROBE_BYTES + LF_SEGMENT_REFILL_PROBE_BYTES,
+            ] {
+                for lf_offset in [edge - 1, edge, edge + 1] {
+                    let mut haystack = vec![b'!'; lf_offset];
+                    haystack.push(b'\n');
+                    let start = haystack.len();
+                    haystack.extend_from_slice(&patterns[17]);
+                    let end = haystack.len();
+                    haystack.push(b'\n');
+                    for window_end in [lf_offset, lf_offset + 1, end - 1, end, end + 1] {
+                        let expected = if window_end >= end {
+                            vec![(start, end)]
+                        } else {
+                            Vec::new()
+                        };
+                        assert_delimiter_block_projections(
+                            &plan,
+                            &canonical,
+                            &haystack,
+                            Window::new(0, window_end),
+                            &expected,
+                        );
+                    }
+                    assert_delimiter_block_projections(
+                        &plan,
+                        &canonical,
+                        &haystack,
+                        Window::new(lf_offset, end + 1),
+                        &[(start, end)],
+                    );
+
+                    // Carry a genuine partial literal into the LF boundary.
+                    // A delimiter must reset it, unlike a no-LF block end.
+                    let prefix = (width - 1).min(lf_offset);
+                    let mut split = vec![b'!'; lf_offset - prefix];
+                    split.extend_from_slice(&patterns[17][..prefix]);
+                    split.push(b'\n');
+                    split.extend_from_slice(&patterns[17][prefix..]);
+                    split.push(b'!');
+                    let valid_start = split.len();
+                    split.extend_from_slice(&patterns[31]);
+                    assert_delimiter_block_projections(
+                        &plan,
+                        &canonical,
+                        &split,
+                        Window::full(&split),
+                        &[(valid_start, valid_start + width)],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matching_line_cursor_jumps_invalidate_cached_lf_and_block_ends() {
+        for width in [64, 65, 128, 320] {
+            let patterns = broad_root_256_lf_free_patterns(width);
+            let canonical =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("external-cursor ordinary fixture")
+                .into_ordinary();
+            for long_line in [false, true] {
+                let first_line_len = if long_line {
+                    LF_SEGMENT_INITIAL_PROBE_BYTES + LF_SEGMENT_REFILL_PROBE_BYTES + width + 17
+                } else {
+                    width + 17
+                };
+                let mut haystack = patterns[17].clone();
+                haystack.resize(first_line_len, b'!');
+                haystack.push(b'\n');
+                let second_start = haystack.len();
+                haystack.extend_from_slice(&patterns[31]);
+                haystack.extend_from_slice(&patterns[63]);
+                haystack.extend_from_slice(b"\n!\n");
+                let third_start = haystack.len();
+                haystack.extend_from_slice(&patterns[127]);
+                let window = Window::full(&haystack);
+                let mut scanner =
+                    CompactOrdinaryScanner::new(&plan.engine, &haystack, window).unwrap();
+                assert_eq!(scanner.next_span(), Some((0, width)));
+                assert_eq!(scanner.segment_ends_at_lf, !long_line);
+                assert!(scanner.segment_end < second_start);
+                // This is the exact external cursor advance used by the
+                // matching-line reducer. Consuming a stale cached LF here
+                // would drop the first byte of the next valid match.
+                scanner.at = second_start;
+                assert_eq!(
+                    scanner.next_span(),
+                    Some((second_start, second_start + width))
+                );
+                let expected = [
+                    (0, width),
+                    (second_start, second_start + width),
+                    (second_start + width, second_start + 2 * width),
+                    (third_start, third_start + width),
+                ];
+                assert_delimiter_block_projections(&plan, &canonical, &haystack, window, &expected);
+                assert_eq!(
+                    plan.ordinary_executor()
+                        .count_matching_lf_lines_value(&haystack, true),
+                    Ok(Some(3))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delimiter_blocks_skip_short_records_above_the_old_sixty_four_byte_cap() {
+        for width in [65, 80, 96, 128] {
+            let patterns = broad_root_256_lf_free_patterns(width);
+            let canonical =
+                LiteralSetPlan::new_stable(&patterns, LiteralSetBuildLimits::default()).unwrap();
+            let plan = ordinary_candidate(&patterns, LiteralSetBuildLimits::default())
+                .unwrap()
+                .expect("wide short-record ordinary fixture")
+                .into_ordinary();
+            let records = 12;
+            let mut record = vec![b'!'; width - 1];
+            record.push(b'\n');
+            let mut haystack = record.repeat(records);
+            // An unterminated short suffix must not be mislabelled as an LF
+            // skip, even though it also cannot contain a complete match.
+            haystack.extend_from_slice(&patterns[17][..width - 1]);
+            let window = Window::full(&haystack);
+            compact_ordinary_scanner_probe::reset();
+            assert_eq!(
+                plan.ordinary_executor()
+                    .count_spans_window_value(&haystack, window),
+                Ok(0)
+            );
+            assert_eq!(
+                compact_ordinary_scanner_probe::short_lf_segment_skips(),
+                records
+            );
+            assert_delimiter_block_projections(&plan, &canonical, &haystack, window, &[]);
+        }
     }
 
     fn compact_outcome(
@@ -1786,12 +3279,9 @@ mod tests {
         haystack.extend(core::iter::repeat_n(b'a', 2 * MIN_PATTERN_BYTES));
         haystack.push(u8::MAX);
         assert!(ordinary.engine.automaton.prefilter().is_none());
-        let direct = CompactOrdinaryScanner::new(
-            ordinary.engine,
-            &haystack,
-            Window::full(&haystack),
-        )
-        .expect("the no-prefilter compact NFA admits direct scanning");
+        let direct =
+            CompactOrdinaryScanner::new(ordinary.engine, &haystack, Window::full(&haystack))
+                .expect("the no-prefilter compact NFA admits direct scanning");
         assert!(direct.automaton.is_start(direct.start_state));
         assert!(!direct.automaton.is_special(direct.start_state));
         compact_ordinary_scanner_probe::reset();
@@ -1994,7 +3484,8 @@ mod tests {
 
         assert_eq!(
             ordinary_build.build_work_upper_bound,
-            dual.build_accounting().build_work_upper_bound,
+            dual.build_accounting().build_work_upper_bound + canonical_build.pattern_bytes,
+            "the ordinary-only owner charges its complete LF census exactly once",
         );
         assert_eq!(
             ordinary_build.build_bytes_upper_bound,
@@ -2090,14 +3581,12 @@ mod tests {
         let text_plan = text_candidate.into_ordinary();
         let byte_plan = byte_candidate.into_ordinary();
         assert_eq!(
-            text_plan.ordinary_executor().find_window_value(
-                haystack,
-                Window::new(0, haystack.len()),
-            ),
-            byte_plan.ordinary_executor().find_window_value(
-                haystack,
-                Window::new(0, haystack.len()),
-            ),
+            text_plan
+                .ordinary_executor()
+                .find_window_value(haystack, Window::new(0, haystack.len()),),
+            byte_plan
+                .ordinary_executor()
+                .find_window_value(haystack, Window::new(0, haystack.len()),),
         );
 
         let short = public_patterns(128, MIN_PATTERN_BYTES);
@@ -2292,7 +3781,8 @@ mod tests {
         let haystack = &patterns[3];
         assert!(ordinary.engine.automaton.prefilter().is_some());
         assert!(
-            CompactOrdinaryScanner::new(ordinary.engine, haystack, Window::full(haystack)).is_none()
+            CompactOrdinaryScanner::new(ordinary.engine, haystack, Window::full(haystack))
+                .is_none()
         );
         compact_ordinary_scanner_probe::reset();
         let invalid = Window::new(1, haystack.len() + 1);

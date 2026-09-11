@@ -479,6 +479,8 @@ pub use literal_set_compact::{
     LiteralSetCompactOrdinaryCandidate, LiteralSetCompactOrdinaryExecutor,
     LiteralSetCompactOrdinaryPlan, LiteralSetCompactPlan,
 };
+#[doc(hidden)]
+pub use literal_set_compact::LiteralSetCompactOrdinaryRouteReceipt;
 pub use ordered_literal_aggregate::{
     ALGORITHM_ID as ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     BUILD_ATTEMPT_ACCOUNTING_VERSION as ORDERED_LITERAL_AGGREGATE_BUILD_ATTEMPT_ACCOUNTING_VERSION,
