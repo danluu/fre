@@ -30,6 +30,9 @@ use fre_aot_regex_runtime::{
 };
 use sha2::{Digest, Sha256};
 
+mod span_factory;
+pub use span_factory::{AotSpanError, AotSpanFactory};
+
 const _: () = assert!(
     PREPARED_CAPABILITY_ORDERED_NFA_V15 == PREPARE_CAPABILITY_ORDERED_NFA_V15,
     "compiler/runtime Ordered-NFA V15 capability bits must remain identical"
@@ -2101,6 +2104,10 @@ impl AotMatcher {
                     && spec.case_insensitive == case_insensitive
             })
             .ok_or_else(|| missing_spec_error(mode, output, pattern, case_insensitive))?;
+        Self::prepare_spec(spec)
+    }
+
+    fn prepare_spec(spec: &CompiledSpec) -> Result<Self, String> {
         let backend = match spec.backend {
             BackendFactory::Native {
                 search,
@@ -2131,7 +2138,7 @@ impl AotMatcher {
             )),
         };
         Ok(Self {
-            output,
+            output: spec.output,
             description: spec.description,
             backend,
         })
